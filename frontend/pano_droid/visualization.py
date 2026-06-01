@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -77,49 +78,101 @@ def _positions_from_pred(
 
 
 def _make_trajectory_panel(gt_xyz: np.ndarray, pred_xyz: np.ndarray) -> Image.Image:
-    canvas = Image.new("RGB", (640, 480), "white")
-    draw = ImageDraw.Draw(canvas)
-    pts = []
-    for arr in (gt_xyz, pred_xyz):
-        finite = np.isfinite(arr[:, 0]) & np.isfinite(arr[:, 2])
-        if finite.any():
-            pts.append(arr[finite][:, [0, 2]])
-    if not pts:
-        draw.text((20, 20), "no valid trajectory", fill=(0, 0, 0))
+    """Render GT and predicted camera centers in a shared 3D coordinate frame."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gt_xyz = np.asarray(gt_xyz, dtype=np.float32)
+    pred_xyz = np.asarray(pred_xyz, dtype=np.float32)
+    gt_valid = np.isfinite(gt_xyz).all(axis=1)
+    pred_valid = np.isfinite(pred_xyz).all(axis=1)
+    if not bool(gt_valid.any() or pred_valid.any()):
+        canvas = Image.new("RGB", (900, 640), "white")
+        ImageDraw.Draw(canvas).text((20, 20), "no valid trajectory", fill=(0, 0, 0))
         return canvas
-    all_pts = np.concatenate(pts, axis=0)
+
+    all_pts = np.concatenate([gt_xyz[gt_valid], pred_xyz[pred_valid]], axis=0)
     mn = all_pts.min(axis=0)
     mx = all_pts.max(axis=0)
-    span = np.maximum(mx - mn, 1e-3)
-    margin = 40
+    center = (mn + mx) * 0.5
+    radius = max(float((mx - mn).max()) * 0.55, 1e-3)
+    n_frames = max(gt_xyz.shape[0], pred_xyz.shape[0])
+    frame_ids = np.arange(n_frames, dtype=np.float32)
 
-    def project(arr: np.ndarray) -> list[tuple[int, int]]:
-        xy = arr[:, [0, 2]]
-        out = []
-        for p in xy:
-            if not np.isfinite(p).all():
-                out.append(None)
-                continue
-            q = (p - mn) / span
-            x = int(margin + q[0] * (640 - 2 * margin))
-            y = int(480 - margin - q[1] * (480 - 2 * margin))
-            out.append((x, y))
-        return out
+    fig = plt.figure(figsize=(9.0, 6.4), dpi=120)
+    ax = fig.add_subplot(111, projection="3d")
+    norm = plt.Normalize(vmin=0.0, vmax=max(1.0, float(n_frames - 1)))
+    cmap = plt.get_cmap("viridis")
 
-    gt = project(gt_xyz)
-    pred = project(pred_xyz)
-    for seq, color in ((gt, (0, 120, 255)), (pred, (220, 40, 40))):
-        prev = None
-        for p in seq:
-            if p is None:
-                prev = None
-                continue
-            draw.ellipse((p[0] - 3, p[1] - 3, p[0] + 3, p[1] + 3), fill=color)
-            if prev is not None:
-                draw.line((prev[0], prev[1], p[0], p[1]), fill=color, width=2)
-            prev = p
-    draw.text((20, 16), "trajectory x-z: GT blue, pred red", fill=(0, 0, 0))
-    return canvas
+    def plot_track(
+        arr: np.ndarray,
+        valid: np.ndarray,
+        *,
+        label: str,
+        marker: str,
+        linestyle: str,
+        line_color: str,
+    ) -> None:
+        idx = np.flatnonzero(valid)
+        if idx.size == 0:
+            return
+        pts = arr[idx]
+        colors = cmap(norm(idx.astype(np.float32)))
+        ax.plot(
+            pts[:, 0],
+            pts[:, 1],
+            pts[:, 2],
+            linestyle=linestyle,
+            linewidth=2.0,
+            color=line_color,
+            alpha=0.75,
+            label=label,
+        )
+        ax.scatter(
+            pts[:, 0],
+            pts[:, 1],
+            pts[:, 2],
+            c=colors,
+            marker=marker,
+            s=46,
+            depthshade=True,
+            edgecolors=line_color,
+            linewidths=0.6,
+        )
+
+    plot_track(gt_xyz, gt_valid, label="GT", marker="o", linestyle="-", line_color="#1f77b4")
+    plot_track(pred_xyz, pred_valid, label="Pred", marker="^", linestyle="--", line_color="#d62728")
+
+    if gt_valid.any():
+        start = gt_xyz[np.flatnonzero(gt_valid)[0]]
+        ax.scatter(start[0], start[1], start[2], c="limegreen", marker="o", s=120, label="Start")
+    if pred_valid.any():
+        end = pred_xyz[np.flatnonzero(pred_valid)[-1]]
+        ax.scatter(end[0], end[1], end[2], c="red", marker="^", s=120, label="Pred end")
+
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title("3D trajectory: GT blue/circles, Pred red/triangles")
+    ax.view_init(elev=24, azim=-58)
+    ax.grid(True)
+    ax.legend(loc="upper left")
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array(frame_ids)
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.78, pad=0.08)
+    cbar.set_label("frame index")
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
 
 
 def save_graph_diagnostics(
@@ -172,4 +225,3 @@ def save_graph_diagnostics(
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     return metrics
-

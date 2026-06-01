@@ -92,7 +92,10 @@ PyTorch implementation; large-scale CUDA BA acceleration is a later step.
 During graph training, diagnostics are written under
 `Training.output_dir/visualizations`:
 
-- `step_XXXXXXX_trajectory.png`: predicted trajectory against GT trajectory
-- `step_XXXXXXX_depth.png`: predicted depth, GT depth, and absolute error
+- `step_XXXXXXX_trajectory.png`: 3D predicted trajectory against GT
+  trajectory.  GT uses circle markers, prediction uses triangle markers, and
+  the colorbar shows frame index.
+- `step_XXXXXXX_depth.png`: three panels from left to right: predicted depth,
+  GT depth, and absolute depth error.
 - `step_XXXXXXX_metrics.json`: trajectory RMSE and depth MAE for the visualized
   batch

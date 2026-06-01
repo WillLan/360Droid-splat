@@ -1,6 +1,6 @@
 numpy
+matplotlib
 pillow
 pyyaml
 torch
 pytest
-
