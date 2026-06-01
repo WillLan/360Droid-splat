@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .correlation import SphericalCorrBlock, coords_grid
 from .dense_ba import SphericalDenseBA
@@ -278,30 +279,65 @@ class PanoDroidModel(nn.Module):
         fmap1: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
+        def run_corr(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+            return self._make_corr_block(a, b)(c)
+
+        use_checkpoint = self.training and (
+            fmap0.requires_grad or fmap1.requires_grad or coords.requires_grad
+        )
         total, channels, height, width = fmap0.shape
         kernel = (2 * self.corr_radius + 1) ** 2
         per_item = max(1, channels * height * width * kernel)
         chunk = max(1, min(total, self.max_corr_elements // per_item))
         if chunk >= total:
-            return self._make_corr_block(fmap0, fmap1)(coords)
+            if use_checkpoint:
+                return checkpoint(run_corr, fmap0, fmap1, coords, use_reentrant=False)
+            return run_corr(fmap0, fmap1, coords)
         out = []
         for start in range(0, total, chunk):
             end = min(total, start + chunk)
-            out.append(self._make_corr_block(fmap0[start:end], fmap1[start:end])(coords[start:end]))
+            if use_checkpoint:
+                out.append(
+                    checkpoint(
+                        run_corr,
+                        fmap0[start:end],
+                        fmap1[start:end],
+                        coords[start:end],
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                out.append(run_corr(fmap0[start:end], fmap1[start:end], coords[start:end]))
         return torch.cat(out, dim=0)
 
     def _update_block_chunked(self, hidden: torch.Tensor, update_input: torch.Tensor) -> torch.Tensor:
+        def run_update(h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            return self.update_block(h, x)
+
+        use_checkpoint = self.training and (hidden.requires_grad or update_input.requires_grad)
         total, hidden_channels, height, width = hidden.shape
         gate_channels = hidden_channels + int(update_input.shape[1])
         kernel = max(1, int(self.update_block.kernel_size) ** 2)
         per_item = max(1, gate_channels * height * width * kernel)
         chunk = max(1, min(total, self.max_corr_elements // per_item))
         if chunk >= total:
-            return self.update_block(hidden, update_input)
+            if use_checkpoint:
+                return checkpoint(run_update, hidden, update_input, use_reentrant=False)
+            return run_update(hidden, update_input)
         out = []
         for start in range(0, total, chunk):
             end = min(total, start + chunk)
-            out.append(self.update_block(hidden[start:end], update_input[start:end]))
+            if use_checkpoint:
+                out.append(
+                    checkpoint(
+                        run_update,
+                        hidden[start:end],
+                        update_input[start:end],
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                out.append(run_update(hidden[start:end], update_input[start:end]))
         return torch.cat(out, dim=0)
 
     @staticmethod
