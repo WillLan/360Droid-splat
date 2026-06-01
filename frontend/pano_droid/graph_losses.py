@@ -7,13 +7,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .spherical_camera import (
-    bearing_to_erp_pixel,
-    erp_pixel_to_bearing,
-    latitude_area_weight,
-    pixel_grid,
-    seam_aware_delta,
-)
+from .projective_ops import projective_flow_from_depth
+from .spherical_camera import latitude_area_weight, pixel_grid
 
 
 def build_temporal_edges(n_frames: int, radius: int = 2, *, bidirectional: bool = True) -> list[tuple[int, int]]:
@@ -146,20 +141,14 @@ def _projective_target(
     height: int,
     width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, P = depth.shape
-    p = pixels.to(device=depth.device, dtype=depth.dtype).unsqueeze(0).expand(B, -1, -1)
-    bearing_i = erp_pixel_to_bearing(p, height, width)
-    xyz_i = bearing_i * depth.clamp_min(1e-6).unsqueeze(-1)
-    ones = torch.ones(B, P, 1, device=depth.device, dtype=depth.dtype)
-    world = torch.einsum("bij,bnj->bni", c2w_i, torch.cat([xyz_i, ones], dim=-1))[..., :3]
-    cam_j = torch.einsum(
-        "bij,bnj->bni",
-        torch.linalg.inv(c2w_j),
-        torch.cat([world, ones], dim=-1),
-    )[..., :3]
-    bearing_j = F.normalize(cam_j, dim=-1, eps=1e-12)
-    target_pixels = bearing_to_erp_pixel(bearing_j, height, width)
-    return seam_aware_delta(p, target_pixels, width), target_pixels
+    return projective_flow_from_depth(
+        pixels,
+        depth,
+        c2w_i,
+        c2w_j,
+        height=height,
+        width=width,
+    )
 
 
 def spherical_projective_flow(
@@ -260,7 +249,7 @@ def graph_supervised_loss(
                 height=Hf,
                 width=Wf,
             )
-            flow_err = seam_aware_delta(gt_flow, pred_flow, Wf)
+            flow_err = pred_flow - gt_flow
             edge_area = area * valid.to(dtype)
             l_flow = l_flow + step_w * (
                 torch.sqrt((flow_err * flow_err).sum(dim=-1) + 1e-6) * edge_area

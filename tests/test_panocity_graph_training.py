@@ -7,6 +7,8 @@ import torch
 
 from frontend.pano_droid.graph_dataset import PanoCityGraphDataset
 from frontend.pano_droid.graph_losses import build_temporal_edges, select_training_edges
+from frontend.pano_droid.graph_tracker import PanoDroidGraphTracker
+from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.model import PanoDroidModel
 from frontend.pano_droid.train_graph import load_graph_train_config, train_graph
 
@@ -123,3 +125,72 @@ def test_forward_graph_returns_refined_history():
     assert pred["residual_steps"].shape[:3] == (1, 1, 2)
     assert pred["refined_poses_c2w"].shape == (1, 3, 4, 4)
     assert pred["refined_inverse_depth"].shape[:3] == (1, 3, 1)
+
+
+def test_graph_tracker_uses_graph_path_not_pairwise_forward():
+    model = PanoDroidModel(
+        feature_dim=8,
+        context_dim=8,
+        hidden_dim=8,
+        encoder_base_dim=8,
+        corr_levels=1,
+        corr_radius=1,
+        update_iters=1,
+    )
+
+    def forbidden_pairwise(*args, **kwargs):
+        raise AssertionError("pairwise forward should not be used by graph tracker")
+
+    model.forward = forbidden_pairwise
+    tracker = PanoDroidGraphTracker(
+        model,
+        device="cpu",
+        window_size=3,
+        temporal_radius=1,
+        max_factors=4,
+        keyframe_threshold=0.0,
+        force_keyframe_interval=1,
+        ba_iters_per_update=1,
+    )
+    first = tracker.track(PanoFrame(image=torch.rand(3, 16, 32), timestamp=0.0, frame_id=0))
+    second = tracker.track(PanoFrame(image=torch.rand(3, 16, 32), timestamp=1.0, frame_id=1))
+    assert first.tracking_status == "initialized"
+    assert second.tracking_status == "tracked_graph"
+    assert second.ba_residual is not None and np.isfinite(second.ba_residual)
+    assert second.inverse_depth is not None and second.inverse_depth.shape[-2:] == (16, 32)
+
+
+def test_graph_ba_refinement_backpropagates_to_update_and_backbone():
+    model = PanoDroidModel(
+        feature_dim=8,
+        context_dim=8,
+        hidden_dim=8,
+        encoder_base_dim=8,
+        corr_levels=1,
+        corr_radius=1,
+        update_iters=1,
+    )
+    with torch.no_grad():
+        model.delta_head[-1].weight.normal_(mean=0.0, std=1e-2)
+        model.delta_head[-1].bias.fill_(0.05)
+    images = torch.rand(1, 3, 3, 16, 32)
+    init = torch.eye(4).view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    pred = model.forward_graph(
+        images,
+        edges=[(0, 1), (1, 2), (2, 1)],
+        init_poses_c2w=init,
+        num_updates=1,
+        ba_iters_per_update=1,
+        fixed_frames=1,
+    )
+    loss = pred["refined_poses_c2w"][:, -1, 0, 3].sum() + 1e-3 * pred["refined_inverse_depth"].sum()
+    loss.backward()
+
+    def grad_sum(param):
+        return 0.0 if param.grad is None else float(param.grad.detach().abs().sum())
+
+    assert grad_sum(model.delta_head[-1].weight) > 0.0
+    assert grad_sum(model.conf_head[-1].weight) > 0.0
+    assert grad_sum(model.graph_agg.damping[-1].weight) > 0.0
+    assert grad_sum(model.cnet.encoder.proj.weight) > 0.0
+    assert grad_sum(model.fnet.proj.weight) > 0.0

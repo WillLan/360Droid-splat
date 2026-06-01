@@ -6,9 +6,23 @@ Dataset:
   pair_stride: 1
 
 Frontend:
+  mode: graph
   checkpoint: null
   keyframe_threshold: 0.5
   force_keyframe_interval: 2
+  window_size: 5
+  num_updates: null
+
+Graph:
+  temporal_radius: 2
+  max_factors: 24
+  fixed_frames_inference: 1
+
+BA:
+  mode: differentiable
+  residual_mode: pixel
+  iters_per_update: 2
+  sample_stride: 1
 
 Model:
   feature_dim: 32

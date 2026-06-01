@@ -24,6 +24,7 @@ from .graph_losses import (
     select_training_edges,
 )
 from .model import PanoDroidModel
+from .spherical_ba import se3_exp
 from .visualization import save_graph_diagnostics
 
 
@@ -45,6 +46,10 @@ def _default_config() -> dict:
             "ba_sample_stride": 1,
             "fixed_frames": 2,
             "loss_gamma": 0.9,
+            "init_mode": "droid_gt_anchor",
+            "init_noise_prob": 0.2,
+            "init_identity_prob": 0.05,
+            "init_noise_std": 0.03,
         },
         "Model": {
             "feature_dim": 16,
@@ -175,7 +180,7 @@ def _forward_graph(
     *,
     edges: list[tuple[int, int]],
     num_updates: int,
-    poses_c2w: torch.Tensor,
+    poses_c2w: torch.Tensor | None,
     init_poses_c2w: torch.Tensor | None,
     init_inverse_depth: torch.Tensor | None,
     ba_iters_per_update: int,
@@ -205,6 +210,68 @@ def _forward_graph(
         fixed_frames=fixed_frames,
         ba_sample_stride=ba_sample_stride,
     )
+
+
+def _droid_anchor_initial_poses(poses_c2w: torch.Tensor, fixed_frames: int) -> torch.Tensor:
+    init = poses_c2w.clone()
+    frames = int(init.shape[1])
+    fixed = max(1, min(int(fixed_frames), frames))
+    anchor = fixed - 1
+    if fixed < frames:
+        init[:, fixed:] = init[:, anchor : anchor + 1].expand(-1, frames - fixed, -1, -1)
+    return init
+
+
+def _make_initial_poses(
+    poses_c2w: torch.Tensor,
+    graph_cfg: dict,
+    *,
+    step: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, str]:
+    mode = str(graph_cfg.get("init_mode", "droid_gt_anchor")).lower()
+    fixed_frames = int(graph_cfg.get("fixed_frames", 2))
+    r = torch.rand((), generator=torch.Generator().manual_seed(int(step) + 6151)).item()
+    identity_prob = float(graph_cfg.get("init_identity_prob", 0.05))
+    noise_prob = float(graph_cfg.get("init_noise_prob", 0.2))
+    if mode in ("mixed", "droid_mixed"):
+        if r < identity_prob:
+            mode = "identity_chain"
+        elif r < identity_prob + noise_prob:
+            mode = "noisy_gt_anchor"
+        else:
+            mode = "droid_gt_anchor"
+    elif mode == "droid_gt_anchor" and r < identity_prob:
+        mode = "identity_chain"
+    elif mode == "droid_gt_anchor" and r < identity_prob + noise_prob:
+        mode = "noisy_gt_anchor"
+
+    if mode in ("droid_gt_anchor", "gt_anchor"):
+        return poses_c2w, None, mode
+
+    B, N = poses_c2w.shape[:2]
+    if mode in ("identity", "identity_chain"):
+        eye = torch.eye(4, device=poses_c2w.device, dtype=poses_c2w.dtype)
+        init = eye.view(1, 1, 4, 4).expand(B, N, -1, -1).clone()
+        return None, init, mode
+
+    init = _droid_anchor_initial_poses(poses_c2w, fixed_frames)
+    if mode in ("noisy", "noisy_gt", "noisy_gt_anchor"):
+        std = float(graph_cfg.get("init_noise_std", 0.03))
+        noise = torch.randn(B, N, 6, device=poses_c2w.device, dtype=poses_c2w.dtype) * std
+        noise[:, : max(1, min(fixed_frames, N))] = 0.0
+        init = se3_exp(noise) @ init
+        return None, init, mode
+
+    if mode in ("constant_velocity", "constant_velocity_anchor"):
+        fixed = max(1, min(fixed_frames, N))
+        if fixed >= 2 and fixed < N:
+            velocity = poses_c2w[:, fixed - 1, :3, 3] - poses_c2w[:, fixed - 2, :3, 3]
+            for k in range(fixed, N):
+                init[:, k] = init[:, fixed - 1]
+                init[:, k, :3, 3] = init[:, fixed - 1, :3, 3] + velocity * float(k - fixed + 1)
+        return None, init, mode
+
+    raise ValueError(f"Unsupported Graph.init_mode: {graph_cfg.get('init_mode')}")
 
 
 def _make_graph_edges(batch: dict, graph_cfg: dict, *, step: int) -> list[tuple[int, int]]:
@@ -391,7 +458,11 @@ def train_graph(config: dict) -> dict:
                 edges = _make_graph_edges(batch, graph_cfg, step=step)
                 last_edges = list(edges)
                 optimizer.zero_grad(set_to_none=True)
-                init_poses = None
+                poses_arg, init_poses, init_mode = _make_initial_poses(
+                    batch_device["poses_c2w"],
+                    graph_cfg,
+                    step=step,
+                )
                 init_inv = None
                 restart_prob = float(tr.get("restart_prob", 0.2))
                 restart_count = 0
@@ -403,7 +474,7 @@ def train_graph(config: dict) -> dict:
                         images,
                         edges=edges,
                         num_updates=int(tr.get("iters", config.get("Model", {}).get("update_iters", 1))),
-                        poses_c2w=batch_device["poses_c2w"],
+                        poses_c2w=poses_arg,
                         init_poses_c2w=init_poses,
                         init_inverse_depth=init_inv,
                         ba_iters_per_update=int(graph_cfg.get("ba_iters_per_update", 2)),
@@ -420,6 +491,7 @@ def train_graph(config: dict) -> dict:
                     )
                     loss.backward()
                     restart_count += 1
+                    poses_arg = None
                     init_poses = pred["refined_poses_c2w"].detach()
                     init_inv = pred["refined_inverse_depth"].detach()
                     r = torch.rand((), generator=torch.Generator().manual_seed(step * 104729 + restart_count))
@@ -432,6 +504,19 @@ def train_graph(config: dict) -> dict:
                 step += 1
                 last_metrics = _reduce_metrics(metrics, ddp)
                 last_metrics["restart_count"] = float(restart_count)
+                last_metrics["init_mode_code"] = float(
+                    {
+                        "droid_gt_anchor": 0,
+                        "gt_anchor": 0,
+                        "noisy_gt_anchor": 1,
+                        "noisy_gt": 1,
+                        "noisy": 1,
+                        "identity_chain": 2,
+                        "identity": 2,
+                        "constant_velocity": 3,
+                        "constant_velocity_anchor": 3,
+                    }.get(init_mode, 9)
+                )
                 if is_main and (step == 1 or step % wandb_log_every == 0):
                     _wandb_log_metrics(wandb_run, last_metrics, step=step)
                 if is_main and step % save_every == 0:

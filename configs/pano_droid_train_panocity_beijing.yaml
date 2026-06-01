@@ -17,6 +17,14 @@ Graph:
   ba_sample_stride: 1
   fixed_frames: 2
   loss_gamma: 0.9
+  init_mode: droid_gt_anchor
+  init_noise_prob: 0.2
+  init_identity_prob: 0.05
+  init_noise_std: 0.03
+
+BA:
+  mode: differentiable
+  residual_mode: pixel
 
 Model:
   feature_dim: 32

@@ -7,14 +7,11 @@ from typing import Optional
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from .spherical_camera import (
-    erp_pixel_to_bearing,
     latitude_area_weight,
-    seam_aware_delta,
-    spherical_log_residual,
 )
+from .projective_ops import spherical_reprojection_residual
 
 
 def skew(v: torch.Tensor) -> torch.Tensor:
@@ -113,42 +110,21 @@ def spherical_ba_residual(
     target_delta: Optional[torch.Tensor] = None,
     target_pixels: Optional[torch.Tensor] = None,
     target_bearing: Optional[torch.Tensor] = None,
+    residual_mode: str = "pixel",
 ) -> torch.Tensor:
-    """Compute ``Log_target(b_pred)`` for spherical BA edges."""
+    """Compute spherical BA residuals with a shared projection path."""
     pixels_b, squeeze = _ensure_batch_pixels(source_pixels)
-    B, N, _ = pixels_b.shape
-    inv = inverse_depth.reshape(B, N).to(device=pixels_b.device, dtype=pixels_b.dtype)
-    T = T_ji.to(device=pixels_b.device, dtype=pixels_b.dtype)
-    if T.ndim == 2:
-        T = T.unsqueeze(0).expand(B, -1, -1)
-
-    b_i = erp_pixel_to_bearing(pixels_b, height, width)
-    X_i = b_i / inv.clamp_min(1e-6).unsqueeze(-1)
-    X_j = transform_points(T, X_i)
-    b_pred = F.normalize(X_j, dim=-1, eps=1e-12)
-
-    if target_bearing is None:
-        if target_pixels is None:
-            if target_delta is None:
-                raise ValueError("Provide target_delta, target_pixels, or target_bearing.")
-            delta = target_delta
-            if delta.ndim == 3 and delta.shape[1] == 2:
-                delta = delta.permute(0, 2, 1)
-            delta = delta.reshape(B, N, 2).to(device=pixels_b.device, dtype=pixels_b.dtype)
-            target_pixels = pixels_b + delta
-        else:
-            target_pixels = target_pixels.reshape(B, N, 2).to(
-                device=pixels_b.device, dtype=pixels_b.dtype
-            )
-        target_pixels = target_pixels.clone()
-        target_pixels[..., 0] = torch.remainder(target_pixels[..., 0], float(width))
-        target_bearing = erp_pixel_to_bearing(target_pixels, height, width)
-    else:
-        target_bearing = target_bearing.reshape(B, N, 3).to(
-            device=pixels_b.device, dtype=pixels_b.dtype
-        )
-
-    residual = spherical_log_residual(target_bearing, b_pred)
+    residual, _, _ = spherical_reprojection_residual(
+        pixels_b,
+        inverse_depth,
+        T_ji,
+        height=height,
+        width=width,
+        target_delta=target_delta,
+        target_pixels=target_pixels,
+        target_bearing=target_bearing,
+        residual_mode=residual_mode,
+    )
     return residual.squeeze(0) if squeeze else residual
 
 
@@ -164,6 +140,7 @@ def spherical_ba_loss(
     target_bearing: Optional[torch.Tensor] = None,
     confidence: Optional[torch.Tensor] = None,
     robust_delta: float = 1e-2,
+    residual_mode: str = "pixel",
 ) -> BALossOutput:
     residual = spherical_ba_residual(
         source_pixels,
@@ -174,6 +151,7 @@ def spherical_ba_loss(
         target_delta=target_delta,
         target_pixels=target_pixels,
         target_bearing=target_bearing,
+        residual_mode=residual_mode,
     )
     res_b = residual.unsqueeze(0) if residual.ndim == 2 else residual
     pixels_b, _ = _ensure_batch_pixels(source_pixels)
@@ -252,6 +230,7 @@ class SphericalBA(nn.Module):
                 T_ji=T,
                 target_delta=target_delta,
                 confidence=confidence,
+                residual_mode="pixel",
             )
             out.loss.backward()
             with torch.no_grad():

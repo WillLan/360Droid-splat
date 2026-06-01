@@ -2,6 +2,7 @@ import torch
 
 from frontend.pano_droid.spherical_ba import SphericalBA, se3_exp, spherical_ba_loss
 from frontend.pano_droid.spherical_camera import pixel_grid
+from frontend.pano_droid.projective_ops import spherical_reprojection_residual
 
 
 def test_spherical_ba_residual_and_gradient_are_finite():
@@ -21,6 +22,33 @@ def test_spherical_ba_residual_and_gradient_are_finite():
     out.loss.backward()
     assert torch.isfinite(inv.grad).all()
     assert torch.isfinite(xi.grad).all()
+
+
+def test_spherical_ba_pixel_residual_uses_shared_projection():
+    H, W = 16, 32
+    pixels = pixel_grid(H, W).reshape(-1, 2)[::41].unsqueeze(0)
+    inv = torch.full((1, pixels.shape[1]), 0.5)
+    target_delta = torch.full((1, pixels.shape[1], 2), 0.25)
+    T = torch.eye(4).unsqueeze(0)
+    out = spherical_ba_loss(
+        pixels,
+        inv,
+        T,
+        height=H,
+        width=W,
+        target_delta=target_delta,
+        residual_mode="pixel",
+    )
+    residual, _, _ = spherical_reprojection_residual(
+        pixels,
+        inv,
+        T,
+        height=H,
+        width=W,
+        target_delta=target_delta,
+        residual_mode="pixel",
+    )
+    assert torch.allclose(out.residual, residual, atol=1e-6)
 
 
 def test_spherical_ba_smoke_optimization_and_seam_stability():

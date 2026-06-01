@@ -10,14 +10,10 @@ import torch.nn.functional as F
 
 from .correlation import SphericalCorrBlock, coords_grid
 from .encoders import BasicEncoder, ContextEncoder
+from .projective_ops import project_edges
 from .sphere_gru import SphereConvGRU
 from .spherical_ba import se3_exp
-from .spherical_camera import (
-    bearing_to_erp_pixel,
-    erp_pixel_to_bearing,
-    pixel_grid,
-    seam_aware_delta,
-)
+from .spherical_camera import pixel_grid, seam_aware_delta
 
 
 def _resize_like(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
@@ -28,8 +24,42 @@ def _resize_depth_like(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     return F.interpolate(x, size=size, mode="bilinear", align_corners=True)
 
 
+def _convex_upsample(data: torch.Tensor, mask: torch.Tensor, scale: int = 8) -> torch.Tensor:
+    """DROID-style convex upsampling for per-pixel fields."""
+    B, C, H, W = data.shape
+    if mask.shape[1] != scale * scale * 9:
+        raise ValueError(f"Expected mask channels {scale * scale * 9}, got {mask.shape[1]}")
+    mask = mask.view(B, 1, 9, scale, scale, H, W)
+    mask = torch.softmax(mask, dim=2)
+    patches = F.unfold(data, [3, 3], padding=1)
+    patches = patches.view(B, C, 9, 1, 1, H, W)
+    up = torch.sum(mask * patches, dim=2)
+    up = up.permute(0, 1, 4, 2, 5, 3).reshape(B, C, H * scale, W * scale)
+    return up
+
+
+def _upsample_inverse_depth(
+    inv_depth: torch.Tensor,
+    upmask: Optional[torch.Tensor],
+    size: tuple[int, int],
+) -> torch.Tensor:
+    B, N, C, H, W = inv_depth.shape
+    if upmask is not None:
+        try:
+            up = _convex_upsample(
+                inv_depth.reshape(B * N, C, H, W),
+                upmask.reshape(B * N, upmask.shape[2], H, W),
+                scale=8,
+            )
+            return up[..., : size[0], : size[1]].reshape(B, N, C, size[0], size[1])
+        except ValueError:
+            pass
+    up = _resize_depth_like(inv_depth.reshape(B * N, C, H, W), size)
+    return up.view(B, N, C, size[0], size[1])
+
+
 class GraphAggregator(nn.Module):
-    """Aggregate edge hidden states into per-source-frame damping."""
+    """Aggregate edge hidden states into per-source-frame damping and upmasks."""
 
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
@@ -40,8 +70,9 @@ class GraphAggregator(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(max(1, hidden_dim // 2), 1, 3, padding=1),
         )
+        self.upmask = nn.Conv2d(hidden_dim, 8 * 8 * 9, 1)
 
-    def forward(self, edge_hidden: torch.Tensor, ii: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def forward(self, edge_hidden: torch.Tensor, ii: torch.Tensor, num_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
         B, E, C, H, W = edge_hidden.shape
         frame_hidden = edge_hidden.new_zeros(B, int(num_frames), C, H, W)
         counts = edge_hidden.new_zeros(int(num_frames))
@@ -52,7 +83,11 @@ class GraphAggregator(nn.Module):
         x = F.silu(self.conv1(x), inplace=True)
         x = F.silu(self.conv2(x), inplace=True)
         damping = F.softplus(self.damping(x)) + 1e-4
-        return damping.view(B, int(num_frames), 1, H, W)
+        upmask = self.upmask(x)
+        return (
+            0.01 * damping.view(B, int(num_frames), 1, H, W),
+            upmask.view(B, int(num_frames), 8 * 8 * 9, H, W),
+        )
 
 
 class PanoDroidModel(nn.Module):
@@ -134,6 +169,7 @@ class PanoDroidModel(nn.Module):
             nn.Conv2d(max(1, self.hidden_dim // 2), 1, 3, padding=1),
         )
         self.graph_agg = GraphAggregator(self.hidden_dim)
+        # Legacy pairwise smoke path only; graph training/inference takes poses from BA state.
         self.pose_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -243,35 +279,15 @@ class PanoDroidModel(nn.Module):
         width: int,
         pixels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B = poses_c2w.shape[0]
-        E = int(ii.numel())
-        if pixels is None:
-            pixels = pixel_grid(height, width, device=poses_c2w.device, dtype=poses_c2w.dtype)
-        else:
-            pixels = pixels.to(device=poses_c2w.device, dtype=poses_c2w.dtype)
-        Hs, Ws = int(pixels.shape[0]), int(pixels.shape[1])
-        inv_map = inverse_depth[:, ii].reshape(B * E, 1, height, width)
-        norm_x = 2.0 * (pixels[..., 0] - 0.5) / max(width - 1, 1) - 1.0
-        norm_y = 2.0 * (pixels[..., 1] - 0.5) / max(height - 1, 1) - 1.0
-        grid = torch.stack([norm_x, norm_y], dim=-1).view(1, Hs, Ws, 2).expand(B * E, -1, -1, -1)
-        inv_src = F.grid_sample(
-            inv_map,
-            grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True,
-        ).view(B, E, Hs, Ws)
-        p = pixels.view(1, 1, Hs, Ws, 2).expand(B, E, -1, -1, -1)
-        bearing_i = erp_pixel_to_bearing(p.reshape(B * E, Hs * Ws, 2), height, width)
-        bearing_i = bearing_i.view(B, E, Hs, Ws, 3)
-        xyz_i = bearing_i / inv_src.clamp_min(1e-6).unsqueeze(-1)
-        T_ji = torch.linalg.inv(poses_c2w[:, jj]) @ poses_c2w[:, ii]
-        xyz_j = torch.einsum("beij,behwj->behwi", T_ji[..., :3, :3], xyz_i) + T_ji[
-            ..., :3, 3
-        ].view(B, E, 1, 1, 3)
-        bearing_j = F.normalize(xyz_j, dim=-1, eps=1e-12)
-        target_pixels = bearing_to_erp_pixel(bearing_j.reshape(B * E, Hs * Ws, 3), height, width)
-        return target_pixels.view(B, E, Hs, Ws, 2)
+        return project_edges(
+            poses_c2w,
+            inverse_depth,
+            ii,
+            jj,
+            height=height,
+            width=width,
+            pixels=pixels,
+        )
 
     def _ba_refine(
         self,
@@ -290,43 +306,56 @@ class PanoDroidModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, N, _, H, W = inverse_depth.shape
         stride = max(1, int(sample_stride))
-        pixels = pixel_grid(H, W, device=target.device, dtype=target.dtype)[::stride, ::stride]
+        pixels = None if stride == 1 else pixel_grid(H, W, device=target.device, dtype=target.dtype)[::stride, ::stride]
         target_s = target[:, :, ::stride, ::stride]
         weight_s = weight[:, :, :, ::stride, ::stride].squeeze(2)
         pose_mask = torch.ones(B, N, 1, device=poses_c2w.device, dtype=poses_c2w.dtype)
         pose_mask[:, : max(1, min(int(fixed_frames), N))] = 0.0
 
-        with torch.enable_grad():
-            base_poses = poses_c2w
-            xi = torch.zeros(B, N, 6, device=poses_c2w.device, dtype=poses_c2w.dtype, requires_grad=True)
-            log_inv = inverse_depth.clamp_min(1e-6).log()
-            log_inv.requires_grad_(True)
-            for _ in range(max(0, int(iters))):
-                xi_used = xi * pose_mask
-                cur_poses = se3_exp(xi_used) @ base_poses
-                cur_inv = log_inv.exp().clamp_min(1e-6)
-                coords = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
-                residual = seam_aware_delta(coords, target_s, W)
-                residual_norm = torch.sqrt((residual * residual).sum(dim=-1) + 1e-6)
-                loss = (residual_norm * weight_s).sum() / weight_s.sum().clamp_min(1e-6)
-                grad_xi, grad_log_inv = torch.autograd.grad(
-                    loss,
-                    (xi, log_inv),
-                    create_graph=False,
-                    retain_graph=True,
-                    allow_unused=True,
-                )
-                frame_damp = 1.0 + damping.mean(dim=(-1, -2, -3), keepdim=False).view(B, N, 1)
-                if grad_xi is not None:
-                    xi = xi - float(lr) * grad_xi * pose_mask / frame_damp
-                if grad_log_inv is not None:
-                    depth_damp = 1.0 + damping
-                    log_inv = log_inv - float(lr) * grad_log_inv / depth_damp
+        cur_poses = poses_c2w
+        cur_inv = inverse_depth.clamp_min(1e-6)
+        Hs, Ws = target_s.shape[-3], target_s.shape[-2]
+        for _ in range(max(0, int(iters))):
+            coords = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
+            residual = seam_aware_delta(coords, target_s, W)
+            w = weight_s.clamp(1e-4, 1.0)
+            denom = w.sum(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
+            edge_mean = (residual * w.unsqueeze(-1)).sum(dim=(-3, -2)) / denom.squeeze(-1)
 
-            cur_poses = se3_exp(xi * pose_mask) @ base_poses
-            cur_inv = log_inv.exp().clamp_min(1e-6)
-            coords_full = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W)
-            residual_full = seam_aware_delta(coords_full, target, W)
+            xi_edge = residual.new_zeros(B, int(ii.numel()), 6)
+            xi_edge[..., 0] = edge_mean[..., 0] / max(float(W), 1.0)
+            xi_edge[..., 1] = edge_mean[..., 1] / max(float(H), 1.0)
+            xi_edge[..., 5] = edge_mean[..., 0] / max(float(W), 1.0)
+
+            pose_update = residual.new_zeros(B, N, 6)
+            pose_counts = residual.new_zeros(N)
+            pose_update.index_add_(1, jj, xi_edge)
+            pose_update.index_add_(1, ii, -0.25 * xi_edge)
+            pose_counts.index_add_(0, jj, torch.ones_like(jj, dtype=residual.dtype))
+            pose_counts.index_add_(0, ii, 0.25 * torch.ones_like(ii, dtype=residual.dtype))
+            pose_update = pose_update / pose_counts.clamp_min(1.0).view(1, N, 1)
+            frame_damp = 1.0 + damping.mean(dim=(-1, -2, -3), keepdim=False).view(B, N, 1)
+            xi = float(lr) * pose_update * pose_mask / frame_damp.clamp_min(1e-6)
+            cur_poses = se3_exp(xi) @ cur_poses
+
+            res_norm = torch.sqrt((residual * residual).sum(dim=-1) + 1e-6)
+            depth_signal = residual.new_zeros(B, N, 1, Hs, Ws)
+            depth_counts = residual.new_zeros(N)
+            depth_signal.index_add_(1, ii, (res_norm * w).unsqueeze(2))
+            depth_counts.index_add_(0, ii, torch.ones_like(ii, dtype=residual.dtype))
+            depth_signal = depth_signal / depth_counts.clamp_min(1.0).view(1, N, 1, 1, 1)
+            if stride != 1:
+                depth_signal = F.interpolate(
+                    depth_signal.reshape(B * N, 1, Hs, Ws),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=True,
+                ).view(B, N, 1, H, W)
+            depth_step = (-0.01 * float(lr) * depth_signal / (1.0 + damping).clamp_min(1e-6)).clamp(-0.05, 0.05)
+            cur_inv = (cur_inv * torch.exp(depth_step)).clamp_min(1e-6)
+
+        coords_full = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W)
+        residual_full = seam_aware_delta(coords_full, target, W)
         return cur_poses, cur_inv, residual_full
 
     def forward(
@@ -509,9 +538,11 @@ class PanoDroidModel(nn.Module):
         target_steps = []
         weight_steps = []
         damping_steps = []
+        upmask_steps = []
 
         for _ in range(iters):
             poses_state = poses_state.detach()
+            inv_depth_state = inv_depth_state.detach()
             coords1 = coords1.detach()
             target = target.detach()
             corr = corr_block(coords1.reshape(B * E, Hf, Wf, 2).permute(0, 3, 1, 2))
@@ -532,7 +563,7 @@ class PanoDroidModel(nn.Module):
             edge_hidden = edge_hidden_flat.view(B, E, self.hidden_dim, Hf, Wf)
             delta = self.delta_head(edge_hidden_flat).view(B, E, 2, Hf, Wf).permute(0, 1, 3, 4, 2)
             edge_weight = torch.sigmoid(self.conf_head(edge_hidden_flat)).view(B, E, 1, Hf, Wf)
-            damping = self.graph_agg(edge_hidden, ii, N)
+            damping, upmask = self.graph_agg(edge_hidden, ii, N)
             target = coords1 + delta
             poses_state, inv_depth_state, residual = self._ba_refine(
                 poses_state,
@@ -553,9 +584,10 @@ class PanoDroidModel(nn.Module):
             target_steps.append(target)
             weight_steps.append(edge_weight)
             damping_steps.append(damping)
+            upmask_steps.append(upmask)
 
         if not pose_steps:
-            damping = self.graph_agg(edge_hidden, ii, N)
+            damping, upmask = self.graph_agg(edge_hidden, ii, N)
             edge_weight = torch.sigmoid(self.conf_head(edge_hidden.reshape(B * E, self.hidden_dim, Hf, Wf))).view(B, E, 1, Hf, Wf)
             residual = seam_aware_delta(coords1, target, Wf)
             pose_steps.append(poses_state)
@@ -564,6 +596,7 @@ class PanoDroidModel(nn.Module):
             target_steps.append(target)
             weight_steps.append(edge_weight)
             damping_steps.append(damping)
+            upmask_steps.append(upmask)
 
         poses_stack = torch.stack(pose_steps, dim=1)
         inv_stack = torch.stack(inv_steps, dim=1)
@@ -571,10 +604,12 @@ class PanoDroidModel(nn.Module):
         target_stack = torch.stack(target_steps, dim=1)
         weight_stack = torch.stack(weight_steps, dim=1)
         damping_stack = torch.stack(damping_steps, dim=1)
+        upmask_stack = torch.stack(upmask_steps, dim=1)
         final_poses = poses_stack[:, -1]
         final_inv = inv_stack[:, -1]
         final_weight = weight_stack[:, -1]
         final_damping = damping_stack[:, -1]
+        final_upmask = upmask_stack[:, -1]
         final_coords = self._project_edges(final_poses, final_inv, ii, jj, height=Hf, width=Wf)
         flow_low_hw = seam_aware_delta(coords0_hw, final_coords, Wf)
         flow_low = flow_low_hw.permute(0, 1, 4, 2, 3).contiguous()
@@ -583,8 +618,8 @@ class PanoDroidModel(nn.Module):
         flow_full[:, 1] *= float(Hp) / max(float(Hf), 1.0)
         flow_full = flow_full[..., :H0, :W0].view(B, E, 2, H0, W0)
 
-        inv_edge_full = _resize_depth_like(final_inv[:, ii].reshape(B * E, 1, Hf, Wf), (Hp, Wp))
-        inv_edge_full = inv_edge_full[..., :H0, :W0].view(B, E, 1, H0, W0)
+        inv_frame_full = _upsample_inverse_depth(final_inv, final_upmask, (Hp, Wp))[..., :H0, :W0]
+        inv_edge_full = inv_frame_full[:, ii]
         conf_full = _resize_depth_like(final_weight.reshape(B * E, 1, Hf, Wf), (Hp, Wp))
         conf_full = conf_full[..., :H0, :W0].view(B, E, 1, H0, W0)
         damp_edge_full = _resize_depth_like(final_damping[:, ii].reshape(B * E, 1, Hf, Wf), (Hp, Wp))
@@ -622,8 +657,10 @@ class PanoDroidModel(nn.Module):
             "target_steps": target_stack,
             "weight_steps": weight_stack,
             "damping_steps": damping_stack,
+            "upmask_steps": upmask_stack,
             "refined_poses_c2w": final_poses,
             "refined_inverse_depth": final_inv,
+            "refined_inverse_depth_full": inv_frame_full,
             "initial_inverse_depth": inv_low_init,
             "flow_low": flow_low,
         }

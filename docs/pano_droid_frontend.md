@@ -1,11 +1,12 @@
 # PanoDROID Frontend
 
-The frontend accepts ERP image pairs and exposes the requested SLAM interface:
+The frontend accepts ERP frame streams and exposes the requested SLAM interface:
 
 - `PanoFrame`
 - `FrontendOutput`
 - `PanoDROIDFrontend`
-- `PanoDROIDFrontendAdapter`
+- `PanoDroidGraphTracker`
+- `PanoDROIDFrontendAdapter` as the backward-compatible graph wrapper
 
 The MVP keeps DROID-style module boundaries:
 
@@ -13,8 +14,10 @@ The MVP keeps DROID-style module boundaries:
 - DROID-style context encoder (`cnet`) that returns `hidden, context`
 - spherical correlation pyramid with seam-aware ERP sampling
 - `SphereConvGRU` update block using BlueHorn/SphereNet-style spherical convolution
-- update heads for spherical flow, confidence, inverse depth, damping, pose,
-  and keyframe score
+- update heads for spherical flow target deltas, confidence/edge weights,
+  inverse depth, graph damping/upmask, and keyframe score
+- a runtime DROID-style graph tracker that reuses `forward_graph` and low-res
+  spherical BA during SLAM inference
 
 ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
 +X right, +Y down, +Z forward.
@@ -28,8 +31,10 @@ ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
   removed.
 - `sphere_gru.py` replaces 3x3/5x5 convolutions in ConvGRU gates with the new
   `SphereConv2d`; 1x1 gates remain ordinary Conv2d.
-- `spherical_ba.py` provides differentiable PyTorch spherical BA utilities.
+- `projective_ops.py` is the single shared ERP projection/residual path used by
+  model BA, losses, and standalone BA utilities.
+- `spherical_ba.py` provides PyTorch spherical BA utilities.
 
-The first version is trainable but intentionally compact.  Replacing the small
-encoders with original DROID modules should happen behind the current class
-interfaces.
+The pairwise `PanoDroidModel.forward(image0, image1)` path is legacy smoke-test
+compatibility.  SLAM inference should use `PanoDroidGraphTracker`, which keeps a
+sliding graph state and outputs refined pose, depth, confidence, and BA residual.

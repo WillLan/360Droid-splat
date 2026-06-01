@@ -1,15 +1,15 @@
 # PanoDROID Training
 
-Run:
+Legacy pairwise smoke training:
 
 ```bash
 python -m frontend.pano_droid.train --config configs/pano_droid_train.yaml
 ```
 
-The default config uses `SyntheticPanoPairDataset`, which creates shifted ERP
+The pairwise trainer uses `SyntheticPanoPairDataset`, which creates shifted ERP
 pairs with supervised flow, inverse depth, and relative pose targets.  This is
-for smoke and tiny overfit validation.  It is not evidence of performance on a
-real sequence.
+for smoke and tiny overfit validation only.  The primary DROID-style path is
+`frontend.pano_droid.train_graph`.
 
 For real data, set:
 
@@ -23,7 +23,7 @@ Dataset:
 ```
 
 Checkpoints are saved under `Training.output_dir/checkpoints` as `latest.pt`
-and `best.pt`.  Inference uses:
+and `best.pt`.  Inference defaults to the graph tracker:
 
 ```bash
 python -m frontend.pano_droid.infer \
@@ -37,13 +37,13 @@ python -m frontend.pano_droid.infer \
 
 1. Set `Dataset.synthetic: false`, `Dataset.dataset_path`, optional
    `Dataset.sequence`, and ERP resize to the training resolution.
-2. Train the frontend only:
+2. Train the graph frontend:
 
    ```bash
-   python -m frontend.pano_droid.train --config configs/pano_droid_train.yaml
+   python -m frontend.pano_droid.train_graph --config configs/pano_droid_train_panocity_beijing.yaml
    ```
 
-3. Verify `outputs/pano_droid_train/checkpoints/latest.pt` and `best.pt`.
+3. Verify `Training.output_dir/checkpoints/latest.pt` and `best.pt`.
 4. Put the checkpoint path into `Frontend.checkpoint` in
    `configs/pano_droid_gs_slam.yaml`.
 5. Run the full SLAM system:
@@ -88,9 +88,10 @@ The PanoCity Beijing config expects:
 `train_graph` is now the primary DROID-style trainer. It extracts all frame
 features once, keeps per-edge recurrent hidden state, feeds correlation plus
 `[flow, target - projection]` motion into the update block, and runs low-res
-spherical BA after each update to refine pose and inverse depth. The PyTorch BA
-path is correctness-first; large-scale CUDA BA acceleration remains a later
-step.
+spherical BA after each update to refine pose and inverse depth. The runtime
+SLAM frontend now uses the same graph path instead of the legacy pairwise pose
+head. The PyTorch BA path is correctness-first; large-scale CUDA BA acceleration
+remains a later step.
 
 Important graph options:
 
@@ -100,6 +101,9 @@ Important graph options:
   prefix truncating them.
 - `Graph.ba_iters_per_update`, `Graph.ba_sample_stride`, `Graph.fixed_frames`:
   control the feature-resolution BA loop.
+- `Graph.init_mode`, `Graph.init_noise_prob`, `Graph.init_identity_prob`, and
+  `Graph.init_noise_std`: keep DROID GT-anchor training while mixing off-GT
+  starts for inference robustness.
 - `Graph.loss_gamma`: gamma weighting across recurrent refined states.
 - `Training.scheduler: onecycle`, `Training.restart_prob`, and
   `Training.resume_checkpoint`: match the DROID-SLAM long-training cadence more
