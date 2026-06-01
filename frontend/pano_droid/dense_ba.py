@@ -40,6 +40,70 @@ def _ensure_weight2(weight: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected 1 or 2 weight channels, got {weight.shape[2]}")
 
 
+def _solve_damped_normal_system(
+    system: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    base_jitter: float,
+) -> torch.Tensor:
+    """Solve a batched normal equation without SVD-based fallbacks.
+
+    Dense BA can temporarily produce nearly singular Schur complements when a
+    window has weak parallax or poor target weights.  Retrying Cholesky-style
+    regularization through ``solve`` is more robust on CUDA than ``pinv``,
+    whose SVD backend can fail to converge for repeated singular values.
+    """
+    if system.ndim != 3 or rhs.ndim != 3:
+        raise ValueError("Expected system as BxDxD and rhs as BxDxK")
+    B, D, _ = system.shape
+    system = torch.nan_to_num(system, nan=0.0, posinf=0.0, neginf=0.0)
+    rhs = torch.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
+    system = 0.5 * (system + system.transpose(-1, -2))
+    eye = torch.eye(D, device=system.device, dtype=system.dtype).view(1, D, D)
+    diag_scale = torch.diagonal(system, dim1=-2, dim2=-1).detach().abs().mean(dim=-1)
+    diag_scale = diag_scale.clamp_min(1.0).view(B, 1, 1)
+    jitters = [base_jitter * (10.0**power) for power in range(7)]
+
+    for jitter in jitters:
+        try:
+            sol = torch.linalg.solve(system + eye * (diag_scale * jitter), rhs)
+        except RuntimeError:
+            continue
+        if torch.isfinite(sol).all():
+            return sol
+
+    sols: list[torch.Tensor] = []
+    for batch_idx in range(B):
+        solved = None
+        for jitter in jitters:
+            try:
+                candidate = torch.linalg.solve(
+                    system[batch_idx : batch_idx + 1]
+                    + eye * (diag_scale[batch_idx : batch_idx + 1] * jitter),
+                    rhs[batch_idx : batch_idx + 1],
+                )
+            except RuntimeError:
+                continue
+            if torch.isfinite(candidate).all():
+                solved = candidate
+                break
+        if solved is None:
+            solved = torch.zeros_like(rhs[batch_idx : batch_idx + 1])
+        sols.append(solved)
+    return torch.cat(sols, dim=0)
+
+
+def _normal_condition(system: torch.Tensor) -> torch.Tensor:
+    system = torch.nan_to_num(system.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    system = 0.5 * (system + system.transpose(-1, -2))
+    try:
+        eig = torch.linalg.eigvalsh(system).clamp_min(1e-12)
+    except RuntimeError:
+        return system.new_tensor(1e12)
+    cond = eig[..., -1] / eig[..., 0]
+    return torch.nan_to_num(cond.mean(), nan=1e12, posinf=1e12, neginf=1e12)
+
+
 def _left_pose_jacobians(
     poses_c2w: torch.Tensor,
     inverse_depth: torch.Tensor,
@@ -250,10 +314,11 @@ class SphericalDenseBA:
 
             S_flat = S.permute(0, 1, 3, 2, 4).reshape(B, N * 6, N * 6)
             y_flat = y.reshape(B, N * 6, 1)
-            try:
-                dx = -torch.linalg.solve(S_flat, y_flat).reshape(B, N, 6)
-            except RuntimeError:
-                dx = (-torch.linalg.pinv(S_flat) @ y_flat).reshape(B, N, 6)
+            dx = -_solve_damped_normal_system(
+                S_flat,
+                y_flat,
+                base_jitter=max(self.lm, 1e-6),
+            ).reshape(B, N, 6)
             dx = torch.nan_to_num(dx, nan=0.0, posinf=0.0, neginf=0.0)
             dx = dx.clamp(-self.max_pose_step, self.max_pose_step) * pose_mask
             cur_poses = se3_exp(dx) @ cur_poses
@@ -275,8 +340,7 @@ class SphericalDenseBA:
             )
             depth_norm = dz.abs().mean()
 
-            eig = torch.linalg.eigvalsh(S_flat.detach().float()).clamp_min(1e-12)
-            cond_accum = cond_accum + (eig[..., -1] / eig[..., 0]).mean().to(cond_accum)
+            cond_accum = cond_accum + _normal_condition(S_flat).to(cond_accum)
             cond_count += 1
 
         coords_full = project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W)

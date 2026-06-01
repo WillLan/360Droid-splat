@@ -3,7 +3,11 @@ import torch
 from frontend.pano_droid.spherical_ba import SphericalBA, se3_exp, spherical_ba_loss
 from frontend.pano_droid.spherical_camera import pixel_grid, seam_aware_delta
 from frontend.pano_droid.projective_ops import spherical_reprojection_residual
-from frontend.pano_droid.dense_ba import SphericalDenseBA, _left_pose_jacobians
+from frontend.pano_droid.dense_ba import (
+    SphericalDenseBA,
+    _left_pose_jacobians,
+    _solve_damped_normal_system,
+)
 from frontend.pano_droid.projective_ops import project_edges
 
 
@@ -141,6 +145,14 @@ def test_spherical_dense_ba_damping_reduces_update_norm():
     lo = SphericalDenseBA()(poses, inv, target, weight, torch.zeros(1, 2, 1, H, W), ii, jj, fixed_frames=1, iters=1)
     hi = SphericalDenseBA()(poses, inv, target, weight, torch.full((1, 2, 1, H, W), 100.0), ii, jj, fixed_frames=1, iters=1)
     assert hi.pose_update_norm < lo.pose_update_norm
+
+
+def test_spherical_dense_ba_solver_handles_singular_system_without_svd():
+    system = torch.zeros(1, 6, 6)
+    rhs = torch.ones(1, 6, 1)
+    solution = _solve_damped_normal_system(system, rhs, base_jitter=1e-6)
+    assert solution.shape == rhs.shape
+    assert torch.isfinite(solution).all()
 
 
 def test_spherical_dense_ba_pose_jacobian_matches_finite_difference():
