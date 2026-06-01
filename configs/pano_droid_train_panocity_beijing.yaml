@@ -1,0 +1,53 @@
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/zwh/Dataset/PanoCity/beijing
+  erp_resize_height: 512
+  erp_resize_width: 1024
+  n_frames: 7
+  clip_stride: 1
+  depth_scale: 1.0
+  depth_invalid_value: 65535.0
+
+Graph:
+  temporal_radius: 2
+  bidirectional: true
+  max_edges_per_step: 4
+  loss_sample_height: 32
+  loss_sample_width: 64
+
+Model:
+  feature_dim: 32
+  context_dim: 32
+  hidden_dim: 48
+  encoder_base_dim: 32
+  feature_stride: 8
+  corr_levels: 4
+  corr_radius: 3
+  max_corr_elements: 80000000
+  use_spherical_corr: true
+  gru_kernel_size: 3
+  update_iters: 2
+  pose_scale: 0.02
+
+Training:
+  epochs: 100
+  batch_size: 1
+  lr: 0.00025
+  grad_clip: 2.5
+  num_workers: 2
+  max_steps: 250000
+  save_every: 500
+  iters: 8
+  output_dir: outputs/pano_droid_panocity_beijing
+
+Visualization:
+  enabled: true
+  every: 500
+
+Loss:
+  pose: 10.0
+  flow: 0.05
+  depth: 0.1
+  residual: 0.01
+  smooth: 0.02
+  confidence: 0.005

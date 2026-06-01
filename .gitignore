@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Training outputs and checkpoints
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Logs and temporary files
+debug.log
+*.log
+*.tmp
+*.bak
+
+# Local environment files
+.env
+.venv/
+venv/
+

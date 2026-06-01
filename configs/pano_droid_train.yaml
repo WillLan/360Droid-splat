@@ -1,0 +1,38 @@
+Dataset:
+  synthetic: true
+  synthetic_length: 16
+  height: 32
+  width: 64
+  pair_stride: 1
+
+Model:
+  feature_dim: 32
+  context_dim: 32
+  hidden_dim: 48
+  encoder_base_dim: 32
+  feature_stride: 8
+  corr_levels: 4
+  corr_radius: 3
+  max_corr_elements: 80000000
+  use_spherical_corr: true
+  gru_kernel_size: 3
+  update_iters: 2
+  pose_scale: 0.02
+
+Training:
+  epochs: 1
+  batch_size: 2
+  lr: 0.001
+  grad_clip: 1.0
+  num_workers: 0
+  max_steps: 4
+  save_every: 2
+  output_dir: outputs/pano_droid_train
+
+Loss:
+  photometric: 1.0
+  flow: 0.2
+  depth: 0.1
+  pose: 0.1
+  smooth: 0.02
+  confidence: 0.005

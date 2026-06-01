@@ -1,0 +1,48 @@
+---
+description: Required safety and execution rules for 360UAV experiments on server 50902.
+alwaysApply: true
+---
+
+# 360UAV Remote Experiment Rules
+
+These rules apply whenever the agent starts, schedules, monitors, or summarizes 360GS-SLAM / 360UAV experiments.
+
+## Remote server
+
+- Use server `50902` via `lanboyang@172.19.53.39`.
+- Run experiments in the `pfgs360` conda environment:
+  `/mnt/disk1/lanboyang/miniconda3/envs/pfgs360/bin/python`
+- Always run long experiments inside `tmux` so they survive terminal disconnects.
+- Do not run more than 2 experiment groups at the same time.
+- Each concurrent experiment group should use one GPU; at most 2 GPUs may be used by this queue at once.
+- Before launching a new group, check CPU load, RAM, swap, active Python jobs, and GPU usage.
+- CPU and system memory are the primary safety constraints. While experiments are running, monitor CPU, RAM, and swap regularly. If the server is under heavy CPU load, close to memory pressure, or swap begins growing, do not launch more jobs and report the status.
+- Avoid launch patterns that can consume excessive CPU/RAM and make the server unresponsive or prevent SSH login, even if GPU memory appears available.
+- Do not delete or overwrite existing result directories unless the user explicitly requests it.
+
+## Baseline configuration
+
+When repeating this experiment setup, use the same configuration as:
+
+```text
+/mnt/disk1/lanboyang/Project/360GS-SLAM/results/debug_pfgs360_full200_neural_sky_fix123_dia_mv_global_prune_v2d_pfgs360_far_guard
+```
+
+## Dataset
+
+The 360UAV sequence root for the 5-sequence experiment is:
+
+```text
+/mnt/disk1/lanboyang/Datasets/360uav/seqs
+```
+
+Run all 5 sequences under this root unless the user gives a narrower sequence list.
+
+## Result summary
+
+After all sequences finish:
+
+- Summarize the experiment results in a concise table.
+- Include the sequence name, output path, status, and key metrics.
+- Mark failed, missing, or incomplete runs explicitly.
+- Include the tmux session name and any relevant log paths when reporting progress or failures.

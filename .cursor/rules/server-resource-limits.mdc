@@ -1,0 +1,86 @@
+---
+description: 监控 CPU 内存（RAM）与线程数，防止多进程/多线程占满内存导致无法 SSH 登录
+alwaysApply: true
+---
+
+# 系统内存与线程限制（360GS-SLAM）
+
+本机为**多用户共享服务器**。实验的主要风险是：**多个 Python 进程 + 每个进程开满 CPU 线程** → 系统 RAM 耗尽或严重 swap → SSH 无法登录、整机假死。
+
+Agent 在启动、编排或建议实验时，**以 CPU 内存（RAM）监控为第一优先级**；GPU 显存仅作辅助参考。
+
+## 启动前必做：RAM 与线程检查
+
+在 `bash scripts/run_*.sh`、`python slam.py`、后台 `nohup`/`screen` 之前执行：
+
+```bash
+free -h
+# 可选：更精确的可用内存（GiB）
+awk '/MemAvailable:/ {printf "MemAvailable_GiB=%.1f\n", $2/1024/1024}' /proc/meminfo
+# 本仓库相关 Python 进程数与内存
+pgrep -af 'slam\.py|ns-train|run_official_omnigs|run_offline' || true
+ps -eo pid,rss,cmd --sort=-rss | awk 'NR<=15 || /slam\.py|python/' 
+```
+
+### 通过条件（默认阈值，可用环境变量覆盖）
+
+| 检查项 | 默认门槛 | 未通过时 |
+|--------|----------|----------|
+| `MemAvailable` | **≥ `SLAM_MIN_MEM_AVAIL_GIB`（默认 24 GiB）** | 禁止启动新 job；保留内存给系统/SSH/其他用户 |
+| 启动后预估占用 | `MemAvailable ≥ SLAM_EST_RAM_GIB × (当前同类进程数 + 1)` | 禁止启动；`SLAM_EST_RAM_GIB` 默认 **48**（单 job `slam.py` 粗估） |
+| Swap 已用 | **SwapUsed = 0** 或增长中 | 禁止加并行；先等现有 job 结束或杀僵尸进程 |
+| 同类训练进程数 | **≤ `SLAM_MAX_PARALLEL`（默认 2）** | 禁止再 launch |
+| 系统 load（可选） | `load1 < 物理核数 × 0.7` | 暂缓启动，避免线程风暴 |
+
+未通过 → **不要启动**；向用户汇报 `free -h` 快照与占用最高的进程，建议等待或串行排队。
+
+## 单进程线程上限（防止 256 核被单进程打满）
+
+**每个** `slam.py` / 训练脚本启动前必须设置（写入 shell、`run_one_seq.sh` 或一次性 `export`）：
+
+```bash
+export OMP_NUM_THREADS="${SLAM_OMP_THREADS:-4}"
+export MKL_NUM_THREADS="${SLAM_OMP_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${SLAM_OMP_THREADS:-4}"
+export NUMEXPR_NUM_THREADS="${SLAM_OMP_THREADS:-4}"
+export VECLIB_MAXIMUM_THREADS="${SLAM_OMP_THREADS:-4}"
+export TOKENIZERS_PARALLELISM=false
+```
+
+规则：
+
+- **禁止** 在未设置上述变量时批量启动多个 PyTorch 进程（默认会按机器核数开线程，极易拖垮整机）。
+- `SLAM_OMP_THREADS` 默认 **4**；仅当 `MemAvailable` 充裕且并行 job 数 = 1 时，经用户同意可提高到 8，**不得超过 8**。
+- 不要增大 DataLoader `num_workers` 或在外部 baseline 里提高 worker 数，除非用户明确要求且当前并行 job ≤ 1。
+
+## 并行度与内存的关系
+
+| 约束 | 默认 | 说明 |
+|------|------|------|
+| 同时运行的 `slam.py` | ≤ 2 | 与 RAM 检查同时生效，取更严者 |
+| 同时运行的 OmniGS / PFGS360 / 360DVO 重型 Python | ≤ 1 | 与 `slam.py` 合计按「同类训练进程」计入 `SLAM_MAX_PARALLEL` |
+| 多序列 sweep | **串行** 或确认 `MemAvailable` 足够后再启动下一个 | 禁止无检查地连续 `nohup` 多个全帧实验 |
+
+需要超过 `SLAM_MAX_PARALLEL` 时，必须先征得用户同意，并附上当前 `free -h` 与 `ps` RSS 前几名。
+
+## Agent 编排实验时的行为
+
+- **优先** `scripts/run_one_seq.sh`（单 job、单 GPU、日志在 `.cache/runner_logs/`）。
+- 生成的启动命令/脚本里**必须包含**上文线程 `export`。
+- 调试默认较小 `--end`（50–200）；全序列 / 多序列批量需用户确认。
+- 用户反馈「登不上 / 卡死」时：先 `free -h`、查 swap、列 RSS 最高的 python，**停止一切新 launch**；不要继续加实验。
+
+## 环境变量（可在 `~/.bashrc` 或提交前 export）
+
+```bash
+export SLAM_MAX_PARALLEL=2           # 同时训练进程上限
+export SLAM_MIN_MEM_AVAIL_GIB=24     # 留给系统+SSH 的最小可用内存 (GiB)
+export SLAM_EST_RAM_GIB=48           # 单个 slam 类 job 预估占用 (GiB)
+export SLAM_OMP_THREADS=4            # 每进程 OpenMP/BLAS 线程上限
+```
+
+Agent 启动前读取已设置的变量；未设置则用上表默认值。
+
+## GPU（次要）
+
+仅在选定 `CUDA_VISIBLE_DEVICES` 时参考：`nvidia-smi` 选显存占用低的卡。**RAM 检查未通过时，即使 GPU 空闲也不得启动。**

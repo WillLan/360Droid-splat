@@ -1,0 +1,55 @@
+Dataset:
+  synthetic: true
+  synthetic_length: 4
+  height: 32
+  width: 64
+  pair_stride: 1
+
+Frontend:
+  checkpoint: null
+  keyframe_threshold: 0.5
+  force_keyframe_interval: 2
+
+Model:
+  feature_dim: 32
+  context_dim: 32
+  hidden_dim: 48
+  encoder_base_dim: 32
+  feature_stride: 8
+  corr_levels: 4
+  corr_radius: 3
+  max_corr_elements: 80000000
+  use_spherical_corr: true
+  gru_kernel_size: 3
+  update_iters: 2
+  pose_scale: 0.02
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Hierarchical:
+  voxel_size_lis: [0.12, 0.45, 1.8]
+
+Mapping:
+  max_seeds_per_keyframe: 512
+  min_depth_confidence: 0.15
+  lr: 0.002
+  refine_steps_per_keyframe: 0
+
+Renderer:
+  allow_smoke_fallback: true
+  extra_gsplat360_roots: []
+
+Results:
+  save_dir: outputs/pano_droid_gs_slam

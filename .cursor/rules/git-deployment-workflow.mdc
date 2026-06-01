@@ -1,0 +1,78 @@
+---
+description: Git upload and 50902 pull workflow for the 360Droid-splat project.
+alwaysApply: true
+---
+
+# Git Deployment Workflow
+
+These rules apply to this project, not to the old 360GS-SLAM reference project.
+
+## Project mapping
+
+- Local project root: `E:\Project\360Droid-splat`
+- GitHub repository: `https://github.com/WillLan/360Droid-splat.git`
+- Git remote name: `origin`
+- Default branch: `main`
+- Remote server: `50902` via `lanboyang@172.19.53.39`
+- Remote project root: `/mnt/disk1/lanboyang/Project/360Droid-splat`
+- Read-only reference source: `/mnt/disk1/lanboyang/Project/360GS-SLAM`
+
+Never push, pull, clone, or deploy this project into
+`/mnt/disk1/lanboyang/Project/360GS-SLAM`.  That directory is only a read-only
+reference source.
+
+## Local checks before commit
+
+Run suitable lightweight checks before committing changed code.  For normal
+Python changes, prefer:
+
+```powershell
+git status --short --branch
+python -m compileall frontend mapping backend system tests
+python -m pytest
+```
+
+## Upload workflow
+
+1. Commit local changes with a clear message.
+2. Ask the user to confirm before pushing.
+3. Push only after confirmation:
+
+   ```powershell
+   git push origin main
+   ```
+
+## Remote update workflow
+
+After a successful push, update only this mapped remote directory.
+
+If the directory does not exist:
+
+```bash
+ssh lanboyang@172.19.53.39 'git clone https://github.com/WillLan/360Droid-splat.git /mnt/disk1/lanboyang/Project/360Droid-splat'
+```
+
+If the directory exists, inspect the worktree and only fast-forward pull when
+it is clean:
+
+```bash
+ssh lanboyang@172.19.53.39 'cd /mnt/disk1/lanboyang/Project/360Droid-splat && git status --short && git pull --ff-only origin main'
+```
+
+If local uncommitted or untracked files block the pull, report them and stop.
+Do not move, delete, overwrite, stash, or reset remote files unless the user
+explicitly asks.
+
+## Artifacts excluded from Git
+
+Do not commit generated outputs, checkpoints, caches, or logs by default:
+`outputs/`, `*.pt`, `*.pth`, `__pycache__/`, `.pytest_cache/`, `debug.log`, and
+temporary run logs.
+
+## Training launch
+
+Pulling code does not imply launching training.  Start or restart experiments
+only after a separate explicit user command.  Training launch must follow the
+remote experiment safety rules: check RAM, swap, active Python jobs, and GPU
+usage; run long jobs inside `tmux`; and use the `pfgs360` Python environment.
+
