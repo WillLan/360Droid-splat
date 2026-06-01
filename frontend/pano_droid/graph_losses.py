@@ -26,27 +26,56 @@ def build_temporal_edges(n_frames: int, radius: int = 2, *, bidirectional: bool 
 
 def build_proximity_edges(
     poses_c2w: torch.Tensor,
+    depths: torch.Tensor | None = None,
     *,
     radius: int = 2,
     max_edges: int = 0,
     bidirectional: bool = True,
+    sample_height: int = 8,
+    sample_width: int = 16,
 ) -> list[tuple[int, int]]:
-    """Build a lightweight co-visibility proxy from camera-center distances."""
+    """Build projection-distance/co-visibility graph edges."""
     if poses_c2w.ndim == 4:
         poses = poses_c2w[0]
     else:
         poses = poses_c2w
+    depth_maps = None
+    if depths is not None:
+        depth_maps = depths[0] if depths.ndim == 5 else depths
     n_frames = int(poses.shape[0])
     temporal = build_temporal_edges(n_frames, radius=radius, bidirectional=bidirectional)
     edge_set = set(temporal)
-    centers = poses[:, :3, 3].detach().float()
-    dist = torch.cdist(centers, centers)
     candidates: list[tuple[float, int, int]] = []
+    if depth_maps is not None:
+        H, W = int(depth_maps.shape[-2]), int(depth_maps.shape[-1])
+        sy = max(1, H // max(1, int(sample_height)))
+        sx = max(1, W // max(1, int(sample_width)))
+        pixels = pixel_grid(H, W, device=poses.device, dtype=poses.dtype)[::sy, ::sx].reshape(-1, 2)
+    else:
+        centers = poses[:, :3, 3].detach().float()
+        dist = torch.cdist(centers, centers)
     for i in range(n_frames):
         for j in range(n_frames):
             if i == j or (i, j) in edge_set:
                 continue
-            candidates.append((float(dist[i, j].cpu()), i, j))
+            if depth_maps is None:
+                score = float(dist[i, j].cpu())
+            else:
+                depth = depth_maps[i, 0, ::sy, ::sx].reshape(1, -1).to(poses)
+                valid = depth > 1e-6
+                if not bool(valid.any()):
+                    score = float("inf")
+                else:
+                    flow, _ = _projective_target(
+                        pixels,
+                        depth,
+                        poses[i : i + 1],
+                        poses[j : j + 1],
+                        height=H,
+                        width=W,
+                    )
+                    score = float(torch.sqrt((flow * flow).sum(dim=-1) + 1e-6)[valid].mean().detach().cpu())
+            candidates.append((score, i, j))
     candidates.sort(key=lambda x: x[0])
     target = int(max_edges) if int(max_edges) > 0 else max(len(temporal), n_frames * max(1, int(radius)) * 2)
     out = list(temporal)
@@ -97,10 +126,10 @@ def select_training_edges(
 class GraphLossWeights:
     pose: float = 10.0
     flow: float = 0.05
-    depth: float = 0.1
     residual: float = 0.01
-    smooth: float = 0.02
-    confidence: float = 0.005
+    depth: float = 0.0
+    smooth: float = 0.0
+    confidence: float = 0.0
 
 
 def _relative_pose_from_c2w(c2w_i: torch.Tensor, c2w_j: torch.Tensor) -> torch.Tensor:
@@ -256,7 +285,8 @@ def graph_supervised_loss(
             ).sum() / edge_area.sum().clamp_min(1e-6)
 
             res = residual_steps[:, s, e, ::sy, ::sx].reshape(B, -1, 2)
-            conf = weight_steps[:, s, e, :, ::sy, ::sx].reshape(B, -1).clamp(1e-4, 1.0)
+            weight_e = weight_steps[:, s, e, :, ::sy, ::sx].reshape(B, weight_steps.shape[3], -1)
+            conf = weight_e.mean(dim=1).clamp(1e-4, 1.0)
             res_norm = torch.sqrt((res * res).sum(dim=-1) + 1e-6)
             l_residual = l_residual + step_w * (
                 res_norm * conf * edge_area
@@ -284,6 +314,22 @@ def graph_supervised_loss(
     mean_residual = residual_steps.detach().norm(dim=-1).mean()
     damping = pred["damping_steps"].detach()
     covered = len({idx for edge in edges for idx in edge})
+    valid_mask = pred.get("ba_valid_mask")
+    valid_ratio = (
+        valid_mask.detach().float().mean()
+        if torch.is_tensor(valid_mask)
+        else torch.tensor(1.0, device=device)
+    )
+    upmask = pred.get("upmask_steps")
+    if torch.is_tensor(upmask):
+        up = upmask.detach().reshape(-1, 9, 8, 8, upmask.shape[-2], upmask.shape[-1])
+        prob = torch.softmax(up, dim=1).clamp_min(1e-8)
+        up_entropy = -(prob * prob.log()).sum(dim=1).mean()
+    else:
+        up_entropy = torch.tensor(0.0, device=device)
+    pose_update_norm = pred.get("ba_pose_update_norm")
+    depth_update_norm = pred.get("ba_depth_update_norm")
+    normal_condition = pred.get("ba_normal_condition")
     return total, {
         "loss": total.detach(),
         "pose": l_pose.detach(),
@@ -293,8 +339,13 @@ def graph_supervised_loss(
         "smooth": l_smooth.detach(),
         "confidence": l_conf.detach(),
         "ba_residual": mean_residual,
+        "ba_valid_ratio": valid_ratio,
+        "ba_pose_update_norm": pose_update_norm.detach() if torch.is_tensor(pose_update_norm) else torch.tensor(0.0, device=device),
+        "ba_depth_update_norm": depth_update_norm.detach() if torch.is_tensor(depth_update_norm) else torch.tensor(0.0, device=device),
+        "ba_normal_condition": normal_condition.detach() if torch.is_tensor(normal_condition) else torch.tensor(0.0, device=device),
         "damping_mean": damping.mean(),
         "damping_max": damping.max(),
+        "upmask_entropy": up_entropy,
         "valid_edges": torch.tensor(float(valid_edges), device=device),
         "edge_coverage": torch.tensor(float(covered) / max(float(N), 1.0), device=device),
     }

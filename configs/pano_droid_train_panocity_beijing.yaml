@@ -5,14 +5,14 @@ Dataset:
   erp_resize_width: 1024
   n_frames: 7
   clip_stride: 1
-  depth_scale: 1.0
+  depth_scale: 0.001
   depth_invalid_value: 65535.0
 
 Graph:
   edge_strategy: mixed
   temporal_radius: 2
   bidirectional: true
-  max_edges_per_step: 4
+  max_edges_per_step: 24
   ba_iters_per_update: 2
   ba_sample_stride: 1
   fixed_frames: 2
@@ -52,6 +52,7 @@ Training:
   scheduler: onecycle
   restart_prob: 0.2
   resume_checkpoint: null
+  freeze_legacy_pairwise: true
   output_dir: outputs/pano_droid_panocity_beijing
 
 Visualization:
@@ -74,12 +75,12 @@ WeightsAndBiases:
 Distributed:
   enabled: auto
   backend: nccl
-  find_unused_parameters: true
+  find_unused_parameters: false
 
 Loss:
   pose: 10.0
   flow: 0.05
-  depth: 0.1
+  depth: 0.0
   residual: 0.01
-  smooth: 0.02
-  confidence: 0.005
+  smooth: 0.0
+  confidence: 0.0

@@ -9,11 +9,12 @@ from torch import nn
 import torch.nn.functional as F
 
 from .correlation import SphericalCorrBlock, coords_grid
+from .dense_ba import SphericalDenseBA
 from .encoders import BasicEncoder, ContextEncoder
 from .projective_ops import project_edges
 from .sphere_gru import SphereConvGRU
 from .spherical_ba import se3_exp
-from .spherical_camera import pixel_grid, seam_aware_delta
+from .spherical_camera import seam_aware_delta
 
 
 def _resize_like(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
@@ -137,8 +138,21 @@ class PanoDroidModel(nn.Module):
         )
 
         corr_dim = self.corr_levels * (2 * self.corr_radius + 1) ** 2
+        enc_half = max(1, self.hidden_dim // 2)
+        self.corr_encoder = nn.Sequential(
+            nn.Conv2d(corr_dim, self.hidden_dim, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(self.hidden_dim, enc_half, 3, padding=1),
+            nn.SiLU(inplace=True),
+        )
+        self.flow_encoder = nn.Sequential(
+            nn.Conv2d(4, enc_half, 7, padding=3),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(enc_half, enc_half, 3, padding=1),
+            nn.SiLU(inplace=True),
+        )
         self.input_proj = nn.Sequential(
-            nn.Conv2d(self.context_dim + corr_dim + 4, self.hidden_dim, 3, padding=1),
+            nn.Conv2d(self.context_dim + enc_half + enc_half, self.hidden_dim, 3, padding=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(self.hidden_dim, self.hidden_dim, 3, padding=1),
             nn.SiLU(inplace=True),
@@ -153,11 +167,12 @@ class PanoDroidModel(nn.Module):
             nn.SiLU(inplace=True),
             nn.Conv2d(self.hidden_dim, 2, 3, padding=1),
         )
-        self.conf_head = nn.Sequential(
+        self.weight_head = nn.Sequential(
             nn.Conv2d(self.hidden_dim, max(1, self.hidden_dim // 2), 3, padding=1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(max(1, self.hidden_dim // 2), 1, 3, padding=1),
+            nn.Conv2d(max(1, self.hidden_dim // 2), 2, 3, padding=1),
         )
+        self.conf_head = self.weight_head
         self.depth_head = nn.Sequential(
             nn.Conv2d(self.hidden_dim, max(1, self.hidden_dim // 2), 3, padding=1),
             nn.SiLU(inplace=True),
@@ -169,6 +184,7 @@ class PanoDroidModel(nn.Module):
             nn.Conv2d(max(1, self.hidden_dim // 2), 1, 3, padding=1),
         )
         self.graph_agg = GraphAggregator(self.hidden_dim)
+        self.ba_layer = SphericalDenseBA()
         # Legacy pairwise smoke path only; graph training/inference takes poses from BA state.
         self.pose_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -304,59 +320,26 @@ class PanoDroidModel(nn.Module):
         sample_stride: int,
         lr: float = 5e-2,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, N, _, H, W = inverse_depth.shape
-        stride = max(1, int(sample_stride))
-        pixels = None if stride == 1 else pixel_grid(H, W, device=target.device, dtype=target.dtype)[::stride, ::stride]
-        target_s = target[:, :, ::stride, ::stride]
-        weight_s = weight[:, :, :, ::stride, ::stride].squeeze(2)
-        pose_mask = torch.ones(B, N, 1, device=poses_c2w.device, dtype=poses_c2w.dtype)
-        pose_mask[:, : max(1, min(int(fixed_frames), N))] = 0.0
-
-        cur_poses = poses_c2w
-        cur_inv = inverse_depth.clamp_min(1e-6)
-        Hs, Ws = target_s.shape[-3], target_s.shape[-2]
-        for _ in range(max(0, int(iters))):
-            coords = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
-            residual = seam_aware_delta(coords, target_s, W)
-            w = weight_s.clamp(1e-4, 1.0)
-            denom = w.sum(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
-            edge_mean = (residual * w.unsqueeze(-1)).sum(dim=(-3, -2)) / denom.squeeze(-1)
-
-            xi_edge = residual.new_zeros(B, int(ii.numel()), 6)
-            xi_edge[..., 0] = edge_mean[..., 0] / max(float(W), 1.0)
-            xi_edge[..., 1] = edge_mean[..., 1] / max(float(H), 1.0)
-            xi_edge[..., 5] = edge_mean[..., 0] / max(float(W), 1.0)
-
-            pose_update = residual.new_zeros(B, N, 6)
-            pose_counts = residual.new_zeros(N)
-            pose_update.index_add_(1, jj, xi_edge)
-            pose_update.index_add_(1, ii, -0.25 * xi_edge)
-            pose_counts.index_add_(0, jj, torch.ones_like(jj, dtype=residual.dtype))
-            pose_counts.index_add_(0, ii, 0.25 * torch.ones_like(ii, dtype=residual.dtype))
-            pose_update = pose_update / pose_counts.clamp_min(1.0).view(1, N, 1)
-            frame_damp = 1.0 + damping.mean(dim=(-1, -2, -3), keepdim=False).view(B, N, 1)
-            xi = float(lr) * pose_update * pose_mask / frame_damp.clamp_min(1e-6)
-            cur_poses = se3_exp(xi) @ cur_poses
-
-            res_norm = torch.sqrt((residual * residual).sum(dim=-1) + 1e-6)
-            depth_signal = residual.new_zeros(B, N, 1, Hs, Ws)
-            depth_counts = residual.new_zeros(N)
-            depth_signal.index_add_(1, ii, (res_norm * w).unsqueeze(2))
-            depth_counts.index_add_(0, ii, torch.ones_like(ii, dtype=residual.dtype))
-            depth_signal = depth_signal / depth_counts.clamp_min(1.0).view(1, N, 1, 1, 1)
-            if stride != 1:
-                depth_signal = F.interpolate(
-                    depth_signal.reshape(B * N, 1, Hs, Ws),
-                    size=(H, W),
-                    mode="bilinear",
-                    align_corners=True,
-                ).view(B, N, 1, H, W)
-            depth_step = (-0.01 * float(lr) * depth_signal / (1.0 + damping).clamp_min(1e-6)).clamp(-0.05, 0.05)
-            cur_inv = (cur_inv * torch.exp(depth_step)).clamp_min(1e-6)
-
-        coords_full = self._project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W)
-        residual_full = seam_aware_delta(coords_full, target, W)
-        return cur_poses, cur_inv, residual_full
+        _ = lr
+        out = self.ba_layer(
+            poses_c2w,
+            inverse_depth,
+            target,
+            weight,
+            damping,
+            ii,
+            jj,
+            fixed_frames=fixed_frames,
+            iters=iters,
+            sample_stride=sample_stride,
+        )
+        self._last_ba_stats = {
+            "valid_mask": out.valid_mask,
+            "pose_update_norm": out.pose_update_norm,
+            "depth_update_norm": out.depth_update_norm,
+            "normal_condition": out.normal_condition,
+        }
+        return out.poses_c2w, out.inverse_depth, out.residual
 
     def forward(
         self,
@@ -368,6 +351,7 @@ class PanoDroidModel(nn.Module):
         poses_c2w: Optional[torch.Tensor] = None,
         init_poses_c2w: Optional[torch.Tensor] = None,
         init_inverse_depth: Optional[torch.Tensor] = None,
+        init_edge_hidden: Optional[torch.Tensor] = None,
         ba_iters_per_update: int = 2,
         fixed_frames: int = 2,
         ba_sample_stride: int = 1,
@@ -382,6 +366,7 @@ class PanoDroidModel(nn.Module):
                 poses_c2w=poses_c2w,
                 init_poses_c2w=init_poses_c2w,
                 init_inverse_depth=init_inverse_depth,
+                init_edge_hidden=init_edge_hidden,
                 ba_iters_per_update=ba_iters_per_update,
                 fixed_frames=fixed_frames,
                 ba_sample_stride=ba_sample_stride,
@@ -403,9 +388,10 @@ class PanoDroidModel(nn.Module):
         coords1 = coords0.clone()
 
         for _ in range(iters):
-            corr = corr_block(coords1)
+            corr = self.corr_encoder(corr_block(coords1))
             flow = coords1 - coords0
             motion = torch.cat([flow, torch.zeros_like(flow)], dim=1)
+            motion = self.flow_encoder(motion)
             gru_in = torch.cat([context, corr, motion], dim=1)
             gru_in = self.input_proj(gru_in)
             h = self.update_block(h, gru_in)
@@ -417,7 +403,8 @@ class PanoDroidModel(nn.Module):
         flow_full[:, 1] *= float(Hp) / max(float(Hf), 1.0)
         flow_full = flow_full[..., :H0, :W0]
 
-        confidence = torch.sigmoid(_resize_like(self.conf_head(h), (Hp, Wp)))[..., :H0, :W0]
+        confidence2 = torch.sigmoid(_resize_like(self.weight_head(h), (Hp, Wp)))[..., :H0, :W0]
+        confidence = confidence2.mean(dim=1, keepdim=True)
         inverse_depth = F.softplus(_resize_like(self.depth_head(h), (Hp, Wp)))[..., :H0, :W0] + 1e-4
         damping = F.softplus(_resize_like(self.damping_head(h), (Hp, Wp)))[..., :H0, :W0] + 1e-4
         pose_delta = self.pose_scale * torch.tanh(self.pose_head(h))
@@ -452,6 +439,7 @@ class PanoDroidModel(nn.Module):
         poses_c2w: Optional[torch.Tensor] = None,
         init_poses_c2w: Optional[torch.Tensor] = None,
         init_inverse_depth: Optional[torch.Tensor] = None,
+        init_edge_hidden: Optional[torch.Tensor] = None,
         ba_iters_per_update: int = 2,
         fixed_frames: int = 2,
         ba_sample_stride: int = 1,
@@ -464,6 +452,7 @@ class PanoDroidModel(nn.Module):
             poses_c2w=poses_c2w,
             init_poses_c2w=init_poses_c2w,
             init_inverse_depth=init_inverse_depth,
+            init_edge_hidden=init_edge_hidden,
             ba_iters_per_update=ba_iters_per_update,
             fixed_frames=fixed_frames,
             ba_sample_stride=ba_sample_stride,
@@ -478,6 +467,7 @@ class PanoDroidModel(nn.Module):
         poses_c2w: Optional[torch.Tensor] = None,
         init_poses_c2w: Optional[torch.Tensor] = None,
         init_inverse_depth: Optional[torch.Tensor] = None,
+        init_edge_hidden: Optional[torch.Tensor] = None,
         ba_iters_per_update: int = 2,
         fixed_frames: int = 2,
         ba_sample_stride: int = 1,
@@ -525,7 +515,13 @@ class PanoDroidModel(nn.Module):
         f0 = fmaps[:, ii].reshape(B * E, self.feature_dim, Hf, Wf)
         f1 = fmaps[:, jj].reshape(B * E, self.feature_dim, Hf, Wf)
         corr_block = self._make_corr_block(f0, f1)
-        edge_hidden = hidden[:, ii].clone()
+        if (
+            init_edge_hidden is not None
+            and tuple(init_edge_hidden.shape) == (B, E, self.hidden_dim, Hf, Wf)
+        ):
+            edge_hidden = init_edge_hidden.to(device=images.device, dtype=images.dtype)
+        else:
+            edge_hidden = hidden[:, ii].clone()
         edge_context = context[:, ii]
         coords0 = coords_grid(B * E, Hf, Wf, device=images.device, dtype=images.dtype)
         coords0_hw = coords0.permute(0, 2, 3, 1).view(B, E, Hf, Wf, 2)
@@ -545,10 +541,11 @@ class PanoDroidModel(nn.Module):
             inv_depth_state = inv_depth_state.detach()
             coords1 = coords1.detach()
             target = target.detach()
-            corr = corr_block(coords1.reshape(B * E, Hf, Wf, 2).permute(0, 3, 1, 2))
+            corr = self.corr_encoder(corr_block(coords1.reshape(B * E, Hf, Wf, 2).permute(0, 3, 1, 2)))
             flow = seam_aware_delta(coords0_hw, coords1, Wf).permute(0, 1, 4, 2, 3)
             resd = seam_aware_delta(coords1, target, Wf).permute(0, 1, 4, 2, 3)
             motion = torch.cat([flow, resd], dim=2).reshape(B * E, 4, Hf, Wf).clamp(-64.0, 64.0)
+            motion = self.flow_encoder(motion)
             gru_in = torch.cat(
                 [
                     edge_context.reshape(B * E, self.context_dim, Hf, Wf),
@@ -562,7 +559,7 @@ class PanoDroidModel(nn.Module):
             edge_hidden_flat = self.update_block(edge_hidden_flat, gru_in)
             edge_hidden = edge_hidden_flat.view(B, E, self.hidden_dim, Hf, Wf)
             delta = self.delta_head(edge_hidden_flat).view(B, E, 2, Hf, Wf).permute(0, 1, 3, 4, 2)
-            edge_weight = torch.sigmoid(self.conf_head(edge_hidden_flat)).view(B, E, 1, Hf, Wf)
+            edge_weight = torch.sigmoid(self.weight_head(edge_hidden_flat)).view(B, E, 2, Hf, Wf)
             damping, upmask = self.graph_agg(edge_hidden, ii, N)
             target = coords1 + delta
             poses_state, inv_depth_state, residual = self._ba_refine(
@@ -588,7 +585,7 @@ class PanoDroidModel(nn.Module):
 
         if not pose_steps:
             damping, upmask = self.graph_agg(edge_hidden, ii, N)
-            edge_weight = torch.sigmoid(self.conf_head(edge_hidden.reshape(B * E, self.hidden_dim, Hf, Wf))).view(B, E, 1, Hf, Wf)
+            edge_weight = torch.sigmoid(self.weight_head(edge_hidden.reshape(B * E, self.hidden_dim, Hf, Wf))).view(B, E, 2, Hf, Wf)
             residual = seam_aware_delta(coords1, target, Wf)
             pose_steps.append(poses_state)
             inv_steps.append(inv_depth_state)
@@ -620,7 +617,7 @@ class PanoDroidModel(nn.Module):
 
         inv_frame_full = _upsample_inverse_depth(final_inv, final_upmask, (Hp, Wp))[..., :H0, :W0]
         inv_edge_full = inv_frame_full[:, ii]
-        conf_full = _resize_depth_like(final_weight.reshape(B * E, 1, Hf, Wf), (Hp, Wp))
+        conf_full = _resize_depth_like(final_weight.mean(dim=2, keepdim=True).reshape(B * E, 1, Hf, Wf), (Hp, Wp))
         conf_full = conf_full[..., :H0, :W0].view(B, E, 1, H0, W0)
         damp_edge_full = _resize_depth_like(final_damping[:, ii].reshape(B * E, 1, Hf, Wf), (Hp, Wp))
         damp_edge_full = damp_edge_full[..., :H0, :W0].view(B, E, 1, H0, W0)
@@ -663,4 +660,9 @@ class PanoDroidModel(nn.Module):
             "refined_inverse_depth_full": inv_frame_full,
             "initial_inverse_depth": inv_low_init,
             "flow_low": flow_low,
+            "edge_hidden": edge_hidden,
+            "ba_valid_mask": self._last_ba_stats.get("valid_mask") if hasattr(self, "_last_ba_stats") else None,
+            "ba_pose_update_norm": self._last_ba_stats.get("pose_update_norm") if hasattr(self, "_last_ba_stats") else None,
+            "ba_depth_update_norm": self._last_ba_stats.get("depth_update_norm") if hasattr(self, "_last_ba_stats") else None,
+            "ba_normal_condition": self._last_ba_stats.get("normal_condition") if hasattr(self, "_last_ba_stats") else None,
         }

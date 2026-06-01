@@ -6,6 +6,7 @@ The frontend accepts ERP frame streams and exposes the requested SLAM interface:
 - `FrontendOutput`
 - `PanoDROIDFrontend`
 - `PanoDroidGraphTracker`
+- `PanoFactorGraph`
 - `PanoDROIDFrontendAdapter` as the backward-compatible graph wrapper
 
 The MVP keeps DROID-style module boundaries:
@@ -16,8 +17,8 @@ The MVP keeps DROID-style module boundaries:
 - `SphereConvGRU` update block using BlueHorn/SphereNet-style spherical convolution
 - update heads for spherical flow target deltas, confidence/edge weights,
   inverse depth, graph damping/upmask, and keyframe score
-- a runtime DROID-style graph tracker that reuses `forward_graph` and low-res
-  spherical BA during SLAM inference
+- a runtime `PanoFactorGraph` that keeps active/inactive factors, edge hidden
+  state, refined pose/depth state, and graph BA diagnostics during SLAM inference
 
 ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
 +X right, +Y down, +Z forward.
@@ -33,8 +34,11 @@ ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
   `SphereConv2d`; 1x1 gates remain ordinary Conv2d.
 - `projective_ops.py` is the single shared ERP projection/residual path used by
   model BA, losses, and standalone BA utilities.
-- `spherical_ba.py` provides PyTorch spherical BA utilities.
+- `dense_ba.py` provides the default PyTorch `SphericalDenseBA` normal-equation
+  layer used by graph training and inference.
+- `spherical_ba.py` provides standalone spherical BA/loss utilities.
 
 The pairwise `PanoDroidModel.forward(image0, image1)` path is legacy smoke-test
-compatibility.  SLAM inference should use `PanoDroidGraphTracker`, which keeps a
-sliding graph state and outputs refined pose, depth, confidence, and BA residual.
+compatibility.  SLAM inference should use `PanoDroidGraphTracker`, which delegates
+optimization to `PanoFactorGraph` and outputs refined pose, depth, confidence,
+and BA residual.

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import subprocess
 import time
 
 import torch
@@ -41,7 +43,7 @@ def _default_config() -> dict:
             "edge_strategy": "mixed",
             "temporal_radius": 2,
             "bidirectional": True,
-            "max_edges_per_step": 4,
+            "max_edges_per_step": 24,
             "ba_iters_per_update": 2,
             "ba_sample_stride": 1,
             "fixed_frames": 2,
@@ -89,7 +91,7 @@ def _default_config() -> dict:
         "Distributed": {
             "enabled": "auto",
             "backend": "auto",
-            "find_unused_parameters": True,
+            "find_unused_parameters": False,
         },
         "Loss": {},
     }
@@ -172,6 +174,12 @@ def _cleanup_distributed(ddp: dict) -> None:
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def _freeze_legacy_pairwise(model: torch.nn.Module) -> None:
+    for name, param in model.named_parameters():
+        if name.startswith("pose_head.") or name.startswith("damping_head."):
+            param.requires_grad_(False)
 
 
 def _forward_graph(
@@ -286,6 +294,7 @@ def _make_graph_edges(batch: dict, graph_cfg: dict, *, step: int) -> list[tuple[
     if use_proximity and "poses_c2w" in batch:
         edges = build_proximity_edges(
             batch["poses_c2w"],
+            batch.get("depths"),
             radius=radius,
             max_edges=max(max_edges, n_frames * 2) if max_edges > 0 else 0,
             bidirectional=bidirectional,
@@ -373,10 +382,52 @@ def _wandb_log_diagnostics(run, vis_metrics: dict, *, step: int) -> None:
         run.log(payload, step=int(step))
 
 
+def _batch_data_stats(batch: dict) -> dict[str, float]:
+    images = batch["images"].detach().float()
+    depths = batch["depths"].detach().float()
+    poses = batch["poses_c2w"].detach().float()
+    valid_depth = depths > 1e-6
+    if poses.shape[1] > 1:
+        trans = poses[:, 1:, :3, 3] - poses[:, :-1, :3, 3]
+        pose_step = trans.norm(dim=-1).mean()
+    else:
+        pose_step = torch.tensor(0.0)
+    valid_values = depths[valid_depth]
+    return {
+        "image_mean": float(images.mean().cpu()),
+        "image_std": float(images.std().cpu()),
+        "depth_valid_ratio": float(valid_depth.float().mean().cpu()),
+        "depth_mean_valid": float(valid_values.mean().cpu()) if valid_values.numel() else 0.0,
+        "depth_max_valid": float(valid_values.max().cpu()) if valid_values.numel() else 0.0,
+        "pose_translation_step_mean": float(pose_step.cpu()),
+        "height": float(images.shape[-2]),
+        "width": float(images.shape[-1]),
+    }
+
+
+def _git_commit() -> str | None:
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+    return commit or None
+
+
 def train_graph(config: dict) -> dict:
     ddp = _setup_distributed(config)
     device = ddp["device"]
     is_main = _is_main_process(ddp)
+    impl = config.setdefault("Implementation", {})
+    impl.setdefault("frontend", "PanoFactorGraph")
+    impl.setdefault("ba", "SphericalDenseBA")
+    impl.setdefault("ba_version", "pytorch_dense_ba_v1")
+    impl.setdefault("residual_mode", "erp_wrapped_pixel")
+    impl.setdefault("git_commit", _git_commit())
     dataset = build_graph_dataset_from_config(config, train=True)
     tr = config.get("Training", {})
     sampler = (
@@ -399,12 +450,14 @@ def train_graph(config: dict) -> dict:
         drop_last=False,
     )
     model = PanoDroidModel(**config.get("Model", {})).to(device)
+    if bool(tr.get("freeze_legacy_pairwise", True)):
+        _freeze_legacy_pairwise(model)
     if ddp["enabled"]:
         model = DistributedDataParallel(
             model,
             device_ids=[int(ddp["local_rank"])] if device.type == "cuda" else None,
             output_device=int(ddp["local_rank"]) if device.type == "cuda" else None,
-            find_unused_parameters=bool(config.get("Distributed", {}).get("find_unused_parameters", True)),
+            find_unused_parameters=bool(config.get("Distributed", {}).get("find_unused_parameters", False)),
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(tr.get("lr", 2.5e-4)), weight_decay=float(tr.get("weight_decay", 1e-5)))
     graph_cfg = config.get("Graph", {})
@@ -447,6 +500,7 @@ def train_graph(config: dict) -> dict:
     start = time.time()
     last_metrics: dict[str, float] = {}
     last_edges: list[tuple[int, int]] = []
+    data_stats_written = False
 
     try:
         for epoch in range(int(tr.get("epochs", 1))):
@@ -455,6 +509,13 @@ def train_graph(config: dict) -> dict:
             for batch in loader:
                 images = batch["images"].to(device)
                 batch_device = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                if is_main and not data_stats_written:
+                    stats = _batch_data_stats(batch_device)
+                    config["DataStats"] = stats
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    with open(output_dir / "data_stats.json", "w", encoding="utf-8") as f:
+                        json.dump(stats, f, indent=2)
+                    data_stats_written = True
                 edges = _make_graph_edges(batch, graph_cfg, step=step)
                 last_edges = list(edges)
                 optimizer.zero_grad(set_to_none=True)

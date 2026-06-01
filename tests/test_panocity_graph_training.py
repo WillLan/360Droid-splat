@@ -6,6 +6,7 @@ from PIL import Image
 import torch
 
 from frontend.pano_droid.graph_dataset import PanoCityGraphDataset
+from frontend.pano_droid.factor_graph import PanoFactorGraph
 from frontend.pano_droid.graph_losses import build_temporal_edges, select_training_edges
 from frontend.pano_droid.graph_tracker import PanoDroidGraphTracker
 from frontend.pano_droid.interfaces import PanoFrame
@@ -123,6 +124,8 @@ def test_forward_graph_returns_refined_history():
     assert pred["poses_c2w_steps"].shape == (1, 1, 3, 4, 4)
     assert pred["inverse_depth_steps"].shape[:3] == (1, 1, 3)
     assert pred["residual_steps"].shape[:3] == (1, 1, 2)
+    assert pred["weight_steps"].shape[3] == 2
+    assert pred["upmask_steps"].shape[3] == 8 * 8 * 9
     assert pred["refined_poses_c2w"].shape == (1, 3, 4, 4)
     assert pred["refined_inverse_depth"].shape[:3] == (1, 3, 1)
 
@@ -190,7 +193,38 @@ def test_graph_ba_refinement_backpropagates_to_update_and_backbone():
         return 0.0 if param.grad is None else float(param.grad.detach().abs().sum())
 
     assert grad_sum(model.delta_head[-1].weight) > 0.0
-    assert grad_sum(model.conf_head[-1].weight) > 0.0
+    assert grad_sum(model.weight_head[-1].weight) > 0.0
     assert grad_sum(model.graph_agg.damping[-1].weight) > 0.0
     assert grad_sum(model.cnet.encoder.proj.weight) > 0.0
     assert grad_sum(model.fnet.proj.weight) > 0.0
+
+
+def test_pano_factor_graph_persists_factors_and_hidden_state():
+    model = PanoDroidModel(
+        feature_dim=8,
+        context_dim=8,
+        hidden_dim=8,
+        encoder_base_dim=8,
+        corr_levels=1,
+        corr_radius=1,
+        update_iters=1,
+    )
+    graph = PanoFactorGraph(
+        model,
+        device=torch.device("cpu"),
+        window_size=3,
+        temporal_radius=1,
+        max_factors=4,
+        ba_iters_per_update=1,
+    )
+    for idx in range(3):
+        graph.add_frame(PanoFrame(image=torch.rand(3, 16, 32), timestamp=float(idx), frame_id=idx), torch.rand(3, 16, 32))
+    assert graph.n_frames == 3
+    assert 0 < len(graph.edges) <= 4
+    out = graph.update()
+    assert out is not None
+    assert out.ba_residual >= 0.0
+    assert len(graph.edge_hidden) == len(graph.edges)
+    graph.remove_keyframe(0)
+    assert graph.n_frames == 2
+    assert all(max(edge) < 2 for edge in graph.edges)

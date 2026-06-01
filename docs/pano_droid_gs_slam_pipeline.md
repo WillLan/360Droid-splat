@@ -17,8 +17,15 @@ Pipeline:
 6. Render/refine through `PFGS360Renderer` when enabled and available.
 
 The backend target is `anchor_scaffold_panorama + pfgs360_gsplat`.  The frontend
-does not use the old pairwise tracker for SLAM; it maintains a DROID-style
-sliding graph and reports real graph BA residuals in `FrontendOutput.ba_residual`.
-Production rendering expects the PFGS360 `gsplat360` package and CUDA extension.
-The fallback point renderer exists only for tests and early integration smoke
-runs.
+does not use the old pairwise tracker for SLAM; `PanoDroidGraphTracker` delegates
+to `PanoFactorGraph`, which keeps active/inactive factors, recurrent edge hidden
+state, refined pose/depth state, factor ages, and keyframe removal bookkeeping.
+Runtime factor creation is GT-free: temporal factors are always added, while
+proximity factors are ranked by current spherical projection distance when
+refined depth is available and by pose distance only as the cold-start fallback.
+
+Each graph update runs the DROID-style update module followed by
+`SphericalDenseBA`, so `FrontendOutput.ba_residual` is the real graph BA residual
+from the refined state.  Production rendering expects the PFGS360 `gsplat360`
+package and CUDA extension.  The fallback point renderer exists only for tests
+and early integration smoke runs.

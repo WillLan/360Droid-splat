@@ -3,6 +3,8 @@ import torch
 from frontend.pano_droid.spherical_ba import SphericalBA, se3_exp, spherical_ba_loss
 from frontend.pano_droid.spherical_camera import pixel_grid
 from frontend.pano_droid.projective_ops import spherical_reprojection_residual
+from frontend.pano_droid.dense_ba import SphericalDenseBA
+from frontend.pano_droid.projective_ops import project_edges
 
 
 def test_spherical_ba_residual_and_gradient_are_finite():
@@ -110,3 +112,32 @@ def test_spherical_ba_damping_reduces_update_size():
     )
     eye = torch.eye(4).unsqueeze(0)
     assert (T_hi - eye).abs().sum() < (T_lo - eye).abs().sum()
+
+
+def test_spherical_dense_ba_zero_residual_and_fixed_frame():
+    H, W = 8, 16
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    inv = torch.full((1, 2, 1, H, W), 0.4)
+    ii = torch.tensor([0])
+    jj = torch.tensor([1])
+    target = project_edges(poses, inv, ii, jj, height=H, width=W)
+    weight = torch.ones(1, 1, 2, H, W)
+    eta = torch.zeros(1, 2, 1, H, W)
+    out = SphericalDenseBA()(poses, inv, target, weight, eta, ii, jj, fixed_frames=1, iters=1)
+    assert out.residual.abs().max() < 1e-4
+    assert torch.allclose(out.poses_c2w[:, 0], poses[:, 0], atol=1e-6)
+
+
+def test_spherical_dense_ba_damping_reduces_update_norm():
+    H, W = 8, 16
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    inv = torch.full((1, 2, 1, H, W), 0.4)
+    ii = torch.tensor([0])
+    jj = torch.tensor([1])
+    target = project_edges(poses, inv, ii, jj, height=H, width=W)
+    target = target.clone()
+    target[..., 0] = target[..., 0] + 0.05
+    weight = torch.ones(1, 1, 2, H, W)
+    lo = SphericalDenseBA()(poses, inv, target, weight, torch.zeros(1, 2, 1, H, W), ii, jj, fixed_frames=1, iters=1)
+    hi = SphericalDenseBA()(poses, inv, target, weight, torch.full((1, 2, 1, H, W), 100.0), ii, jj, fixed_frames=1, iters=1)
+    assert hi.pose_update_norm < lo.pose_update_norm
