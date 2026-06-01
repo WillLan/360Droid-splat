@@ -14,10 +14,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import yaml
 
-from .checkpoint import save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint
 from .graph_dataset import build_graph_dataset_from_config
 from .graph_losses import (
     GraphLossWeights,
+    build_proximity_edges,
     build_temporal_edges,
     graph_supervised_loss,
     select_training_edges,
@@ -36,11 +37,14 @@ def _default_config() -> dict:
             "width": 64,
         },
         "Graph": {
+            "edge_strategy": "mixed",
             "temporal_radius": 2,
             "bidirectional": True,
             "max_edges_per_step": 4,
-            "loss_sample_height": 16,
-            "loss_sample_width": 32,
+            "ba_iters_per_update": 2,
+            "ba_sample_stride": 1,
+            "fixed_frames": 2,
+            "loss_gamma": 0.9,
         },
         "Model": {
             "feature_dim": 16,
@@ -59,6 +63,9 @@ def _default_config() -> dict:
             "max_steps": 2,
             "save_every": 1,
             "grad_clip": 2.5,
+            "scheduler": "onecycle",
+            "restart_prob": 0.2,
+            "resume_checkpoint": None,
             "output_dir": "outputs/pano_droid_graph_train",
         },
         "Visualization": {
@@ -168,10 +175,76 @@ def _forward_graph(
     *,
     edges: list[tuple[int, int]],
     num_updates: int,
+    poses_c2w: torch.Tensor,
+    init_poses_c2w: torch.Tensor | None,
+    init_inverse_depth: torch.Tensor | None,
+    ba_iters_per_update: int,
+    fixed_frames: int,
+    ba_sample_stride: int,
 ) -> dict:
     if isinstance(model, DistributedDataParallel):
-        return model(images, edges=edges, num_updates=num_updates)
-    return model.forward_graph(images, edges=edges, num_updates=num_updates)
+        return model(
+            images,
+            edges=edges,
+            num_updates=num_updates,
+            poses_c2w=poses_c2w,
+            init_poses_c2w=init_poses_c2w,
+            init_inverse_depth=init_inverse_depth,
+            ba_iters_per_update=ba_iters_per_update,
+            fixed_frames=fixed_frames,
+            ba_sample_stride=ba_sample_stride,
+        )
+    return model.forward_graph(
+        images,
+        edges=edges,
+        num_updates=num_updates,
+        poses_c2w=poses_c2w,
+        init_poses_c2w=init_poses_c2w,
+        init_inverse_depth=init_inverse_depth,
+        ba_iters_per_update=ba_iters_per_update,
+        fixed_frames=fixed_frames,
+        ba_sample_stride=ba_sample_stride,
+    )
+
+
+def _make_graph_edges(batch: dict, graph_cfg: dict, *, step: int) -> list[tuple[int, int]]:
+    n_frames = int(batch["images"].shape[1])
+    radius = int(graph_cfg.get("temporal_radius", 2))
+    bidirectional = bool(graph_cfg.get("bidirectional", True))
+    max_edges = int(graph_cfg.get("max_edges_per_step", 0))
+    strategy = str(graph_cfg.get("edge_strategy", "mixed")).lower()
+    use_proximity = strategy == "proximity"
+    if strategy == "mixed":
+        use_proximity = bool(torch.rand((), generator=torch.Generator().manual_seed(int(step) + 1729)).item() < 0.5)
+    if use_proximity and "poses_c2w" in batch:
+        edges = build_proximity_edges(
+            batch["poses_c2w"],
+            radius=radius,
+            max_edges=max(max_edges, n_frames * 2) if max_edges > 0 else 0,
+            bidirectional=bidirectional,
+        )
+    else:
+        edges = build_temporal_edges(n_frames, radius=radius, bidirectional=bidirectional)
+    gen = torch.Generator().manual_seed(int(step) + 7919)
+    edges = select_training_edges(edges, max_edges=max_edges, n_frames=n_frames, generator=gen)
+    if not edges:
+        raise ValueError("Graph has no training edges.")
+    return edges
+
+
+def _make_scheduler(optimizer: torch.optim.Optimizer, tr: dict, *, total_steps: int):
+    name = str(tr.get("scheduler", "onecycle") or "none").lower()
+    if name in ("none", "disabled", "false"):
+        return None
+    if name == "onecycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(tr.get("lr", 2.5e-4)),
+            total_steps=max(1, int(total_steps)),
+            pct_start=float(tr.get("scheduler_pct_start", 0.01)),
+            cycle_momentum=False,
+        )
+    raise ValueError(f"Unsupported Training.scheduler: {name}")
 
 
 def _reduce_metrics(metrics: dict[str, torch.Tensor], ddp: dict) -> dict[str, float]:
@@ -266,16 +339,27 @@ def train_graph(config: dict) -> dict:
             output_device=int(ddp["local_rank"]) if device.type == "cuda" else None,
             find_unused_parameters=bool(config.get("Distributed", {}).get("find_unused_parameters", True)),
         )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(tr.get("lr", 2.5e-4)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(tr.get("lr", 2.5e-4)), weight_decay=float(tr.get("weight_decay", 1e-5)))
     graph_cfg = config.get("Graph", {})
-    edges = build_temporal_edges(
-        int(config.get("Dataset", {}).get("n_frames", 7)),
-        radius=int(graph_cfg.get("temporal_radius", 2)),
-        bidirectional=bool(graph_cfg.get("bidirectional", True)),
-    )
-    edges = select_training_edges(edges, max_edges=int(graph_cfg.get("max_edges_per_step", 0)))
-    if not edges:
-        raise ValueError("Graph has no training edges.")
+    max_steps = int(tr.get("max_steps", 0))
+    estimated_total_steps = max_steps if max_steps > 0 else max(1, int(tr.get("epochs", 1)) * len(loader))
+    scheduler = _make_scheduler(optimizer, tr, total_steps=estimated_total_steps)
+    resume_checkpoint = tr.get("resume_checkpoint")
+    step = 0
+    best = float("inf")
+    if resume_checkpoint:
+        payload = load_checkpoint(
+            str(resume_checkpoint),
+            _unwrap_model(model),
+            optimizer=optimizer,
+            scheduler=scheduler,
+            map_location=device,
+            strict=True,
+        )
+        step = int(payload.get("step", 0))
+        metrics = payload.get("metrics") or {}
+        if "loss" in metrics:
+            best = float(metrics["loss"])
     loss_keys = set(GraphLossWeights.__dataclass_fields__)
     loss_cfg = config.get("Loss", {})
     weights = GraphLossWeights(**{k: float(v) for k, v in loss_cfg.items() if k in loss_keys})
@@ -286,7 +370,6 @@ def train_graph(config: dict) -> dict:
     if is_main:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     _barrier(ddp)
-    max_steps = int(tr.get("max_steps", 0))
     save_every = max(1, int(tr.get("save_every", 100)))
     vis_cfg = config.get("Visualization", {})
     vis_enabled = bool(vis_cfg.get("enabled", True))
@@ -294,10 +377,9 @@ def train_graph(config: dict) -> dict:
     wb_cfg = config.get("WeightsAndBiases", {})
     wandb_run = _init_wandb(config, output_dir, enabled_on_rank=is_main)
     wandb_log_every = max(1, int(wb_cfg.get("log_every", 10)))
-    step = 0
-    best = float("inf")
     start = time.time()
     last_metrics: dict[str, float] = {}
+    last_edges: list[tuple[int, int]] = []
 
     try:
         for epoch in range(int(tr.get("epochs", 1))):
@@ -305,25 +387,51 @@ def train_graph(config: dict) -> dict:
                 sampler.set_epoch(epoch)
             for batch in loader:
                 images = batch["images"].to(device)
-                pred = _forward_graph(
-                    model,
-                    images,
-                    edges=edges,
-                    num_updates=int(tr.get("iters", config.get("Model", {}).get("update_iters", 1))),
-                )
-                loss, metrics = graph_supervised_loss(
-                    {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()},
-                    pred,
-                    weights=weights,
-                    sample_height=int(graph_cfg.get("loss_sample_height", 32)),
-                    sample_width=int(graph_cfg.get("loss_sample_width", 64)),
-                )
+                batch_device = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                edges = _make_graph_edges(batch, graph_cfg, step=step)
+                last_edges = list(edges)
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+                init_poses = None
+                init_inv = None
+                restart_prob = float(tr.get("restart_prob", 0.2))
+                restart_count = 0
+                metrics = {}
+                pred = None
+                while True:
+                    pred = _forward_graph(
+                        model,
+                        images,
+                        edges=edges,
+                        num_updates=int(tr.get("iters", config.get("Model", {}).get("update_iters", 1))),
+                        poses_c2w=batch_device["poses_c2w"],
+                        init_poses_c2w=init_poses,
+                        init_inverse_depth=init_inv,
+                        ba_iters_per_update=int(graph_cfg.get("ba_iters_per_update", 2)),
+                        fixed_frames=int(graph_cfg.get("fixed_frames", 2)),
+                        ba_sample_stride=int(graph_cfg.get("ba_sample_stride", 1)),
+                    )
+                    loss, metrics = graph_supervised_loss(
+                        batch_device,
+                        pred,
+                        weights=weights,
+                        sample_height=graph_cfg.get("loss_sample_height"),
+                        sample_width=graph_cfg.get("loss_sample_width"),
+                        gamma=float(graph_cfg.get("loss_gamma", 0.9)),
+                    )
+                    loss.backward()
+                    restart_count += 1
+                    init_poses = pred["refined_poses_c2w"].detach()
+                    init_inv = pred["refined_inverse_depth"].detach()
+                    r = torch.rand((), generator=torch.Generator().manual_seed(step * 104729 + restart_count))
+                    if float(r) >= restart_prob:
+                        break
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 2.5)))
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 step += 1
                 last_metrics = _reduce_metrics(metrics, ddp)
+                last_metrics["restart_count"] = float(restart_count)
                 if is_main and (step == 1 or step % wandb_log_every == 0):
                     _wandb_log_metrics(wandb_run, last_metrics, step=step)
                 if is_main and step % save_every == 0:
@@ -331,6 +439,7 @@ def train_graph(config: dict) -> dict:
                         str(ckpt_dir / "latest.pt"),
                         model=_unwrap_model(model),
                         optimizer=optimizer,
+                        scheduler=scheduler,
                         step=step,
                         epoch=epoch,
                         config=config,
@@ -342,6 +451,7 @@ def train_graph(config: dict) -> dict:
                         str(ckpt_dir / "best.pt"),
                         model=_unwrap_model(model),
                         optimizer=optimizer,
+                        scheduler=scheduler,
                         step=step,
                         epoch=epoch,
                         config=config,
@@ -355,6 +465,10 @@ def train_graph(config: dict) -> dict:
                             images[:1],
                             edges=chain_edges,
                             num_updates=int(tr.get("iters", config.get("Model", {}).get("update_iters", 1))),
+                            poses_c2w=batch_device["poses_c2w"][:1],
+                            ba_iters_per_update=int(graph_cfg.get("ba_iters_per_update", 2)),
+                            fixed_frames=int(graph_cfg.get("fixed_frames", 2)),
+                            ba_sample_stride=int(graph_cfg.get("ba_sample_stride", 1)),
                         )
                         vis_metrics = save_graph_diagnostics(
                             {k: v[:1].detach().cpu() if torch.is_tensor(v) else v for k, v in batch.items()},
@@ -380,6 +494,7 @@ def train_graph(config: dict) -> dict:
                 str(ckpt_dir / "latest.pt"),
                 model=_unwrap_model(model),
                 optimizer=optimizer,
+                scheduler=scheduler,
                 step=step,
                 epoch=max(0, int(tr.get("epochs", 1)) - 1),
                 config=config,
@@ -398,7 +513,7 @@ def train_graph(config: dict) -> dict:
             "last_metrics": last_metrics,
             "checkpoint": str(ckpt_dir / "latest.pt"),
             "elapsed_sec": time.time() - start,
-            "edges": edges,
+            "edges": last_edges,
             "rank": int(ddp["rank"]),
             "world_size": int(ddp["world_size"]),
         }
@@ -408,7 +523,7 @@ def train_graph(config: dict) -> dict:
         "last_metrics": last_metrics,
         "checkpoint": str(ckpt_dir / "latest.pt"),
         "elapsed_sec": time.time() - start,
-        "edges": edges,
+        "edges": last_edges,
         "rank": int(ddp["rank"]),
         "world_size": int(ddp["world_size"]),
     }

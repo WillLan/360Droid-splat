@@ -85,9 +85,25 @@ The PanoCity Beijing config expects:
 - training resize: height `512`, width `1024`
 - graph clip length: `n_frames=7`
 
-The first graph trainer uses supervised RGB+pose+depth losses with sampled
-spherical projection residuals.  It is designed as a correctness-first
-PyTorch implementation; large-scale CUDA BA acceleration is a later step.
+`train_graph` is now the primary DROID-style trainer. It extracts all frame
+features once, keeps per-edge recurrent hidden state, feeds correlation plus
+`[flow, target - projection]` motion into the update block, and runs low-res
+spherical BA after each update to refine pose and inverse depth. The PyTorch BA
+path is correctness-first; large-scale CUDA BA acceleration remains a later
+step.
+
+Important graph options:
+
+- `Graph.edge_strategy: mixed`: alternates temporal and pose-distance graph
+  construction.
+- `Graph.max_edges_per_step`: randomly samples edges per batch instead of
+  prefix truncating them.
+- `Graph.ba_iters_per_update`, `Graph.ba_sample_stride`, `Graph.fixed_frames`:
+  control the feature-resolution BA loop.
+- `Graph.loss_gamma`: gamma weighting across recurrent refined states.
+- `Training.scheduler: onecycle`, `Training.restart_prob`, and
+  `Training.resume_checkpoint`: match the DROID-SLAM long-training cadence more
+  closely.
 
 During graph training, diagnostics are written under
 `Training.output_dir/visualizations`:
@@ -97,8 +113,8 @@ During graph training, diagnostics are written under
   the colorbar shows frame index.
 - `step_XXXXXXX_depth.png`: three panels from left to right: predicted depth,
   GT depth, and absolute depth error.
-- `step_XXXXXXX_metrics.json`: trajectory RMSE and depth MAE for the visualized
-  batch
+- `step_XXXXXXX_metrics.json`: trajectory RMSE, depth MAE, and BA residual for
+  the visualized batch
 
 When `WeightsAndBiases.enabled=true`, rank 0 also logs the same diagnostics to
 W&B:

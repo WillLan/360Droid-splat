@@ -6,6 +6,8 @@ from PIL import Image
 import torch
 
 from frontend.pano_droid.graph_dataset import PanoCityGraphDataset
+from frontend.pano_droid.graph_losses import build_temporal_edges, select_training_edges
+from frontend.pano_droid.model import PanoDroidModel
 from frontend.pano_droid.train_graph import load_graph_train_config, train_graph
 
 
@@ -78,6 +80,46 @@ def test_train_graph_synthetic_smoke(tmp_path: Path):
     assert result["steps"] == 2
     assert Path(result["checkpoint"]).is_file()
     assert np.isfinite(result["best_loss"])
+    assert "ba_residual" in result["last_metrics"]
+    assert "edge_coverage" in result["last_metrics"]
     vis_dir = tmp_path / "visualizations"
     assert (vis_dir / "step_0000001_trajectory.png").is_file()
     assert (vis_dir / "step_0000001_depth.png").is_file()
+
+
+def test_random_edge_sampling_is_not_prefix_truncation():
+    edges = build_temporal_edges(4, radius=2, bidirectional=True)
+    first = select_training_edges(edges, max_edges=4, n_frames=4, generator=torch.Generator().manual_seed(1))
+    second = select_training_edges(edges, max_edges=4, n_frames=4, generator=torch.Generator().manual_seed(2))
+    assert first != edges[:4]
+    assert second != edges[:4]
+    assert first != second
+    assert {idx for edge in first for idx in edge} == {0, 1, 2, 3}
+
+
+def test_forward_graph_returns_refined_history():
+    model = PanoDroidModel(
+        feature_dim=8,
+        context_dim=8,
+        hidden_dim=8,
+        encoder_base_dim=8,
+        corr_levels=1,
+        corr_radius=1,
+        update_iters=1,
+    )
+    images = torch.rand(1, 3, 3, 16, 32)
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    poses[:, 1, 0, 3] = 0.05
+    poses[:, 2, 0, 3] = 0.1
+    pred = model.forward_graph(
+        images,
+        edges=[(0, 1), (1, 2)],
+        poses_c2w=poses,
+        num_updates=1,
+        ba_iters_per_update=1,
+    )
+    assert pred["poses_c2w_steps"].shape == (1, 1, 3, 4, 4)
+    assert pred["inverse_depth_steps"].shape[:3] == (1, 1, 3)
+    assert pred["residual_steps"].shape[:3] == (1, 1, 2)
+    assert pred["refined_poses_c2w"].shape == (1, 3, 4, 4)
+    assert pred["refined_inverse_depth"].shape[:3] == (1, 3, 1)

@@ -9,11 +9,14 @@ Dataset:
   depth_invalid_value: 65535.0
 
 Graph:
+  edge_strategy: mixed
   temporal_radius: 2
   bidirectional: true
   max_edges_per_step: 4
-  loss_sample_height: 32
-  loss_sample_width: 64
+  ba_iters_per_update: 2
+  ba_sample_stride: 1
+  fixed_frames: 2
+  loss_gamma: 0.9
 
 Model:
   feature_dim: 32
@@ -38,6 +41,9 @@ Training:
   max_steps: 250000
   save_every: 500
   iters: 8
+  scheduler: onecycle
+  restart_prob: 0.2
+  resume_checkpoint: null
   output_dir: outputs/pano_droid_panocity_beijing
 
 Visualization:

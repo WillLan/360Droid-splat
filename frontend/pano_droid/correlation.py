@@ -17,8 +17,8 @@ def coords_grid(
     device=None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    y = torch.arange(height, device=device, dtype=dtype)
-    x = torch.arange(width, device=device, dtype=dtype)
+    y = torch.arange(height, device=device, dtype=dtype) + 0.5
+    x = torch.arange(width, device=device, dtype=dtype) + 0.5
     yy, xx = torch.meshgrid(y, x, indexing="ij")
     coords = torch.stack([xx, yy], dim=0)
     return coords.unsqueeze(0).expand(batch, -1, -1, -1).contiguous()
@@ -35,11 +35,11 @@ def _norm_grid_from_coords(
     if width <= 1:
         nx = torch.zeros_like(x)
     else:
-        nx = 2.0 * x / float(width - 1) - 1.0
+        nx = 2.0 * (x - 0.5) / float(width - 1) - 1.0
     if height <= 1:
         ny = torch.zeros_like(y)
     else:
-        ny = 2.0 * y / float(height - 1) - 1.0
+        ny = 2.0 * (y - 0.5) / float(height - 1) - 1.0
     return torch.stack([nx, ny], dim=-1)
 
 

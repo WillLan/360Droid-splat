@@ -79,3 +79,9 @@ def test_droid_style_encoders_and_correlation_shapes():
     out = corr(coords)
     assert out.shape == (1, 18, 4, 8)
     assert torch.isfinite(out).all()
+
+
+def test_coords_grid_uses_pixel_centers():
+    coords = coords_grid(1, 2, 3)
+    assert torch.allclose(coords[0, :, 0, 0], torch.tensor([0.5, 0.5]))
+    assert torch.allclose(coords[0, :, -1, -1], torch.tensor([2.5, 1.5]))

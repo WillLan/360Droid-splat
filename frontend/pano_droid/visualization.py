@@ -185,19 +185,33 @@ def save_graph_diagnostics(
     """Save trajectory and depth comparison images for one graph batch."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    edges = list(pred["edges"])
     gt_c2w = batch["poses_c2w"][0].detach().cpu().float()
-    rel = pred["relative_pose"][0].detach().cpu().float()
-    pred_xyz = _positions_from_pred(rel, edges, gt_c2w)
+    if "refined_poses_c2w" in pred:
+        pred_c2w = pred["refined_poses_c2w"][0].detach().cpu().float()
+        pred_xyz = pred_c2w[:, :3, 3]
+    else:
+        edges = list(pred["edges"])
+        rel = pred["relative_pose"][0].detach().cpu().float()
+        pred_xyz = _positions_from_pred(rel, edges, gt_c2w)
     gt_xyz = gt_c2w[:, :3, 3]
 
     traj = _make_trajectory_panel(_to_numpy(gt_xyz), _to_numpy(pred_xyz))
     traj_path = output_path / f"step_{int(step):07d}_trajectory.png"
     traj.save(traj_path)
 
+    edges = list(pred["edges"])
     src_idx = int(edges[0][0])
     gt_depth = batch["depths"][0, src_idx, 0].detach().cpu().float()
-    pred_inv = pred["inverse_depth"][0, 0, 0].detach().cpu().float()
+    if "refined_inverse_depth" in pred:
+        pred_inv = pred["refined_inverse_depth"][0, src_idx, 0].detach().cpu().float()
+        pred_inv = torch.nn.functional.interpolate(
+            pred_inv.view(1, 1, *pred_inv.shape),
+            size=gt_depth.shape,
+            mode="bilinear",
+            align_corners=True,
+        ).view_as(gt_depth)
+    else:
+        pred_inv = pred["inverse_depth"][0, 0, 0].detach().cpu().float()
     pred_depth = torch.zeros_like(pred_inv)
     valid_pred = pred_inv > 1e-6
     pred_depth[valid_pred] = 1.0 / pred_inv[valid_pred].clamp_min(1e-6)
@@ -221,6 +235,8 @@ def save_graph_diagnostics(
         "trajectory_rmse": float(traj_rmse),
         "depth_mae": float(depth_mae),
     }
+    if "residual_steps" in pred:
+        metrics["ba_residual"] = float(pred["residual_steps"].detach().norm(dim=-1).mean().cpu())
     metrics_path = output_path / f"step_{int(step):07d}_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)

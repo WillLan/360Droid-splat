@@ -33,23 +33,47 @@ def skew(v: torch.Tensor) -> torch.Tensor:
 def so3_exp(omega: torch.Tensor) -> torch.Tensor:
     """SO(3) exponential map for ``[..., 3]`` rotation vectors."""
     theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
-    small = theta < 1e-8
-    axis = omega / theta.clamp_min(1e-8)
-    K = skew(axis)
+    K = skew(omega)
     eye = torch.eye(3, device=omega.device, dtype=omega.dtype)
     eye = eye.expand(*omega.shape[:-1], 3, 3)
-    sin_t = torch.sin(theta)[..., None]
-    cos_t = torch.cos(theta)[..., None]
-    R = eye + sin_t * K + (1.0 - cos_t) * (K @ K)
-    K_small = skew(omega)
-    return torch.where(small[..., None], eye + K_small, R)
+    theta2 = theta * theta
+    small = theta < 1e-4
+    a = torch.where(
+        small,
+        1.0 - theta2 / 6.0 + theta2 * theta2 / 120.0,
+        torch.sin(theta) / theta.clamp_min(1e-8),
+    )
+    b = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(1e-8),
+    )
+    return eye + a[..., None] * K + b[..., None] * (K @ K)
 
 
 def se3_exp(xi: torch.Tensor) -> torch.Tensor:
     """SE(3) exponential map for ``[..., 6]`` vectors ``[tx, ty, tz, rx, ry, rz]``."""
-    trans = xi[..., :3]
+    rho = xi[..., :3]
     omega = xi[..., 3:]
     R = so3_exp(omega)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta * theta
+    K = skew(omega)
+    eye = torch.eye(3, device=xi.device, dtype=xi.dtype)
+    eye = eye.expand(*xi.shape[:-1], 3, 3)
+    small = theta < 1e-4
+    a = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2 * theta2 / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(1e-8),
+    )
+    b = torch.where(
+        small,
+        1.0 / 6.0 - theta2 / 120.0 + theta2 * theta2 / 5040.0,
+        (theta - torch.sin(theta)) / (theta2 * theta).clamp_min(1e-8),
+    )
+    V = eye + a[..., None] * K + b[..., None] * (K @ K)
+    trans = torch.einsum("...ij,...j->...i", V, rho)
     T = torch.zeros(*xi.shape[:-1], 4, 4, device=xi.device, dtype=xi.dtype)
     T[..., :3, :3] = R
     T[..., :3, 3] = trans
@@ -198,6 +222,7 @@ class SphericalBA(nn.Module):
         steps: int = 3,
         lr: float = 1e-2,
         optimize_depth: bool = True,
+        damping: Optional[torch.Tensor | float] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
         xi = torch.zeros(
             *T_init.shape[:-2], 6, device=T_init.device, dtype=T_init.dtype, requires_grad=True
@@ -208,10 +233,17 @@ class SphericalBA(nn.Module):
         else:
             log_inv = inverse_depth.detach().clamp_min(1e-6).log()
             params = [xi]
-        opt = torch.optim.Adam(params, lr=lr)
         losses: list[float] = []
+        if damping is None:
+            damp = torch.ones(*T_init.shape[:-2], 1, device=T_init.device, dtype=T_init.dtype)
+        elif torch.is_tensor(damping):
+            damp = damping.to(device=T_init.device, dtype=T_init.dtype).reshape(*T_init.shape[:-2], -1).mean(dim=-1, keepdim=True)
+        else:
+            damp = torch.full((*T_init.shape[:-2], 1), float(damping), device=T_init.device, dtype=T_init.dtype)
         for _ in range(int(steps)):
-            opt.zero_grad(set_to_none=True)
+            for p in params:
+                if p.grad is not None:
+                    p.grad = None
             T = se3_exp(xi) @ T_init
             inv = log_inv.exp().clamp_min(1e-6)
             out = self(
@@ -222,8 +254,11 @@ class SphericalBA(nn.Module):
                 confidence=confidence,
             )
             out.loss.backward()
-            opt.step()
+            with torch.no_grad():
+                if xi.grad is not None:
+                    xi -= float(lr) * xi.grad / (1.0 + damp)
+                if optimize_depth and log_inv.grad is not None:
+                    log_inv -= float(lr) * log_inv.grad / (1.0 + damp.mean().clamp_min(1e-6))
             losses.append(float(out.loss.detach().cpu()))
         with torch.no_grad():
             return se3_exp(xi) @ T_init, log_inv.exp().clamp_min(1e-6), losses
-
