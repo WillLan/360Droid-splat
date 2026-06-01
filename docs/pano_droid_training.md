@@ -91,19 +91,23 @@ plus encoded motion into the update block, and predicts DROID-style
 `delta/weight/eta/upmask` heads.  The edge weight is 2-channel per-coordinate
 weight, not the legacy scalar confidence map.  After every update step it runs
 `SphericalDenseBA` on the feature-grid ERP residual to refine pose and inverse
-depth. The runtime SLAM frontend now uses the same graph path through
+depth. The default PanoCity model profile is `droid_base` (`128/128/128`
+feature/context/hidden channels with image normalization); tiny profiles remain
+for smoke tests. The runtime SLAM frontend now uses the same graph path through
 `PanoFactorGraph` instead of the legacy pairwise pose head.
 
-The first PyTorch `SphericalDenseBA` implementation is correctness-first: it
-uses the shared ERP projective ops, wrapped pixel residuals, valid/depth masks,
-LM damping, fixed-frame handling, and bounded updates.  It is the default graph
-training/inference path, while a future CUDA/Schur backend can replace the same
-interface for speed and fuller DROID parity.
+The PyTorch `SphericalDenseBA` implementation is correctness-first: it uses
+closed-form ERP pixel Jacobians, shared projection ops, wrapped pixel residuals,
+valid/depth masks, LM damping, fixed-frame handling, bounded updates, and a
+pose-depth Schur complement.  It is the default graph training/inference path,
+while a future CUDA backend can replace the same interface for speed.
 
 Important graph options:
 
 - `Graph.edge_strategy: mixed`: alternates temporal and spherical
   projection-distance graph construction when depth is available.
+- `Graph.edge_pose_source: init`: builds proximity edges from the same warm-start
+  poses used by training, reducing the train/inference graph-selection gap.
 - `Graph.max_edges_per_step`: randomly samples edges per batch instead of
   prefix truncating them.  The PanoCity default is `24`, close to the DROID
   training factor count for short clips.
@@ -122,14 +126,19 @@ Important graph options:
 
 Default graph losses follow the DROID-style main supervision:
 `geodesic_loss + residual_loss + flow_loss` with gamma weighting over recurrent
-refined states.  Depth L1, smoothness, and residual-aware confidence calibration
-remain available as auxiliary terms, but the PanoCity config keeps them disabled
-by default so they do not dominate the graph/BA objective.
+refined states.  A sampled full-resolution flow term supervises
+`refined_inverse_depth_full`, so the convex upsampling mask is trained by
+geometry instead of only reported as a diagnostic.  Depth L1, smoothness, and
+residual-aware confidence calibration remain available as auxiliary terms, but
+the PanoCity config keeps them disabled by default so they do not dominate the
+graph/BA objective.
 
 At startup, rank 0 records dataset sanity statistics in
 `Training.output_dir/data_stats.json`: image range, depth range, invalid-depth
 ratio, and pose translation scale.  The same stats are stored in checkpoints
-alongside config/git metadata to make long runs reproducible.
+alongside config/git metadata to make long runs reproducible.  Training metrics
+also include per-module grad norms and unused trainable parameter counts for
+catching accidental legacy-path participation.
 
 During graph training, diagnostics are written under
 `Training.output_dir/visualizations`:

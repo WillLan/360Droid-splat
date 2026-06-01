@@ -10,6 +10,7 @@ Dataset:
 
 Graph:
   edge_strategy: mixed
+  edge_pose_source: init
   temporal_radius: 2
   bidirectional: true
   max_edges_per_step: 24
@@ -17,6 +18,7 @@ Graph:
   ba_sample_stride: 1
   fixed_frames: 2
   loss_gamma: 0.9
+  fullres_loss_sample_stride: 4
   init_mode: droid_gt_anchor
   init_noise_prob: 0.2
   init_identity_prob: 0.05
@@ -27,10 +29,12 @@ BA:
   residual_mode: pixel
 
 Model:
-  feature_dim: 32
-  context_dim: 32
-  hidden_dim: 48
-  encoder_base_dim: 32
+  profile: droid_base
+  feature_dim: 128
+  context_dim: 128
+  hidden_dim: 128
+  encoder_base_dim: 64
+  normalize_images: true
   feature_stride: 8
   corr_levels: 4
   corr_radius: 3
@@ -80,6 +84,7 @@ Distributed:
 Loss:
   pose: 10.0
   flow: 0.05
+  fullres_flow: 0.02
   depth: 0.0
   residual: 0.01
   smooth: 0.0

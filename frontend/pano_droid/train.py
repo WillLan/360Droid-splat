@@ -19,7 +19,13 @@ from .model import PanoDroidModel
 def _default_config() -> dict:
     return {
         "Dataset": {"synthetic": True, "synthetic_length": 16, "height": 32, "width": 64},
-        "Model": {"feature_dim": 32, "context_dim": 32, "hidden_dim": 48, "update_iters": 2},
+        "Model": {
+            "profile": "tiny",
+            "feature_dim": 32,
+            "context_dim": 32,
+            "hidden_dim": 48,
+            "update_iters": 2,
+        },
         "Training": {
             "epochs": 1,
             "batch_size": 2,

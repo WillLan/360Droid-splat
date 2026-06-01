@@ -20,15 +20,18 @@ Pipeline:
 The backend target is `anchor_scaffold_panorama + pfgs360_gsplat`.  The frontend
 does not use the old pairwise tracker for SLAM; `PanoDroidGraphTracker` delegates
 to `PanoFactorGraph`, which keeps active/inactive factors, recurrent edge hidden
-state, refined pose/depth state, factor ages, and keyframe removal bookkeeping.
+state, cached features/context, refined pose/depth state, factor ages, and
+keyframe removal bookkeeping.
 Runtime factor creation is GT-free: temporal factors are always added, while
 proximity factors are ranked by current spherical projection distance when
 refined depth is available and by pose distance only as the cold-start fallback.
 
 Each graph update runs the DROID-style update module followed by
-`SphericalDenseBA`, so `FrontendOutput.ba_residual` is the real graph BA residual
-from the refined state. The PanoVGGT frontend keeps the same `FrontendOutput`
-contract but may emit delayed stabilized outputs after chunk alignment.
+`SphericalDenseBA`; inactive factors with stored target/weight are reused in the
+final BA pass when available, so `FrontendOutput.ba_residual` is the real graph
+BA residual from the refined state. The PanoVGGT frontend keeps the same
+`FrontendOutput` contract but may emit delayed stabilized outputs after chunk
+alignment.
 Production rendering expects the PFGS360 `gsplat360` package and CUDA extension.
 The fallback point renderer exists only for tests and early integration smoke
 runs.

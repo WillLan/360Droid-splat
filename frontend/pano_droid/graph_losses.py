@@ -126,6 +126,7 @@ def select_training_edges(
 class GraphLossWeights:
     pose: float = 10.0
     flow: float = 0.05
+    fullres_flow: float = 0.02
     residual: float = 0.01
     depth: float = 0.0
     smooth: float = 0.0
@@ -200,6 +201,7 @@ def graph_supervised_loss(
     weights: GraphLossWeights | None = None,
     sample_height: int | None = None,
     sample_width: int | None = None,
+    fullres_sample_stride: int = 4,
     gamma: float = 0.9,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or GraphLossWeights()
@@ -231,6 +233,7 @@ def graph_supervised_loss(
 
     l_pose = depths.new_tensor(0.0)
     l_flow = depths.new_tensor(0.0)
+    l_fullres_flow = depths.new_tensor(0.0)
     l_depth = depths.new_tensor(0.0)
     l_residual = depths.new_tensor(0.0)
     l_smooth = depths.new_tensor(0.0)
@@ -296,9 +299,51 @@ def graph_supervised_loss(
             ).mean()
             valid_edges += 1
 
+    fullres_edges = 0
+    full_inv = pred.get("refined_inverse_depth_full")
+    if torch.is_tensor(full_inv):
+        H0, W0 = int(depths.shape[-2]), int(depths.shape[-1])
+        fs = max(1, int(fullres_sample_stride))
+        pixels_full = pixel_grid(H0, W0, device=device, dtype=dtype)[::fs, ::fs].reshape(-1, 2)
+        area_full = latitude_area_weight(H0, W0, device=device, dtype=dtype, normalize=True)[
+            0, ::fs, ::fs
+        ].reshape(1, -1)
+        for i, j in edges:
+            gt_depth = depths[:, i, 0, ::fs, ::fs].reshape(B, -1)
+            valid = gt_depth > 1e-6
+            if not bool(valid.any()):
+                continue
+            pred_inv = full_inv[:, i, 0, ::fs, ::fs].reshape(B, -1)
+            pred_depth = torch.zeros_like(pred_inv)
+            pred_valid = pred_inv > 1e-6
+            pred_depth[pred_valid] = 1.0 / pred_inv[pred_valid].clamp_min(1e-6)
+            gt_flow, _ = _projective_target(
+                pixels_full,
+                gt_depth,
+                gt_poses[:, i],
+                gt_poses[:, j],
+                height=H0,
+                width=W0,
+            )
+            pred_flow, _ = _projective_target(
+                pixels_full,
+                pred_depth,
+                pred["refined_poses_c2w"][:, i],
+                pred["refined_poses_c2w"][:, j],
+                height=H0,
+                width=W0,
+            )
+            flow_err = pred_flow - gt_flow
+            full_area = area_full * valid.to(dtype)
+            l_fullres_flow = l_fullres_flow + (
+                torch.sqrt((flow_err * flow_err).sum(dim=-1) + 1e-6) * full_area
+            ).sum() / full_area.sum().clamp_min(1e-6)
+            fullres_edges += 1
+
     denom = max(valid_edges, 1)
     l_pose = l_pose / denom
     l_flow = l_flow / denom
+    l_fullres_flow = l_fullres_flow / max(fullres_edges, 1)
     l_residual = l_residual / denom
     l_conf = l_conf / max(S, 1)
     l_depth = l_depth / max(S, 1)
@@ -306,6 +351,7 @@ def graph_supervised_loss(
     total = (
         weights.pose * l_pose
         + weights.flow * l_flow
+        + weights.fullres_flow * l_fullres_flow
         + weights.depth * l_depth
         + weights.residual * l_residual
         + weights.smooth * l_smooth
@@ -334,6 +380,7 @@ def graph_supervised_loss(
         "loss": total.detach(),
         "pose": l_pose.detach(),
         "flow": l_flow.detach(),
+        "fullres_flow": l_fullres_flow.detach(),
         "depth": l_depth.detach(),
         "residual": l_residual.detach(),
         "smooth": l_smooth.detach(),

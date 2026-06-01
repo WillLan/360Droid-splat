@@ -1,21 +1,22 @@
 """PyTorch spherical dense BA used by the graph frontend.
 
-This is a correctness-first ERP version of DROID's dense BA contract.  It builds
-per-frame damped normal equations for pose updates and diagonal per-pixel inverse
-depth updates from the shared spherical projection residual.  The implementation
-keeps the public shape and optimization semantics close to DROID while leaving a
-clear replacement point for a future CUDA/Schur backend.
+This is the correctness-first ERP version of DROID's dense BA contract.  It
+builds a pose-depth normal equation from shared spherical projection residuals,
+eliminates per-pixel inverse-depth variables with a Schur complement, then
+applies SE(3) pose retractions and log inverse-depth updates.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
+import torch.nn.functional as F
 
 from .projective_ops import project_edges
-from .spherical_ba import se3_exp
-from .spherical_camera import pixel_grid, seam_aware_delta
+from .spherical_ba import se3_exp, skew
+from .spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid, seam_aware_delta
 
 
 @dataclass
@@ -39,21 +40,101 @@ def _ensure_weight2(weight: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected 1 or 2 weight channels, got {weight.shape[2]}")
 
 
+def _left_pose_jacobians(
+    poses_c2w: torch.Tensor,
+    inverse_depth: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    stride: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project graph edges and return ERP pixel Jacobians.
+
+    Jacobians are for left SE(3) perturbations ``exp(dx) @ T_c2w`` with
+    ``dx=[tx,ty,tz,rx,ry,rz]`` and for log inverse-depth increments.
+    """
+    B = int(poses_c2w.shape[0])
+    E = int(ii.numel())
+    pixels = pixel_grid(height, width, device=poses_c2w.device, dtype=poses_c2w.dtype)[
+        ::stride, ::stride
+    ]
+    Hs, Ws = int(pixels.shape[0]), int(pixels.shape[1])
+    p = pixels.view(1, 1, Hs, Ws, 2).expand(B, E, -1, -1, -1)
+    bearing_i = erp_pixel_to_bearing(p.reshape(B * E, Hs * Ws, 2), height, width).view(
+        B, E, Hs, Ws, 3
+    )
+    inv_src = inverse_depth[:, ii, 0, ::stride, ::stride].clamp_min(1e-6)
+    xyz_i = bearing_i / inv_src.unsqueeze(-1)
+
+    Ti = poses_c2w[:, ii]
+    Tj = poses_c2w[:, jj]
+    Ri = Ti[..., :3, :3]
+    Rj = Tj[..., :3, :3]
+    ti = Ti[..., :3, 3]
+    tj = Tj[..., :3, 3]
+    world = torch.einsum("beij,behwj->behwi", Ri, xyz_i) + ti.view(B, E, 1, 1, 3)
+    rjt = Rj.transpose(-1, -2)
+    xyz_j = torch.einsum("beij,behwj->behwi", rjt, world - tj.view(B, E, 1, 1, 3))
+    bearing_j = F.normalize(xyz_j, dim=-1, eps=1e-12)
+    coords = bearing_to_erp_pixel(bearing_j.reshape(B * E, Hs * Ws, 3), height, width).view(
+        B, E, Hs, Ws, 2
+    )
+
+    x = xyz_j[..., 0]
+    y = xyz_j[..., 1]
+    z = xyz_j[..., 2]
+    q = (x * x + z * z).clamp_min(1e-8)
+    r2 = (q + y * y).clamp_min(1e-8)
+    sqrt_q = torch.sqrt(q).clamp_min(1e-8)
+    su = float(width) / (2.0 * math.pi)
+    sv = float(height) / math.pi
+    j_pix = xyz_j.new_zeros(B, E, Hs, Ws, 2, 3)
+    j_pix[..., 0, 0] = su * z / q
+    j_pix[..., 0, 2] = -su * x / q
+    j_pix[..., 1, 0] = sv * (-x * y) / (r2 * sqrt_q)
+    j_pix[..., 1, 1] = sv * sqrt_q / r2
+    j_pix[..., 1, 2] = sv * (-z * y) / (r2 * sqrt_q)
+
+    eye = torch.eye(3, device=poses_c2w.device, dtype=poses_c2w.dtype).view(1, 1, 1, 1, 3, 3)
+    rjt_px = rjt.view(B, E, 1, 1, 3, 3)
+    world_skew = skew(world)
+    src_motion = torch.cat(
+        [
+            rjt_px.expand(-1, -1, Hs, Ws, -1, -1),
+            -torch.matmul(rjt_px, world_skew),
+        ],
+        dim=-1,
+    )
+    tgt_motion = torch.cat(
+        [
+            -rjt_px.expand(-1, -1, Hs, Ws, -1, -1),
+            torch.matmul(rjt_px, world_skew),
+        ],
+        dim=-1,
+    )
+    ji = torch.einsum("behwca,behwak->behwck", j_pix, src_motion)
+    jjac = torch.einsum("behwca,behwak->behwck", j_pix, tgt_motion)
+
+    d_world_dlog = -torch.einsum("beij,behwj->behwi", Ri, xyz_i)
+    d_cam_dlog = torch.einsum("beij,behwj->behwi", rjt, d_world_dlog)
+    jz = torch.einsum("behwca,behwa->behwc", j_pix, d_cam_dlog)
+    _ = eye  # keeps the intended coordinate convention visible for readers.
+    return coords, ji, jjac, jz
+
+
 class SphericalDenseBA:
     """Low-resolution ERP dense bundle adjustment with DROID-style inputs."""
 
     def __init__(
         self,
         *,
-        pose_eps: float = 1e-3,
-        depth_eps: float = 1e-3,
         lm: float = 1e-4,
         max_pose_step: float = 0.05,
         max_depth_step: float = 0.10,
         min_inverse_depth: float = 1e-6,
     ) -> None:
-        self.pose_eps = float(pose_eps)
-        self.depth_eps = float(depth_eps)
         self.lm = float(lm)
         self.max_pose_step = float(max_pose_step)
         self.max_depth_step = float(max_depth_step)
@@ -74,108 +155,129 @@ class SphericalDenseBA:
         sample_stride: int = 1,
     ) -> SphericalDenseBAOutput:
         B, N, _, H, W = inverse_depth.shape
+        E = int(ii.numel())
         stride = max(1, int(sample_stride))
-        pixels = None if stride == 1 else pixel_grid(H, W, device=target.device, dtype=target.dtype)[::stride, ::stride]
         target_s = target[:, :, ::stride, ::stride]
         weight_s = _ensure_weight2(weight)[:, :, :, ::stride, ::stride].clamp(1e-4, 1.0)
         eta_s = eta[:, :, :, ::stride, ::stride].clamp_min(0.0)
+        Hs, Ws = int(target_s.shape[-3]), int(target_s.shape[-2])
         fixed = max(1, min(int(fixed_frames), N))
         pose_mask = torch.ones(B, N, 1, device=poses_c2w.device, dtype=poses_c2w.dtype)
         pose_mask[:, :fixed] = 0.0
 
         cur_poses = poses_c2w
         cur_inv = inverse_depth.clamp_min(self.min_inverse_depth)
-        valid_mask = target_s.new_ones(B, int(ii.numel()), target_s.shape[-3], target_s.shape[-2])
+        valid_mask = target_s.new_ones(B, E, Hs, Ws, dtype=torch.bool)
         pose_norm = target_s.new_tensor(0.0)
         depth_norm = target_s.new_tensor(0.0)
         cond_accum = target_s.new_tensor(0.0)
         cond_count = 0
+        eye6 = torch.eye(6, device=target.device, dtype=target.dtype)
 
         for _ in range(max(0, int(iters))):
-            coords = project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
+            coords, j_src, j_tgt, jz = _left_pose_jacobians(
+                cur_poses,
+                cur_inv,
+                ii,
+                jj,
+                height=H,
+                width=W,
+                stride=stride,
+            )
             residual = seam_aware_delta(coords, target_s, W)
-            valid_mask = torch.isfinite(residual).all(dim=-1) & torch.isfinite(weight_s).all(dim=2)
+            valid_mask = (
+                torch.isfinite(residual).all(dim=-1)
+                & torch.isfinite(weight_s).all(dim=2)
+                & torch.isfinite(jz).all(dim=-1)
+            )
             residual = torch.where(valid_mask.unsqueeze(-1), residual, torch.zeros_like(residual))
-            w_hw2 = weight_s.permute(0, 1, 3, 4, 2)
+            w = weight_s.permute(0, 1, 3, 4, 2) * valid_mask.unsqueeze(-1).to(target.dtype)
 
-            H_pose = residual.new_zeros(B, N, 6, 6)
-            b_pose = residual.new_zeros(B, N, 6)
-            for frame_idx in range(N):
-                if frame_idx < fixed:
-                    continue
-                for dof in range(6):
-                    xi = residual.new_zeros(B, N, 6)
-                    xi[:, frame_idx, dof] = self.pose_eps
-                    poses_eps = se3_exp(xi) @ cur_poses
-                    coords_eps = project_edges(poses_eps, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
-                    res_eps = seam_aware_delta(coords_eps, target_s, W)
-                    jac = (res_eps - residual) / self.pose_eps
-                    touched = (ii == frame_idx) | (jj == frame_idx)
-                    if not bool(touched.any()):
-                        continue
-                    jac = jac[:, touched]
-                    res_t = residual[:, touched]
-                    w_t = w_hw2[:, touched]
-                    valid_t = valid_mask[:, touched].unsqueeze(-1).to(residual.dtype)
-                    jw = jac * w_t * valid_t
-                    b_pose[:, frame_idx, dof] = (jw * res_t).sum(dim=(1, 2, 3, 4))
-                    for dof2 in range(dof, 6):
-                        if dof2 == dof:
-                            jac2 = jac
-                        else:
-                            xi2 = residual.new_zeros(B, N, 6)
-                            xi2[:, frame_idx, dof2] = self.pose_eps
-                            poses_eps2 = se3_exp(xi2) @ cur_poses
-                            coords_eps2 = project_edges(poses_eps2, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
-                            res_eps2 = seam_aware_delta(coords_eps2, target_s, W)
-                            jac2 = ((res_eps2 - residual) / self.pose_eps)[:, touched]
-                        h_val = (jw * jac2).sum(dim=(1, 2, 3, 4))
-                        H_pose[:, frame_idx, dof, dof2] = h_val
-                        H_pose[:, frame_idx, dof2, dof] = h_val
+            Hpp = residual.new_zeros(B, N, N, 6, 6)
+            bp = residual.new_zeros(B, N, 6)
+            C = residual.new_zeros(B, N, 1, Hs, Ws)
+            bz = residual.new_zeros(B, N, 1, Hs, Ws)
+            Epd = residual.new_zeros(B, N, N, 6, Hs, Ws)
+
+            for edge_idx in range(E):
+                src = int(ii[edge_idx])
+                dst = int(jj[edge_idx])
+                js = j_src[:, edge_idx]
+                jt = j_tgt[:, edge_idx]
+                j_depth = jz[:, edge_idx]
+                res = residual[:, edge_idx]
+                we = w[:, edge_idx]
+
+                C[:, src, 0] = C[:, src, 0] + (we * j_depth * j_depth).sum(dim=-1)
+                bz[:, src, 0] = bz[:, src, 0] + (we * j_depth * res).sum(dim=-1)
+                pose_terms = ((src, js), (dst, jt))
+                for a_frame, ja in pose_terms:
+                    if a_frame >= fixed:
+                        bp[:, a_frame] = bp[:, a_frame] + torch.einsum(
+                            "bhwc,bhwc,bhwck->bk", we, res, ja
+                        )
+                        Epd[:, a_frame, src] = Epd[:, a_frame, src] + torch.einsum(
+                            "bhwc,bhwc,bhwck->bkhw", we, j_depth, ja
+                        )
+                    for b_frame, jb in pose_terms:
+                        if a_frame >= fixed and b_frame >= fixed:
+                            Hpp[:, a_frame, b_frame] = Hpp[:, a_frame, b_frame] + torch.einsum(
+                                "bhwc,bhwck,bhwcl->bkl", we, ja, jb
+                            )
 
             eta_frame = eta_s.mean(dim=(-1, -2, -3)).view(B, N)
-            eye6 = torch.eye(6, device=target.device, dtype=target.dtype).view(1, 1, 6, 6)
-            H_pose = H_pose + eye6 * (self.lm + eta_frame.view(B, N, 1, 1))
+            for frame_idx in range(N):
+                Hpp[:, frame_idx, frame_idx] = Hpp[:, frame_idx, frame_idx] + eye6 * (
+                    self.lm + eta_frame[:, frame_idx].view(B, 1, 1)
+                )
+                if frame_idx < fixed:
+                    Hpp[:, frame_idx] = 0.0
+                    Hpp[:, :, frame_idx] = 0.0
+                    Hpp[:, frame_idx, frame_idx] = eye6
+                    bp[:, frame_idx] = 0.0
+                    Epd[:, frame_idx] = 0.0
+
+            C = C + self.lm + eta_s
+            Cinv = C.clamp_min(1e-6).reciprocal()
+            S = Hpp.clone()
+            y = bp.clone()
+            for depth_frame in range(N):
+                c = Cinv[:, depth_frame, 0]
+                bzd = bz[:, depth_frame, 0]
+                e = Epd[:, :, depth_frame]
+                S = S - torch.einsum("bprhw,bhw,bqshw->bpqrs", e, c, e)
+                y = y - torch.einsum("bprhw,bhw,bhw->bpr", e, c, bzd)
+
+            S_flat = S.permute(0, 1, 3, 2, 4).reshape(B, N * 6, N * 6)
+            y_flat = y.reshape(B, N * 6, 1)
             try:
-                dx = -torch.linalg.solve(H_pose.reshape(B * N, 6, 6), b_pose.reshape(B * N, 6, 1))
-                dx = dx.reshape(B, N, 6)
+                dx = -torch.linalg.solve(S_flat, y_flat).reshape(B, N, 6)
             except RuntimeError:
-                dx = -torch.linalg.pinv(H_pose.reshape(B * N, 6, 6)) @ b_pose.reshape(B * N, 6, 1)
-                dx = dx.reshape(B, N, 6)
+                dx = (-torch.linalg.pinv(S_flat) @ y_flat).reshape(B, N, 6)
             dx = torch.nan_to_num(dx, nan=0.0, posinf=0.0, neginf=0.0)
             dx = dx.clamp(-self.max_pose_step, self.max_pose_step) * pose_mask
             cur_poses = se3_exp(dx) @ cur_poses
             pose_norm = dx.norm(dim=-1).mean()
 
-            eig = torch.linalg.eigvalsh(H_pose.detach().float()).clamp_min(1e-12)
-            cond_accum = cond_accum + (eig[..., -1] / eig[..., 0]).mean().to(cond_accum)
-            cond_count += 1
-
-            coords = project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W, pixels=pixels)
-            residual = seam_aware_delta(coords, target_s, W)
-            inv_eps = (cur_inv * torch.exp(torch.full_like(cur_inv, self.depth_eps))).clamp_min(self.min_inverse_depth)
-            coords_z = project_edges(cur_poses, inv_eps, ii, jj, height=H, width=W, pixels=pixels)
-            res_z = seam_aware_delta(coords_z, target_s, W)
-            jz = (res_z - residual) / self.depth_eps
-            valid_mask = torch.isfinite(residual).all(dim=-1) & torch.isfinite(jz).all(dim=-1)
-            valid_f = valid_mask.unsqueeze(-1).to(residual.dtype)
-            h_depth_edge = (w_hw2 * jz * jz * valid_f).sum(dim=-1).unsqueeze(2)
-            b_depth_edge = (w_hw2 * jz * residual * valid_f).sum(dim=-1).unsqueeze(2)
-            depth_h = residual.new_zeros(B, N, 1, h_depth_edge.shape[-2], h_depth_edge.shape[-1])
-            depth_b = torch.zeros_like(depth_h)
-            depth_h.index_add_(1, ii, h_depth_edge)
-            depth_b.index_add_(1, ii, b_depth_edge)
-            depth_h = depth_h + self.lm + eta_s
-            dz = (-depth_b / depth_h.clamp_min(1e-6)).clamp(-self.max_depth_step, self.max_depth_step)
+            pose_term = torch.einsum("bpdrhw,bpr->bdhw", Epd, dx)
+            dz = (-(bz[:, :, 0] + pose_term) * Cinv[:, :, 0]).clamp(
+                -self.max_depth_step, self.max_depth_step
+            )
             if stride != 1:
-                dz = torch.nn.functional.interpolate(
-                    dz.reshape(B * N, 1, dz.shape[-2], dz.shape[-1]),
+                dz = F.interpolate(
+                    dz.reshape(B * N, 1, Hs, Ws),
                     size=(H, W),
                     mode="bilinear",
                     align_corners=True,
-                ).view(B, N, 1, H, W)
-            cur_inv = (cur_inv * torch.exp(torch.nan_to_num(dz, nan=0.0))).clamp_min(self.min_inverse_depth)
+                ).view(B, N, H, W)
+            cur_inv = (cur_inv * torch.exp(torch.nan_to_num(dz.unsqueeze(2), nan=0.0))).clamp_min(
+                self.min_inverse_depth
+            )
             depth_norm = dz.abs().mean()
+
+            eig = torch.linalg.eigvalsh(S_flat.detach().float()).clamp_min(1e-12)
+            cond_accum = cond_accum + (eig[..., -1] / eig[..., 0]).mean().to(cond_accum)
+            cond_count += 1
 
         coords_full = project_edges(cur_poses, cur_inv, ii, jj, height=H, width=W)
         residual_full = seam_aware_delta(coords_full, target, W)

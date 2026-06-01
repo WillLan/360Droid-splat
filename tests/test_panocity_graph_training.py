@@ -186,7 +186,11 @@ def test_graph_ba_refinement_backpropagates_to_update_and_backbone():
         ba_iters_per_update=1,
         fixed_frames=1,
     )
-    loss = pred["refined_poses_c2w"][:, -1, 0, 3].sum() + 1e-3 * pred["refined_inverse_depth"].sum()
+    loss = (
+        pred["refined_poses_c2w"][:, -1, 0, 3].sum()
+        + 1e-3 * pred["refined_inverse_depth"].sum()
+        + 1e-4 * pred["refined_inverse_depth_full"].sum()
+    )
     loss.backward()
 
     def grad_sum(param):
@@ -195,6 +199,7 @@ def test_graph_ba_refinement_backpropagates_to_update_and_backbone():
     assert grad_sum(model.delta_head[-1].weight) > 0.0
     assert grad_sum(model.weight_head[-1].weight) > 0.0
     assert grad_sum(model.graph_agg.damping[-1].weight) > 0.0
+    assert grad_sum(model.graph_agg.upmask.weight) > 0.0
     assert grad_sum(model.cnet.encoder.proj.weight) > 0.0
     assert grad_sum(model.fnet.proj.weight) > 0.0
 
@@ -220,11 +225,34 @@ def test_pano_factor_graph_persists_factors_and_hidden_state():
     for idx in range(3):
         graph.add_frame(PanoFrame(image=torch.rand(3, 16, 32), timestamp=float(idx), frame_id=idx), torch.rand(3, 16, 32))
     assert graph.n_frames == 3
+    assert len(graph.fmaps) == graph.n_frames
     assert 0 < len(graph.edges) <= 4
     out = graph.update()
     assert out is not None
     assert out.ba_residual >= 0.0
     assert len(graph.edge_hidden) == len(graph.edges)
+    edge = graph.edges.pop()
+    graph.inactive_edges.add(edge)
+    graph.inactive_target[edge] = graph.factor_target[edge]
+    graph.inactive_weight[edge] = graph.factor_weight[edge]
+    graph.edge_hidden.pop(edge, None)
+    graph.edge_age.pop(edge, None)
+    out2 = graph.update()
+    assert out2 is not None
+    assert out2.inverse_depth.shape[-2:] == (16, 32)
     graph.remove_keyframe(0)
     assert graph.n_frames == 2
+    assert len(graph.fmaps) == graph.n_frames
     assert all(max(edge) < 2 for edge in graph.edges)
+
+
+def test_model_profiles_default_to_droid_base_and_keep_tiny():
+    base = PanoDroidModel()
+    assert base.profile == "droid_base"
+    assert base.feature_dim == 128
+    assert base.context_dim == 128
+    assert base.hidden_dim == 128
+    tiny = PanoDroidModel(profile="tiny")
+    assert tiny.feature_dim == 32
+    assert tiny.context_dim == 32
+    assert tiny.hidden_dim == 48

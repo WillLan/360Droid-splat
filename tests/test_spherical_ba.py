@@ -1,9 +1,9 @@
 import torch
 
 from frontend.pano_droid.spherical_ba import SphericalBA, se3_exp, spherical_ba_loss
-from frontend.pano_droid.spherical_camera import pixel_grid
+from frontend.pano_droid.spherical_camera import pixel_grid, seam_aware_delta
 from frontend.pano_droid.projective_ops import spherical_reprojection_residual
-from frontend.pano_droid.dense_ba import SphericalDenseBA
+from frontend.pano_droid.dense_ba import SphericalDenseBA, _left_pose_jacobians
 from frontend.pano_droid.projective_ops import project_edges
 
 
@@ -141,3 +141,20 @@ def test_spherical_dense_ba_damping_reduces_update_norm():
     lo = SphericalDenseBA()(poses, inv, target, weight, torch.zeros(1, 2, 1, H, W), ii, jj, fixed_frames=1, iters=1)
     hi = SphericalDenseBA()(poses, inv, target, weight, torch.full((1, 2, 1, H, W), 100.0), ii, jj, fixed_frames=1, iters=1)
     assert hi.pose_update_norm < lo.pose_update_norm
+
+
+def test_spherical_dense_ba_pose_jacobian_matches_finite_difference():
+    H, W = 8, 16
+    poses = torch.eye(4, dtype=torch.float64).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    poses[:, 1, 0, 3] = 0.1
+    inv = torch.full((1, 2, 1, H, W), 0.4, dtype=torch.float64)
+    ii = torch.tensor([0])
+    jj = torch.tensor([1])
+    coords, _, j_tgt, _ = _left_pose_jacobians(poses, inv, ii, jj, height=H, width=W, stride=1)
+    eps = 1e-5
+    xi = torch.zeros(1, 2, 6, dtype=torch.float64)
+    xi[:, 1, 0] = eps
+    coords_eps = project_edges(se3_exp(xi) @ poses, inv, ii, jj, height=H, width=W)
+    finite = seam_aware_delta(coords, coords_eps, W) / eps
+    analytic = j_tgt[..., 0]
+    assert torch.allclose(analytic, finite, atol=5e-3, rtol=5e-3)

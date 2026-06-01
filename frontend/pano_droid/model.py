@@ -97,33 +97,49 @@ class PanoDroidModel(nn.Module):
     def __init__(
         self,
         *,
-        feature_dim: int = 96,
-        context_dim: int = 96,
-        hidden_dim: int = 96,
+        profile: str = "droid_base",
+        feature_dim: int | None = None,
+        context_dim: int | None = None,
+        hidden_dim: int | None = None,
         encoder_base_dim: int | None = None,
         feature_stride: int = 8,
         corr_levels: int = 4,
         corr_radius: int = 3,
         gru_kernel_size: int = 3,
-        update_iters: int = 4,
+        update_iters: int | None = None,
         pose_scale: float = 0.02,
         max_corr_elements: int = 80_000_000,
         use_spherical_corr: bool = True,
+        normalize_images: bool = True,
+        image_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
+        image_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         **unused,
     ) -> None:
         super().__init__()
+        profile_name = str(profile or "droid_base").lower()
+        if profile_name in ("tiny", "debug", "smoke"):
+            defaults = {"feature_dim": 32, "context_dim": 32, "hidden_dim": 48, "base": 32, "iters": 2}
+        elif profile_name in ("droid_base", "base", "droid"):
+            defaults = {"feature_dim": 128, "context_dim": 128, "hidden_dim": 128, "base": 64, "iters": 4}
+        else:
+            raise ValueError(f"Unsupported PanoDroidModel profile: {profile}")
         if int(feature_stride) != 8:
             raise ValueError("PanoDroidModel currently supports feature_stride=8.")
-        self.feature_dim = int(feature_dim)
-        self.context_dim = int(context_dim)
-        self.hidden_dim = int(hidden_dim)
+        self.profile = profile_name
+        self.feature_dim = int(feature_dim if feature_dim is not None else defaults["feature_dim"])
+        self.context_dim = int(context_dim if context_dim is not None else defaults["context_dim"])
+        self.hidden_dim = int(hidden_dim if hidden_dim is not None else defaults["hidden_dim"])
         self.feature_stride = int(feature_stride)
         self.corr_levels = int(corr_levels)
         self.corr_radius = int(corr_radius)
-        self.update_iters = int(update_iters)
+        self.update_iters = int(update_iters if update_iters is not None else defaults["iters"])
         self.pose_scale = float(pose_scale)
         self.max_corr_elements = int(max_corr_elements)
         self.use_spherical_corr = bool(use_spherical_corr)
+        self.normalize_images = bool(normalize_images)
+        self.register_buffer("image_mean", torch.tensor(image_mean, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("image_std", torch.tensor(image_std, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+        encoder_base_dim = int(encoder_base_dim if encoder_base_dim is not None else defaults["base"])
 
         self.fnet = BasicEncoder(
             input_dim=3,
@@ -205,8 +221,8 @@ class PanoDroidModel(nn.Module):
         nn.init.zeros_(self.pose_head[-1].bias)
         nn.init.constant_(self.depth_head[-1].bias, -1.5)
 
-    @staticmethod
     def _split_inputs(
+        self,
         image0: torch.Tensor,
         image1: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -221,7 +237,21 @@ class PanoDroidModel(nn.Module):
             raise ValueError("Images must be BxCxHxW tensors.")
         if image0.shape != image1.shape:
             raise ValueError(f"Image shape mismatch: {tuple(image0.shape)} vs {tuple(image1.shape)}")
-        return image0.float().clamp(0.0, 1.0), image1.float().clamp(0.0, 1.0)
+        return self._preprocess_images(image0), self._preprocess_images(image1)
+
+    def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
+        x = images.float()
+        if x.detach().max() > 2.0:
+            x = x / 255.0
+        x = x.clamp(0.0, 1.0)
+        if self.normalize_images:
+            mean = self.image_mean.to(device=x.device, dtype=x.dtype)
+            std = self.image_std.to(device=x.device, dtype=x.dtype)
+            while mean.ndim < x.ndim:
+                mean = mean.unsqueeze(0)
+                std = std.unsqueeze(0)
+            x = (x - mean) / std.clamp_min(1e-6)
+        return x
 
     def _pad_to_stride(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
         _, _, H, W = x.shape
@@ -440,6 +470,7 @@ class PanoDroidModel(nn.Module):
         init_poses_c2w: Optional[torch.Tensor] = None,
         init_inverse_depth: Optional[torch.Tensor] = None,
         init_edge_hidden: Optional[torch.Tensor] = None,
+        graph_features: Optional[dict[str, torch.Tensor | int]] = None,
         ba_iters_per_update: int = 2,
         fixed_frames: int = 2,
         ba_sample_stride: int = 1,
@@ -453,10 +484,33 @@ class PanoDroidModel(nn.Module):
             init_poses_c2w=init_poses_c2w,
             init_inverse_depth=init_inverse_depth,
             init_edge_hidden=init_edge_hidden,
+            graph_features=graph_features,
             ba_iters_per_update=ba_iters_per_update,
             fixed_frames=fixed_frames,
             ba_sample_stride=ba_sample_stride,
         )
+
+    def encode_graph_images(self, images: torch.Tensor) -> dict[str, torch.Tensor | int]:
+        if images.ndim != 5:
+            raise ValueError(f"Expected images as BxNxCxHxW, got {tuple(images.shape)}")
+        B, N, C, H0, W0 = images.shape
+        flat = self._preprocess_images(images.reshape(B * N, C, H0, W0))
+        flat_pad, _ = self._pad_to_stride(flat)
+        _, _, Hp, Wp = flat_pad.shape
+        fmaps = self.fnet(flat_pad)
+        hidden, context = self.cnet(flat_pad)
+        Hf, Wf = fmaps.shape[-2:]
+        inv_low_init = F.softplus(self.depth_head(hidden.reshape(B * N, self.hidden_dim, Hf, Wf)))
+        return {
+            "fmaps": fmaps.view(B, N, self.feature_dim, Hf, Wf),
+            "hidden": hidden.view(B, N, self.hidden_dim, Hf, Wf),
+            "context": context.view(B, N, self.context_dim, Hf, Wf),
+            "inv_low_init": inv_low_init.view(B, N, 1, Hf, Wf) + 1e-4,
+            "Hp": int(Hp),
+            "Wp": int(Wp),
+            "Hf": int(Hf),
+            "Wf": int(Wf),
+        }
 
     def forward_graph_droid_style(
         self,
@@ -468,6 +522,7 @@ class PanoDroidModel(nn.Module):
         init_poses_c2w: Optional[torch.Tensor] = None,
         init_inverse_depth: Optional[torch.Tensor] = None,
         init_edge_hidden: Optional[torch.Tensor] = None,
+        graph_features: Optional[dict[str, torch.Tensor | int]] = None,
         ba_iters_per_update: int = 2,
         fixed_frames: int = 2,
         ba_sample_stride: int = 1,
@@ -481,18 +536,20 @@ class PanoDroidModel(nn.Module):
         E = int(ii.numel())
         iters = int(num_updates or self.update_iters)
 
-        flat = images.float().clamp(0.0, 1.0).reshape(B * N, C, H0, W0)
-        flat_pad, _ = self._pad_to_stride(flat)
-        _, _, Hp, Wp = flat_pad.shape
-        fmaps = self.fnet(flat_pad)
-        hidden, context = self.cnet(flat_pad)
-        Hf, Wf = fmaps.shape[-2:]
-        fmaps = fmaps.view(B, N, self.feature_dim, Hf, Wf)
-        hidden = hidden.view(B, N, self.hidden_dim, Hf, Wf)
-        context = context.view(B, N, self.context_dim, Hf, Wf)
-
-        inv_low_init = F.softplus(self.depth_head(hidden.reshape(B * N, self.hidden_dim, Hf, Wf)))
-        inv_low_init = inv_low_init.view(B, N, 1, Hf, Wf) + 1e-4
+        if graph_features is None:
+            graph_features = self.encode_graph_images(images)
+        fmaps = graph_features["fmaps"].to(device=images.device, dtype=images.dtype)
+        hidden = graph_features["hidden"].to(device=images.device, dtype=images.dtype)
+        context = graph_features["context"].to(device=images.device, dtype=images.dtype)
+        inv_low_init = graph_features["inv_low_init"].to(device=images.device, dtype=images.dtype)
+        Hp = int(graph_features["Hp"])
+        Wp = int(graph_features["Wp"])
+        Hf = int(graph_features["Hf"])
+        Wf = int(graph_features["Wf"])
+        if tuple(fmaps.shape[:2]) != (B, N):
+            raise ValueError(
+                f"Cached graph features have sequence shape {tuple(fmaps.shape[:2])}, expected {(B, N)}"
+            )
         if init_inverse_depth is not None:
             inv_depth_state = self._downsample_inverse_depth(
                 init_inverse_depth.to(device=images.device, dtype=images.dtype), (Hf, Wf)

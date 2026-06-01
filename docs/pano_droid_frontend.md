@@ -11,14 +11,16 @@ The frontend accepts ERP frame streams and exposes the requested SLAM interface:
 
 The MVP keeps DROID-style module boundaries:
 
-- DROID-style feature encoder (`fnet`) with ordinary 2D convolutions
+- DROID-base feature encoder (`fnet`) profile by default, with tiny/debug
+  profiles retained for smoke tests
 - DROID-style context encoder (`cnet`) that returns `hidden, context`
 - spherical correlation pyramid with seam-aware ERP sampling
 - `SphereConvGRU` update block using BlueHorn/SphereNet-style spherical convolution
 - update heads for spherical flow target deltas, confidence/edge weights,
   inverse depth, graph damping/upmask, and keyframe score
-- a runtime `PanoFactorGraph` that keeps active/inactive factors, edge hidden
-  state, refined pose/depth state, and graph BA diagnostics during SLAM inference
+- a runtime `PanoFactorGraph` that keeps active/inactive factors, cached
+  feature/context tensors, edge hidden state, refined pose/depth state, and
+  graph BA diagnostics during SLAM inference
 
 ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
 +X right, +Y down, +Z forward.
@@ -35,7 +37,7 @@ ERP geometry follows the original backend convention in `utils/erp_geometry.py`:
 - `projective_ops.py` is the single shared ERP projection/residual path used by
   model BA, losses, and standalone BA utilities.
 - `dense_ba.py` provides the default PyTorch `SphericalDenseBA` normal-equation
-  layer used by graph training and inference.
+  layer with ERP Jacobians and Schur pose-depth updates.
 - `spherical_ba.py` provides standalone spherical BA/loss utilities.
 
 The pairwise `PanoDroidModel.forward(image0, image1)` path is legacy smoke-test

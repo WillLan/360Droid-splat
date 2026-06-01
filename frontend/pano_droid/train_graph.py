@@ -41,6 +41,7 @@ def _default_config() -> dict:
         },
         "Graph": {
             "edge_strategy": "mixed",
+            "edge_pose_source": "init",
             "temporal_radius": 2,
             "bidirectional": True,
             "max_edges_per_step": 24,
@@ -48,12 +49,14 @@ def _default_config() -> dict:
             "ba_sample_stride": 1,
             "fixed_frames": 2,
             "loss_gamma": 0.9,
+            "fullres_loss_sample_stride": 4,
             "init_mode": "droid_gt_anchor",
             "init_noise_prob": 0.2,
             "init_identity_prob": 0.05,
             "init_noise_std": 0.03,
         },
         "Model": {
+            "profile": "tiny",
             "feature_dim": 16,
             "context_dim": 16,
             "hidden_dim": 16,
@@ -182,6 +185,31 @@ def _freeze_legacy_pairwise(model: torch.nn.Module) -> None:
             param.requires_grad_(False)
 
 
+def _grad_diagnostics(model: torch.nn.Module, device: torch.device) -> dict[str, torch.Tensor]:
+    base = _unwrap_model(model)
+    out: dict[str, torch.Tensor] = {}
+    unused = 0
+    trainable = 0
+    for _, param in base.named_parameters():
+        if not param.requires_grad:
+            continue
+        trainable += 1
+        if param.grad is None:
+            unused += 1
+    out["grad_unused_params"] = torch.tensor(float(unused), device=device)
+    out["grad_trainable_params"] = torch.tensor(float(trainable), device=device)
+    for name in ("fnet", "cnet", "update_block", "delta_head", "weight_head", "graph_agg"):
+        module = getattr(base, name, None)
+        if module is None:
+            continue
+        total = torch.tensor(0.0, device=device)
+        for param in module.parameters():
+            if param.grad is not None:
+                total = total + param.grad.detach().float().pow(2).sum()
+        out[f"grad_{name}"] = total.sqrt()
+    return out
+
+
 def _forward_graph(
     model: torch.nn.Module,
     images: torch.Tensor,
@@ -282,7 +310,14 @@ def _make_initial_poses(
     raise ValueError(f"Unsupported Graph.init_mode: {graph_cfg.get('init_mode')}")
 
 
-def _make_graph_edges(batch: dict, graph_cfg: dict, *, step: int) -> list[tuple[int, int]]:
+def _make_graph_edges(
+    batch: dict,
+    graph_cfg: dict,
+    *,
+    step: int,
+    poses_for_graph: torch.Tensor | None = None,
+    depths_for_graph: torch.Tensor | None = None,
+) -> list[tuple[int, int]]:
     n_frames = int(batch["images"].shape[1])
     radius = int(graph_cfg.get("temporal_radius", 2))
     bidirectional = bool(graph_cfg.get("bidirectional", True))
@@ -291,10 +326,12 @@ def _make_graph_edges(batch: dict, graph_cfg: dict, *, step: int) -> list[tuple[
     use_proximity = strategy == "proximity"
     if strategy == "mixed":
         use_proximity = bool(torch.rand((), generator=torch.Generator().manual_seed(int(step) + 1729)).item() < 0.5)
-    if use_proximity and "poses_c2w" in batch:
+    if use_proximity and (poses_for_graph is not None or "poses_c2w" in batch):
+        graph_poses = poses_for_graph if poses_for_graph is not None else batch["poses_c2w"]
+        graph_depths = depths_for_graph if depths_for_graph is not None else batch.get("depths")
         edges = build_proximity_edges(
-            batch["poses_c2w"],
-            batch.get("depths"),
+            graph_poses,
+            graph_depths,
             radius=radius,
             max_edges=max(max_edges, n_frames * 2) if max_edges > 0 else 0,
             bidirectional=bidirectional,
@@ -425,7 +462,7 @@ def train_graph(config: dict) -> dict:
     impl = config.setdefault("Implementation", {})
     impl.setdefault("frontend", "PanoFactorGraph")
     impl.setdefault("ba", "SphericalDenseBA")
-    impl.setdefault("ba_version", "pytorch_dense_ba_v1")
+    impl.setdefault("ba_version", "pytorch_schur_ba_v2")
     impl.setdefault("residual_mode", "erp_wrapped_pixel")
     impl.setdefault("git_commit", _git_commit())
     dataset = build_graph_dataset_from_config(config, train=True)
@@ -516,14 +553,25 @@ def train_graph(config: dict) -> dict:
                     with open(output_dir / "data_stats.json", "w", encoding="utf-8") as f:
                         json.dump(stats, f, indent=2)
                     data_stats_written = True
-                edges = _make_graph_edges(batch, graph_cfg, step=step)
-                last_edges = list(edges)
-                optimizer.zero_grad(set_to_none=True)
                 poses_arg, init_poses, init_mode = _make_initial_poses(
                     batch_device["poses_c2w"],
                     graph_cfg,
                     step=step,
                 )
+                graph_pose_source = str(graph_cfg.get("edge_pose_source", "init")).lower()
+                if graph_pose_source in ("init", "initial", "warm_start"):
+                    poses_for_edges = init_poses if init_poses is not None else poses_arg
+                else:
+                    poses_for_edges = batch_device["poses_c2w"]
+                edges = _make_graph_edges(
+                    batch_device,
+                    graph_cfg,
+                    step=step,
+                    poses_for_graph=poses_for_edges,
+                    depths_for_graph=batch_device.get("depths"),
+                )
+                last_edges = list(edges)
+                optimizer.zero_grad(set_to_none=True)
                 init_inv = None
                 restart_prob = float(tr.get("restart_prob", 0.2))
                 restart_count = 0
@@ -548,6 +596,7 @@ def train_graph(config: dict) -> dict:
                         weights=weights,
                         sample_height=graph_cfg.get("loss_sample_height"),
                         sample_width=graph_cfg.get("loss_sample_width"),
+                        fullres_sample_stride=int(graph_cfg.get("fullres_loss_sample_stride", 4)),
                         gamma=float(graph_cfg.get("loss_gamma", 0.9)),
                     )
                     loss.backward()
@@ -558,6 +607,7 @@ def train_graph(config: dict) -> dict:
                     r = torch.rand((), generator=torch.Generator().manual_seed(step * 104729 + restart_count))
                     if float(r) >= restart_prob:
                         break
+                metrics.update(_grad_diagnostics(model, device))
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr.get("grad_clip", 2.5)))
                 optimizer.step()
                 if scheduler is not None:
