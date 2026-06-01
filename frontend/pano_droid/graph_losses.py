@@ -162,6 +162,22 @@ def _downsample_depths(depths: torch.Tensor, size: tuple[int, int]) -> torch.Ten
     return low.view(B, N, 1, size[0], size[1])
 
 
+def _upmask_entropy_metric(upmask: torch.Tensor, *, max_height: int = 16, max_width: int = 32) -> torch.Tensor:
+    """Cheap diagnostic entropy for DROID convex upsampling masks."""
+    with torch.no_grad():
+        up = upmask.detach()
+        if up.ndim == 6:
+            up = up[:, -1]
+        h, w = int(up.shape[-2]), int(up.shape[-1])
+        sy = max(1, h // max(1, int(max_height)))
+        sx = max(1, w // max(1, int(max_width)))
+        up = up[..., ::sy, ::sx].float()
+        up = up.reshape(-1, 9, 8, 8, up.shape[-2], up.shape[-1])
+        prob = torch.softmax(up, dim=1).clamp_min(1e-8)
+        entropy = -(prob * prob.log()).sum(dim=1).mean()
+    return entropy
+
+
 def _projective_target(
     pixels: torch.Tensor,
     depth: torch.Tensor,
@@ -368,9 +384,7 @@ def graph_supervised_loss(
     )
     upmask = pred.get("upmask_steps")
     if torch.is_tensor(upmask):
-        up = upmask.detach().reshape(-1, 9, 8, 8, upmask.shape[-2], upmask.shape[-1])
-        prob = torch.softmax(up, dim=1).clamp_min(1e-8)
-        up_entropy = -(prob * prob.log()).sum(dim=1).mean()
+        up_entropy = _upmask_entropy_metric(upmask)
     else:
         up_entropy = torch.tensor(0.0, device=device)
     pose_update_norm = pred.get("ba_pose_update_norm")

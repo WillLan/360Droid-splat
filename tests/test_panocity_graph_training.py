@@ -7,7 +7,11 @@ import torch
 
 from frontend.pano_droid.graph_dataset import PanoCityGraphDataset
 from frontend.pano_droid.factor_graph import PanoFactorGraph
-from frontend.pano_droid.graph_losses import build_temporal_edges, select_training_edges
+from frontend.pano_droid.graph_losses import (
+    _upmask_entropy_metric,
+    build_temporal_edges,
+    select_training_edges,
+)
 from frontend.pano_droid.graph_tracker import PanoDroidGraphTracker
 from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.model import PanoDroidModel
@@ -128,6 +132,13 @@ def test_forward_graph_returns_refined_history():
     assert pred["upmask_steps"].shape[3] == 8 * 8 * 9
     assert pred["refined_poses_c2w"].shape == (1, 3, 4, 4)
     assert pred["refined_inverse_depth"].shape[:3] == (1, 3, 1)
+
+
+def test_upmask_entropy_metric_samples_without_grad():
+    upmask = torch.randn(1, 2, 3, 8 * 8 * 9, 33, 65, requires_grad=True)
+    entropy = _upmask_entropy_metric(upmask, max_height=8, max_width=8)
+    assert torch.isfinite(entropy)
+    assert not entropy.requires_grad
 
 
 def test_forward_graph_chunked_correlation_path():
