@@ -290,6 +290,20 @@ class PanoDroidModel(nn.Module):
             out.append(self._make_corr_block(fmap0[start:end], fmap1[start:end])(coords[start:end]))
         return torch.cat(out, dim=0)
 
+    def _update_block_chunked(self, hidden: torch.Tensor, update_input: torch.Tensor) -> torch.Tensor:
+        total, hidden_channels, height, width = hidden.shape
+        gate_channels = hidden_channels + int(update_input.shape[1])
+        kernel = max(1, int(self.update_block.kernel_size) ** 2)
+        per_item = max(1, gate_channels * height * width * kernel)
+        chunk = max(1, min(total, self.max_corr_elements // per_item))
+        if chunk >= total:
+            return self.update_block(hidden, update_input)
+        out = []
+        for start in range(0, total, chunk):
+            end = min(total, start + chunk)
+            out.append(self.update_block(hidden[start:end], update_input[start:end]))
+        return torch.cat(out, dim=0)
+
     @staticmethod
     def _edge_tensors(edges: list[tuple[int, int]], *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if not edges:
@@ -441,7 +455,7 @@ class PanoDroidModel(nn.Module):
             motion = self.flow_encoder(motion)
             gru_in = torch.cat([context, corr, motion], dim=1)
             gru_in = self.input_proj(gru_in)
-            h = self.update_block(h, gru_in)
+            h = self._update_block_chunked(h, gru_in)
             coords1 = coords1 + self.delta_head(h)
 
         flow_low = coords1 - coords0
@@ -630,7 +644,7 @@ class PanoDroidModel(nn.Module):
             )
             gru_in = self.input_proj(gru_in)
             edge_hidden_flat = edge_hidden.reshape(B * E, self.hidden_dim, Hf, Wf)
-            edge_hidden_flat = self.update_block(edge_hidden_flat, gru_in)
+            edge_hidden_flat = self._update_block_chunked(edge_hidden_flat, gru_in)
             edge_hidden = edge_hidden_flat.view(B, E, self.hidden_dim, Hf, Wf)
             delta = self.delta_head(edge_hidden_flat).view(B, E, 2, Hf, Wf).permute(0, 1, 3, 4, 2)
             edge_weight = torch.sigmoid(self.weight_head(edge_hidden_flat)).view(B, E, 2, Hf, Wf)
