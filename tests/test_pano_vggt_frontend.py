@@ -6,6 +6,7 @@ from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTLongTracker, SubmapAligner
 from frontend.pano_vggt.alignment import sample_overlap_points
+from frontend.pano_vggt.engine import normalize_panovggt_output
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
 
 
@@ -18,6 +19,20 @@ def test_fake_panovggt_engine_outputs_local_geometry():
     assert pred.point_maps.shape == (3, 16, 32, 3)
     assert torch.isfinite(pred.point_maps).all()
     assert pred.poses_c2w[2, 0, 3] > pred.poses_c2w[1, 0, 3]
+
+
+def test_normalize_panovggt_output_accepts_official_shapes():
+    images = torch.rand(2, 3, 8, 16)
+    output = {
+        "camera_poses": torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1),
+        "depth": torch.ones(1, 2, 8, 16),
+        "world_points": torch.zeros(1, 2, 8, 16, 3),
+        "local_points": torch.ones(1, 2, 8, 16, 3),
+    }
+    pred = normalize_panovggt_output(output, images)
+    assert pred.poses_c2w.shape == (2, 4, 4)
+    assert pred.depth.shape == (2, 1, 8, 16)
+    assert pred.point_maps.shape == (2, 8, 16, 3)
 
 
 def test_panovggt_erp_bearing_convention_matches_project_camera():

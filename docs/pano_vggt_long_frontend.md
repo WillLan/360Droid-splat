@@ -53,6 +53,13 @@ PanoVGGT:
   loop_enable: false
 ```
 
+The ready-to-edit real-data config is
+`configs/pano_vggt_long_gs_slam.yaml`. It points to the planned server paths:
+
+- PanoVGGT source: `/mnt/disk1/lanboyang/Project/PanoVGGT`
+- PanoVGGT checkpoint: `/mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt`
+- 360UAV sequence root: `/mnt/disk1/lanboyang/Datasets/360uav/seqs`
+
 External PanoVGGT configuration:
 
 ```yaml
@@ -61,7 +68,8 @@ PanoVGGT:
   repo_path: /path/to/PanoVGGT
   config_path: /path/to/panovggt_config.yaml
   checkpoint: /path/to/panovggt.ckpt
-  class_path: panovggt.models.panovggt_model.PanoVGGT
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  strict_checkpoint: false
   image_size: [518, 1036]
   amp: true
   input_batch_dim: true
@@ -71,10 +79,12 @@ Runtime notes:
 
 - The tracker buffers frames until a chunk is ready, aligns the new chunk to
   previous overlap point maps, and queues only stable delayed outputs.
+- The external engine follows the official PanoVGGT inference path:
+  `PanoVGGTModel`, `training/config/default.yaml`, and checkpoint keys
+  `model_state_dict`, `model`, or `state_dict`.
 - The SLAM runner matches delayed outputs back to the original `PanoFrame`
   image by `frame_id` before Gaussian seed initialization.
 - Loop edges are diagnostic/bookkeeping in v1. They do not retroactively move
   already inserted Gaussian anchors.
 - For server experiments on `50902`, keep the existing tmux, GPU, conda, and
   CPU/RAM/swap safety rules from `AGENTS.md`.
-

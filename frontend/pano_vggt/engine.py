@@ -47,8 +47,13 @@ def _as_dict(output: Any) -> dict[str, Any]:
         "confidence",
         "depth_confidence",
         "world_points",
+        "local_points",
         "point_maps",
+        "points",
+        "points3d",
         "descriptors",
+        "tokens",
+        "features",
     )
     out = {key: getattr(output, key) for key in keys if hasattr(output, key)}
     if out:
@@ -215,6 +220,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
     """Dynamic wrapper around an external PanoVGGT checkout."""
 
     DEFAULT_CLASS_PATHS = (
+        "panovggt.models.panovggt_model.PanoVGGTModel",
         "panovggt.models.panovggt_model.PanoVGGT",
         "panovggt.models.PanoVGGT",
         "vggt.models.vggt.VGGT",
@@ -232,12 +238,14 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         device: torch.device | str | None = None,
         amp: bool = True,
         input_batch_dim: bool = True,
+        strict_checkpoint: bool = False,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.config_path = config_path
         self.image_size = image_size
         self.amp = bool(amp)
         self.input_batch_dim = bool(input_batch_dim)
+        self.strict_checkpoint = bool(strict_checkpoint)
         if repo_path:
             repo = str(Path(repo_path).expanduser().resolve())
             if repo not in sys.path:
@@ -262,6 +270,10 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         raise ImportError(f"Could not construct external PanoVGGT model.\n{joined}")
 
     def _instantiate(self, cls: type, model_kwargs: dict[str, Any]) -> torch.nn.Module:
+        if self.config_path is not None and cls.__name__ == "PanoVGGTModel":
+            official = self._instantiate_official_panovggt(cls, model_kwargs)
+            if official is not None:
+                return official
         attempts: list[dict[str, Any]] = []
         if self.config_path is not None:
             attempts.append({**model_kwargs, "config_path": self.config_path})
@@ -279,6 +291,39 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
                 continue
         return cls()
 
+    def _instantiate_official_panovggt(
+        self,
+        cls: type,
+        model_kwargs: dict[str, Any],
+    ) -> torch.nn.Module | None:
+        try:
+            from omegaconf import OmegaConf
+        except ImportError as exc:  # pragma: no cover - external dependency only
+            raise ImportError("External PanoVGGT requires omegaconf for config loading.") from exc
+
+        cfg = OmegaConf.load(self.config_path)
+        OmegaConf.resolve(cfg)
+        mc = cfg.model
+        aggregator = OmegaConf.to_container(mc.aggregator, resolve=True)
+        kwargs = {
+            "img_size": int(cfg.img_size),
+            "patch_size": int(cfg.patch_size),
+            "embed_dim": int(cfg.embed_dim),
+            "enable_camera": bool(mc.enable_camera),
+            "enable_depth": bool(mc.enable_depth),
+            "enable_point": bool(mc.enable_point),
+            "aggregator": aggregator,
+        }
+        kwargs.update(model_kwargs)
+        signature = inspect.signature(cls)
+        filtered = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+        }
+        return cls(**filtered)
+
     def load_checkpoint(self, path: str) -> None:
         payload = torch.load(path, map_location=self.device)
         state = payload
@@ -289,7 +334,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         if not isinstance(state, dict):
             raise ValueError(f"Unsupported checkpoint payload in {path}")
         state = {k.removeprefix("module."): v for k, v in state.items()}
-        self.model.load_state_dict(state, strict=False)
+        self.model.load_state_dict(state, strict=self.strict_checkpoint)
         self.model.eval()
 
     def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
@@ -334,5 +379,5 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         device=device,
         amp=bool(config.get("amp", True)),
         input_batch_dim=bool(config.get("input_batch_dim", True)),
+        strict_checkpoint=bool(config.get("strict_checkpoint", False)),
     )
-

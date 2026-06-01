@@ -19,6 +19,7 @@ PanoVGGT:
   config_path: null
   checkpoint: null
   class_path: null
+  strict_checkpoint: false
   image_size: [518, 1036]
   chunk_size: 8
   overlap: 4
