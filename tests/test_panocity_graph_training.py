@@ -130,6 +130,28 @@ def test_forward_graph_returns_refined_history():
     assert pred["refined_inverse_depth"].shape[:3] == (1, 3, 1)
 
 
+def test_forward_graph_chunked_correlation_path():
+    model = PanoDroidModel(
+        feature_dim=8,
+        context_dim=8,
+        hidden_dim=8,
+        encoder_base_dim=8,
+        corr_levels=1,
+        corr_radius=1,
+        update_iters=1,
+        max_corr_elements=1,
+    )
+    images = torch.rand(1, 3, 3, 16, 32)
+    pred = model.forward_graph(
+        images,
+        edges=[(0, 1), (1, 2), (2, 1)],
+        num_updates=1,
+        ba_iters_per_update=1,
+        fixed_frames=1,
+    )
+    assert pred["spherical_flow"].shape[:3] == (1, 3, 2)
+
+
 def test_graph_tracker_uses_graph_path_not_pairwise_forward():
     model = PanoDroidModel(
         feature_dim=8,

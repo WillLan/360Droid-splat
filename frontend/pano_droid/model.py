@@ -272,6 +272,24 @@ class PanoDroidModel(nn.Module):
             latitude_scale=self.use_spherical_corr,
         )
 
+    def _corr_lookup_chunked(
+        self,
+        fmap0: torch.Tensor,
+        fmap1: torch.Tensor,
+        coords: torch.Tensor,
+    ) -> torch.Tensor:
+        total, channels, height, width = fmap0.shape
+        kernel = (2 * self.corr_radius + 1) ** 2
+        per_item = max(1, channels * height * width * kernel)
+        chunk = max(1, min(total, self.max_corr_elements // per_item))
+        if chunk >= total:
+            return self._make_corr_block(fmap0, fmap1)(coords)
+        out = []
+        for start in range(0, total, chunk):
+            end = min(total, start + chunk)
+            out.append(self._make_corr_block(fmap0[start:end], fmap1[start:end])(coords[start:end]))
+        return torch.cat(out, dim=0)
+
     @staticmethod
     def _edge_tensors(edges: list[tuple[int, int]], *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if not edges:
@@ -413,12 +431,11 @@ class PanoDroidModel(nn.Module):
         fmap1 = self.fnet(image1_pad)
         h, context = self.cnet(image0_pad)
         Hf, Wf = fmap0.shape[-2:]
-        corr_block = self._make_corr_block(fmap0, fmap1)
         coords0 = coords_grid(B, Hf, Wf, device=image0.device, dtype=image0.dtype)
         coords1 = coords0.clone()
 
         for _ in range(iters):
-            corr = self.corr_encoder(corr_block(coords1))
+            corr = self.corr_encoder(self._corr_lookup_chunked(fmap0, fmap1, coords1))
             flow = coords1 - coords0
             motion = torch.cat([flow, torch.zeros_like(flow)], dim=1)
             motion = self.flow_encoder(motion)
@@ -571,7 +588,6 @@ class PanoDroidModel(nn.Module):
 
         f0 = fmaps[:, ii].reshape(B * E, self.feature_dim, Hf, Wf)
         f1 = fmaps[:, jj].reshape(B * E, self.feature_dim, Hf, Wf)
-        corr_block = self._make_corr_block(f0, f1)
         if (
             init_edge_hidden is not None
             and tuple(init_edge_hidden.shape) == (B, E, self.hidden_dim, Hf, Wf)
@@ -598,7 +614,8 @@ class PanoDroidModel(nn.Module):
             inv_depth_state = inv_depth_state.detach()
             coords1 = coords1.detach()
             target = target.detach()
-            corr = self.corr_encoder(corr_block(coords1.reshape(B * E, Hf, Wf, 2).permute(0, 3, 1, 2)))
+            coords_flat = coords1.reshape(B * E, Hf, Wf, 2).permute(0, 3, 1, 2)
+            corr = self.corr_encoder(self._corr_lookup_chunked(f0, f1, coords_flat))
             flow = seam_aware_delta(coords0_hw, coords1, Wf).permute(0, 1, 4, 2, 3)
             resd = seam_aware_delta(coords1, target, Wf).permute(0, 1, 4, 2, 3)
             motion = torch.cat([flow, resd], dim=2).reshape(B * E, 4, Hf, Wf).clamp(-64.0, 64.0)
