@@ -44,6 +44,23 @@ Visualization:
   enabled: true
   every: 500
 
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: pano_droid_panocity_beijing
+  mode: online
+  account: zb2302106@buaa.edu.cn
+  log_every: 10
+  tags:
+    - panocity
+    - beijing
+    - pano-droid
+
+Distributed:
+  enabled: auto
+  backend: nccl
+
 Loss:
   pose: 10.0
   flow: 0.05

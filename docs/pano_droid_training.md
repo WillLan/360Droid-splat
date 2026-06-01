@@ -99,3 +99,27 @@ During graph training, diagnostics are written under
   GT depth, and absolute depth error.
 - `step_XXXXXXX_metrics.json`: trajectory RMSE and depth MAE for the visualized
   batch
+
+When `WeightsAndBiases.enabled=true`, rank 0 also logs the same diagnostics to
+W&B:
+
+- `train/*`: scalar losses and training metrics
+- `diagnostics/trajectory_3d`: 3D GT-vs-pred trajectory image
+- `diagnostics/depth_pred_gt_error`: predicted depth, GT depth, and absolute
+  error image
+- `diagnostics/trajectory_rmse` and `diagnostics/depth_mae`
+
+W&B authentication uses the normal `wandb login` flow on the training server.
+The configured account owner is `zb2302106@buaa.edu.cn`, but W&B requires an API
+key or an existing login session rather than an email-only login.
+
+For 4-GPU training on 50902 GPUs 4, 5, 6, and 7, launch with `torchrun`:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 /mnt/disk1/lanboyang/miniconda3/envs/pfgs360/bin/python \
+  -m torch.distributed.run --nproc_per_node=4 \
+  -m frontend.pano_droid.train_graph \
+  --config configs/pano_droid_train_panocity_beijing.yaml \
+  --wandb \
+  --run-name pano_droid_panocity_beijing_gpus4567
+```

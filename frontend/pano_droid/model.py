@@ -160,8 +160,14 @@ class PanoDroidModel(nn.Module):
         image0: torch.Tensor,
         image1: Optional[torch.Tensor] = None,
         *,
+        edges: Optional[list[tuple[int, int]]] = None,
         num_updates: Optional[int] = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor] | dict[str, torch.Tensor | list[tuple[int, int]]]:
+        if edges is not None or image0.ndim == 5:
+            if edges is None:
+                raise ValueError("Graph forward requires an explicit edge list.")
+            return self.forward_graph(image0, edges=edges, num_updates=num_updates)
+
         image0, image1 = self._split_inputs(image0, image1)
         B, _, H0, W0 = image0.shape
         image0_pad, _ = self._pad_to_stride(image0)
