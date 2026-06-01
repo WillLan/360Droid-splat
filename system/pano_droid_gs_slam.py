@@ -90,25 +90,45 @@ class PanoDroidGSSlamSystem:
         output_dir = Path(self.config.get("Results", {}).get("save_dir", "outputs/pano_droid_gs_slam"))
         output_dir.mkdir(parents=True, exist_ok=True)
         refine_steps = int(self.config.get("Mapping", {}).get("refine_steps_per_keyframe", 0))
+        frame_cache: dict[int, PanoFrame] = {}
         frame_count = 0
         keyframes = 0
         last_status = None
-        for frame in iter_sequence_frames(self.config):
-            if max_frames is not None and frame_count >= int(max_frames):
-                break
-            out = self.frontend.track(frame)
+
+        def process_output(out) -> None:
+            nonlocal keyframes, last_status
             last_status = out.tracking_status
+            source_frame = frame_cache.pop(int(out.frame_id), None)
+            if source_frame is None:
+                self.mapper.stats.notes.append(f"frame {out.frame_id}: missing source frame for frontend output")
+                return
             if out.is_keyframe and out.inverse_depth is not None:
-                seeds = self.initializer.from_frontend_output(out, frame.image)
+                seeds = self.initializer.from_frontend_output(out, source_frame.image)
                 self.mapper.insert_keyframe(seeds, out)
                 keyframes += 1
                 if refine_steps > 0:
                     self.mapper.refine_on_keyframe(
-                        image=frame.image,
+                        image=source_frame.image,
                         c2w=out.pose_c2w,
                         steps=refine_steps,
                     )
+
+        for frame in iter_sequence_frames(self.config):
+            if max_frames is not None and frame_count >= int(max_frames):
+                break
+            frame_cache[int(frame.frame_id)] = frame
+            out = self.frontend.track(frame)
+            last_status = out.tracking_status
+            pop_ready = getattr(self.frontend, "pop_ready_outputs", None)
+            outputs = pop_ready() if callable(pop_ready) else [out]
+            for ready in outputs:
+                process_output(ready)
             frame_count += 1
+
+        flush = getattr(self.frontend, "flush", None)
+        if callable(flush):
+            for ready in flush():
+                process_output(ready)
 
         summary = {
             "frames": frame_count,
@@ -135,4 +155,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

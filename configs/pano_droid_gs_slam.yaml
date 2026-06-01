@@ -13,6 +13,23 @@ Frontend:
   window_size: 5
   num_updates: null
 
+PanoVGGT:
+  engine: external
+  repo_path: null
+  config_path: null
+  checkpoint: null
+  class_path: null
+  image_size: [518, 1036]
+  chunk_size: 8
+  overlap: 4
+  emit_delay: 2
+  align_mode: sim3
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 128
+  amp: true
+  input_batch_dim: true
+
 Graph:
   temporal_radius: 2
   max_factors: 24

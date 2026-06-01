@@ -1,7 +1,8 @@
-"""Compatibility adapter for the graph-based PanoDROID frontend."""
+"""Compatibility adapter and frontend-mode dispatcher."""
 
 from __future__ import annotations
 
+from .interfaces import PanoDROIDFrontend
 from .graph_tracker import PanoDroidGraphTracker
 from .model import PanoDroidModel
 
@@ -10,7 +11,7 @@ class PanoDROIDFrontendAdapter(PanoDroidGraphTracker):
     """Backward-compatible name for the default graph tracker."""
 
 
-def build_frontend_from_config(config: dict) -> PanoDROIDFrontendAdapter:
+def _build_graph_frontend_from_config(config: dict) -> PanoDROIDFrontendAdapter:
     model = PanoDroidModel(**config.get("Model", {}))
     frontend_cfg = config.get("Frontend", {})
     graph_cfg = config.get("Graph", {})
@@ -31,3 +32,19 @@ def build_frontend_from_config(config: dict) -> PanoDROIDFrontendAdapter:
     if ckpt:
         adapter.load_checkpoint(ckpt)
     return adapter
+
+
+def build_frontend_from_config(config: dict) -> PanoDROIDFrontend:
+    frontend_cfg = config.get("Frontend", {})
+    mode = str(frontend_cfg.get("mode", "graph")).lower()
+    if mode in {"graph", "pano_droid", "pano_droid_graph"}:
+        return _build_graph_frontend_from_config(config)
+    if mode in {"panovggt_long", "pano_vggt_long", "panovggt"}:
+        from frontend.pano_vggt import build_panovggt_frontend_from_config
+
+        adapter = build_panovggt_frontend_from_config(config)
+        ckpt = frontend_cfg.get("checkpoint")
+        if ckpt:
+            adapter.load_checkpoint(ckpt)
+        return adapter
+    raise ValueError(f"Unsupported Frontend.mode: {frontend_cfg.get('mode')}")
