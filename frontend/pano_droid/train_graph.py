@@ -77,6 +77,7 @@ def _default_config() -> dict:
         "Distributed": {
             "enabled": "auto",
             "backend": "auto",
+            "find_unused_parameters": True,
         },
         "Loss": {},
     }
@@ -263,7 +264,7 @@ def train_graph(config: dict) -> dict:
             model,
             device_ids=[int(ddp["local_rank"])] if device.type == "cuda" else None,
             output_device=int(ddp["local_rank"]) if device.type == "cuda" else None,
-            find_unused_parameters=False,
+            find_unused_parameters=bool(config.get("Distributed", {}).get("find_unused_parameters", True)),
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(tr.get("lr", 2.5e-4)))
     graph_cfg = config.get("Graph", {})

@@ -60,6 +60,7 @@ WeightsAndBiases:
 Distributed:
   enabled: auto
   backend: nccl
+  find_unused_parameters: true
 
 Loss:
   pose: 10.0
