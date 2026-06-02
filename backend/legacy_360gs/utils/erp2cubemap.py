@@ -100,7 +100,8 @@ class ERPToCubemapTorch(nn.Module):
         ones = torch.ones_like(uu)
         xyz_local = torch.stack([uu, vv, ones], dim=-1)  # (fw, fw, 3)
 
-        # cosmap in face-local space: 1 / 鈥朳u, v, 1]鈥?        norm_local = xyz_local.norm(dim=-1).clamp(min=1e-8)
+        # cosmap in face-local space: 1 / ||[u, v, 1]||.
+        norm_local = xyz_local.norm(dim=-1).clamp(min=1e-8)
         cosmap = 1.0 / norm_local  # (fw, fw)
 
         # Rotate to body space

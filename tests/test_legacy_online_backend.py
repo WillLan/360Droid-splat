@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 
+from backend.legacy_360gs.utils.erp2cubemap import ERPToCubemapTorch
 from backend.legacy_360gs.online import LegacyOnlineBackendClient
 from backend.legacy_360gs.viewpoint_adapter import LegacyViewpointAdapter
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
@@ -49,6 +50,16 @@ def test_legacy_viewpoint_adapter_pose_depth_and_sky_mask():
     assert torch.allclose(bundle.pose_w2c, torch.linalg.inv(pose))
     assert torch.allclose(bundle.viewpoint.R, bundle.pose_w2c[:3, :3])
     assert torch.allclose(bundle.viewpoint.T, bundle.pose_w2c[:3, 3])
+
+
+def test_erp_to_cubemap_torch_builds_valid_cosmap():
+    erp2cube = ERPToCubemapTorch(face_w=8)
+    assert erp2cube.cosmap.shape == (6, 8, 8)
+    assert torch.isfinite(erp2cube.cosmap).all()
+    assert float(erp2cube.cosmap.min()) > 0.0
+
+    faces = erp2cube(torch.rand(3, 16, 32))
+    assert faces.shape == (6, 3, 8, 8)
 
 
 def test_legacy_fake_backend_queue_roundtrip(tmp_path: Path):
