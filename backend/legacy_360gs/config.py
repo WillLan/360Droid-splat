@@ -91,6 +91,7 @@ LEGACY_TRAINING_DEFAULTS: dict[str, Any] = {
     "freeze_pose": False,
     "lr": {"cam_rot_delta": 0.0001, "cam_trans_delta": 0.0001},
     "edge_threshold": 1.1,
+    "rgb_boundary_threshold": 0.01,
     "render_background_rgb": [0.12, 0.14, 0.18],
     "panorama_render_mode": "pfgs360_gsplat",
     "pfgs360_render_mode": "RGB+ED",

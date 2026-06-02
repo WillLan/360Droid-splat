@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 
+from backend.legacy_360gs.config import build_legacy_config
 from backend.legacy_360gs.utils.erp2cubemap import ERPToCubemapTorch
 from backend.legacy_360gs.online import LegacyOnlineBackendClient
 from backend.legacy_360gs.viewpoint_adapter import LegacyViewpointAdapter
@@ -60,6 +61,11 @@ def test_erp_to_cubemap_torch_builds_valid_cosmap():
 
     faces = erp2cube(torch.rand(3, 16, 32))
     assert faces.shape == (6, 3, 8, 8)
+
+
+def test_legacy_config_includes_rgb_boundary_threshold_default():
+    cfg = build_legacy_config({})
+    assert cfg["Training"]["rgb_boundary_threshold"] == 0.01
 
 
 def test_legacy_fake_backend_queue_roundtrip(tmp_path: Path):
