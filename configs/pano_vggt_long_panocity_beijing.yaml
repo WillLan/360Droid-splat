@@ -23,6 +23,7 @@ PanoVGGT:
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   strict_checkpoint: false
   image_size: [512, 1024]
+  patch_multiple: 14
   chunk_size: 4
   overlap: 2
   emit_delay: 1

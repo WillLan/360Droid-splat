@@ -9,7 +9,7 @@ from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTLongTracker, SubmapAligner
 from frontend.pano_vggt.alignment import sample_overlap_points
-from frontend.pano_vggt.engine import normalize_panovggt_output
+from frontend.pano_vggt.engine import _ceil_size_to_multiple, _resize_prediction, normalize_panovggt_output
 from scripts.run_pano_vggt_panocity_blocks import build_block_config, discover_panocity_blocks
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, iter_sequence_frames
 
@@ -42,6 +42,21 @@ def test_normalize_panovggt_output_accepts_official_shapes():
     assert pred.poses_c2w.shape == (2, 4, 4)
     assert pred.depth.shape == (2, 1, 8, 16)
     assert pred.point_maps.shape == (2, 8, 16, 3)
+
+
+def test_panovggt_external_patch_multiple_resize_helpers():
+    assert _ceil_size_to_multiple((512, 1024), 14) == (518, 1036)
+    pred = normalize_panovggt_output(
+        {
+            "camera_poses": torch.eye(4).view(1, 1, 4, 4),
+            "depth": torch.ones(1, 1, 518, 1036),
+        },
+        torch.rand(1, 3, 518, 1036),
+    )
+    resized = _resize_prediction(pred, (512, 1024))
+    assert resized.depth.shape == (1, 1, 512, 1024)
+    assert resized.confidence.shape == (1, 1, 512, 1024)
+    assert resized.point_maps.shape == (1, 512, 1024, 3)
 
 
 def test_panovggt_erp_bearing_convention_matches_project_camera():

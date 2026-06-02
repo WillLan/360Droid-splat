@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 import inspect
+import math
 import sys
 from typing import Any
 
@@ -27,6 +28,36 @@ def _resize_images(images: torch.Tensor, image_size: tuple[int, int] | None) -> 
     if tuple(images.shape[-2:]) == tuple(image_size):
         return images
     return F.interpolate(images, size=image_size, mode="bilinear", align_corners=False)
+
+
+def _ceil_size_to_multiple(image_size: tuple[int, int], multiple: int) -> tuple[int, int]:
+    if int(multiple) <= 1:
+        return image_size
+    h, w = int(image_size[0]), int(image_size[1])
+    return (
+        int(math.ceil(h / float(multiple)) * int(multiple)),
+        int(math.ceil(w / float(multiple)) * int(multiple)),
+    )
+
+
+def _resize_prediction(pred: PanoVGGTLocalPrediction, image_size: tuple[int, int]) -> PanoVGGTLocalPrediction:
+    if tuple(pred.depth.shape[-2:]) == tuple(image_size):
+        return pred
+    depth = F.interpolate(pred.depth.float(), size=image_size, mode="bilinear", align_corners=False).clamp_min(1e-6)
+    confidence = F.interpolate(pred.confidence.float(), size=image_size, mode="bilinear", align_corners=False).clamp(0.0, 1.0)
+    points = F.interpolate(
+        pred.point_maps.permute(0, 3, 1, 2).float(),
+        size=image_size,
+        mode="bilinear",
+        align_corners=False,
+    ).permute(0, 2, 3, 1)
+    return PanoVGGTLocalPrediction(
+        poses_c2w=pred.poses_c2w,
+        depth=depth,
+        confidence=confidence,
+        point_maps=points,
+        descriptors=pred.descriptors,
+    )
 
 
 def _import_attr(path: str) -> Any:
@@ -266,6 +297,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         input_batch_dim: bool = True,
         strict_checkpoint: bool = False,
         skip_dinov2_pretrain: bool = False,
+        patch_multiple: int = 14,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.config_path = config_path
@@ -274,6 +306,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         self.input_batch_dim = bool(input_batch_dim)
         self.strict_checkpoint = bool(strict_checkpoint)
         self.skip_dinov2_pretrain = bool(skip_dinov2_pretrain)
+        self.patch_multiple = int(patch_multiple)
         if repo_path:
             repo = str(Path(repo_path).expanduser().resolve())
             if repo not in sys.path:
@@ -368,14 +401,18 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
 
     def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
         images = _resize_images(images.float().to(self.device), self.image_size)
-        model_input = images.unsqueeze(0) if self.input_batch_dim else images
+        target_size = tuple(int(v) for v in images.shape[-2:])
+        model_size = _ceil_size_to_multiple(target_size, self.patch_multiple)
+        model_images = _resize_images(images, model_size)
+        model_input = model_images.unsqueeze(0) if self.input_batch_dim else model_images
         with torch.no_grad():
             if self.amp and self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = self._call_model(model_input)
             else:
                 output = self._call_model(model_input)
-        return normalize_panovggt_output(output, images)
+        pred = normalize_panovggt_output(output, model_images)
+        return _resize_prediction(pred, target_size)
 
     def _call_model(self, model_input: torch.Tensor) -> Any:
         for name in ("infer", "inference", "predict", "forward"):
@@ -410,4 +447,5 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         input_batch_dim=bool(config.get("input_batch_dim", True)),
         strict_checkpoint=bool(config.get("strict_checkpoint", False)),
         skip_dinov2_pretrain=bool(config.get("skip_dinov2_pretrain", False)),
+        patch_multiple=int(config.get("patch_multiple", 14)),
     )
