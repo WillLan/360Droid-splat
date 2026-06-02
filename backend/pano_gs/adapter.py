@@ -160,7 +160,7 @@ class PFGS360Renderer:
             quats=gaussians.get_rotation,
             scales=gaussians.get_scaling,
             opacities=gaussians.get_opacity.squeeze(-1),
-            colors=gaussians.get_features,
+            colors=gaussians.get_features.unsqueeze(1),
             viewmats=viewmat.unsqueeze(0),
             Ks=K.unsqueeze(0),
             width=W,
