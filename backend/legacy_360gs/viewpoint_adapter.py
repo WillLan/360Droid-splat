@@ -295,7 +295,7 @@ class LegacyViewpointAdapter:
             frame_id,
             image,
             depth_map,
-            depth_map,
+            depth_map.numpy().astype("float32"),
             gt_T,
             projection_matrix,
             fx,

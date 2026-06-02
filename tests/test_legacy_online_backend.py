@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from backend.legacy_360gs.config import build_legacy_config
@@ -51,6 +52,15 @@ def test_legacy_viewpoint_adapter_pose_depth_and_sky_mask():
     assert torch.allclose(bundle.pose_w2c, torch.linalg.inv(pose))
     assert torch.allclose(bundle.viewpoint.R, bundle.pose_w2c[:3, :3])
     assert torch.allclose(bundle.viewpoint.T, bundle.pose_w2c[:3, 3])
+
+
+def test_legacy_viewpoint_adapter_real_camera_uses_numpy_mono_depth():
+    cfg = {"LegacyOnlineBackend": {"face_w": 8}, "Mapping": {"sky_mask_enable": False}}
+    frame = PanoFrame(image=torch.rand(3, 8, 16), timestamp=0.0, frame_id=0, meta={})
+    bundle = LegacyViewpointAdapter(cfg, use_legacy_camera=True).build(frame, _frontend_output(0))
+    assert isinstance(bundle.viewpoint.depth, torch.Tensor)
+    assert isinstance(bundle.viewpoint.mono_depth, np.ndarray)
+    assert bundle.viewpoint.mono_depth.shape == (8, 16)
 
 
 def test_erp_to_cubemap_torch_builds_valid_cosmap():
