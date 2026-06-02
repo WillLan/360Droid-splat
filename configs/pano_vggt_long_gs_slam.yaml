@@ -2,8 +2,8 @@ Dataset:
   synthetic: false
   dataset_path: /mnt/disk1/lanboyang/Datasets/360uav/seqs
   sequence: null
-  erp_resize_height: 518
-  erp_resize_width: 1036
+  erp_resize_height: 512
+  erp_resize_width: 1024
   begin: 0
   end: null
 
@@ -20,7 +20,7 @@ PanoVGGT:
   checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   strict_checkpoint: false
-  image_size: [518, 1036]
+  image_size: [512, 1024]
   chunk_size: 4
   overlap: 2
   emit_delay: 1
@@ -49,8 +49,15 @@ Hierarchical:
   voxel_size_lis: [0.12, 0.45, 1.8]
 
 Mapping:
-  max_seeds_per_keyframe: 1024
+  max_seeds_per_keyframe: 0
   min_depth_confidence: 0.2
+  sky_mask_enable: true
+  sky_mask_top_ratio: 0.58
+  sky_mask_min_blue: 0.35
+  sky_mask_blue_margin: 0.05
+  sky_mask_cloud_brightness: 0.72
+  sky_mask_cloud_saturation: 0.22
+  sky_mask_texture_threshold: 0.08
   lr: 0.002
   refine_steps_per_keyframe: 0
 
@@ -60,4 +67,3 @@ Renderer:
 
 Results:
   save_dir: outputs/pano_vggt_long_gs_slam
-

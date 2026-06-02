@@ -510,9 +510,17 @@ class PanoDroidGSSlamSystem:
     def __init__(self, config: dict) -> None:
         self.config = config
         self.frontend = build_frontend_from_config(config)
+        mapping_cfg = config.get("Mapping", {})
         self.initializer = GaussianInitializer(
-            max_seeds_per_keyframe=int(config.get("Mapping", {}).get("max_seeds_per_keyframe", 2048)),
-            min_confidence=float(config.get("Mapping", {}).get("min_depth_confidence", 0.15)),
+            max_seeds_per_keyframe=int(mapping_cfg.get("max_seeds_per_keyframe", 2048)),
+            min_confidence=float(mapping_cfg.get("min_depth_confidence", 0.15)),
+            sky_mask_enable=bool(mapping_cfg.get("sky_mask_enable", False)),
+            sky_mask_top_ratio=float(mapping_cfg.get("sky_mask_top_ratio", 0.58)),
+            sky_mask_min_blue=float(mapping_cfg.get("sky_mask_min_blue", 0.35)),
+            sky_mask_blue_margin=float(mapping_cfg.get("sky_mask_blue_margin", 0.05)),
+            sky_mask_cloud_brightness=float(mapping_cfg.get("sky_mask_cloud_brightness", 0.72)),
+            sky_mask_cloud_saturation=float(mapping_cfg.get("sky_mask_cloud_saturation", 0.22)),
+            sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
             voxel_sizes=tuple(config.get("Hierarchical", {}).get("voxel_size_lis", [0.12, 0.45, 1.8])),
         )
         self.map = PanoGaussianMap(config=config)
