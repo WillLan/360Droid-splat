@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Iterable
 
@@ -22,6 +23,36 @@ from mapping.gaussian_initializer import GaussianInitializer
 def load_config(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _load_panocity_gt_poses(root: str) -> dict[str, np.ndarray]:
+    root_path = Path(root)
+    block_dir = root_path.parent if root_path.name == "pano_images" else root_path
+    image_dir = block_dir / "pano_images"
+    if not image_dir.is_dir():
+        return {}
+    pose_files = sorted(block_dir.glob("*poses*.json"))
+    if not pose_files:
+        return {}
+    pose_path = next((p for p in pose_files if ".1." not in p.name), pose_files[0])
+    with open(pose_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    frames = payload.get("frames", payload)
+    if not isinstance(frames, list):
+        return {}
+    out: dict[str, np.ndarray] = {}
+    for frame in frames:
+        name = frame.get("name")
+        mat = frame.get("transformation_matrix")
+        if name is None or mat is None:
+            continue
+        c2w = np.asarray(mat, dtype=np.float32)
+        if c2w.shape != (4, 4):
+            continue
+        image_path = image_dir / str(name)
+        out[str(image_path.resolve())] = c2w
+        out[str(name)] = c2w
+    return out
 
 
 def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
@@ -53,13 +84,20 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
     h = ds_cfg.get("erp_resize_height")
     w = ds_cfg.get("erp_resize_width")
     resize = (int(h), int(w)) if h is not None and w is not None else None
+    gt_poses = _load_panocity_gt_poses(root)
     for local_idx, path in enumerate(files):
         frame_id = begin + local_idx
+        gt = gt_poses.get(str(Path(path).resolve()))
+        if gt is None:
+            gt = gt_poses.get(Path(path).name)
+        meta = {"path": path}
+        if gt is not None:
+            meta["gt_c2w"] = torch.from_numpy(gt).float()
         yield PanoFrame(
             image=load_erp_image(path, resize=resize),
             timestamp=float(frame_id),
             frame_id=frame_id,
-            meta={"path": path},
+            meta=meta,
         )
 
 
@@ -112,6 +150,42 @@ def _resize_to_max_width(image: Image.Image, max_width: int) -> Image.Image:
     return image.resize((int(max_width), max(1, int(image.size[1] * scale))), Image.BILINEAR)
 
 
+def _pose_xyz_from_meta(frame: PanoFrame) -> np.ndarray | None:
+    meta = frame.meta or {}
+    gt = meta.get("gt_c2w")
+    if gt is None:
+        return None
+    gt_t = torch.as_tensor(gt).detach().cpu().float()
+    if gt_t.shape != (4, 4):
+        return None
+    return gt_t[:3, 3].numpy()
+
+
+def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    pred = np.asarray(pred, dtype=np.float32)
+    gt = np.asarray(gt, dtype=np.float32)
+    valid = np.isfinite(pred).all(axis=1) & np.isfinite(gt).all(axis=1)
+    if int(valid.sum()) < 3:
+        return pred
+    src = pred[valid]
+    tgt = gt[valid]
+    src_mean = src.mean(axis=0)
+    tgt_mean = tgt.mean(axis=0)
+    src_c = src - src_mean
+    tgt_c = tgt - tgt_mean
+    cov = src_c.T @ tgt_c / max(1, src.shape[0])
+    u, s, vh = np.linalg.svd(cov)
+    rot = vh.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vh = vh.copy()
+        vh[-1] *= -1.0
+        rot = vh.T @ u.T
+    var_src = np.mean(np.sum(src_c * src_c, axis=1))
+    scale = float(np.sum(s) / max(var_src, 1e-8))
+    trans = tgt_mean - scale * (rot @ src_mean)
+    return scale * (pred @ rot.T) + trans
+
+
 class SlamRuntimeLogger:
     """Runtime W&B and local visualization logger for online SLAM runs."""
 
@@ -130,7 +204,9 @@ class SlamRuntimeLogger:
         self.run = None
         self._wandb = None
         self._step = 0
-        self._pose_history: list[tuple[int, np.ndarray]] = []
+        self._frontend_pose_history: list[tuple[int, np.ndarray]] = []
+        self._backend_pose_history: list[tuple[int, np.ndarray]] = []
+        self._gt_pose_history: list[tuple[int, np.ndarray]] = []
 
         if self.wandb_enabled:
             try:
@@ -167,11 +243,19 @@ class SlamRuntimeLogger:
         anchor_count: int,
         keyframe_count: int,
         backend_loss: float | None,
+        backend_pose_c2w: torch.Tensor | None = None,
+        backend_render_pkg: dict | None = None,
     ) -> None:
         self._step += 1
         pose = output.pose_c2w.detach().cpu().float()
         if pose.shape == (4, 4):
-            self._pose_history.append((int(output.frame_id), pose[:3, 3].numpy()))
+            self._frontend_pose_history.append((int(output.frame_id), pose[:3, 3].numpy()))
+        backend_pose = backend_pose_c2w.detach().cpu().float() if backend_pose_c2w is not None else None
+        if backend_pose is not None and backend_pose.shape == (4, 4):
+            self._backend_pose_history.append((int(output.frame_id), backend_pose[:3, 3].numpy()))
+        gt_xyz = _pose_xyz_from_meta(source_frame)
+        if gt_xyz is not None:
+            self._gt_pose_history.append((int(output.frame_id), gt_xyz))
 
         payload: dict[str, float | int | str] = {
             "slam/frame_id": int(output.frame_id),
@@ -197,13 +281,37 @@ class SlamRuntimeLogger:
         if output.inverse_depth is not None:
             depth_path = self._save_depth_panel(output, source_frame)
             if self.run is not None and self._wandb is not None:
+                image_payload["frontend/depth"] = self._wandb.Image(str(depth_path))
                 image_payload["slam/depth"] = self._wandb.Image(str(depth_path))
-        traj_path = self._save_trajectory_panel(output)
+        frontend_traj_path = self._save_trajectory_panel(
+            output,
+            kind="frontend",
+            pred_history=self._frontend_pose_history,
+        )
+        backend_traj_path = self._save_trajectory_panel(
+            output,
+            kind="backend",
+            pred_history=self._backend_pose_history,
+        )
+        backend_rgb_path = None
+        backend_depth_path = None
+        if backend_render_pkg is not None:
+            backend_rgb_path = self._save_backend_render_panel(output, source_frame, backend_render_pkg)
+            backend_depth_path = self._save_backend_depth_panel(output, backend_render_pkg)
         if self.run is not None and self._wandb is not None:
-            image_payload["slam/trajectory"] = self._wandb.Image(str(traj_path))
+            image_payload["frontend/trajectory_vs_gt"] = self._wandb.Image(str(frontend_traj_path))
+            image_payload["backend/trajectory_vs_gt"] = self._wandb.Image(str(backend_traj_path))
+            image_payload["slam/trajectory"] = self._wandb.Image(str(frontend_traj_path))
             if depth_path is not None:
                 image_payload["slam/depth_png"] = str(depth_path)
-            image_payload["slam/trajectory_png"] = str(traj_path)
+            if backend_rgb_path is not None:
+                image_payload["backend/render_vs_gt_panorama"] = self._wandb.Image(str(backend_rgb_path))
+                image_payload["backend/render_vs_gt_png"] = str(backend_rgb_path)
+            if backend_depth_path is not None:
+                image_payload["backend/render_depth"] = self._wandb.Image(str(backend_depth_path))
+                image_payload["backend/render_depth_png"] = str(backend_depth_path)
+            image_payload["frontend/trajectory_png"] = str(frontend_traj_path)
+            image_payload["backend/trajectory_png"] = str(backend_traj_path)
             self.run.log(image_payload, step=self._step)
 
     def _should_visualize(self, output: FrontendOutput) -> bool:
@@ -230,15 +338,28 @@ class SlamRuntimeLogger:
         canvas.save(path)
         return path
 
-    def _save_trajectory_panel(self, output: FrontendOutput) -> Path:
-        path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_trajectory.png"
-        positions = np.asarray([p for _, p in self._pose_history], dtype=np.float32)
-        frame_ids = np.asarray([fid for fid, _ in self._pose_history], dtype=np.float32)
+    def _save_trajectory_panel(
+        self,
+        output: FrontendOutput,
+        *,
+        kind: str,
+        pred_history: list[tuple[int, np.ndarray]],
+    ) -> Path:
+        path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_{kind}_trajectory_vs_gt.png"
+        legacy_path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_trajectory.png" if kind == "frontend" else None
+        positions = np.asarray([p for _, p in pred_history], dtype=np.float32)
+        frame_ids = np.asarray([fid for fid, _ in pred_history], dtype=np.float32)
         if positions.size == 0:
             image = Image.new("RGB", (900, 640), "white")
             ImageDraw.Draw(image).text((20, 20), "no valid trajectory", fill=(0, 0, 0))
             image.save(path)
+            if legacy_path is not None:
+                shutil.copyfile(path, legacy_path)
             return path
+        gt_by_id = {fid: xyz for fid, xyz in self._gt_pose_history}
+        gt_positions = np.asarray([gt_by_id.get(int(fid), np.full(3, np.nan)) for fid in frame_ids], dtype=np.float32)
+        has_gt = bool(np.isfinite(gt_positions).all(axis=1).any())
+        positions_plot = _align_xyz_for_plot(positions, gt_positions) if has_gt else positions
         try:
             import matplotlib
 
@@ -247,27 +368,47 @@ class SlamRuntimeLogger:
 
             fig = plt.figure(figsize=(8.5, 6.2), dpi=120)
             ax = fig.add_subplot(111, projection="3d")
-            ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], color="#1f77b4", linewidth=2.0)
+            all_for_limits = [positions_plot]
+            if has_gt:
+                valid_gt = np.isfinite(gt_positions).all(axis=1)
+                all_for_limits.append(gt_positions[valid_gt])
+                ax.plot(
+                    gt_positions[valid_gt, 0],
+                    gt_positions[valid_gt, 1],
+                    gt_positions[valid_gt, 2],
+                    color="#2ca02c",
+                    linewidth=2.0,
+                    label="GT",
+                )
+            ax.plot(
+                positions_plot[:, 0],
+                positions_plot[:, 1],
+                positions_plot[:, 2],
+                color="#1f77b4",
+                linewidth=2.0,
+                label=f"{kind} pred",
+            )
             sc = ax.scatter(
-                positions[:, 0],
-                positions[:, 1],
-                positions[:, 2],
+                positions_plot[:, 0],
+                positions_plot[:, 1],
+                positions_plot[:, 2],
                 c=frame_ids,
                 cmap="viridis",
                 s=28,
                 depthshade=True,
             )
-            ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], c="limegreen", s=80, label="start")
-            ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], c="red", s=80, label="latest")
-            center = 0.5 * (positions.min(axis=0) + positions.max(axis=0))
-            radius = max(float((positions.max(axis=0) - positions.min(axis=0)).max()) * 0.55, 1e-3)
+            ax.scatter(positions_plot[0, 0], positions_plot[0, 1], positions_plot[0, 2], c="limegreen", s=80, label="start")
+            ax.scatter(positions_plot[-1, 0], positions_plot[-1, 1], positions_plot[-1, 2], c="red", s=80, label="latest")
+            limits_pts = np.concatenate([arr for arr in all_for_limits if arr.size], axis=0)
+            center = 0.5 * (limits_pts.min(axis=0) + limits_pts.max(axis=0))
+            radius = max(float((limits_pts.max(axis=0) - limits_pts.min(axis=0)).max()) * 0.55, 1e-3)
             ax.set_xlim(center[0] - radius, center[0] + radius)
             ax.set_ylim(center[1] - radius, center[1] + radius)
             ax.set_zlim(center[2] - radius, center[2] + radius)
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.set_zlabel("Z")
-            ax.set_title("Online camera trajectory")
+            ax.set_title(f"{kind} trajectory vs GT" if has_gt else f"{kind} trajectory")
             ax.view_init(elev=24, azim=-58)
             ax.legend(loc="upper left")
             fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.08, label="frame id")
@@ -275,8 +416,69 @@ class SlamRuntimeLogger:
             fig.savefig(path, facecolor="white")
             plt.close(fig)
         except Exception:
-            self._save_topdown_trajectory(path, positions)
+            self._save_topdown_trajectory(path, positions_plot)
+        if legacy_path is not None:
+            shutil.copyfile(path, legacy_path)
         return path
+
+    def _save_backend_render_panel(
+        self,
+        output: FrontendOutput,
+        source_frame: PanoFrame,
+        render_pkg: dict,
+    ) -> Path:
+        target = _image_tensor_to_pil(source_frame.image)
+        render = _image_tensor_to_pil(render_pkg["render"])
+        if render.size != target.size:
+            render = render.resize(target.size, Image.BILINEAR)
+        w, h = target.size
+        canvas = Image.new("RGB", (2 * w, h + 26), "white")
+        canvas.paste(target, (0, 26))
+        canvas.paste(render, (w, 26))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 6), "target panorama", fill=(0, 0, 0))
+        draw.text((w + 8, 6), "backend render", fill=(0, 0, 0))
+        canvas = _resize_to_max_width(canvas, 1600)
+        path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_backend_render_vs_gt.png"
+        canvas.save(path)
+        return path
+
+    def _save_backend_depth_panel(self, output: FrontendOutput, render_pkg: dict) -> Path:
+        depth = render_pkg.get("depth")
+        if depth is None:
+            image = Image.new("RGB", (900, 480), "white")
+            ImageDraw.Draw(image).text((20, 20), "no backend depth", fill=(0, 0, 0))
+        else:
+            image = _inverse_depth_to_pil(depth.detach().clamp_min(1e-6).reciprocal())
+            image = _resize_to_max_width(image, 1200)
+        path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_backend_render_depth.png"
+        image.save(path)
+        return path
+
+    def log_final_backend_trajectory(self, poses: list[tuple[int, torch.Tensor]], *, step: int) -> str | None:
+        if not poses or not self.save_local:
+            return None
+        history = [(int(fid), pose.detach().cpu().float()[:3, 3].numpy()) for fid, pose in poses if pose.shape == (4, 4)]
+        if not history:
+            return None
+        dummy = FrontendOutput(
+            frame_id=history[-1][0],
+            timestamp=float(history[-1][0]),
+            pose_c2w=torch.eye(4),
+            relative_pose=None,
+            pose_confidence=0.0,
+            inverse_depth=None,
+            depth_confidence=None,
+            spherical_flow=None,
+            keyframe_score=0.0,
+            is_keyframe=False,
+            ba_residual=None,
+            tracking_status="final_backend_trajectory",
+        )
+        path = self._save_trajectory_panel(dummy, kind="backend_final", pred_history=history)
+        if self.run is not None and self._wandb is not None:
+            self.run.log({"backend/final_trajectory_vs_gt": self._wandb.Image(str(path))}, step=int(step))
+        return str(path)
 
     @staticmethod
     def _save_topdown_trajectory(path: Path, positions: np.ndarray) -> None:
@@ -362,12 +564,22 @@ class PanoDroidGSSlamSystem:
                         steps=refine_steps,
                     )
                     backend_loss = metrics.get("loss")
+            backend_pose = self.mapper.refined_pose_c2w(int(out.frame_id))
+            render_pose = backend_pose if backend_pose is not None else out.pose_c2w.detach().cpu()
+            backend_render_pkg = None
+            if self.map.anchor_count() > 0:
+                try:
+                    backend_render_pkg = self.mapper.render_view(image=source_frame.image, c2w=render_pose)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(f"frame {out.frame_id}: backend visualization render failed: {exc!r}")
             logger.observe(
                 out,
                 source_frame,
                 anchor_count=self.map.anchor_count(),
                 keyframe_count=keyframes,
                 backend_loss=backend_loss,
+                backend_pose_c2w=backend_pose,
+                backend_render_pkg=backend_render_pkg,
             )
 
         try:
@@ -389,6 +601,10 @@ class PanoDroidGSSlamSystem:
                     process_output(ready)
 
             final_metrics = self.mapper.finalize_optimization()
+            final_backend_traj = logger.log_final_backend_trajectory(
+                self.mapper.refined_keyframe_poses(),
+                step=frame_count,
+            )
             summary = {
                 "frames": frame_count,
                 "keyframes": keyframes,
@@ -401,6 +617,7 @@ class PanoDroidGSSlamSystem:
                 "backend_optimization_steps": self.mapper.stats.optimization_steps,
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_final_metrics": final_metrics,
+                "backend_final_trajectory_png": final_backend_traj,
                 "wandb_run_url": logger.run_url,
                 "visualization_dir": str(logger.visualization_dir) if logger.save_local else None,
                 "notes": self.mapper.stats.notes,

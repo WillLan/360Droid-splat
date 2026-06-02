@@ -86,13 +86,13 @@ WeightsAndBiases:
   entity: null
   mode: online
   run_name: panovggt_long_panocity_beijing
-  log_every: 10
+  log_every: 1
   log_keyframes: true
   tags: [panovggt_long, panocity, beijing]
 
 Visualization:
   save_local: true
-  log_every: 10
+  log_every: 1
 
 Results:
   save_dir: outputs/pano_vggt_long_panocity_beijing

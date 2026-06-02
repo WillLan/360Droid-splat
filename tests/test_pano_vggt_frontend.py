@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from PIL import Image
 import torch
@@ -10,7 +11,7 @@ from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTLongTracker,
 from frontend.pano_vggt.alignment import sample_overlap_points
 from frontend.pano_vggt.engine import normalize_panovggt_output
 from scripts.run_pano_vggt_panocity_blocks import build_block_config, discover_panocity_blocks
-from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
+from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, iter_sequence_frames
 
 
 def _write_rgb(path: Path) -> None:
@@ -140,6 +141,30 @@ def test_panocity_block_config_targets_first_frames_and_wandb_run(tmp_path: Path
     assert cfg["WeightsAndBiases"]["run_name"] == "base_run_beijing_block_001"
 
 
+def test_panocity_gt_pose_is_attached_to_runtime_frames(tmp_path: Path):
+    block = tmp_path / "beijing_block_001"
+    _write_rgb(block / "pano_images" / "000001.png")
+    pose = torch.eye(4)
+    pose[0, 3] = 1.25
+    with open(block / "poses.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "frames": [
+                    {
+                        "name": "000001.png",
+                        "depth": "000001.png",
+                        "transformation_matrix": pose.tolist(),
+                    }
+                ]
+            },
+            f,
+        )
+    cfg = {"Dataset": {"dataset_path": str(block / "pano_images")}}
+    frame = next(iter_sequence_frames(cfg))
+    assert frame.meta is not None
+    assert torch.allclose(frame.meta["gt_c2w"], pose)
+
+
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 16, "width": 32},
@@ -176,6 +201,10 @@ def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     assert (tmp_path / "summary.json").is_file()
     assert any((tmp_path / "visualizations").glob("*_depth.png"))
     assert any((tmp_path / "visualizations").glob("*_trajectory.png"))
+    assert any((tmp_path / "visualizations").glob("*_frontend_trajectory_vs_gt.png"))
+    assert any((tmp_path / "visualizations").glob("*_backend_trajectory_vs_gt.png"))
+    assert any((tmp_path / "visualizations").glob("*_backend_render_vs_gt.png"))
+    assert any((tmp_path / "visualizations").glob("*_backend_render_depth.png"))
 
 
 def test_system_runs_joint_gaussian_pose_backend_smoke(tmp_path: Path):

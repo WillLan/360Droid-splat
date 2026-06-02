@@ -213,6 +213,23 @@ class PanoGaussianMapper:
             return None
         return pose_delta().detach().cpu()
 
+    def refined_keyframe_poses(self) -> list[tuple[int, torch.Tensor]]:
+        out = []
+        for keyframe in self.keyframes:
+            pose = self.refined_pose_c2w(keyframe.frame_id)
+            if pose is not None:
+                out.append((int(keyframe.frame_id), pose))
+        return out
+
+    def render_view(self, *, image: torch.Tensor, c2w: torch.Tensor) -> dict | None:
+        if self.map.anchor_count() == 0:
+            return None
+        target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
+        with torch.no_grad():
+            return self.renderer.render(camera, self.map)
+
     def refine_on_keyframe(
         self,
         *,
