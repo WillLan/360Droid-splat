@@ -1,0 +1,78 @@
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/zwh/Dataset/PanoCity/beijing
+  block_glob: beijing_block*
+  frames_per_block: 300
+  sequence: null
+  erp_resize_height: 518
+  erp_resize_width: 1036
+  begin: 0
+  end: 300
+
+Frontend:
+  mode: panovggt_long
+  checkpoint: null
+  keyframe_threshold: 1.1
+  force_keyframe_interval: 8
+
+PanoVGGT:
+  engine: external
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  strict_checkpoint: false
+  image_size: [518, 1036]
+  chunk_size: 4
+  overlap: 2
+  emit_delay: 1
+  align_mode: sim3
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 128
+  amp: true
+  input_batch_dim: true
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Hierarchical:
+  voxel_size_lis: [0.12, 0.45, 1.8]
+
+Mapping:
+  max_seeds_per_keyframe: 512
+  min_depth_confidence: 0.2
+  lr: 0.002
+  refine_steps_per_keyframe: 1
+
+Renderer:
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  mode: online
+  run_name: panovggt_long_panocity_beijing
+  log_every: 10
+  log_keyframes: true
+  tags: [panovggt_long, panocity, beijing]
+
+Visualization:
+  save_local: true
+  log_every: 10
+
+Results:
+  save_dir: outputs/pano_vggt_long_panocity_beijing

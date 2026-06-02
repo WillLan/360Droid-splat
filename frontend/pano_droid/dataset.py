@@ -30,7 +30,7 @@ def discover_erp_images(root: str, sequence: Optional[str] = None) -> list[str]:
     if sequence:
         candidates.append(root_path / "Sequences" / sequence)
         candidates.append(root_path / sequence)
-    candidates.extend([root_path / "images", root_path / "rgb", root_path])
+    candidates.extend([root_path / "pano_images", root_path / "images", root_path / "rgb", root_path])
     exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
     for folder in candidates:
         if not folder.is_dir():
@@ -38,7 +38,7 @@ def discover_erp_images(root: str, sequence: Optional[str] = None) -> list[str]:
         files: list[str] = []
         for ext in exts:
             files.extend(glob.glob(str(folder / ext)))
-        files = sorted(files)
+        files = sorted(dict.fromkeys(files))
         if files:
             return files
     raise FileNotFoundError(f"No ERP images found under {root}")
@@ -214,4 +214,3 @@ def build_dataset_from_config(config: dict, *, train: bool = True) -> Dataset:
         begin=int(ds_cfg.get("begin", 0)),
         end=ds_cfg.get("end"),
     )
-
