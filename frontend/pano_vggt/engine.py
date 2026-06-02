@@ -6,6 +6,7 @@ smoke runs use the fake engine so this repository stays self contained.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 import inspect
@@ -32,6 +33,31 @@ def _import_attr(path: str) -> Any:
     module_name, attr = path.rsplit(".", 1)
     module = import_module(module_name)
     return getattr(module, attr)
+
+
+@contextmanager
+def _maybe_skip_dinov2_pretrain(enabled: bool):
+    if not enabled:
+        yield
+        return
+    try:
+        aggregator_mod = import_module("panovggt.models.aggregator")
+        aggregator_cls = getattr(aggregator_mod, "Aggregator", None)
+        original = getattr(aggregator_cls, "_try_load_dinov2", None) if aggregator_cls is not None else None
+        if aggregator_cls is None or original is None:
+            yield
+            return
+
+        def _skip(self, hub_name, url, patch_embed_key):
+            return None
+
+        aggregator_cls._try_load_dinov2 = _skip
+        try:
+            yield
+        finally:
+            aggregator_cls._try_load_dinov2 = original
+    except ModuleNotFoundError:
+        yield
 
 
 def _as_dict(output: Any) -> dict[str, Any]:
@@ -239,6 +265,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         amp: bool = True,
         input_batch_dim: bool = True,
         strict_checkpoint: bool = False,
+        skip_dinov2_pretrain: bool = False,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.config_path = config_path
@@ -246,11 +273,13 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         self.amp = bool(amp)
         self.input_batch_dim = bool(input_batch_dim)
         self.strict_checkpoint = bool(strict_checkpoint)
+        self.skip_dinov2_pretrain = bool(skip_dinov2_pretrain)
         if repo_path:
             repo = str(Path(repo_path).expanduser().resolve())
             if repo not in sys.path:
                 sys.path.insert(0, repo)
-        self.model = self._build_model(class_path, model_kwargs or {}).to(self.device)
+        with _maybe_skip_dinov2_pretrain(self.skip_dinov2_pretrain):
+            self.model = self._build_model(class_path, model_kwargs or {}).to(self.device)
         if checkpoint:
             self.load_checkpoint(checkpoint)
         self.model.eval()
@@ -380,4 +409,5 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         amp=bool(config.get("amp", True)),
         input_batch_dim=bool(config.get("input_batch_dim", True)),
         strict_checkpoint=bool(config.get("strict_checkpoint", False)),
+        skip_dinov2_pretrain=bool(config.get("skip_dinov2_pretrain", False)),
     )

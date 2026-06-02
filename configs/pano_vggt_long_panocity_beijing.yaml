@@ -32,6 +32,7 @@ PanoVGGT:
   max_alignment_cache_frames: 128
   amp: true
   input_batch_dim: true
+  skip_dinov2_pretrain: true
 
 MapRepresentation:
   mode: anchor_scaffold_panorama
