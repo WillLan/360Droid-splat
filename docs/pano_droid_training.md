@@ -151,8 +151,9 @@ During graph training, diagnostics are written under
 - `step_XXXXXXX_metrics.json`: trajectory RMSE, depth MAE, and BA residual for
   the visualized batch
 
-When `WeightsAndBiases.enabled=true`, rank 0 also logs the same diagnostics to
-W&B:
+For remote experiments, keep both `Visualization.enabled=true` and
+`WeightsAndBiases.enabled=true`.  Every time graph diagnostics are generated,
+rank 0 must log the same images to W&B:
 
 - `train/*`: scalar losses and training metrics
 - `diagnostics/trajectory_3d`: 3D GT-vs-pred trajectory image
@@ -163,6 +164,9 @@ W&B:
 W&B authentication uses the normal `wandb login` flow on the training server.
 The configured account owner is `zb2302106@buaa.edu.cn`, but W&B requires an API
 key or an existing login session rather than an email-only login.
+If online sync is unavailable, launch with W&B `offline` mode and keep the
+offline run directory for later `wandb sync`; do not disable W&B for remote
+training runs.
 
 For 4-GPU training on 50902 GPUs 4, 5, 6, and 7, launch with `torchrun`:
 

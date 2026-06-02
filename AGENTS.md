@@ -11,6 +11,19 @@
 - Avoid commands or job layouts that can occupy excessive CPU/RAM and make the server unresponsive or prevent SSH login, even if GPU memory appears available.
 - Preserve existing experiment outputs. Do not delete or overwrite result directories unless the user explicitly asks.
 
+## Training visualization and W&B logging
+
+- Every remote training run for this project must keep diagnostic visualization enabled and must log the generated visualizations to Weights & Biases.
+- PanoDROID graph training should save the local PNG diagnostics under
+  `Training.output_dir/visualizations` and log the same images to W&B as
+  `diagnostics/trajectory_3d` and `diagnostics/depth_pred_gt_error`.
+- Do not disable W&B just because online sync is unavailable. If the server
+  cannot reach W&B, run W&B in `offline` mode and preserve the offline run
+  directory so it can be synced later.
+- Local smoke tests and unit tests may keep W&B disabled to avoid requiring
+  external credentials, but any launched experiment on `50902` should use
+  `WeightsAndBiases.enabled=true` and `Visualization.enabled=true`.
+
 ## 360UAV experiment baseline
 
 - When the user asks to repeat this experiment setup, use the configuration corresponding to:
