@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+import traceback
 
 import torch
 
@@ -132,12 +133,28 @@ class PanoVGGTLegacyOnlineSlamSystem:
                 json.dump(summary, f, indent=2)
             logger.finish(summary)
             return summary
-        except Exception:
+        except Exception as exc:
+            system_traceback = traceback.format_exc()
+            stop_error = None
+            stop_traceback = None
             try:
                 handle_snapshots(self.backend.stop(join_timeout_s=5.0))
-            finally:
-                failed = {"frames": frame_count, "keyframes": keyframes, "runtime_mode": "legacy_online_failed"}
-                with open(self.output_dir / "summary.json", "w", encoding="utf-8") as f:
-                    json.dump(failed, f, indent=2)
-                logger.finish(failed)
+            except Exception as stop_exc:
+                stop_error = repr(stop_exc)
+                stop_traceback = traceback.format_exc()
+            failed = {
+                "frames": frame_count,
+                "keyframes": keyframes,
+                "runtime_mode": "legacy_online_failed",
+                "error": repr(exc),
+                "backend_stop_error": stop_error,
+            }
+            with open(self.output_dir / "summary.json", "w", encoding="utf-8") as f:
+                json.dump(failed, f, indent=2)
+            with open(self.output_dir / "system_error.log", "w", encoding="utf-8") as f:
+                f.write(system_traceback)
+                if stop_traceback is not None:
+                    f.write("\n--- backend stop error ---\n")
+                    f.write(stop_traceback)
+            logger.finish(failed)
             raise
