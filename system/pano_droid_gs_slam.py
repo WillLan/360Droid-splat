@@ -480,6 +480,51 @@ class SlamRuntimeLogger:
             self.run.log({"backend/final_trajectory_vs_gt": self._wandb.Image(str(path))}, step=int(step))
         return str(path)
 
+    def observe_backend_snapshot(self, snapshot, *, step: int) -> None:
+        """Log asynchronous legacy backend snapshots."""
+
+        poses = getattr(snapshot, "poses_c2w", {}) or {}
+        for frame_id, pose in sorted(poses.items()):
+            pose_cpu = pose.detach().cpu().float()
+            if pose_cpu.shape != (4, 4):
+                continue
+            self._backend_pose_history = [
+                item for item in self._backend_pose_history if item[0] != int(frame_id)
+            ]
+            self._backend_pose_history.append((int(frame_id), pose_cpu[:3, 3].numpy()))
+        if not self.save_local or not poses:
+            return
+        latest_id = int(max(poses))
+        dummy = FrontendOutput(
+            frame_id=latest_id,
+            timestamp=float(latest_id),
+            pose_c2w=torch.eye(4),
+            relative_pose=None,
+            pose_confidence=0.0,
+            inverse_depth=None,
+            depth_confidence=None,
+            spherical_flow=None,
+            keyframe_score=0.0,
+            is_keyframe=True,
+            ba_residual=None,
+            tracking_status=f"backend_snapshot_{getattr(snapshot, 'tag', 'unknown')}",
+        )
+        path = self._save_trajectory_panel(dummy, kind="backend", pred_history=self._backend_pose_history)
+        if self.run is not None and self._wandb is not None:
+            payload = {
+                "backend/trajectory_vs_gt": self._wandb.Image(str(path)),
+                "backend/trajectory_png": str(path),
+            }
+            render_path = getattr(snapshot, "render_path", None)
+            if render_path:
+                payload["backend/render_vs_gt_panorama"] = self._wandb.Image(str(render_path))
+                payload["backend/render_vs_gt_png"] = str(render_path)
+            depth_path = getattr(snapshot, "depth_path", None)
+            if depth_path:
+                payload["backend/render_depth"] = self._wandb.Image(str(depth_path))
+                payload["backend/render_depth_png"] = str(depth_path)
+            self.run.log(payload, step=int(step))
+
     @staticmethod
     def _save_topdown_trajectory(path: Path, positions: np.ndarray) -> None:
         image = Image.new("RGB", (900, 640), "white")
@@ -509,6 +554,13 @@ class PanoDroidGSSlamSystem:
 
     def __init__(self, config: dict) -> None:
         self.config = config
+        runtime_mode = str(config.get("Runtime", {}).get("mode", "sync_mvp")).lower()
+        self._delegate = None
+        if runtime_mode == "legacy_online":
+            from system.legacy_online_slam import PanoVGGTLegacyOnlineSlamSystem
+
+            self._delegate = PanoVGGTLegacyOnlineSlamSystem(config)
+            return
         self.frontend = build_frontend_from_config(config)
         mapping_cfg = config.get("Mapping", {})
         self.initializer = GaussianInitializer(
@@ -537,6 +589,8 @@ class PanoDroidGSSlamSystem:
         )
 
     def run(self, *, max_frames: int | None = None) -> dict:
+        if self._delegate is not None:
+            return self._delegate.run(max_frames=max_frames)
         self.frontend.initialize({"config": self.config})
         output_dir = Path(self.config.get("Results", {}).get("save_dir", "outputs/pano_droid_gs_slam"))
         output_dir.mkdir(parents=True, exist_ok=True)

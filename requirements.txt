@@ -3,5 +3,6 @@ matplotlib
 pillow
 pyyaml
 torch
+tqdm
 wandb
 pytest

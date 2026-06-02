@@ -81,11 +81,20 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.depth_by_frame: dict[int, torch.Tensor] = {}
         self.conf_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
+        self.backend_pose_overrides: dict[int, torch.Tensor] = {}
         self.last_keyframe_id: Optional[int] = None
         self.chunk_count = 0
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
+
+    def apply_backend_pose_updates(self, updates: dict[int, torch.Tensor]) -> None:
+        """Inject refined backend keyframe poses for future chunk alignment."""
+
+        for frame_id, pose in updates.items():
+            pose_cpu = pose.detach().cpu().float()
+            self.backend_pose_overrides[int(frame_id)] = pose_cpu
+            self.pose_by_frame[int(frame_id)] = pose_cpu.to(self.device)
 
     def track(self, frame: PanoFrame) -> FrontendOutput:
         image = ensure_chw_image(frame.image).to(self.device)
@@ -153,6 +162,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
         pred = self.engine.infer(images)
         transform = self._align_chunk(pred, frame_ids)
+        backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)
         chunk_descriptor = self._chunk_descriptor(pred, images)
         loop_target = self.loop_manager.add_chunk(chunk_descriptor)
         if loop_target is not None:
@@ -178,6 +188,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 conf_full = 0.5 * conf_full
             pose = transform.apply_pose(pred.poses_c2w[local_idx].to(self.device)).detach()
             points = transform.apply_points(pred.point_maps[local_idx].to(self.device)).detach()
+            if backend_correction is not None:
+                pose = (backend_correction @ pose).detach()
+                points = self._apply_pose_correction_to_points(points, backend_correction).detach()
 
             self.pose_by_frame[frame_id] = pose
             self.depth_by_frame[frame_id] = inv_full
@@ -212,6 +225,29 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 self.emitted_frame_ids.add(frame_id)
         self.chunk_count += 1
         self._trim_alignment_cache()
+
+    def _backend_feedback_correction(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        frame_ids: tuple[int, ...],
+        transform: SimilarityTransform,
+    ) -> torch.Tensor | None:
+        for local_idx, frame_id in enumerate(frame_ids):
+            refined = self.backend_pose_overrides.get(int(frame_id))
+            if refined is None:
+                continue
+            pose = transform.apply_pose(pred.poses_c2w[local_idx].to(self.device)).detach()
+            target = refined.to(device=self.device, dtype=pose.dtype)
+            if target.shape == (4, 4) and torch.isfinite(target).all():
+                return target @ torch.linalg.inv(pose)
+        return None
+
+    @staticmethod
+    def _apply_pose_correction_to_points(points: torch.Tensor, correction: torch.Tensor) -> torch.Tensor:
+        flat = points.reshape(-1, 3)
+        hom = torch.cat([flat, torch.ones(flat.shape[0], 1, device=flat.device, dtype=flat.dtype)], dim=-1)
+        corrected = (correction.to(device=flat.device, dtype=flat.dtype) @ hom.T).T[:, :3]
+        return corrected.reshape_as(points)
 
     def _align_chunk(self, pred: PanoVGGTLocalPrediction, frame_ids: tuple[int, ...]) -> SimilarityTransform:
         if not self.global_points_by_frame:

@@ -14,11 +14,13 @@ dependencies = [
   "pillow",
   "pyyaml",
   "torch",
+  "tqdm",
   "wandb",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+legacy360gs = ["opencv-python", "scipy", "plyfile", "pandas", "munch"]
 
 [tool.setuptools.packages.find]
 include = ["frontend*", "mapping*", "backend*", "system*"]
