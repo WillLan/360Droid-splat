@@ -270,6 +270,11 @@ class SlamRuntimeLogger:
             payload["slam/ba_residual"] = float(output.ba_residual)
         if backend_loss is not None:
             payload["backend/loss"] = float(backend_loss)
+        if output.valid_world_points_mask is not None:
+            valid_world = output.valid_world_points_mask.detach().cpu().bool()
+            payload["frontend/valid_world_points"] = int(valid_world.sum().item())
+        if output.world_points is not None:
+            payload["frontend/world_points_finite"] = int(torch.isfinite(output.world_points).all(dim=-1).sum().item())
 
         if self.run is not None:
             self.run.log(payload, step=self._step)
@@ -563,6 +568,8 @@ class PanoDroidGSSlamSystem:
             return
         self.frontend = build_frontend_from_config(config)
         mapping_cfg = config.get("Mapping", {})
+        frontend_mode = str(config.get("Frontend", {}).get("mode", "graph")).lower()
+        default_seed_source = "world_points_only" if frontend_mode == "panovggt_long" else "depth_pose"
         self.initializer = GaussianInitializer(
             max_seeds_per_keyframe=int(mapping_cfg.get("max_seeds_per_keyframe", 2048)),
             min_confidence=float(mapping_cfg.get("min_depth_confidence", 0.15)),
@@ -574,6 +581,7 @@ class PanoDroidGSSlamSystem:
             sky_mask_cloud_saturation=float(mapping_cfg.get("sky_mask_cloud_saturation", 0.22)),
             sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
             voxel_sizes=tuple(config.get("Hierarchical", {}).get("voxel_size_lis", [0.12, 0.45, 1.8])),
+            seed_source=str(mapping_cfg.get("seed_source", default_seed_source)),
         )
         self.map = PanoGaussianMap(config=config)
         render_cfg = config.get("Renderer", {})

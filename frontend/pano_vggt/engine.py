@@ -45,17 +45,16 @@ def _resize_prediction(pred: PanoVGGTLocalPrediction, image_size: tuple[int, int
         return pred
     depth = F.interpolate(pred.depth.float(), size=image_size, mode="bilinear", align_corners=False).clamp_min(1e-6)
     confidence = F.interpolate(pred.confidence.float(), size=image_size, mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-    points = F.interpolate(
-        pred.point_maps.permute(0, 3, 1, 2).float(),
-        size=image_size,
-        mode="bilinear",
-        align_corners=False,
-    ).permute(0, 2, 3, 1)
+    points = _resize_points(pred.chunk_world_points, image_size)
+    local_points = None if pred.local_points is None else _resize_points(pred.local_points, image_size)
+    global_points = None if pred.global_points is None else _resize_points(pred.global_points, image_size)
     return PanoVGGTLocalPrediction(
         poses_c2w=pred.poses_c2w,
         depth=depth,
         confidence=confidence,
-        point_maps=points,
+        chunk_world_points=points,
+        local_points=local_points,
+        global_points=global_points,
         descriptors=pred.descriptors,
     )
 
@@ -104,10 +103,13 @@ def _as_dict(output: Any) -> dict[str, Any]:
         "confidence",
         "depth_confidence",
         "world_points",
+        "global_points",
         "local_points",
         "point_maps",
         "points",
         "points3d",
+        "extrinsics",
+        "extrinsic",
         "descriptors",
         "tokens",
         "features",
@@ -152,6 +154,18 @@ def _normalize_poses(poses: torch.Tensor) -> torch.Tensor:
     return poses.float()
 
 
+def _select_poses(output: dict[str, Any], device: torch.device) -> torch.Tensor | None:
+    for name in ("camera_poses", "poses", "pose"):
+        value = _first_present(output, (name,))
+        if value is not None:
+            return _normalize_poses(torch.as_tensor(value, device=device))
+    value = _first_present(output, ("extrinsics", "extrinsic"))
+    if value is None:
+        return None
+    w2c = _normalize_poses(torch.as_tensor(value, device=device))
+    return torch.linalg.inv(w2c)
+
+
 def _normalize_confidence(confidence: torch.Tensor | None, depth: torch.Tensor) -> torch.Tensor:
     if confidence is None:
         return torch.isfinite(depth).to(depth.dtype)
@@ -168,58 +182,81 @@ def _normalize_confidence(confidence: torch.Tensor | None, depth: torch.Tensor) 
 
 
 def _build_point_maps(depth: torch.Tensor, poses_c2w: torch.Tensor) -> torch.Tensor:
+    pts_cam = _build_local_points(depth)
+    return _local_points_to_world(pts_cam, poses_c2w)
+
+
+def _build_local_points(depth: torch.Tensor) -> torch.Tensor:
     n, _, height, width = depth.shape
     grid = pixel_grid(height, width, device=depth.device, dtype=depth.dtype)
     bearing = erp_pixel_to_bearing(grid, height, width).to(device=depth.device, dtype=depth.dtype)
-    pts_cam = bearing.unsqueeze(0) * depth[:, 0].unsqueeze(-1)
+    return bearing.unsqueeze(0) * depth[:, 0].unsqueeze(-1)
+
+
+def _local_points_to_world(local_points: torch.Tensor, poses_c2w: torch.Tensor) -> torch.Tensor:
+    n = local_points.shape[0]
     rot = poses_c2w[:, :3, :3]
     trans = poses_c2w[:, :3, 3]
-    pts = torch.einsum("nij,nhwj->nhwi", rot, pts_cam) + trans.view(n, 1, 1, 3)
-    return pts
+    return torch.einsum("nij,nhwj->nhwi", rot, local_points) + trans.view(n, 1, 1, 3)
 
 
-def _normalize_point_maps(points: torch.Tensor | None, depth: torch.Tensor, poses_c2w: torch.Tensor) -> torch.Tensor:
+def _resize_points(points: torch.Tensor, image_size: tuple[int, int]) -> torch.Tensor:
+    if tuple(points.shape[1:3]) == tuple(image_size):
+        return points.float()
+    return F.interpolate(
+        points.permute(0, 3, 1, 2).float(),
+        size=image_size,
+        mode="bilinear",
+        align_corners=False,
+    ).permute(0, 2, 3, 1)
+
+
+def _normalize_points_shape(points: torch.Tensor | None, depth: torch.Tensor) -> torch.Tensor | None:
     if points is None:
-        return _build_point_maps(depth, poses_c2w)
+        return None
     points = _drop_batch_dim(points)
-    if points.ndim == 4 and points.shape[1] == 3:
+    if points.ndim == 4 and points.shape[-1] != 3 and points.shape[1] == 3:
         points = points.permute(0, 2, 3, 1)
     if points.ndim != 4 or points.shape[-1] != 3:
         raise ValueError(f"Expected point maps as NxHxWx3, got {tuple(points.shape)}")
     if points.shape[1:3] != depth.shape[-2:]:
-        points = F.interpolate(
-            points.permute(0, 3, 1, 2).float(),
-            size=depth.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        ).permute(0, 2, 3, 1)
+        points = _resize_points(points, tuple(depth.shape[-2:]))
     return points.float()
 
 
 def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLocalPrediction:
     out = _as_dict(output)
-    poses = _first_present(out, ("camera_poses", "poses", "pose", "extrinsics", "extrinsic"))
     depth = _first_present(out, ("depth", "depths", "depth_map", "depth_maps", "pred_depth"))
-    if poses is None or depth is None:
+    poses_t = _select_poses(out, images.device)
+    if poses_t is None or depth is None:
         raise ValueError("PanoVGGT output must include camera poses and depth.")
-    poses_t = _normalize_poses(torch.as_tensor(poses, device=images.device))
     depth_t = _normalize_depth(torch.as_tensor(depth, device=images.device))
     confidence_t = _normalize_confidence(
         _first_present(out, ("depth_confidence", "confidence", "conf", "scores")),
         depth_t,
     )
-    points_t = _normalize_point_maps(
-        _first_present(out, ("world_points", "local_points", "point_maps", "points", "points3d")),
+    local_points_t = _normalize_points_shape(
+        _first_present(out, ("local_points", "cam_points", "camera_points")),
         depth_t,
-        poses_t,
     )
+    chunk_world_t = _normalize_points_shape(
+        _first_present(out, ("world_points", "points", "point_maps", "points3d")),
+        depth_t,
+    )
+    global_points_t = _normalize_points_shape(_first_present(out, ("global_points",)), depth_t)
+    if chunk_world_t is None:
+        if local_points_t is None:
+            local_points_t = _build_local_points(depth_t)
+        chunk_world_t = _local_points_to_world(local_points_t, poses_t)
     descriptors = _first_present(out, ("descriptors", "descriptor", "tokens", "features"))
     descriptors_t = None if descriptors is None else _drop_batch_dim(torch.as_tensor(descriptors, device=images.device)).float()
     return PanoVGGTLocalPrediction(
         poses_c2w=poses_t,
         depth=depth_t,
         confidence=confidence_t,
-        point_maps=points_t,
+        chunk_world_points=chunk_world_t,
+        local_points=local_points_t,
+        global_points=global_points_t,
         descriptors=descriptors_t,
     )
 
@@ -256,7 +293,8 @@ class FakePanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         depth = depth.clamp_min(0.2).view(1, 1, height, width).repeat(n, 1, 1, 1)
         image_luma = images.mean(dim=1, keepdim=True)
         confidence = (0.65 + 0.35 * image_luma).clamp(0.0, 1.0)
-        points = _build_point_maps(depth, poses)
+        local_points = _build_local_points(depth)
+        points = _local_points_to_world(local_points, poses)
         descriptors = torch.cat(
             [images.mean(dim=(2, 3)), images.std(dim=(2, 3), unbiased=False)],
             dim=1,
@@ -265,7 +303,8 @@ class FakePanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
             poses_c2w=poses,
             depth=depth,
             confidence=confidence,
-            point_maps=points,
+            chunk_world_points=points,
+            local_points=local_points,
             descriptors=descriptors,
         )
 

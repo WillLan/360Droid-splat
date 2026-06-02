@@ -104,8 +104,9 @@ def test_legacy_online_system_fake_smoke(tmp_path: Path):
             "overlap": 1,
             "emit_delay": 0,
             "align_mode": "sim3",
+            "min_overlap_points": 16,
         },
-        "Mapping": {"min_depth_confidence": 0.0, "sky_mask_enable": False},
+        "Mapping": {"seed_source": "world_points_only", "min_depth_confidence": 0.0, "sky_mask_enable": False},
         "WeightsAndBiases": {"mode": "disabled"},
         "Visualization": {"save_local": True, "log_every": 1},
         "Results": {"save_dir": str(tmp_path)},
@@ -117,4 +118,3 @@ def test_legacy_online_system_fake_smoke(tmp_path: Path):
     assert summary["anchors"] > 0
     assert summary["backend_last_tag"] in {"init", "keyframe"}
     assert any((tmp_path / "visualizations").glob("*_backend_trajectory_vs_gt.png"))
-

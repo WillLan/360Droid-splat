@@ -159,7 +159,11 @@ def _run_fake_backend_process(
             viewpoint = data[2]
             depth_map = data[3] if tag == "init" else data[4]
             keyframes[frame_id] = (viewpoint.R.detach().cpu(), viewpoint.T.detach().cpu())
-            valid = torch.as_tensor(depth_map).detach().cpu() > 0.01
+            world_valid = getattr(viewpoint, "global_world_points_valid_mask", None)
+            if world_valid is not None:
+                valid = torch.as_tensor(world_valid).detach().cpu().bool()
+            else:
+                valid = torch.as_tensor(depth_map).detach().cpu() > 0.01
             anchor_count += int(valid.sum().item())
             payload = [
                 tag,

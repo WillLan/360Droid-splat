@@ -1529,16 +1529,17 @@ class BackEnd(mp.Process):
         if frame_idx not in self.submaps[submap_id]["kf_ids"]:
             self.submaps[submap_id]["kf_ids"].append(frame_idx)
 
+        use_global_world_points = bool(getattr(viewpoint, "global_world_points_required", False))
         fastgs_insert_mask = None
         fastgs_insert_stats = None
-        if self.use_anchor_scaffold and depth_map is not None:
+        if self.use_anchor_scaffold and depth_map is not None and not use_global_world_points:
             fastgs_insert_mask, fastgs_insert_stats = self._build_anchor_fastgs_insert_mask(
                 viewpoint,
                 init=init,
             )
         dia_insert_mask = None
         dia_insert_stats = None
-        if self.use_anchor_scaffold and depth_map is not None:
+        if self.use_anchor_scaffold and depth_map is not None and not use_global_world_points:
             dia_insert_mask, dia_insert_stats = self._build_anchor_dia_insert_mask(
                 viewpoint,
                 depth_map,
@@ -1551,6 +1552,15 @@ class BackEnd(mp.Process):
             anchor_insert_mask = dia_insert_mask
         else:
             anchor_insert_mask = fastgs_insert_mask
+        if self.use_anchor_scaffold and use_global_world_points:
+            world_mask = getattr(viewpoint, "global_world_points_valid_mask", None)
+            if world_mask is not None:
+                if isinstance(world_mask, torch.Tensor):
+                    anchor_insert_mask = world_mask.detach().cpu().numpy().astype(bool)
+                else:
+                    anchor_insert_mask = np.asarray(world_mask, dtype=bool)
+                if anchor_insert_mask.ndim == 3:
+                    anchor_insert_mask = anchor_insert_mask[0]
         if (
             self.use_anchor_scaffold
             and anchor_insert_mask is None

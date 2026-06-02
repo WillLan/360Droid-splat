@@ -14,6 +14,13 @@ class PanoVGGTLocalPrediction:
     poses_c2w: torch.Tensor
     depth: torch.Tensor
     confidence: torch.Tensor
-    point_maps: torch.Tensor
+    chunk_world_points: torch.Tensor
+    local_points: torch.Tensor | None = None
+    global_points: torch.Tensor | None = None
     descriptors: torch.Tensor | None = None
 
+    @property
+    def point_maps(self) -> torch.Tensor:
+        """Backward-compatible alias for chunk-world point maps."""
+
+        return self.chunk_world_points

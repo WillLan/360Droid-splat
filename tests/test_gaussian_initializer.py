@@ -99,3 +99,57 @@ def test_gaussian_initializer_sky_mask_skips_blue_upper_pixels():
 
     assert len(seeds) == (H - 3) * W
     assert torch.allclose(seeds.rgb, torch.full_like(seeds.rgb, 0.25))
+
+
+def test_gaussian_initializer_world_points_only_uses_input_xyz_exactly():
+    H, W = 3, 4
+    points = torch.arange(H * W * 3, dtype=torch.float32).view(H, W, 3)
+    conf = torch.ones(1, H, W)
+    valid = torch.ones(1, H, W, dtype=torch.bool)
+    valid[0, 0, 0] = False
+    output = FrontendOutput(
+        frame_id=5,
+        timestamp=5.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+        world_points=points,
+        world_points_confidence=conf,
+        valid_world_points_mask=valid,
+    )
+    image = torch.rand(3, H, W)
+    initializer = GaussianInitializer(max_seeds_per_keyframe=0, seed_source="world_points_only")
+    seeds = initializer.from_frontend_output(output, image)
+    expected = points.reshape(-1, 3)[valid.view(-1)]
+    assert torch.allclose(seeds.xyz, expected)
+
+
+def test_gaussian_initializer_world_points_only_requires_world_points():
+    output = FrontendOutput(
+        frame_id=6,
+        timestamp=6.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=torch.ones(1, 2, 4),
+        depth_confidence=torch.ones(1, 2, 4),
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+    )
+    initializer = GaussianInitializer(seed_source="world_points_only")
+    try:
+        initializer.from_frontend_output(output, torch.rand(3, 2, 4))
+    except ValueError as exc:
+        assert "world_points" in str(exc)
+    else:
+        raise AssertionError("world_points_only should reject missing world_points")

@@ -56,7 +56,11 @@ class GaussianInitializer:
         sky_mask_cloud_brightness: float = 0.72,
         sky_mask_cloud_saturation: float = 0.22,
         sky_mask_texture_threshold: float = 0.08,
+        seed_source: str = "depth_pose",
     ) -> None:
+        seed_source = str(seed_source).lower()
+        if seed_source not in {"depth_pose", "world_points_only"}:
+            raise ValueError(f"Unsupported Gaussian seed_source: {seed_source}")
         self.max_seeds_per_keyframe = int(max_seeds_per_keyframe)
         self.min_confidence = float(min_confidence)
         self.depth_min = float(depth_min)
@@ -69,12 +73,15 @@ class GaussianInitializer:
         self.sky_mask_cloud_brightness = float(sky_mask_cloud_brightness)
         self.sky_mask_cloud_saturation = float(sky_mask_cloud_saturation)
         self.sky_mask_texture_threshold = float(sky_mask_texture_threshold)
+        self.seed_source = seed_source
 
     def from_frontend_output(
         self,
         output: FrontendOutput,
         image: torch.Tensor,
     ) -> GaussianSeedBatch:
+        if self.seed_source == "world_points_only":
+            return self.from_world_points_only(output, image)
         if output.inverse_depth is None:
             return self._empty(output.frame_id, image)
         inv = output.inverse_depth.detach().float()
@@ -132,6 +139,96 @@ class GaussianInitializer:
         return GaussianSeedBatch(
             xyz=xyz,
             rgb=rgb.to(xyz),
+            confidence=conf_sel.to(xyz),
+            scale=scale,
+            level=levels.to(device=xyz.device),
+            frame_id=int(output.frame_id),
+        )
+
+    def from_world_points_only(
+        self,
+        output: FrontendOutput,
+        image: torch.Tensor,
+    ) -> GaussianSeedBatch:
+        """Create seeds from already-global point maps without depth backprojection."""
+
+        if output.world_points is None:
+            raise ValueError(
+                "Mapping.seed_source=world_points_only requires FrontendOutput.world_points."
+            )
+        points = output.world_points.detach().float()
+        if points.ndim == 4 and points.shape[0] == 1:
+            points = points[0]
+        if points.ndim == 3 and points.shape[-1] != 3 and points.shape[0] == 3:
+            points = points.permute(1, 2, 0)
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError(f"Expected world_points as HxWx3, got {tuple(points.shape)}")
+
+        img = image.detach().float()
+        if img.ndim == 4:
+            img = img[0]
+        if img.shape[0] != 3:
+            raise ValueError(f"Expected CHW RGB image, got {tuple(img.shape)}")
+        _, H, W = img.shape
+        if tuple(points.shape[:2]) != (H, W):
+            raise ValueError(f"World-points shape {tuple(points.shape[:2])} does not match image {(H, W)}")
+
+        conf = output.world_points_confidence
+        if conf is None:
+            conf = output.depth_confidence
+        if conf is None:
+            conf_t = torch.ones((1, H, W), dtype=points.dtype, device=points.device)
+        else:
+            conf_t = conf.detach().float()
+            if conf_t.ndim == 2:
+                conf_t = conf_t.unsqueeze(0)
+            if conf_t.ndim == 3 and conf_t.shape[0] != 1:
+                raise ValueError(f"Expected confidence as 1xHxW, got {tuple(conf_t.shape)}")
+            if tuple(conf_t.shape[-2:]) != (H, W):
+                raise ValueError(f"World-points confidence shape {tuple(conf_t.shape[-2:])} does not match image {(H, W)}")
+
+        valid_mask = output.valid_world_points_mask
+        if valid_mask is None:
+            valid_t = torch.ones((1, H, W), dtype=torch.bool, device=points.device)
+        else:
+            valid_t = valid_mask.detach().bool()
+            if valid_t.ndim == 2:
+                valid_t = valid_t.unsqueeze(0)
+            if valid_t.ndim == 3 and valid_t.shape[0] != 1:
+                raise ValueError(f"Expected valid_world_points_mask as 1xHxW, got {tuple(valid_t.shape)}")
+            if tuple(valid_t.shape[-2:]) != (H, W):
+                raise ValueError(f"World-points mask shape {tuple(valid_t.shape[-2:])} does not match image {(H, W)}")
+
+        conf_t = conf_t.to(device=points.device, dtype=points.dtype)
+        valid_t = valid_t.to(device=points.device)
+        mask = (
+            torch.isfinite(points).all(dim=-1, keepdim=False).unsqueeze(0)
+            & valid_t
+            & torch.isfinite(conf_t)
+            & (conf_t >= self.min_confidence)
+        )
+        if self.sky_mask_enable:
+            sky = self._sky_mask_from_image(img).to(device=mask.device)
+            mask = mask & ~sky
+        flat_idx = torch.nonzero(mask.view(-1), as_tuple=False).flatten()
+        if flat_idx.numel() == 0:
+            return self._empty(output.frame_id, image)
+        if self.max_seeds_per_keyframe > 0 and flat_idx.numel() > self.max_seeds_per_keyframe:
+            scores = conf_t.reshape(-1)[flat_idx]
+            _, order = torch.topk(scores, k=self.max_seeds_per_keyframe, largest=True)
+            flat_idx = flat_idx[order]
+
+        xyz = points.reshape(-1, 3)[flat_idx]
+        rgb = img.to(device=xyz.device, dtype=xyz.dtype).permute(1, 2, 0).reshape(-1, 3)[flat_idx].clamp(0.0, 1.0)
+        conf_sel = conf_t.reshape(-1)[flat_idx].clamp(0.0, 1.0)
+        c2w = output.pose_c2w.detach().to(device=xyz.device, dtype=xyz.dtype)
+        camera_center = c2w[:3, 3] if c2w.shape == (4, 4) else torch.zeros(3, device=xyz.device, dtype=xyz.dtype)
+        distance = torch.linalg.norm(xyz - camera_center.view(1, 3), dim=-1).clamp_min(self.depth_min)
+        levels = self._levels_from_depth(distance)
+        scale = torch.tensor(self.voxel_sizes, device=xyz.device, dtype=xyz.dtype)[levels.long()]
+        return GaussianSeedBatch(
+            xyz=xyz,
+            rgb=rgb,
             confidence=conf_sel.to(xyz),
             scale=scale,
             level=levels.to(device=xyz.device),

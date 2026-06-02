@@ -21,6 +21,9 @@ class LegacyViewpointBundle:
     valid_mask: torch.Tensor
     sky_mask: torch.Tensor
     pose_w2c: torch.Tensor
+    world_points: torch.Tensor | None = None
+    world_points_confidence: torch.Tensor | None = None
+    valid_world_points_mask: torch.Tensor | None = None
 
 
 class LightweightPanoramaViewpoint:
@@ -56,6 +59,10 @@ class LightweightPanoramaViewpoint:
         self.grad_mask = None
         self.erp_region_masks = None
         self.erp_sky_mask = None
+        self.global_world_points = None
+        self.global_world_points_confidence = None
+        self.global_world_points_valid_mask = None
+        self.global_world_points_required = False
         self.mdl_insert_mask = None
         self.mdl_overlap = None
         self.submap_id = -1
@@ -91,6 +98,14 @@ class LegacyViewpointAdapter:
             sky_mask_cloud_saturation=float(mapping_cfg.get("sky_mask_cloud_saturation", 0.22)),
             sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
         )
+        frontend_mode = str(config.get("Frontend", {}).get("mode", "")).lower()
+        seed_source = str(
+            mapping_cfg.get(
+                "seed_source",
+                "world_points_only" if frontend_mode == "panovggt_long" else "depth_pose",
+            )
+        ).lower()
+        self.require_world_points = bool(seed_source == "world_points_only" or frontend_mode == "panovggt_long")
 
     def build(self, frame: PanoFrame, output: FrontendOutput) -> LegacyViewpointBundle:
         if output.inverse_depth is None:
@@ -117,7 +132,7 @@ class LegacyViewpointAdapter:
                 raise ValueError(f"Depth confidence shape {tuple(conf.shape)} does not match image {(H, W)}")
 
         depth = inv.clamp_min(1e-6).reciprocal()
-        valid = (
+        depth_valid = (
             torch.isfinite(depth)
             & (depth >= self.depth_min)
             & (depth <= self.depth_max)
@@ -129,14 +144,35 @@ class LegacyViewpointAdapter:
             if mask.ndim == 3:
                 mask = mask[0]
             if tuple(mask.shape) == (H, W):
-                valid = valid & mask
+                depth_valid = depth_valid & mask
 
         sky = torch.zeros((H, W), dtype=torch.bool)
         if self.sky_helper.sky_mask_enable:
             sky = self.sky_helper._sky_mask_from_image(image)[0].detach().cpu().bool()
-            valid = valid & ~sky
+            depth_valid = depth_valid & ~sky
 
-        depth_map = torch.where(valid, depth, torch.zeros_like(depth)).float()
+        world_points, world_conf, world_valid = self._world_points_payload(output, H, W)
+        if world_points is None:
+            if self.require_world_points:
+                raise ValueError("PanoVGGT legacy backend requires global FrontendOutput.world_points.")
+            valid = depth_valid
+        else:
+            world_valid = (
+                world_valid
+                & torch.isfinite(world_points).all(dim=-1)
+                & torch.isfinite(world_conf)
+                & (world_conf >= self.min_confidence)
+                & ~sky
+            )
+            if frame.mask is not None:
+                mask = frame.mask.detach().cpu().bool()
+                if mask.ndim == 3:
+                    mask = mask[0]
+                if tuple(mask.shape) == (H, W):
+                    world_valid = world_valid & mask
+            valid = world_valid
+
+        depth_map = torch.where(depth_valid, depth, torch.zeros_like(depth)).float()
         pose_c2w = output.pose_c2w.detach().cpu().float()
         if tuple(pose_c2w.shape) != (4, 4):
             raise ValueError(f"Expected pose_c2w as 4x4, got {tuple(pose_c2w.shape)}")
@@ -156,6 +192,10 @@ class LegacyViewpointAdapter:
         viewpoint.erp_sky_mask = sky.numpy().astype(bool)
         viewpoint.erp_region_masks = {"valid": valid.numpy().astype(bool)}
         viewpoint.depth_confidence = conf
+        viewpoint.global_world_points = None if world_points is None else world_points.float()
+        viewpoint.global_world_points_confidence = None if world_conf is None else world_conf.float()
+        viewpoint.global_world_points_valid_mask = None if world_valid is None else world_valid.bool()
+        viewpoint.global_world_points_required = bool(self.require_world_points)
         viewpoint.frame_path = frame.meta.get("path") if isinstance(frame.meta, dict) else None
         viewpoint.timestamp = float(frame.timestamp)
         viewpoint.motion_norm_m = float(output.ba_residual or 0.0)
@@ -167,7 +207,52 @@ class LegacyViewpointAdapter:
             valid_mask=valid,
             sky_mask=sky,
             pose_w2c=pose_w2c,
+            world_points=world_points,
+            world_points_confidence=world_conf,
+            valid_world_points_mask=world_valid,
         )
+
+    def _world_points_payload(
+        self,
+        output: FrontendOutput,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        points = output.world_points
+        if points is None:
+            return None, None, None
+        pts = points.detach().cpu().float()
+        if pts.ndim == 4 and pts.shape[0] == 1:
+            pts = pts[0]
+        if pts.ndim == 3 and pts.shape[-1] != 3 and pts.shape[0] == 3:
+            pts = pts.permute(1, 2, 0)
+        if pts.ndim != 3 or pts.shape[-1] != 3:
+            raise ValueError(f"Expected world_points as HxWx3, got {tuple(pts.shape)}")
+        if tuple(pts.shape[:2]) != (height, width):
+            raise ValueError(f"World-points shape {tuple(pts.shape[:2])} does not match image {(height, width)}")
+
+        conf = output.world_points_confidence
+        if conf is None:
+            conf = output.depth_confidence
+        if conf is None:
+            conf_t = torch.ones((height, width), dtype=torch.float32)
+        else:
+            conf_t = conf.detach().cpu().float()
+            if conf_t.ndim == 3:
+                conf_t = conf_t[0]
+            if tuple(conf_t.shape) != (height, width):
+                raise ValueError(f"World-points confidence shape {tuple(conf_t.shape)} does not match image {(height, width)}")
+
+        mask = output.valid_world_points_mask
+        if mask is None:
+            mask_t = torch.ones((height, width), dtype=torch.bool)
+        else:
+            mask_t = mask.detach().cpu().bool()
+            if mask_t.ndim == 3:
+                mask_t = mask_t[0]
+            if tuple(mask_t.shape) != (height, width):
+                raise ValueError(f"World-points mask shape {tuple(mask_t.shape)} does not match image {(height, width)}")
+        return pts, conf_t, mask_t
 
     def _make_viewpoint(
         self,
@@ -225,4 +310,3 @@ class LegacyViewpointAdapter:
             face_zfar=self.face_zfar,
             device="cpu",
         )
-

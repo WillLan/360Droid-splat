@@ -2,12 +2,13 @@ from pathlib import Path
 import json
 
 from PIL import Image
+import pytest
 import torch
 
 from frontend.pano_droid.dataset import discover_erp_images
 from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
-from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTLongTracker, SubmapAligner
+from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTAlignmentError, PanoVGGTLongTracker, SubmapAligner
 from frontend.pano_vggt.alignment import sample_overlap_points
 from frontend.pano_vggt.engine import _ceil_size_to_multiple, _resize_prediction, normalize_panovggt_output
 from scripts.run_pano_vggt_panocity_blocks import build_block_config, discover_panocity_blocks
@@ -42,6 +43,24 @@ def test_normalize_panovggt_output_accepts_official_shapes():
     assert pred.poses_c2w.shape == (2, 4, 4)
     assert pred.depth.shape == (2, 1, 8, 16)
     assert pred.point_maps.shape == (2, 8, 16, 3)
+
+
+def test_normalize_panovggt_output_inverts_extrinsics_and_transforms_local_points():
+    images = torch.rand(1, 3, 4, 8)
+    w2c = torch.eye(4).view(1, 1, 4, 4)
+    w2c[0, 0, 0, 3] = -2.0
+    local = torch.zeros(1, 1, 4, 8, 3)
+    local[..., 2] = 1.0
+    pred = normalize_panovggt_output(
+        {
+            "extrinsics": w2c,
+            "depth": torch.ones(1, 1, 4, 8),
+            "local_points": local,
+        },
+        images,
+    )
+    assert torch.allclose(pred.poses_c2w[0, :3, 3], torch.tensor([2.0, 0.0, 0.0]))
+    assert torch.allclose(pred.chunk_world_points[0, 0, 0], torch.tensor([2.0, 0.0, 1.0]))
 
 
 def test_panovggt_external_patch_multiple_resize_helpers():
@@ -114,6 +133,7 @@ def test_panovggt_tracker_emits_stable_monotonic_outputs():
         emit_delay=1,
         keyframe_threshold=0.0,
         force_keyframe_interval=1,
+        min_overlap_points=16,
     )
     outputs = []
     for idx in range(5):
@@ -124,7 +144,25 @@ def test_panovggt_tracker_emits_stable_monotonic_outputs():
     assert ids == sorted(ids)
     assert ids == list(range(5))
     assert all(out.inverse_depth is not None for out in outputs)
+    assert all(out.world_points is not None for out in outputs)
+    assert all(out.valid_world_points_mask is not None for out in outputs)
     assert all(out.tracking_status.startswith("tracked_panovggt_long") for out in outputs)
+
+
+def test_panovggt_tracker_raises_on_alignment_failure():
+    tracker = PanoVGGTLongTracker(
+        engine=FakePanoVGGTInferenceEngine(image_size=(8, 16)),
+        chunk_size=1,
+        overlap=0,
+        emit_delay=0,
+        keyframe_threshold=0.0,
+        force_keyframe_interval=1,
+        min_overlap_points=16,
+    )
+    tracker.track(PanoFrame(image=torch.rand(3, 8, 16), timestamp=0.0, frame_id=0))
+    tracker.pop_ready_outputs()
+    with pytest.raises(PanoVGGTAlignmentError):
+        tracker.track(PanoFrame(image=torch.rand(3, 8, 16), timestamp=1.0, frame_id=1))
 
 
 def test_panocity_pano_images_are_discoverable(tmp_path: Path):
@@ -195,6 +233,7 @@ def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
             "overlap": 1,
             "emit_delay": 1,
             "align_mode": "sim3",
+            "min_overlap_points": 16,
         },
         "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
@@ -237,6 +276,7 @@ def test_system_runs_joint_gaussian_pose_backend_smoke(tmp_path: Path):
             "overlap": 1,
             "emit_delay": 1,
             "align_mode": "sim3",
+            "min_overlap_points": 16,
         },
         "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

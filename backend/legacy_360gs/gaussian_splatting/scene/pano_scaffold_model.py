@@ -837,6 +837,90 @@ class PanoScaffoldModel(GaussianModel):
             insert_enabled=np.concatenate(insert_chunks, axis=0).astype(bool),
         )
 
+    def build_voxel_candidates_from_global_world_points(
+        self,
+        cam,
+        depthmap: Optional[np.ndarray] = None,
+        pixel_mask: Optional[np.ndarray] = None,
+        init: bool = False,
+        anchor_submap: int = -1,
+        birth_frame: Optional[int] = None,
+    ) -> VoxelCandidateBatch:
+        del init, anchor_submap, birth_frame
+        expected_shape = None if depthmap is None else depthmap.shape
+        payload = self._world_points_payload_from_viewpoint(cam, expected_shape=expected_shape)
+        if payload is None:
+            raise ValueError("global_world_points are required for world-points anchor insertion.")
+        flat_valid = payload["valid"].reshape(-1)
+        if not np.any(flat_valid):
+            raise ValueError(f"Keyframe {cam.uid} has no valid global world points.")
+
+        pixel_insert_valid = None
+        if pixel_mask is not None:
+            pixel_mask_np = np.asarray(pixel_mask, dtype=bool)
+            if tuple(pixel_mask_np.shape) == tuple(payload["valid"].shape):
+                pixel_insert_valid = pixel_mask_np.reshape(-1)
+
+        pts_world = payload["points"].reshape(-1, 3)[flat_valid]
+        rgb_valid = payload["rgb"].reshape(-1, 3)[flat_valid]
+        confidence_valid = payload["confidence"].reshape(-1)[flat_valid]
+        region_valid = payload["region_tag"].reshape(-1)[flat_valid]
+        depth_valid_values = payload["distance"].reshape(-1)[flat_valid]
+        level_valid = self._depth_to_level(depth_valid_values)
+        if pixel_insert_valid is None:
+            insert_valid = np.ones((pts_world.shape[0],), dtype=bool)
+        else:
+            insert_valid = pixel_insert_valid[flat_valid].astype(bool, copy=False)
+
+        xyz_chunks = []
+        rgb_chunks = []
+        conf_chunks = []
+        region_chunks = []
+        level_chunks = []
+        voxel_chunks = []
+        grid_chunks = []
+        insert_chunks = []
+        for level_id, voxel_size in enumerate(self.voxel_size_lis):
+            mask = level_valid == level_id
+            if not np.any(mask):
+                continue
+            pts_l = pts_world[mask]
+            rgb_l = rgb_valid[mask]
+            conf_l = confidence_valid[mask]
+            region_l = region_valid[mask]
+            insert_l = insert_valid[mask]
+            grid_l = np.floor(pts_l / max(voxel_size, 1e-6)).astype(np.int32)
+            _, keep_idx, inverse = np.unique(
+                grid_l, axis=0, return_index=True, return_inverse=True
+            )
+            order = np.argsort(keep_idx)
+            keep_idx = keep_idx[order]
+            insert_unique = np.zeros((inverse.max() + 1,), dtype=np.uint8)
+            np.maximum.at(insert_unique, inverse, insert_l.astype(np.uint8))
+            insert_unique = insert_unique.astype(bool)[order]
+            xyz_chunks.append(pts_l[keep_idx].astype(np.float32))
+            rgb_chunks.append(rgb_l[keep_idx].astype(np.float32))
+            conf_chunks.append(conf_l[keep_idx].astype(np.float32))
+            region_chunks.append(region_l[keep_idx].astype(np.int8))
+            level_chunks.append(np.full((keep_idx.shape[0],), level_id, dtype=np.int8))
+            voxel_chunks.append(np.full((keep_idx.shape[0],), voxel_size, dtype=np.float32))
+            grid_chunks.append(grid_l[keep_idx].astype(np.int32))
+            insert_chunks.append(insert_unique)
+
+        if not xyz_chunks:
+            return self._empty_voxel_candidates()
+
+        return VoxelCandidateBatch(
+            xyz=np.concatenate(xyz_chunks, axis=0).astype(np.float32),
+            rgb=np.concatenate(rgb_chunks, axis=0).astype(np.float32),
+            confidence=np.concatenate(conf_chunks, axis=0).astype(np.float32),
+            region_tag=np.concatenate(region_chunks, axis=0).astype(np.int8),
+            level=np.concatenate(level_chunks, axis=0).astype(np.int8),
+            voxel_size=np.concatenate(voxel_chunks, axis=0).astype(np.float32),
+            grid_coord=np.concatenate(grid_chunks, axis=0).astype(np.int32),
+            insert_enabled=np.concatenate(insert_chunks, axis=0).astype(bool),
+        )
+
     def _prepare_anchor_tensors(
         self,
         xyz: np.ndarray,
@@ -1134,6 +1218,14 @@ class PanoScaffoldModel(GaussianModel):
         anchor_submap: int = -1,
         birth_frame: Optional[int] = None,
     ):
+        if self._world_points_payload_from_viewpoint(cam, expected_shape=depthmap.shape) is not None:
+            return self._create_pcd_from_global_world_points(
+                cam,
+                depthmap=depthmap,
+                init=init,
+                anchor_submap=anchor_submap,
+                birth_frame=birth_frame,
+            )
         H, W = depthmap.shape
         dx, dy, dz = erp_dense_pixel_center_bearings(H, W)
         training_cfg = self.config.get("Training", {}) if self.config else {}
@@ -1236,6 +1328,55 @@ class PanoScaffoldModel(GaussianModel):
         self._last_growth_stats = {"n_new_anchors_added": int(n_total), "n_anchors_pruned": 0}
         return fused_point_cloud, features, scales, rots, opacities
 
+    def _create_pcd_from_global_world_points(
+        self,
+        cam,
+        depthmap=None,
+        init: bool = False,
+        anchor_submap: int = -1,
+        birth_frame: Optional[int] = None,
+    ):
+        candidates = self.build_voxel_candidates_from_global_world_points(
+            cam,
+            depthmap=depthmap,
+            pixel_mask=None,
+            init=init,
+            anchor_submap=anchor_submap,
+            birth_frame=birth_frame,
+        )
+        if len(candidates) <= 0:
+            raise ValueError(f"Keyframe {cam.uid} has no valid global world point candidates.")
+
+        is_sky_anchor = np.zeros((len(candidates),), dtype=bool)
+        tensors = self._prepare_anchor_tensors(
+            xyz=candidates.xyz,
+            rgb=candidates.rgb,
+            voxel_size=candidates.voxel_size,
+            is_sky_anchor=is_sky_anchor,
+        )
+        if tensors is None:
+            raise ValueError(f"Keyframe {cam.uid} produced empty global world point tensors.")
+
+        if birth_frame is None:
+            birth_frame = int(cam.uid)
+        n_total = len(candidates)
+        self._n_sky_pending = 0
+        self._layer_pending = torch.from_numpy(candidates.level.copy())
+        self._confidence_pending = torch.from_numpy(candidates.confidence.copy())
+        self._region_tag_pending = torch.from_numpy(candidates.region_tag.copy())
+        self._anchor_kf_pending = torch.full((n_total,), int(cam.uid), dtype=torch.int32)
+        self._anchor_submap_pending = torch.full((n_total,), int(anchor_submap), dtype=torch.int32)
+        self._birth_frame_pending = torch.full((n_total,), int(birth_frame), dtype=torch.int32)
+        self._anchor_level_pending = torch.from_numpy(candidates.level.copy())
+        self._anchor_voxel_pending = torch.from_numpy(candidates.voxel_size.copy())
+        self._is_sky_anchor_pending = torch.from_numpy(is_sky_anchor.copy())
+        self._anchor_grid_coord_pending = torch.from_numpy(candidates.grid_coord.copy())
+        self._anchor_obs_count_pending = torch.ones((n_total,), dtype=torch.int32)
+        self._anchor_last_seen_kf_pending = torch.full((n_total,), int(cam.uid), dtype=torch.int32)
+        self._anchor_conf_accum_pending = torch.from_numpy(candidates.confidence.copy())
+        self._last_growth_stats = {"n_new_anchors_added": int(n_total), "n_anchors_pruned": 0}
+        return tensors
+
     def extend_from_pcd_seq(
         self,
         cam_info,
@@ -1248,6 +1389,27 @@ class PanoScaffoldModel(GaussianModel):
         birth_frame=None,
         anchor_hash_index=None,
     ):
+        if self._world_points_payload_from_viewpoint(
+            cam_info,
+            expected_shape=None if depthmap is None else depthmap.shape,
+        ) is not None:
+            candidates = self.build_voxel_candidates_from_global_world_points(
+                cam_info,
+                depthmap=depthmap,
+                pixel_mask=pixel_mask,
+                init=init,
+                anchor_submap=anchor_submap,
+                birth_frame=birth_frame,
+            )
+            return self.extend_or_merge_from_voxel_candidates(
+                candidates,
+                anchor_hash_index,
+                cam=cam_info,
+                frame_idx=int(kf_id if kf_id is not None else cam_info.uid),
+                init=init,
+                anchor_submap=anchor_submap,
+                birth_frame=birth_frame,
+            )
         if depthmap is None:
             return super().extend_from_pcd_seq(
                 cam_info,

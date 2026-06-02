@@ -32,6 +32,9 @@ class FrontendOutput:
     is_keyframe: bool
     ba_residual: Optional[float]
     tracking_status: str
+    world_points: Optional[Tensor] = None
+    world_points_confidence: Optional[Tensor] = None
+    valid_world_points_mask: Optional[Tensor] = None
 
 
 class PanoDROIDFrontend:
@@ -65,4 +68,3 @@ def ensure_chw_image(image: Tensor) -> Tensor:
 
 def identity_pose(device=None, dtype=torch.float32) -> Tensor:
     return torch.eye(4, device=device, dtype=dtype)
-

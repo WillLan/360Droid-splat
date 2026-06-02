@@ -16,6 +16,10 @@ from .loop import FrontendPoseGraph, LoopManager, PoseGraphEdge
 from .types import PanoVGGTLocalPrediction
 
 
+class PanoVGGTAlignmentError(RuntimeError):
+    """Raised when a PanoVGGT chunk cannot be aligned into the global map."""
+
+
 @dataclass
 class _FrameRecord:
     frame: PanoFrame
@@ -30,6 +34,17 @@ def _resize_field(field: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     if tuple(field.shape[-2:]) == tuple(size):
         return field
     return F.interpolate(field.unsqueeze(0), size=size, mode="bilinear", align_corners=False)[0]
+
+
+def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    if tuple(points.shape[:2]) == tuple(size):
+        return points
+    return F.interpolate(
+        points.permute(2, 0, 1).unsqueeze(0).float(),
+        size=size,
+        mode="bilinear",
+        align_corners=False,
+    )[0].permute(1, 2, 0)
 
 
 class PanoVGGTLongTracker(PanoDROIDFrontend):
@@ -50,6 +65,12 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         loop_enable: bool = False,
         max_alignment_points: int = 4096,
         max_alignment_cache_frames: int = 128,
+        min_overlap_points: int = 4096,
+        max_align_rmse: float = 0.25,
+        min_inlier_ratio: float = 0.35,
+        max_scale_jump: float = 2.0,
+        require_aligned_world_points: bool = True,
+        emit_unaligned: bool = False,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.chunk_size = max(1, int(chunk_size))
@@ -59,8 +80,17 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.force_keyframe_interval = int(force_keyframe_interval)
         self.max_alignment_points = int(max_alignment_points)
         self.max_alignment_cache_frames = int(max_alignment_cache_frames)
+        self.min_overlap_points = int(min_overlap_points)
+        self.require_aligned_world_points = bool(require_aligned_world_points)
+        self.emit_unaligned = bool(emit_unaligned)
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
-        self.aligner = SubmapAligner(align_mode=align_mode)
+        self.aligner = SubmapAligner(
+            align_mode=align_mode,
+            max_residual=float(max_align_rmse),
+            min_inlier_ratio=float(min_inlier_ratio),
+            max_scale_change=float(max_scale_jump),
+            min_points=max(3, int(min_overlap_points)),
+        )
         self.pose_graph = FrontendPoseGraph()
         self.loop_manager = LoopManager(enabled=loop_enable)
         self.reset()
@@ -128,6 +158,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             is_keyframe=False,
             ba_residual=None,
             tracking_status="buffering_panovggt_long",
+            world_points=None,
+            world_points_confidence=None,
+            valid_world_points_mask=None,
         )
 
     def _run_ready_chunks(self, *, final: bool) -> None:
@@ -176,7 +209,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 )
             )
 
-        output_data: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, str]] = {}
+        output_data: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, str],
+        ] = {}
         for local_idx, record in enumerate(self.records[start:end]):
             frame_id = int(record.frame.frame_id)
             image_size = tuple(int(v) for v in record.image.shape[-2:])
@@ -187,10 +223,17 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             if not transform.accepted:
                 conf_full = 0.5 * conf_full
             pose = transform.apply_pose(pred.poses_c2w[local_idx].to(self.device)).detach()
-            points = transform.apply_points(pred.point_maps[local_idx].to(self.device)).detach()
+            points = transform.apply_points(pred.chunk_world_points[local_idx].to(self.device)).detach()
             if backend_correction is not None:
                 pose = (backend_correction @ pose).detach()
                 points = self._apply_pose_correction_to_points(points, backend_correction).detach()
+            points_full = _resize_points(points, image_size).detach()
+            valid_world = (
+                torch.isfinite(points_full).all(dim=-1, keepdim=False)
+                & torch.isfinite(inv_full[0])
+                & torch.isfinite(conf_full[0])
+                & (conf_full[0] > 0.0)
+            ).unsqueeze(0)
 
             self.pose_by_frame[frame_id] = pose
             self.depth_by_frame[frame_id] = inv_full
@@ -200,8 +243,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 pose,
                 inv_full,
                 conf_full,
+                points_full,
+                valid_world,
                 transform.residual,
-                "tracked_panovggt_long" if transform.accepted else "tracked_panovggt_long_unaligned",
+                "tracked_panovggt_long",
             )
 
         emit_end = end if final else max(start, end - self.emit_delay)
@@ -211,13 +256,15 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 continue
             data = output_data.get(frame_id)
             if data is not None:
-                pose, inverse_depth, confidence, residual, status = data
+                pose, inverse_depth, confidence, world_points, valid_world, residual, status = data
                 self.pending_outputs.append(
                     self._make_output(
                         record.frame,
                         pose=pose,
                         inverse_depth=inverse_depth,
                         confidence=confidence,
+                        world_points=world_points,
+                        valid_world_points_mask=valid_world,
                         residual=residual,
                         status=status,
                     )
@@ -251,7 +298,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
 
     def _align_chunk(self, pred: PanoVGGTLocalPrediction, frame_ids: tuple[int, ...]) -> SimilarityTransform:
         if not self.global_points_by_frame:
-            transform = SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
+            transform = self._root_transform(pred.poses_c2w[0])
             self.pose_graph.add_edge(
                 PoseGraphEdge(
                     source_chunk=self.chunk_count,
@@ -270,7 +317,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             target = self.global_points_by_frame.get(int(frame_id))
             if target is None:
                 continue
-            source = pred.point_maps[local_idx].to(target.device)
+            source = pred.chunk_world_points[local_idx].to(target.device)
             conf = pred.confidence[local_idx, 0].to(target.device)
             src, tgt, weights = sample_overlap_points(
                 source,
@@ -285,11 +332,31 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             target_parts.append(tgt)
             weight_parts.append(weights)
         if not source_parts:
-            return SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
+            return self._handle_alignment_failure(
+                "no overlapping frames with cached global world points",
+                device=pred.depth.device,
+                dtype=pred.depth.dtype,
+            )
         source_all = torch.cat(source_parts, dim=0)
         target_all = torch.cat(target_parts, dim=0)
         weight_all = torch.cat(weight_parts, dim=0)
+        if source_all.shape[0] < self.min_overlap_points:
+            return self._handle_alignment_failure(
+                f"only {source_all.shape[0]} overlap points, require {self.min_overlap_points}",
+                device=pred.depth.device,
+                dtype=pred.depth.dtype,
+            )
         transform = self.aligner.align(source_all, target_all, weight_all)
+        if not transform.accepted:
+            return self._handle_alignment_failure(
+                (
+                    f"alignment rejected: rmse={transform.residual:.4f}, "
+                    f"inlier_ratio={transform.inlier_ratio:.4f}, scale={transform.scale:.4f}"
+                ),
+                device=pred.depth.device,
+                dtype=pred.depth.dtype,
+                transform=transform,
+            )
         self.pose_graph.add_edge(
             PoseGraphEdge(
                 source_chunk=self.chunk_count,
@@ -301,6 +368,35 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         )
         return transform
 
+    def _root_transform(self, first_pose_c2w: torch.Tensor) -> SimilarityTransform:
+        pose = first_pose_c2w.detach().float()
+        rot = pose[:3, :3].T.contiguous()
+        trans = -(rot @ pose[:3, 3])
+        return SimilarityTransform(
+            scale=1.0,
+            rotation=rot.to(device=first_pose_c2w.device, dtype=first_pose_c2w.dtype),
+            translation=trans.to(device=first_pose_c2w.device, dtype=first_pose_c2w.dtype),
+            residual=0.0,
+            inlier_ratio=1.0,
+            accepted=True,
+        )
+
+    def _handle_alignment_failure(
+        self,
+        reason: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        transform: SimilarityTransform | None = None,
+    ) -> SimilarityTransform:
+        if self.require_aligned_world_points and not self.emit_unaligned:
+            raise PanoVGGTAlignmentError(f"PanoVGGT chunk {self.chunk_count} alignment failed: {reason}")
+        if transform is not None:
+            return transform
+        fallback = SimilarityTransform.identity(device=device, dtype=dtype)
+        fallback.accepted = False
+        return fallback
+
     def _make_output(
         self,
         frame: PanoFrame,
@@ -308,6 +404,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         pose: torch.Tensor,
         inverse_depth: torch.Tensor,
         confidence: torch.Tensor,
+        world_points: torch.Tensor,
+        valid_world_points_mask: torch.Tensor,
         residual: float,
         status: str,
     ) -> FrontendOutput:
@@ -336,6 +434,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             is_keyframe=bool(is_keyframe),
             ba_residual=float(residual),
             tracking_status=status,
+            world_points=world_points.detach().cpu(),
+            world_points_confidence=confidence.detach().cpu(),
+            valid_world_points_mask=valid_world_points_mask.detach().cpu(),
         )
 
     def _chunk_descriptor(self, pred: PanoVGGTLocalPrediction, images: torch.Tensor) -> torch.Tensor:
@@ -383,4 +484,10 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         loop_enable=bool(pano_cfg.get("loop_enable", False)),
         max_alignment_points=int(pano_cfg.get("max_alignment_points", 4096)),
         max_alignment_cache_frames=int(pano_cfg.get("max_alignment_cache_frames", 128)),
+        min_overlap_points=int(pano_cfg.get("min_overlap_points", 4096)),
+        max_align_rmse=float(pano_cfg.get("max_align_rmse", 0.25)),
+        min_inlier_ratio=float(pano_cfg.get("min_inlier_ratio", 0.35)),
+        max_scale_jump=float(pano_cfg.get("max_scale_jump", 2.0)),
+        require_aligned_world_points=bool(pano_cfg.get("require_aligned_world_points", True)),
+        emit_unaligned=bool(pano_cfg.get("emit_unaligned", False)),
     )

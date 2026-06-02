@@ -683,6 +683,14 @@ class GaussianModel:
         if depthmap is not None:
             from backend.legacy_360gs.utils.camera_utils import PanoramaCamera
             if isinstance(cam, PanoramaCamera):
+                if self._world_points_payload_from_viewpoint(cam, expected_shape=depthmap.shape) is not None:
+                    return self._create_pcd_from_global_world_points(
+                        cam,
+                        depthmap=depthmap,
+                        init=init,
+                        anchor_submap=anchor_submap,
+                        birth_frame=birth_frame,
+                    )
                 return self._create_pcd_from_erp_depth(
                     cam,
                     depthmap,
@@ -713,6 +721,163 @@ class GaussianModel:
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+
+    def _world_points_payload_from_viewpoint(self, cam, expected_shape=None) -> dict[str, np.ndarray] | None:
+        world_points = getattr(cam, "global_world_points", None)
+        if world_points is None:
+            return None
+        points = world_points.detach().cpu().float().numpy() if isinstance(world_points, torch.Tensor) else np.asarray(world_points, dtype=np.float32)
+        if points.ndim == 4 and points.shape[0] == 1:
+            points = points[0]
+        if points.ndim == 3 and points.shape[-1] != 3 and points.shape[0] == 3:
+            points = np.transpose(points, (1, 2, 0))
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError(f"Expected global_world_points as HxWx3, got {points.shape}")
+        H, W = int(points.shape[0]), int(points.shape[1])
+        if expected_shape is not None:
+            eh, ew = int(expected_shape[-2]), int(expected_shape[-1])
+            if (H, W) != (eh, ew):
+                raise ValueError(f"Global world points shape {(H, W)} does not match expected {(eh, ew)}")
+
+        valid_attr = getattr(cam, "global_world_points_valid_mask", None)
+        if valid_attr is None:
+            valid = np.ones((H, W), dtype=bool)
+        else:
+            valid = valid_attr.detach().cpu().bool().numpy() if isinstance(valid_attr, torch.Tensor) else np.asarray(valid_attr, dtype=bool)
+            if valid.ndim == 3:
+                valid = valid[0]
+            if valid.shape != (H, W):
+                raise ValueError(f"Global world point mask shape {valid.shape} does not match {(H, W)}")
+
+        confidence_attr = getattr(cam, "global_world_points_confidence", None)
+        if confidence_attr is None:
+            confidence = np.ones((H, W), dtype=np.float32)
+        else:
+            confidence = confidence_attr.detach().cpu().float().numpy() if isinstance(confidence_attr, torch.Tensor) else np.asarray(confidence_attr, dtype=np.float32)
+            if confidence.ndim == 3:
+                confidence = confidence[0]
+            if confidence.shape != (H, W):
+                raise ValueError(f"Global world point confidence shape {confidence.shape} does not match {(H, W)}")
+
+        sky_mask = getattr(cam, "erp_sky_mask", None)
+        if sky_mask is not None:
+            sky_np = sky_mask.detach().cpu().bool().numpy() if isinstance(sky_mask, torch.Tensor) else np.asarray(sky_mask, dtype=bool)
+            if sky_np.ndim == 3:
+                sky_np = sky_np[0]
+            if sky_np.shape == (H, W):
+                valid = valid & (~sky_np)
+
+        valid = valid & np.isfinite(points).all(axis=-1) & np.isfinite(confidence) & (confidence > 0.0)
+        image_ab = cam.original_image.clamp(0.0, 1.0)
+        rgb_np = image_ab.detach().cpu().permute(1, 2, 0).contiguous().numpy().astype(np.float32)
+        if rgb_np.shape[:2] != (H, W):
+            raise ValueError(f"Image shape {rgb_np.shape[:2]} does not match global world points {(H, W)}")
+
+        R_np = cam.R.detach().cpu().float().numpy().astype(np.float64)
+        T_np = cam.T.detach().cpu().float().numpy().astype(np.float64)
+        center = -(R_np.T @ T_np)
+        distance = np.linalg.norm(points.astype(np.float64) - center.reshape(1, 1, 3), axis=-1).astype(np.float32)
+
+        region_tag = np.full((H, W), self.REGION_TAG_DEFAULT, dtype=np.int8)
+        region_masks = getattr(cam, "erp_region_masks", None) or {}
+        bottom_pole_mask = region_masks.get("bottom_pole", None)
+        if bottom_pole_mask is not None:
+            bottom_np = bottom_pole_mask.detach().cpu().bool().numpy() if isinstance(bottom_pole_mask, torch.Tensor) else np.asarray(bottom_pole_mask, dtype=bool)
+            if bottom_np.ndim == 3:
+                bottom_np = bottom_np[0]
+            if bottom_np.shape == (H, W):
+                region_tag[bottom_np] = self.REGION_TAG_BOTTOM_POLE_GROUND
+
+        return {
+            "points": points.astype(np.float32),
+            "rgb": rgb_np,
+            "valid": valid.astype(bool),
+            "confidence": confidence.astype(np.float32),
+            "distance": distance,
+            "region_tag": region_tag,
+        }
+
+    def _create_pcd_from_global_world_points(
+        self,
+        cam,
+        depthmap=None,
+        init: bool = False,
+        anchor_submap: int = -1,
+        birth_frame: Optional[int] = None,
+    ):
+        del depthmap
+        payload = self._world_points_payload_from_viewpoint(cam)
+        if payload is None:
+            raise ValueError("global_world_points are required for world-points Gaussian initialization.")
+        if init:
+            downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
+        else:
+            downsample_factor = self.config["Dataset"]["pcd_downsample"]
+
+        flat_valid = payload["valid"].reshape(-1)
+        if not np.any(flat_valid):
+            raise ValueError(f"Keyframe {cam.uid} has no valid global world points.")
+        pts_world = payload["points"].reshape(-1, 3)[flat_valid].astype(np.float64)
+        rgb_valid = payload["rgb"].reshape(-1, 3)[flat_valid].astype(np.float64)
+        region_tag_valid = payload["region_tag"].reshape(-1)[flat_valid].astype(np.int8)
+        distance_valid = payload["distance"].reshape(-1)[flat_valid].astype(np.float32)
+        idx = None
+        if downsample_factor > 1:
+            n_keep = max(1, pts_world.shape[0] // downsample_factor)
+            idx = np.random.choice(pts_world.shape[0], n_keep, replace=False)
+            pts_world = pts_world[idx]
+            rgb_valid = rgb_valid[idx]
+            region_tag_valid = region_tag_valid[idx]
+            distance_valid = distance_valid[idx]
+
+        pcd = BasicPointCloud(
+            points=pts_world,
+            colors=rgb_valid,
+            normals=np.zeros((pts_world.shape[0], 3)),
+        )
+        self.ply_input = pcd
+
+        fused_point_cloud = torch.from_numpy(pts_world).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(rgb_valid).float().cuda())
+        features = torch.zeros(
+            (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2),
+            dtype=torch.float32, device="cuda",
+        )
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1.0
+        opacities = inverse_sigmoid(
+            0.5 * torch.ones(
+                (fused_point_cloud.shape[0], 1), dtype=torch.float32, device="cuda"
+            )
+        )
+        self._n_sky_pending = 0
+
+        enable_layered = bool(
+            self.config.get("Training", {}).get("enable_layered_map", False)
+        )
+        if enable_layered:
+            near_max = float(self.config.get("Training", {}).get("layer_near_max_depth", 80.0))
+            far_max = float(self.config.get("Training", {}).get("layer_far_max_depth", 100.0))
+            geom_layers = np.zeros(distance_valid.shape[0], dtype=np.int8)
+            geom_layers[(distance_valid >= near_max) & (distance_valid < far_max)] = 1
+            geom_layers[distance_valid >= far_max] = 2
+            self._layer_pending = torch.from_numpy(geom_layers)
+        else:
+            self._layer_pending = None
+
+        self._region_tag_pending = torch.from_numpy(region_tag_valid.astype(np.int8))
+        if birth_frame is None:
+            birth_frame = int(cam.uid)
+        n_total = pts_world.shape[0]
+        self._anchor_kf_pending = torch.full((n_total,), int(cam.uid), dtype=torch.int32)
+        self._anchor_submap_pending = torch.full((n_total,), int(anchor_submap), dtype=torch.int32)
+        self._birth_frame_pending = torch.full((n_total,), int(birth_frame), dtype=torch.int32)
+        return fused_point_cloud, features, scales, rots, opacities
 
     def _create_pcd_from_erp_depth(
         self,

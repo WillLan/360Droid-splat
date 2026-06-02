@@ -26,6 +26,12 @@ PanoVGGT:
   overlap: 2
   emit_delay: 1
   align_mode: sim3
+  require_aligned_world_points: true
+  emit_unaligned: false
+  min_overlap_points: 4096
+  max_align_rmse: 0.25
+  min_inlier_ratio: 0.35
+  max_scale_jump: 2.0
   loop_enable: false
   max_alignment_points: 4096
   max_alignment_cache_frames: 128
@@ -50,6 +56,7 @@ Hierarchical:
   voxel_size_lis: [0.12, 0.45, 1.8]
 
 Mapping:
+  seed_source: world_points_only
   max_seeds_per_keyframe: 0
   min_depth_confidence: 0.2
   sky_mask_enable: true
