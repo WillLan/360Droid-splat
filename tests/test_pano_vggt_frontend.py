@@ -176,3 +176,53 @@ def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     assert (tmp_path / "summary.json").is_file()
     assert any((tmp_path / "visualizations").glob("*_depth.png"))
     assert any((tmp_path / "visualizations").glob("*_trajectory.png"))
+
+
+def test_system_runs_joint_gaussian_pose_backend_smoke(tmp_path: Path):
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 3, "height": 12, "width": 24},
+        "Frontend": {
+            "mode": "panovggt_long",
+            "keyframe_threshold": 0.0,
+            "force_keyframe_interval": 1,
+        },
+        "PanoVGGT": {
+            "engine": "fake",
+            "image_size": [12, 24],
+            "chunk_size": 3,
+            "overlap": 1,
+            "emit_delay": 1,
+            "align_mode": "sim3",
+        },
+        "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Hierarchical": {"voxel_size_lis": [0.2, 0.6, 1.8]},
+        "Mapping": {
+            "max_seeds_per_keyframe": 8,
+            "min_depth_confidence": 0.0,
+            "refine_steps_per_keyframe": 0,
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": True,
+            "local_submap_steps": 1,
+            "local_window_keyframes": 2,
+            "sliding_window_steps": 1,
+            "window_keyframes": 3,
+            "final_global_steps": 1,
+            "optimize_existing_gaussians": "visible_recent",
+            "existing_gaussian_lr_scale": 0.1,
+            "pose_prior_weight": 0.001,
+            "fixed_window_frames": 1,
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+        "WeightsAndBiases": {"mode": "disabled"},
+        "Visualization": {"save_local": False},
+        "Results": {"save_dir": str(tmp_path)},
+    }
+    summary = PanoDroidGSSlamSystem(cfg).run(max_frames=4)
+    assert summary["anchors"] > 0
+    assert summary["backend_optimization_steps"] > 0
+    assert summary["backend_last_phase"] == "final_global"
+    assert summary["backend_final_metrics"]["steps"] == 1.0

@@ -54,7 +54,26 @@ Mapping:
   max_seeds_per_keyframe: 512
   min_depth_confidence: 0.2
   lr: 0.002
-  refine_steps_per_keyframe: 1
+  refine_steps_per_keyframe: 0
+
+BackendOptimization:
+  enabled: true
+  gaussian_refine_enable: true
+  pose_refine_enable: true
+  local_submap_steps: 20
+  local_window_keyframes: 2
+  sliding_window_steps: 20
+  window_keyframes: 8
+  final_global_steps: 200
+  final_global_max_keyframes: 0
+  optimize_existing_gaussians: visible_recent
+  existing_gaussian_lr_scale: 0.1
+  global_gaussian_lr_scale: 1.0
+  gaussian_lr: 0.002
+  pose_lr: 0.001
+  pose_prior_weight: 0.001
+  fixed_window_frames: 1
+  weight_decay: 0.0
 
 Renderer:
   allow_smoke_fallback: false

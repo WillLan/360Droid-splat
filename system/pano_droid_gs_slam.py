@@ -347,9 +347,15 @@ class PanoDroidGSSlamSystem:
             backend_loss = None
             if out.is_keyframe and out.inverse_depth is not None:
                 seeds = self.initializer.from_frontend_output(out, source_frame.image)
-                self.mapper.insert_keyframe(seeds, out)
+                if self.mapper.uses_joint_optimization:
+                    self.mapper.insert_keyframe(seeds, out, image=source_frame.image)
+                else:
+                    self.mapper.insert_keyframe(seeds, out)
                 keyframes += 1
-                if refine_steps > 0:
+                if self.mapper.uses_joint_optimization:
+                    metrics = self.mapper.optimize_after_keyframe()
+                    backend_loss = metrics.get("loss")
+                elif refine_steps > 0:
                     metrics = self.mapper.refine_on_keyframe(
                         image=source_frame.image,
                         c2w=out.pose_c2w,
@@ -382,6 +388,7 @@ class PanoDroidGSSlamSystem:
                 for ready in flush():
                     process_output(ready)
 
+            final_metrics = self.mapper.finalize_optimization()
             summary = {
                 "frames": frame_count,
                 "keyframes": keyframes,
@@ -389,6 +396,11 @@ class PanoDroidGSSlamSystem:
                 "last_tracking_status": last_status,
                 "map_mode": self.map.map_mode,
                 "renderer": self.config.get("Training", {}).get("panorama_render_mode", "pfgs360_gsplat"),
+                "backend_last_loss": self.mapper.stats.last_loss,
+                "backend_last_phase": self.mapper.stats.last_phase,
+                "backend_optimization_steps": self.mapper.stats.optimization_steps,
+                "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
+                "backend_final_metrics": final_metrics,
                 "wandb_run_url": logger.run_url,
                 "visualization_dir": str(logger.visualization_dir) if logger.save_local else None,
                 "notes": self.mapper.stats.notes,

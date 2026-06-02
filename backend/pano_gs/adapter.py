@@ -221,7 +221,7 @@ class PFGS360Renderer:
         """
         H = int(camera.image_height)
         W = int(camera.image_width)
-        xyz = gaussians.get_xyz
+        xyz = gaussians.get_xyz.detach()
         device = xyz.device
         dtype = xyz.dtype
         render = background.to(device=device, dtype=dtype).view(3, 1, 1).expand(3, H, W).clone()
@@ -238,8 +238,8 @@ class PFGS360Renderer:
             return _blank_package(camera, gaussians, background)
 
         cam_v = cam[valid]
-        colors = gaussians.get_features[valid, :3].clamp(0.0, 1.0)
-        opacity = gaussians.get_opacity[valid, 0].clamp(0.0, 1.0)
+        colors = gaussians.get_features.detach()[valid, :3].clamp(0.0, 1.0)
+        opacity = gaussians.get_opacity.detach()[valid, 0].clamp(0.0, 1.0)
         pixels = bearing_to_erp_pixel(cam_v, H, W)
         ui = pixels[:, 0].round().long().remainder(W)
         vi = pixels[:, 1].round().long().clamp(0, H - 1)
@@ -269,4 +269,3 @@ class PFGS360Renderer:
             "viewspace_points": pixels,
             "visibility_filter": radii > 0,
         }
-
