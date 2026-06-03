@@ -9,7 +9,11 @@ from backend.legacy_360gs.online import LegacyBackendSnapshot, LegacyOnlineBacke
 from backend.legacy_360gs.viewpoint_adapter import LegacyViewpointAdapter
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_vggt import PanoVGGTLongTracker
-from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, SlamRuntimeLogger
+from system.pano_droid_gs_slam import (
+    PanoDroidGSSlamSystem,
+    SlamRuntimeLogger,
+    _compute_ape_translation,
+)
 
 
 def _frontend_output(frame_id: int, pose: torch.Tensor | None = None) -> FrontendOutput:
@@ -175,6 +179,35 @@ def test_backend_snapshot_wandb_step_does_not_skip_frontend_frames(tmp_path: Pat
     )
 
     assert fake_run.steps == [1, 1, 1, 2]
+
+
+def test_trajectory_ape_translation_uses_sim3_umeyama_alignment():
+    pred = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.5],
+        ],
+        dtype=np.float32,
+    )
+    theta = np.deg2rad(35.0)
+    rot = np.asarray(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    gt = 2.5 * (pred @ rot.T) + np.asarray([5.0, -3.0, 1.0], dtype=np.float32)
+
+    aligned, ape, metrics, sim3_aligned = _compute_ape_translation(pred, gt)
+
+    assert sim3_aligned
+    assert np.allclose(aligned, gt, atol=1e-5)
+    assert float(np.nanmax(ape)) < 1e-5
+    assert metrics["rmse"] < 1e-5
 
 
 def test_panovggt_backend_pose_feedback_updates_pose_cache():

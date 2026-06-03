@@ -161,12 +161,12 @@ def _pose_xyz_from_meta(frame: PanoFrame) -> np.ndarray | None:
     return gt_t[:3, 3].numpy()
 
 
-def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+def _align_xyz_umeyama_sim3(pred: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, bool]:
     pred = np.asarray(pred, dtype=np.float32)
     gt = np.asarray(gt, dtype=np.float32)
     valid = np.isfinite(pred).all(axis=1) & np.isfinite(gt).all(axis=1)
     if int(valid.sum()) < 3:
-        return pred
+        return pred, False
     src = pred[valid]
     tgt = gt[valid]
     src_mean = src.mean(axis=0)
@@ -183,7 +183,36 @@ def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     var_src = np.mean(np.sum(src_c * src_c, axis=1))
     scale = float(np.sum(s) / max(var_src, 1e-8))
     trans = tgt_mean - scale * (rot @ src_mean)
-    return scale * (pred @ rot.T) + trans
+    return scale * (pred @ rot.T) + trans, True
+
+
+def _compute_ape_translation(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float], bool]:
+    """Return Sim(3)-aligned predictions and APE translation per frame."""
+
+    aligned, sim3_aligned = _align_xyz_umeyama_sim3(pred, gt)
+    gt = np.asarray(gt, dtype=np.float32)
+    valid = np.isfinite(aligned).all(axis=1) & np.isfinite(gt).all(axis=1)
+    ape = np.full((len(aligned),), np.nan, dtype=np.float32)
+    ape[valid] = np.linalg.norm(aligned[valid] - gt[valid], axis=1)
+    finite = np.isfinite(ape)
+    metrics: dict[str, float] = {}
+    if finite.any():
+        vals = ape[finite].astype(np.float64)
+        metrics = {
+            "rmse": float(np.sqrt(np.mean(vals * vals))),
+            "mean": float(np.mean(vals)),
+            "median": float(np.median(vals)),
+            "max": float(np.max(vals)),
+        }
+    return aligned, ape, metrics, sim3_aligned
+
+
+def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    aligned, _ = _align_xyz_umeyama_sim3(pred, gt)
+    return aligned
 
 
 def _xyz_to_y_up_plot(xyz: np.ndarray) -> np.ndarray:
@@ -373,7 +402,15 @@ class SlamRuntimeLogger:
         gt_by_id = {fid: xyz for fid, xyz in self._gt_pose_history}
         gt_positions = np.asarray([gt_by_id.get(int(fid), np.full(3, np.nan)) for fid in frame_ids], dtype=np.float32)
         has_gt = bool(np.isfinite(gt_positions).all(axis=1).any())
-        positions_plot = _align_xyz_for_plot(positions, gt_positions) if has_gt else positions
+        positions_plot = positions
+        ape_errors = None
+        ape_metrics: dict[str, float] = {}
+        sim3_aligned = False
+        if has_gt:
+            positions_plot, ape_errors, ape_metrics, sim3_aligned = _compute_ape_translation(
+                positions,
+                gt_positions,
+            )
         try:
             import matplotlib
 
@@ -387,14 +424,11 @@ class SlamRuntimeLogger:
             all_for_limits = [plot_pred]
             valid_gt = np.zeros((len(frame_ids),), dtype=bool)
             plot_gt = None
-            errors = None
             if has_gt:
                 valid_gt = np.isfinite(gt_positions).all(axis=1)
                 plot_gt_all = _xyz_to_y_up_plot(gt_positions)
                 plot_gt = plot_gt_all[valid_gt]
                 all_for_limits.append(plot_gt)
-                errors = np.full((len(positions_plot),), np.nan, dtype=np.float32)
-                errors[valid_gt] = np.linalg.norm(positions_plot[valid_gt] - gt_positions[valid_gt], axis=1)
                 ax.plot(
                     plot_gt[:, 0],
                     plot_gt[:, 1],
@@ -406,8 +440,8 @@ class SlamRuntimeLogger:
                 )
             if len(plot_pred) >= 2:
                 segments = np.stack([plot_pred[:-1], plot_pred[1:]], axis=1)
-                if errors is not None and np.isfinite(errors).any():
-                    endpoint_errors = np.stack([errors[:-1], errors[1:]], axis=1)
+                if ape_errors is not None and np.isfinite(ape_errors).any():
+                    endpoint_errors = np.stack([ape_errors[:-1], ape_errors[1:]], axis=1)
                     finite_counts = np.isfinite(endpoint_errors).sum(axis=1)
                     segment_errors = np.divide(
                         np.nansum(endpoint_errors, axis=1),
@@ -429,7 +463,7 @@ class SlamRuntimeLogger:
                         ax=ax,
                         shrink=0.75,
                         pad=0.08,
-                        label="translation error",
+                        label="APE translation",
                     )
                 else:
                     line_collection = Line3DCollection(segments, colors="#1f77b4", linewidth=2.2)
@@ -455,7 +489,19 @@ class SlamRuntimeLogger:
             ax.set_xlabel("X")
             ax.set_ylabel("Z")
             ax.set_zlabel("Y")
-            ax.set_title(f"{kind} trajectory error vs GT" if has_gt else f"{kind} trajectory")
+            if has_gt:
+                align_text = "Sim(3) Umeyama" if sim3_aligned else "unaligned (<3 GT matches)"
+                metric_text = ""
+                if ape_metrics:
+                    metric_text = (
+                        f"\nAPE trans. {align_text}: "
+                        f"RMSE={ape_metrics['rmse']:.3f}, "
+                        f"mean={ape_metrics['mean']:.3f}, "
+                        f"max={ape_metrics['max']:.3f}"
+                    )
+                ax.set_title(f"{kind} trajectory APE vs GT{metric_text}")
+            else:
+                ax.set_title(f"{kind} trajectory")
             ax.view_init(elev=24, azim=-58)
             ax.legend(loc="upper left")
             fig.tight_layout()
