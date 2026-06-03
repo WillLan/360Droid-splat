@@ -2,8 +2,8 @@ Dataset:
   synthetic: false
   dataset_path: /mnt/disk1/lanboyang/Datasets/360uav/seqs
   sequence: null
-  erp_resize_height: 512
-  erp_resize_width: 1024
+  erp_resize_height: 518
+  erp_resize_width: 1036
   begin: 0
   end: null
 
@@ -20,7 +20,7 @@ PanoVGGT:
   checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   strict_checkpoint: false
-  image_size: [512, 1024]
+  image_size: [518, 1036]
   patch_multiple: 14
   chunk_size: 4
   overlap: 2

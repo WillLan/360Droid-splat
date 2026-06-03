@@ -4,6 +4,7 @@ import json
 from PIL import Image
 import pytest
 import torch
+import yaml
 
 from frontend.pano_droid.dataset import discover_erp_images
 from frontend.pano_droid.interfaces import PanoFrame
@@ -76,6 +77,24 @@ def test_panovggt_external_patch_multiple_resize_helpers():
     assert resized.depth.shape == (1, 1, 512, 1024)
     assert resized.confidence.shape == (1, 1, 512, 1024)
     assert resized.point_maps.shape == (1, 512, 1024, 3)
+
+
+def test_panovggt_configs_use_patch_multiple_erp_size():
+    for config_path in (
+        Path("configs/pano_vggt_long_gs_slam.yaml"),
+        Path("configs/pano_vggt_long_panocity_beijing.yaml"),
+        Path("configs/pano_vggt_legacy_online_panocity_beijing.yaml"),
+    ):
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+        height = int(cfg["Dataset"]["erp_resize_height"])
+        width = int(cfg["Dataset"]["erp_resize_width"])
+        image_size = tuple(int(v) for v in cfg["PanoVGGT"]["image_size"])
+        patch_multiple = int(cfg["PanoVGGT"].get("patch_multiple", 14))
+
+        assert (height, width) == image_size
+        assert height % patch_multiple == 0
+        assert width % patch_multiple == 0
+        assert (height, width) == (518, 1036)
 
 
 def test_panovggt_erp_bearing_convention_matches_project_camera():

@@ -77,6 +77,10 @@ PanoVGGT:
 
 Runtime notes:
 
+- Use the same patch-aligned ERP size for the dataset and PanoVGGT inference:
+  height `518`, width `1036`. Both are divisible by the default patch multiple
+  `14`, avoiding an extra resize between PanoVGGT point maps and Gaussian seed
+  pixels.
 - The tracker buffers frames until a chunk is ready, aligns the new chunk to
   previous overlap point maps, and queues only stable delayed outputs.
 - The external engine follows the official PanoVGGT inference path:
