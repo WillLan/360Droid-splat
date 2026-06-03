@@ -3360,6 +3360,7 @@ class BackEnd(mp.Process):
                     T = torch.from_numpy(T_np).to(self.device)
                     if self.enable_submap:
                         self._submap_manager.assign_frame(cur_frame_idx, pose_c2w=T_np)
+                    self.current_window = normalize_window_order([cur_frame_idx])
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )
