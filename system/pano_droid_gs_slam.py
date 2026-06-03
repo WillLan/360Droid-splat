@@ -569,7 +569,7 @@ class SlamRuntimeLogger:
             if depth_path:
                 payload["backend/render_depth"] = self._wandb.Image(str(depth_path))
                 payload["backend/render_depth_png"] = str(depth_path)
-            self.run.log(payload, step=int(step))
+            self.run.log(payload, step=self._step + 1)
 
     @staticmethod
     def _save_topdown_trajectory(path: Path, positions: np.ndarray) -> None:

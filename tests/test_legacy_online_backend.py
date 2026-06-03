@@ -5,11 +5,11 @@ import torch
 
 from backend.legacy_360gs.config import build_legacy_config
 from backend.legacy_360gs.utils.erp2cubemap import ERPToCubemapTorch
-from backend.legacy_360gs.online import LegacyOnlineBackendClient
+from backend.legacy_360gs.online import LegacyBackendSnapshot, LegacyOnlineBackendClient
 from backend.legacy_360gs.viewpoint_adapter import LegacyViewpointAdapter
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_vggt import PanoVGGTLongTracker
-from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
+from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, SlamRuntimeLogger
 
 
 def _frontend_output(frame_id: int, pose: torch.Tensor | None = None) -> FrontendOutput:
@@ -127,6 +127,54 @@ def test_legacy_fake_backend_window_roundtrip(tmp_path: Path):
     assert target == 2
     assert sorted(poses) == [0, 1, 2]
     assert snapshots[-1].anchor_count > 0
+
+
+def test_backend_snapshot_wandb_step_does_not_skip_frontend_frames(tmp_path: Path):
+    class _FakeRun:
+        def __init__(self):
+            self.steps = []
+
+        def log(self, payload, step=None):
+            del payload
+            self.steps.append(step)
+
+    class _FakeWandb:
+        @staticmethod
+        def Image(path):
+            return str(path)
+
+    runtime_logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"enabled": False},
+            "Visualization": {"save_local": True, "log_every": 1},
+        },
+        tmp_path,
+    )
+    fake_run = _FakeRun()
+    runtime_logger.run = fake_run
+    runtime_logger._wandb = _FakeWandb()
+
+    pose0 = torch.eye(4)
+    pose1 = torch.eye(4)
+    pose1[0, 3] = 1.0
+    runtime_logger.observe_backend_snapshot(
+        LegacyBackendSnapshot(tag="init", poses_c2w={0: pose0}),
+        step=99,
+    )
+    frame = PanoFrame(image=torch.rand(3, 8, 16), timestamp=0.0, frame_id=0, meta={})
+    runtime_logger.observe(
+        _frontend_output(0),
+        frame,
+        anchor_count=1,
+        keyframe_count=1,
+        backend_loss=None,
+    )
+    runtime_logger.observe_backend_snapshot(
+        LegacyBackendSnapshot(tag="keyframe", poses_c2w={1: pose1}),
+        step=99,
+    )
+
+    assert fake_run.steps == [1, 1, 1, 2]
 
 
 def test_panovggt_backend_pose_feedback_updates_pose_cache():
