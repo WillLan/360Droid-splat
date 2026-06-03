@@ -2288,12 +2288,20 @@ class BackEnd(mp.Process):
             visibility_filter_acm = []                      
             radii_acm = []                                  
             n_touched_acm = []                            
+            n_touched_kf_ids = []
 
             keyframes_opt = []          
 
             _sync()
             stage_start = time.perf_counter()
-            for cam_idx in range(len(current_window)):      # For each keyframe in the current window, perform rendering and compute loss
+            random_window_frame = bool(
+                self.config["Training"].get("random_window_frame_per_iter", False)
+            ) and not prune
+            if random_window_frame and len(current_window) > 1:
+                current_cam_indices = [random.randrange(len(current_window))]
+            else:
+                current_cam_indices = list(range(len(current_window)))
+            for cam_idx in current_cam_indices:      # Render selected current-window frames and compute loss
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
 
@@ -2325,6 +2333,7 @@ class BackEnd(mp.Process):
                     visibility_filter_acm.append(pano_pkg["visibility_filter"])
                     radii_acm.append(pano_pkg["radii"])
                     n_touched_acm.append(pano_pkg["n_touched"])
+                    n_touched_kf_ids.append(current_window[cam_idx])
                 else:
                     render_pkg = render(
                         viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -2352,6 +2361,7 @@ class BackEnd(mp.Process):
                     visibility_filter_acm.append(visibility_filter)
                     radii_acm.append(radii)
                     n_touched_acm.append(n_touched)
+                    n_touched_kf_ids.append(current_window[cam_idx])
             _sync()
             current_window_render_ms = (time.perf_counter() - stage_start) * 1000.0
 
@@ -2435,8 +2445,7 @@ class BackEnd(mp.Process):
                 stage_start = time.perf_counter()
                 self.occ_aware_visibility = {}
                 _n_touched_sum = None
-                for idx in range((len(current_window))):
-                    kf_idx = current_window[idx]
+                for idx, kf_idx in enumerate(n_touched_kf_ids):
                     n_touched = n_touched_acm[idx]
                     self.occ_aware_visibility[kf_idx] = (n_touched > 0).long().cpu()
                     # Accumulate n_touched for EMA stability update
@@ -2575,6 +2584,8 @@ class BackEnd(mp.Process):
                             "event": "map_iter",
                             "iteration": int(self.iteration_count),
                             "window_size": int(len(current_window)),
+                            "sampled_window_size": int(len(current_cam_indices)),
+                            "sampled_window_kfs": [int(current_window[idx]) for idx in current_cam_indices],
                             "gaussian_count": int(self.gaussians.get_xyz.shape[0]),
                             "update_gaussian": False,
                             "prune_only": True,
@@ -2820,6 +2831,8 @@ class BackEnd(mp.Process):
                         "event": "map_iter",
                         "iteration": int(self.iteration_count),
                         "window_size": int(len(current_window)),
+                        "sampled_window_size": int(len(current_cam_indices)),
+                        "sampled_window_kfs": [int(current_window[idx]) for idx in current_cam_indices],
                         "gaussian_count": int(self.gaussians.get_xyz.shape[0]),
                         "update_gaussian": bool(update_gaussian),
                         "prune_only": False,
@@ -3352,6 +3365,19 @@ class BackEnd(mp.Process):
                     )
                     self.initialize_map(cur_frame_idx, viewpoint)
                     self.push_to_frontend("init")
+
+                elif data[0] == "register":
+                    cur_frame_idx = data[1]
+                    viewpoint = data[2]
+                    depth_map = data[3]
+                    move_obj_to_device_(viewpoint, device=self.device)
+                    depth_map = move_obj_to_device_(depth_map, device=self.device)
+
+                    T_np = np.linalg.inv(getWorld2View2(viewpoint.R,viewpoint.T).cpu().numpy())
+                    self.viewpoints[cur_frame_idx] = viewpoint
+                    if self.enable_submap:
+                        self._submap_manager.assign_frame(cur_frame_idx, pose_c2w=T_np)
+                    self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
 
                 elif data[0] == "keyframe":
                     cur_frame_idx = data[1]

@@ -16,6 +16,9 @@ Runtime:
 LegacyOnlineBackend:
   backend_impl: legacy
   feedback_enable: true
+  submit_all_frontend_outputs: true
+  synchronous_windows: true
+  window_wait_timeout_s: 1800
   push_every_iters: 10
   join_timeout_s: 30
   color_refinement_on_stop: false
@@ -95,6 +98,8 @@ Training:
   init_itr_num: 300
   mapping_itr_num: 200
   mapping_itr_nosingle: 200
+  random_window_frame_per_iter: true
+  replay_random_kfs: 0
   global_BA_itr_num: 0
   window_size: 8
   pose_window: 8

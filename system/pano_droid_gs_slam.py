@@ -186,6 +186,15 @@ def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     return scale * (pred @ rot.T) + trans
 
 
+def _xyz_to_y_up_plot(xyz: np.ndarray) -> np.ndarray:
+    """Map project coordinates to Matplotlib coordinates with original Y vertical."""
+
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if xyz.size == 0:
+        return xyz.reshape(-1, 3)
+    return np.stack([xyz[:, 0], xyz[:, 2], xyz[:, 1]], axis=1)
+
+
 class SlamRuntimeLogger:
     """Runtime W&B and local visualization logger for online SLAM runs."""
 
@@ -370,40 +379,73 @@ class SlamRuntimeLogger:
 
             matplotlib.use("Agg", force=True)
             import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
             fig = plt.figure(figsize=(8.5, 6.2), dpi=120)
             ax = fig.add_subplot(111, projection="3d")
-            all_for_limits = [positions_plot]
+            plot_pred = _xyz_to_y_up_plot(positions_plot)
+            all_for_limits = [plot_pred]
+            valid_gt = np.zeros((len(frame_ids),), dtype=bool)
+            plot_gt = None
+            errors = None
             if has_gt:
                 valid_gt = np.isfinite(gt_positions).all(axis=1)
-                all_for_limits.append(gt_positions[valid_gt])
+                plot_gt_all = _xyz_to_y_up_plot(gt_positions)
+                plot_gt = plot_gt_all[valid_gt]
+                all_for_limits.append(plot_gt)
+                errors = np.full((len(positions_plot),), np.nan, dtype=np.float32)
+                errors[valid_gt] = np.linalg.norm(positions_plot[valid_gt] - gt_positions[valid_gt], axis=1)
                 ax.plot(
-                    gt_positions[valid_gt, 0],
-                    gt_positions[valid_gt, 1],
-                    gt_positions[valid_gt, 2],
-                    color="#2ca02c",
-                    linewidth=2.0,
+                    plot_gt[:, 0],
+                    plot_gt[:, 1],
+                    plot_gt[:, 2],
+                    color="#6b7280",
+                    linestyle="--",
+                    linewidth=1.6,
                     label="GT",
                 )
-            ax.plot(
-                positions_plot[:, 0],
-                positions_plot[:, 1],
-                positions_plot[:, 2],
-                color="#1f77b4",
-                linewidth=2.0,
-                label=f"{kind} pred",
-            )
-            sc = ax.scatter(
-                positions_plot[:, 0],
-                positions_plot[:, 1],
-                positions_plot[:, 2],
-                c=frame_ids,
-                cmap="viridis",
-                s=28,
-                depthshade=True,
-            )
-            ax.scatter(positions_plot[0, 0], positions_plot[0, 1], positions_plot[0, 2], c="limegreen", s=80, label="start")
-            ax.scatter(positions_plot[-1, 0], positions_plot[-1, 1], positions_plot[-1, 2], c="red", s=80, label="latest")
+            if len(plot_pred) >= 2:
+                segments = np.stack([plot_pred[:-1], plot_pred[1:]], axis=1)
+                if errors is not None and np.isfinite(errors).any():
+                    endpoint_errors = np.stack([errors[:-1], errors[1:]], axis=1)
+                    finite_counts = np.isfinite(endpoint_errors).sum(axis=1)
+                    segment_errors = np.divide(
+                        np.nansum(endpoint_errors, axis=1),
+                        np.maximum(finite_counts, 1),
+                    )
+                    segment_errors[finite_counts == 0] = np.nan
+                    finite = np.isfinite(segment_errors)
+                    if finite.any():
+                        fill = float(np.nanmedian(segment_errors[finite]))
+                        segment_errors = np.where(finite, segment_errors, fill)
+                    else:
+                        segment_errors = np.zeros((len(segments),), dtype=np.float32)
+                    line_collection = Line3DCollection(segments, cmap="turbo", linewidth=2.2)
+                    line_collection.set_array(segment_errors.astype(np.float32))
+                    line_collection.set_label(f"{kind} pred")
+                    ax.add_collection3d(line_collection)
+                    fig.colorbar(
+                        line_collection,
+                        ax=ax,
+                        shrink=0.75,
+                        pad=0.08,
+                        label="translation error",
+                    )
+                else:
+                    line_collection = Line3DCollection(segments, colors="#1f77b4", linewidth=2.2)
+                    line_collection.set_label(f"{kind} pred")
+                    ax.add_collection3d(line_collection)
+            else:
+                ax.plot(
+                    plot_pred[:, 0],
+                    plot_pred[:, 1],
+                    plot_pred[:, 2],
+                    color="#1f77b4",
+                    linewidth=2.2,
+                    label=f"{kind} pred",
+                )
+            ax.scatter(plot_pred[0, 0], plot_pred[0, 1], plot_pred[0, 2], c="limegreen", s=64, label="start")
+            ax.scatter(plot_pred[-1, 0], plot_pred[-1, 1], plot_pred[-1, 2], c="red", s=64, label="latest")
             limits_pts = np.concatenate([arr for arr in all_for_limits if arr.size], axis=0)
             center = 0.5 * (limits_pts.min(axis=0) + limits_pts.max(axis=0))
             radius = max(float((limits_pts.max(axis=0) - limits_pts.min(axis=0)).max()) * 0.55, 1e-3)
@@ -411,12 +453,11 @@ class SlamRuntimeLogger:
             ax.set_ylim(center[1] - radius, center[1] + radius)
             ax.set_zlim(center[2] - radius, center[2] + radius)
             ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            ax.set_zlabel("Z")
-            ax.set_title(f"{kind} trajectory vs GT" if has_gt else f"{kind} trajectory")
+            ax.set_ylabel("Z")
+            ax.set_zlabel("Y")
+            ax.set_title(f"{kind} trajectory error vs GT" if has_gt else f"{kind} trajectory")
             ax.view_init(elev=24, azim=-58)
             ax.legend(loc="upper left")
-            fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.08, label="frame id")
             fig.tight_layout()
             fig.savefig(path, facecolor="white")
             plt.close(fig)

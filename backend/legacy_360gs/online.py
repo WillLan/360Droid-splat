@@ -154,6 +154,18 @@ def _run_fake_backend_process(
             break
         if tag in {"pause", "unpause", "color_refinement"}:
             continue
+        if tag == "register":
+            frame_id = int(data[1])
+            viewpoint = data[2]
+            depth_map = data[3]
+            keyframes[frame_id] = (viewpoint.R.detach().cpu(), viewpoint.T.detach().cpu())
+            world_valid = getattr(viewpoint, "global_world_points_valid_mask", None)
+            if world_valid is not None:
+                valid = torch.as_tensor(world_valid).detach().cpu().bool()
+            else:
+                valid = torch.as_tensor(depth_map).detach().cpu() > 0.01
+            anchor_count += int(valid.sum().item())
+            continue
         if tag in {"init", "keyframe"}:
             frame_id = int(data[1])
             viewpoint = data[2]
@@ -213,6 +225,42 @@ class LegacyOnlineBackendClient:
                 ["keyframe", int(frame_id), viewpoint, current_window, depth_map.detach().cpu(), theta]
             )
         )
+
+    def submit_window(self, bundles: list[tuple[int, Any, torch.Tensor]]) -> int | None:
+        """Register a frontend prediction window and optimise it once.
+
+        All frames except the last are registered without running mapping.  The
+        final frame triggers the legacy ``keyframe`` path with a current window
+        that includes every frame submitted here, so the backend performs one
+        mapping burst for the PanoVGGT submap instead of queueing one burst per
+        frame.
+        """
+
+        if not bundles:
+            return None
+        normalized = [(int(fid), viewpoint, depth_map.detach().cpu()) for fid, viewpoint, depth_map in bundles]
+        for frame_id, viewpoint, depth_map in normalized[:-1]:
+            self._remember_keyframe(frame_id)
+            self.backend_queue.put(pack_queue_message(["register", frame_id, viewpoint, depth_map]))
+        frame_id, viewpoint, depth_map = normalized[-1]
+        self.submit_keyframe(frame_id=frame_id, viewpoint=viewpoint, depth_map=depth_map)
+        return int(frame_id)
+
+    def wait_for_frame(self, frame_id: int, *, timeout_s: float = 1800.0) -> list[LegacyBackendSnapshot]:
+        """Wait until a backend snapshot contains ``frame_id``."""
+
+        target = int(frame_id)
+        snapshots: list[LegacyBackendSnapshot] = []
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            polled = self.poll()
+            snapshots.extend(polled)
+            if any(target in snapshot.poses_c2w for snapshot in polled):
+                return snapshots
+            if self.started and self.process.exitcode not in (0, None):
+                raise RuntimeError(f"Legacy backend process exited with code {self.process.exitcode}")
+            time.sleep(0.1)
+        raise TimeoutError(f"Timed out waiting for legacy backend frame {target}")
 
     def poll(self) -> list[LegacyBackendSnapshot]:
         snapshots: list[LegacyBackendSnapshot] = []

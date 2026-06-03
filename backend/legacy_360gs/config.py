@@ -75,6 +75,8 @@ LEGACY_TRAINING_DEFAULTS: dict[str, Any] = {
     "init_gaussian_extent": 50,
     "mapping_itr_num": 200,
     "mapping_itr_nosingle": 200,
+    "random_window_frame_per_iter": False,
+    "replay_random_kfs": 2,
     "global_BA_itr_num": 0,
     "gaussian_update_every": 200,
     "gaussian_update_offset": 100,

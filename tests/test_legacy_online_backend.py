@@ -96,6 +96,39 @@ def test_legacy_fake_backend_queue_roundtrip(tmp_path: Path):
     assert snapshots[-1].anchor_count > 0
 
 
+def test_legacy_fake_backend_window_roundtrip(tmp_path: Path):
+    cfg = {
+        "Runtime": {"multiprocessing_start_method": "spawn"},
+        "LegacyOnlineBackend": {"backend_impl": "fake"},
+        "Training": {"window_size": 3},
+    }
+    adapter = LegacyViewpointAdapter(cfg, use_legacy_camera=False)
+    client = LegacyOnlineBackendClient(cfg, save_dir=tmp_path)
+    bundles = []
+    for frame_id in range(3):
+        frame = PanoFrame(image=torch.rand(3, 8, 16), timestamp=float(frame_id), frame_id=frame_id, meta={})
+        bundles.append(adapter.build(frame, _frontend_output(frame_id)))
+
+    client.start()
+    client.submit_init(
+        frame_id=bundles[0].frame_id,
+        viewpoint=bundles[0].viewpoint,
+        depth_map=bundles[0].depth_map,
+    )
+    init_snapshots = client.wait_for_frame(0, timeout_s=10.0)
+    target = client.submit_window(
+        [(bundle.frame_id, bundle.viewpoint, bundle.depth_map) for bundle in bundles[1:]]
+    )
+    window_snapshots = client.wait_for_frame(target, timeout_s=10.0)
+    snapshots = init_snapshots + window_snapshots + client.stop(join_timeout_s=10.0)
+    poses = {}
+    for snapshot in snapshots:
+        poses.update(snapshot.poses_c2w)
+    assert target == 2
+    assert sorted(poses) == [0, 1, 2]
+    assert snapshots[-1].anchor_count > 0
+
+
 def test_panovggt_backend_pose_feedback_updates_pose_cache():
     tracker = PanoVGGTLongTracker(
         engine_config={"engine": "fake", "image_size": [8, 16]},
