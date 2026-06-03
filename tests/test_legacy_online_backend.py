@@ -80,6 +80,8 @@ def test_erp_to_cubemap_torch_builds_valid_cosmap():
 def test_legacy_config_includes_rgb_boundary_threshold_default():
     cfg = build_legacy_config({})
     assert cfg["Training"]["rgb_boundary_threshold"] == 0.01
+    assert cfg["Results"]["save_final_ply"] is True
+    assert cfg["Results"]["render_final_all_frames"] is True
 
 
 def test_legacy_fake_backend_queue_roundtrip(tmp_path: Path):

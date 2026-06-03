@@ -49,6 +49,8 @@ LEGACY_RESULTS_DEFAULTS: dict[str, Any] = {
     "eval_rendering": True,
     "global_BA": False,
     "kf_render_format": "png",
+    "save_final_ply": True,
+    "render_final_all_frames": True,
 }
 
 

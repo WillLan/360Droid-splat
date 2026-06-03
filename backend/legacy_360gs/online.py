@@ -274,12 +274,18 @@ class LegacyOnlineBackendClient:
                 snapshots.append(snapshot)
         return snapshots
 
-    def stop(self, *, color_refinement: bool = False, join_timeout_s: float = 30.0) -> list[LegacyBackendSnapshot]:
+    def stop(
+        self,
+        *,
+        color_refinement: bool = False,
+        join_timeout_s: float = 30.0,
+        save_final_artifacts: bool = True,
+    ) -> list[LegacyBackendSnapshot]:
         if not self.started:
             return []
         if color_refinement:
             self.backend_queue.put(pack_queue_message(["color_refinement"]))
-        self.backend_queue.put(pack_queue_message(["stop"]))
+        self.backend_queue.put(pack_queue_message(["stop", {"save_final_artifacts": bool(save_final_artifacts)}]))
         snapshots: list[LegacyBackendSnapshot] = []
         deadline = time.monotonic() + float(join_timeout_s)
         while self.process.is_alive() and time.monotonic() < deadline:

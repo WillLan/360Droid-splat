@@ -569,7 +569,7 @@ class SlamRuntimeLogger:
         )
         path = self._save_trajectory_panel(dummy, kind="backend_final", pred_history=history)
         if self.run is not None and self._wandb is not None:
-            self.run.log({"backend/final_trajectory_vs_gt": self._wandb.Image(str(path))}, step=int(step))
+            self.run.log({"backend/final_trajectory_vs_gt": self._wandb.Image(str(path))}, step=self._step + 1)
         return str(path)
 
     def observe_backend_snapshot(self, snapshot, *, step: int) -> None:

@@ -20,7 +20,7 @@ LegacyOnlineBackend:
   synchronous_windows: true
   window_wait_timeout_s: 1800
   push_every_iters: 10
-  join_timeout_s: 30
+  join_timeout_s: 600
   color_refinement_on_stop: false
   device: cuda
   face_w: 256
@@ -171,3 +171,5 @@ Results:
   eval_rendering: true
   global_BA: false
   kf_render_format: png
+  save_final_ply: true
+  render_final_all_frames: true

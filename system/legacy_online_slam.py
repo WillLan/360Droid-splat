@@ -39,6 +39,16 @@ class PanoVGGTLegacyOnlineSlamSystem:
         self.backend_poses: dict[int, torch.Tensor] = {}
         self.last_backend_tag: str | None = None
 
+    def _load_final_artifacts(self) -> dict[str, Any] | None:
+        path = self.output_dir / "final_artifacts.json"
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def run(self, *, max_frames: int | None = None) -> dict[str, Any]:
         self.frontend.initialize({"config": self.config})
         logger = SlamRuntimeLogger(self.config, self.output_dir)
@@ -147,11 +157,13 @@ class PanoVGGTLegacyOnlineSlamSystem:
             handle_snapshots(self.backend.stop(
                 color_refinement=self.color_refinement_on_stop,
                 join_timeout_s=self.join_timeout_s,
+                save_final_artifacts=True,
             ))
             final_backend_traj = logger.log_final_backend_trajectory(
                 sorted(self.backend_poses.items()),
                 step=frame_count,
             )
+            final_artifacts = self._load_final_artifacts()
             summary = {
                 "frames": frame_count,
                 "keyframes": backend_frames,
@@ -159,6 +171,7 @@ class PanoVGGTLegacyOnlineSlamSystem:
                 "backend_last_tag": self.last_backend_tag,
                 "last_status": last_status,
                 "final_backend_trajectory": final_backend_traj,
+                "final_artifacts": final_artifacts,
                 "runtime_mode": "legacy_online",
             }
             with open(self.output_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -170,7 +183,7 @@ class PanoVGGTLegacyOnlineSlamSystem:
             stop_error = None
             stop_traceback = None
             try:
-                handle_snapshots(self.backend.stop(join_timeout_s=5.0))
+                handle_snapshots(self.backend.stop(join_timeout_s=5.0, save_final_artifacts=False))
             except Exception as stop_exc:
                 stop_error = repr(stop_exc)
                 stop_traceback = traceback.format_exc()

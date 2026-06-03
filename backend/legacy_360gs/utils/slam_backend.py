@@ -3276,6 +3276,187 @@ class BackEnd(mp.Process):
         except Exception as e:
             Log(f"[BackEnd] _save_kf_render_backend failed: {e}")
 
+    def _render_final_viewpoint(self, frame_idx: int, viewpoint, panel_dir: str, render_dir: str, depth_dir: str) -> dict:
+        """Render one registered predicted-pose frame with the final Gaussian map."""
+
+        import cv2
+        from backend.legacy_360gs.gaussian_splatting.utils.image_utils import psnr as compute_psnr
+
+        with torch.no_grad():
+            if isinstance(viewpoint, PanoramaCamera):
+                theta0 = torch.zeros(1, 3, device=self.device)
+                rho0 = torch.zeros(1, 3, device=self.device)
+                pkg = render_panorama_for_config(
+                    viewpoint,
+                    self.gaussians,
+                    self.pipeline_params,
+                    self.background,
+                    config=self.config,
+                    theta=theta0,
+                    rho=rho0,
+                )
+            else:
+                pkg = render(viewpoint, self.gaussians, self.pipeline_params, self.background)
+
+        rendering = pkg["render"].clamp(0, 1)
+        gt = viewpoint.original_image.to(rendering.device).clamp(0, 1)
+        psnr_val = float(compute_psnr(rendering.unsqueeze(0), gt.unsqueeze(0)).item())
+
+        def _to_bgr(tensor):
+            return (
+                tensor.detach().permute(1, 2, 0).cpu().numpy() * 255.0
+            ).clip(0, 255).astype(np.uint8)[:, :, ::-1]
+
+        gt_bgr = _to_bgr(gt)
+        render_bgr = _to_bgr(rendering)
+        h, w = gt_bgr.shape[:2]
+        gap = 4
+        canvas = np.zeros((h + 28, w * 2 + gap, 3), dtype=np.uint8)
+        canvas[28:, :w] = gt_bgr
+        canvas[28:, w + gap:] = render_bgr
+        label = f"Frame {frame_idx:04d} [final map + predicted pose]  PSNR: {psnr_val:.2f} dB"
+        cv2.putText(
+            canvas,
+            label,
+            (6, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        if canvas.shape[1] > 1920:
+            scale = 1920 / canvas.shape[1]
+            canvas = cv2.resize(
+                canvas,
+                (int(canvas.shape[1] * scale), int(canvas.shape[0] * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        panel_path = os.path.join(panel_dir, f"frame_{frame_idx:04d}.png")
+        render_path = os.path.join(render_dir, f"frame_{frame_idx:04d}.png")
+        cv2.imwrite(panel_path, canvas)
+        cv2.imwrite(render_path, render_bgr)
+
+        depth_path = None
+        depth_tensor = pkg.get("depth", None)
+        if depth_tensor is not None:
+            depth_np = depth_tensor.detach().float().squeeze().cpu().numpy()
+            valid = np.isfinite(depth_np) & (depth_np > 0)
+            depth_canvas = np.zeros((*depth_np.shape, 3), dtype=np.uint8)
+            if valid.any():
+                lo, hi = np.percentile(depth_np[valid], [2.0, 98.0])
+                if hi <= lo:
+                    hi = lo + 1.0
+                norm = ((depth_np - lo) / (hi - lo)).clip(0.0, 1.0)
+                gray = (norm * 255.0).astype(np.uint8)
+                depth_canvas = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+                depth_canvas[~valid] = 0
+            depth_path = os.path.join(depth_dir, f"frame_{frame_idx:04d}.png")
+            cv2.imwrite(depth_path, depth_canvas)
+
+        return {
+            "frame_idx": int(frame_idx),
+            "psnr": psnr_val,
+            "panel_path": panel_path,
+            "render_path": render_path,
+            "depth_path": depth_path,
+        }
+
+    def _save_final_artifacts(self) -> dict:
+        """Save final Gaussian PLY and final-map renders for every predicted-pose frame."""
+
+        artifacts: dict = {
+            "point_cloud_ply": None,
+            "all_frames": None,
+            "errors": [],
+        }
+        if self.save_dir is None:
+            return artifacts
+
+        results_cfg = self.config.get("Results", {})
+        if bool(results_cfg.get("save_final_ply", True)) and self.gaussians is not None:
+            ply_path = os.path.join(self.save_dir, "point_cloud", "final", "point_cloud.ply")
+            try:
+                self.gaussians.save_ply(ply_path)
+                artifacts["point_cloud_ply"] = ply_path
+                Log(f"[BackEnd] saved final Gaussian PLY -> {ply_path}")
+            except Exception as exc:
+                msg = f"save final ply failed: {exc}"
+                artifacts["errors"].append(msg)
+                Log(f"[BackEnd] {msg}")
+
+        if bool(results_cfg.get("render_final_all_frames", True)):
+            root = os.path.join(self.save_dir, "final_all_frames")
+            panel_dir = os.path.join(root, "panels")
+            render_dir = os.path.join(root, "renders")
+            depth_dir = os.path.join(root, "depths")
+            for directory in (panel_dir, render_dir, depth_dir):
+                os.makedirs(directory, exist_ok=True)
+
+            frame_ids = sorted(int(fid) for fid in self.viewpoints.keys())
+            records = []
+            psnrs = []
+            Log(
+                f"[BackEnd] final all-frames render: {len(frame_ids)} frames "
+                "using final gaussians and registered predicted poses"
+            )
+            for n, frame_idx in enumerate(frame_ids, start=1):
+                try:
+                    rec = self._render_final_viewpoint(
+                        frame_idx,
+                        self.viewpoints[frame_idx],
+                        panel_dir,
+                        render_dir,
+                        depth_dir,
+                    )
+                    records.append(rec)
+                    if np.isfinite(rec["psnr"]):
+                        psnrs.append(float(rec["psnr"]))
+                except Exception as exc:
+                    msg = f"final render frame {frame_idx} failed: {exc}"
+                    records.append({"frame_idx": int(frame_idx), "error": str(exc)})
+                    artifacts["errors"].append(msg)
+                    Log(f"[BackEnd] {msg}")
+                if n % 50 == 0 or n == len(frame_ids):
+                    Log(f"[BackEnd] final all-frames render progress {n}/{len(frame_ids)}")
+
+            metrics = {
+                "frame_count": int(len(frame_ids)),
+                "render_count": int(sum(1 for r in records if r.get("render_path"))),
+                "depth_count": int(sum(1 for r in records if r.get("depth_path"))),
+            }
+            if psnrs:
+                metrics.update(
+                    {
+                        "mean_psnr": float(np.mean(psnrs)),
+                        "median_psnr": float(np.median(psnrs)),
+                        "min_psnr": float(np.min(psnrs)),
+                        "max_psnr": float(np.max(psnrs)),
+                    }
+                )
+            artifacts["all_frames"] = {
+                "root": root,
+                "panel_dir": panel_dir,
+                "render_dir": render_dir,
+                "depth_dir": depth_dir,
+                "metrics": metrics,
+                "frames": records,
+            }
+            Log(
+                f"[BackEnd] final all-frames render done: "
+                f"{metrics.get('render_count', 0)}/{metrics.get('frame_count', 0)} "
+                f"mean_psnr={metrics.get('mean_psnr', 0.0):.2f}"
+            )
+
+        path = os.path.join(self.save_dir, "final_artifacts.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(artifacts, f, indent=2)
+        except Exception as exc:
+            Log(f"[BackEnd] write final_artifacts.json failed: {exc}")
+        return artifacts
+
     def push_to_frontend(self, tag=None):
         self.last_sent = 0
         keyframes = []
@@ -3329,6 +3510,10 @@ class BackEnd(mp.Process):
             else:
                 data = unpack_queue_message(self.backend_queue.get())
                 if data[0] == "stop":
+                    stop_options = data[1] if len(data) > 1 and isinstance(data[1], dict) else {}
+                    if bool(stop_options.get("save_final_artifacts", True)):
+                        self._save_final_artifacts()
+                        self.push_to_frontend("final")
                     break
                 elif data[0] == "pause":
                     self.pause = True
