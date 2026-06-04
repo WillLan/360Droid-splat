@@ -21,7 +21,6 @@ from frontend.pano_vggt.matching_losses import (
     PanoVGGTMatchingSkyLoss,
     sky_bce_dice_loss,
     spherical_match_regression_loss,
-    static_confidence_loss,
     symmetric_info_nce_loss,
 )
 from frontend.pano_vggt.spherical_correspondence import (
@@ -151,12 +150,10 @@ def test_matching_and_sky_head_shapes_ranges_and_descriptor_norms():
     out = wrapper(feature)
     assert out["dense_descriptors"].shape == (2, 3, 24, 5, 7)
     assert out["match_confidence"].shape == (2, 3, 1, 5, 7)
-    assert out["static_confidence"].shape == (2, 3, 1, 5, 7)
     assert out["sky_logits"].shape == (2, 3, 1, 5, 7)
     assert out["sky_prob"].shape == (2, 3, 1, 5, 7)
     assert torch.allclose(out["dense_descriptors"].norm(dim=2), torch.ones(2, 3, 5, 7), atol=1.0e-5)
     assert out["match_confidence"].min() >= 0.0 and out["match_confidence"].max() <= 1.0
-    assert out["static_confidence"].min() >= 0.0 and out["static_confidence"].max() <= 1.0
     assert out["sky_prob"].min() >= 0.0 and out["sky_prob"].max() <= 1.0
 
 
@@ -184,22 +181,20 @@ def test_info_nce_prefers_correct_positives_over_shuffled_positives():
     assert good < bad
 
 
-def test_spherical_regression_static_and_sky_losses_are_finite():
+def test_spherical_regression_confidence_and_sky_losses_are_finite():
     corr = _make_correspondence((4, 6))
     desc = torch.rand(1, 2, 24, 4, 6)
     desc = torch.nn.functional.normalize(desc, dim=2)
     sph, sph_stats = spherical_match_regression_loss(desc, corr, image_hw=(8, 12), search_radius=1)
-    static_conf = torch.full((1, 2, 1, 4, 6), 0.7)
-    static, _ = static_confidence_loss(static_conf, corr)
     sky_logits = torch.randn(1, 2, 1, 4, 6)
     sky_gt = torch.zeros(1, 2, 1, 8, 12, dtype=torch.bool)
     sky_gt[..., :2, :] = True
     sky, sky_stats = sky_bce_dice_loss(sky_logits, sky_gt)
     assert torch.isfinite(sph)
-    assert torch.isfinite(static)
     assert torch.isfinite(sky)
     assert sph_stats["spherical_n"] > 0
     assert 0.0 <= float(sky_stats["sky_iou"]) <= 1.0
+    assert 0.0 <= float(sky_stats["sky_pixel_acc"]) <= 1.0
 
 
 def test_total_losses_backward_only_updates_selected_heads():
@@ -241,7 +236,8 @@ def test_training_one_step_modes_and_missing_supervision_errors(tmp_path: Path):
     matching_result = train_matching(_config(tmp_path / "matching", mode="matching_only", variant="complete"))
     assert Path(matching_result["checkpoint"]).name == "matching_head.pt"
     assert any((tmp_path / "matching" / "visualizations").glob("*matching.png"))
-    assert "val/match_angular_error_deg" in matching_result["last_metrics"]
+    assert any((tmp_path / "matching" / "visualizations").glob("*match_confidence.png"))
+    assert "val/precision_at_0_5deg" in matching_result["last_metrics"]
     with pytest.raises(ValueError, match="requires RGB, depth, and pose"):
         train_matching(_config(tmp_path / "bad", mode="matching_only", variant="no_pose"))
 

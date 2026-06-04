@@ -21,7 +21,6 @@ class PanoVGGTMatchingLossWeights:
     nce: float = 1.0
     confidence: float = 0.1
     spherical: float = 0.2
-    static: float = 0.05
     sky: float = 0.2
     sky_dice: float = 0.5
     smoothness: float = 0.01
@@ -148,32 +147,6 @@ def confidence_calibration_loss(
     }
 
 
-def static_confidence_loss(
-    static_confidence: torch.Tensor,
-    correspondences: SphericalCorrespondenceBatch,
-    *,
-    non_sky_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train static confidence from valid, depth-consistent non-sky supervision."""
-
-    confidence = _as_single_sample_maps(static_confidence, name="static_confidence")
-    flat = _flatten_correspondence(correspondences)
-    target = flat["valid"].float()
-    if non_sky_mask is not None:
-        non_sky = _as_single_sample_maps(non_sky_mask.float(), name="non_sky_mask")
-        src_non_sky = sample_feature_values(non_sky, flat["src_idx"], flat["src_uv"])[:, 0] > 0.5
-        tgt_non_sky = sample_feature_values(non_sky, flat["tgt_idx"], flat["tgt_uv"])[:, 0] > 0.5
-        target = target * (src_non_sky & tgt_non_sky).float()
-    src_conf = sample_feature_values(confidence, flat["src_idx"], flat["src_uv"])[:, 0]
-    tgt_conf = sample_feature_values(confidence, flat["tgt_idx"], flat["tgt_uv"])[:, 0]
-    pred = torch.stack([src_conf, tgt_conf], dim=0).mean(dim=0).clamp(1.0e-5, 1.0 - 1.0e-5)
-    loss = F.binary_cross_entropy(pred, target.to(pred))
-    return loss, {
-        "static_target_ratio": target.to(pred).mean().detach(),
-        "static_confidence_mean": pred.mean().detach(),
-    }
-
-
 def spherical_match_regression_loss(
     dense_descriptors: torch.Tensor,
     correspondences: SphericalCorrespondenceBatch,
@@ -253,6 +226,7 @@ def sky_bce_dice_loss(
     dice = 1.0 - ((2.0 * intersection + 1.0e-6) / (denom + 1.0e-6)).mean()
     pred_mask = prob >= 0.5
     gt_mask = target >= 0.5
+    pixel_acc = (pred_mask == gt_mask).float().mean()
     tp = (pred_mask & gt_mask).float().sum()
     fp = (pred_mask & ~gt_mask).float().sum()
     fn = (~pred_mask & gt_mask).float().sum()
@@ -264,6 +238,7 @@ def sky_bce_dice_loss(
         "sky_bce": bce.detach(),
         "sky_dice": dice.detach(),
         "sky_iou": iou.detach(),
+        "sky_pixel_acc": pixel_acc.detach(),
         "sky_precision": precision.detach(),
         "sky_recall": recall.detach(),
     }
@@ -301,7 +276,7 @@ class PanoVGGTMatchingSkyLoss:
         image_hw: tuple[int, int],
         non_sky_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute matching/static losses without sky-head supervision."""
+        """Compute descriptor and confidence losses without sky-head supervision."""
 
         total = outputs["dense_descriptors"].sum() * 0.0
         metrics: dict[str, torch.Tensor] = {}
@@ -320,18 +295,12 @@ class PanoVGGTMatchingSkyLoss:
             correspondences,
             non_sky_mask=non_sky_mask,
         )
-        static, static_stats = static_confidence_loss(
-            outputs["static_confidence"],
-            correspondences,
-            non_sky_mask=non_sky_mask,
-        )
         smooth = descriptor_smoothness_loss(outputs["dense_descriptors"])
         total = (
             total
             + self.weights.nce * nce
             + self.weights.spherical * sph
             + self.weights.confidence * conf
-            + self.weights.static * static
             + self.weights.smoothness * smooth
         )
         metrics.update(
@@ -340,12 +309,10 @@ class PanoVGGTMatchingSkyLoss:
                 "nce": nce.detach(),
                 "spherical": sph.detach(),
                 "confidence": conf.detach(),
-                "static": static.detach(),
                 "smoothness": smooth.detach(),
             }
         )
         metrics.update(nce_stats)
         metrics.update(sph_stats)
         metrics.update(conf_stats)
-        metrics.update(static_stats)
         return total, metrics

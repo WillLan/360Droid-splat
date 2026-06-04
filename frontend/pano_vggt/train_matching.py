@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -11,9 +12,12 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import yaml
 
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing
@@ -59,7 +63,6 @@ def _default_config() -> dict[str, Any]:
             "num_conv_blocks": 2,
             "train_matching": True,
             "train_sky": False,
-            "train_static": True,
         },
         "Dataset": {
             "synthetic": True,
@@ -84,7 +87,6 @@ def _default_config() -> dict[str, Any]:
             "nce_weight": 1.0,
             "confidence_weight": 0.1,
             "spherical_regression_weight": 0.2,
-            "static_weight": 0.05,
             "sky_weight": 0.2,
             "sky_dice_weight": 0.5,
             "smoothness_weight": 0.01,
@@ -309,10 +311,10 @@ def _build_feature_extractor(config: dict[str, Any], *, device: torch.device) ->
 def _mode_head_flags(mode: str, heads_cfg: dict[str, Any]) -> dict[str, bool]:
     training_mode = normalize_training_mode(mode)
     if training_mode == "sky_only":
-        return {"train_matching": False, "train_static": False, "train_sky": True}
+        return {"train_matching": False, "train_sky": True}
     if training_mode == "matching_only":
-        return {"train_matching": True, "train_static": bool(heads_cfg.get("train_static", True)), "train_sky": False}
-    return {"train_matching": True, "train_static": bool(heads_cfg.get("train_static", True)), "train_sky": True}
+        return {"train_matching": True, "train_sky": False}
+    return {"train_matching": True, "train_sky": True}
 
 
 def _set_trainable_for_mode(wrapper: PanoVGGTMatchingSkyHead, mode: str) -> None:
@@ -333,7 +335,6 @@ def _loss_weights_from_config(config: dict[str, Any]) -> PanoVGGTMatchingLossWei
         nce=float(raw.get("nce_weight", 1.0)),
         confidence=float(raw.get("confidence_weight", 0.1)),
         spherical=float(raw.get("spherical_regression_weight", 0.2)),
-        static=float(raw.get("static_weight", 0.05)),
         sky=float(raw.get("sky_weight", 0.2)),
         sky_dice=float(raw.get("sky_dice_weight", 0.5)),
         smoothness=float(raw.get("smoothness_weight", 0.01)),
@@ -343,6 +344,59 @@ def _loss_weights_from_config(config: dict[str, Any]) -> PanoVGGTMatchingLossWei
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
+
+
+def _unwrap_head_wrapper(wrapper: nn.Module) -> PanoVGGTMatchingSkyHead:
+    if isinstance(wrapper, DistributedDataParallel):
+        module = wrapper.module
+    else:
+        module = wrapper
+    if not isinstance(module, PanoVGGTMatchingSkyHead):
+        raise TypeError(f"Expected PanoVGGTMatchingSkyHead, got {type(module)!r}.")
+    return module
+
+
+def _distributed_state() -> dict[str, int | bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    return {
+        "distributed": distributed,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "is_main": rank == 0,
+    }
+
+
+def _init_distributed_if_needed(state: dict[str, int | bool]) -> None:
+    if not bool(state["distributed"]):
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(state["local_rank"]))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+
+
+def _cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _barrier_if_distributed(state: dict[str, int | bool]) -> None:
+    if bool(state["distributed"]) and dist.is_initialized():
+        dist.barrier()
+
+
+def _reduce_float_metrics(metrics: dict[str, float], state: dict[str, int | bool], device: torch.device) -> dict[str, float]:
+    if not bool(state["distributed"]) or not metrics:
+        return metrics
+    keys = sorted(metrics)
+    values = torch.tensor([float(metrics[key]) for key in keys], device=device, dtype=torch.float32)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values = values / float(state["world_size"])
+    return {key: float(value.detach().cpu()) for key, value in zip(keys, values)}
 
 
 def _resize_non_sky_mask(sample_sky_mask: torch.Tensor | None, feature_hw: tuple[int, int]) -> torch.Tensor | None:
@@ -364,6 +418,7 @@ def save_sky_head_checkpoint(
 ) -> None:
     """Save a standalone sky-head checkpoint."""
 
+    wrapper = _unwrap_head_wrapper(wrapper)
     payload = {
         "format": "panovggt_m3_sphere_sky_head_v1",
         "sky_mask_head": wrapper.sky_head.state_dict(),
@@ -388,6 +443,7 @@ def save_matching_head_checkpoint(
 ) -> None:
     """Save a standalone matching-head checkpoint."""
 
+    wrapper = _unwrap_head_wrapper(wrapper)
     payload = {
         "format": "panovggt_m3_sphere_matching_head_v1",
         "matching_head": wrapper.matching_head.state_dict(),
@@ -410,6 +466,7 @@ def save_combined_head_bundle(
 ) -> None:
     """Save a combined bundle for later inference adapter loading."""
 
+    wrapper = _unwrap_head_wrapper(wrapper)
     payload = {
         "format": "panovggt_m3_sphere_matching_sky_bundle_v1",
         "matching_head": wrapper.matching_head.state_dict(),
@@ -431,9 +488,11 @@ def load_head_checkpoint(path: str | Path, wrapper: PanoVGGTMatchingSkyHead, *, 
     if fmt == "panovggt_m3_sphere_sky_head_v1":
         wrapper.sky_head.load_state_dict(payload["sky_mask_head"], strict=strict)
     elif fmt == "panovggt_m3_sphere_matching_head_v1":
-        wrapper.matching_head.load_state_dict(payload["matching_head"], strict=strict)
+        state = {key: value for key, value in payload["matching_head"].items() if not key.startswith("static_confidence_proj.")}
+        wrapper.matching_head.load_state_dict(state, strict=strict)
     elif fmt == "panovggt_m3_sphere_matching_sky_bundle_v1":
-        wrapper.matching_head.load_state_dict(payload["matching_head"], strict=strict)
+        state = {key: value for key, value in payload["matching_head"].items() if not key.startswith("static_confidence_proj.")}
+        wrapper.matching_head.load_state_dict(state, strict=strict)
         wrapper.sky_head.load_state_dict(payload["sky_mask_head"], strict=strict)
     else:
         raise ValueError(f"Unsupported PanoVGGT-M3-Sphere head checkpoint format: {fmt!r}")
@@ -490,7 +549,8 @@ def _build_head_and_optimizer(
     feature_dim: int,
     mode: str,
     device: torch.device,
-) -> tuple[PanoVGGTMatchingSkyHead, torch.optim.Optimizer, list[torch.nn.Parameter]]:
+    distributed_state: dict[str, int | bool] | None = None,
+) -> tuple[nn.Module, torch.optim.Optimizer, list[torch.nn.Parameter]]:
     heads_cfg = config.get("Heads", {})
     flags = _mode_head_flags(mode, heads_cfg)
     wrapper = PanoVGGTMatchingSkyHead(
@@ -505,6 +565,14 @@ def _build_head_and_optimizer(
     if resume:
         load_head_checkpoint(resume, wrapper, strict=False)
     _set_trainable_for_mode(wrapper, mode)
+    module: nn.Module = wrapper
+    if distributed_state is not None and bool(distributed_state["distributed"]):
+        module = DistributedDataParallel(
+            wrapper,
+            device_ids=[int(distributed_state["local_rank"])] if device.type == "cuda" else None,
+            output_device=int(distributed_state["local_rank"]) if device.type == "cuda" else None,
+            find_unused_parameters=False,
+        )
     trainable = [param for param in wrapper.parameters() if param.requires_grad]
     if not trainable:
         raise ValueError(f"No trainable parameters for mode {mode}.")
@@ -514,7 +582,7 @@ def _build_head_and_optimizer(
         lr=float(opt_cfg.get("lr", 2.0e-4)),
         weight_decay=float(opt_cfg.get("weight_decay", 0.05)),
     )
-    return wrapper, optimizer, trainable
+    return module, optimizer, trainable
 
 
 def _descriptor_recall_metrics(
@@ -531,10 +599,8 @@ def _descriptor_recall_metrics(
     if valid_idx.numel() == 0:
         zero = descriptors.sum() * 0.0
         return {
-            "match_recall_0_1deg": zero.detach(),
-            "match_recall_0_5deg": zero.detach(),
-            "match_recall_1deg": zero.detach(),
-            "match_angular_error_deg": zero.detach(),
+            "matching_recall": zero.detach(),
+            "precision_at_0_5deg": zero.detach(),
         }
     if valid_idx.numel() > int(max_correspondences):
         keep = torch.linspace(0, valid_idx.numel() - 1, steps=int(max_correspondences), device=valid_idx.device).round().long()
@@ -565,11 +631,10 @@ def _descriptor_recall_metrics(
     pred_image_uv = feature_uv_to_image_uv(pred_uv, (height_f, width_f), image_hw)
     pred_bearing = erp_pixel_to_bearing(pred_image_uv, int(image_hw[0]), int(image_hw[1])).to(descriptors)
     residual_deg = torch.rad2deg(spherical_tangent_residual(gt_bearing, pred_bearing).norm(dim=-1))
+    correct = (residual_deg <= 0.5).float().mean().detach()
     return {
-        "match_recall_0_1deg": (residual_deg <= 0.1).float().mean().detach(),
-        "match_recall_0_5deg": (residual_deg <= 0.5).float().mean().detach(),
-        "match_recall_1deg": (residual_deg <= 1.0).float().mean().detach(),
-        "match_angular_error_deg": residual_deg.mean().detach(),
+        "matching_recall": correct,
+        "precision_at_0_5deg": correct,
     }
 
 
@@ -637,6 +702,30 @@ def _mask_overlay(image: Image.Image, mask: torch.Tensor, color: tuple[int, int,
     return Image.fromarray(data.clip(0, 255).astype(np.uint8), mode="RGB")
 
 
+def _binary_mask_image(mask: torch.Tensor, size_hw: tuple[int, int] | None = None, *, threshold: float = 0.5) -> Image.Image:
+    m = mask.detach().float().cpu()
+    if m.ndim == 3:
+        m = m[0]
+    if size_hw is not None and tuple(m.shape[-2:]) != tuple(size_hw):
+        m = F.interpolate(m.view(1, 1, int(m.shape[-2]), int(m.shape[-1])), size=size_hw, mode="bilinear", align_corners=False)[0, 0]
+    data = ((m >= float(threshold)).numpy().astype(np.uint8) * 255)
+    return Image.fromarray(data, mode="L").convert("RGB")
+
+
+def _heatmap_image(value: torch.Tensor, size_hw: tuple[int, int]) -> Image.Image:
+    v = value.detach().float().cpu()
+    if v.ndim == 3:
+        v = v[0]
+    if tuple(v.shape[-2:]) != tuple(size_hw):
+        v = F.interpolate(v.view(1, 1, int(v.shape[-2]), int(v.shape[-1])), size=size_hw, mode="bilinear", align_corners=False)[0, 0]
+    v = v.clamp(0.0, 1.0).numpy()
+    r = np.clip(2.0 * v - 0.25, 0.0, 1.0)
+    g = np.clip(2.0 - np.abs(2.0 * v - 1.0) * 2.0, 0.0, 1.0)
+    b = np.clip(1.25 - 2.0 * v, 0.0, 1.0)
+    data = np.stack([r, g, b], axis=-1)
+    return Image.fromarray((data * 255.0).round().astype(np.uint8), mode="RGB")
+
+
 def _save_sky_visualization(
     *,
     sample: dict[str, Any],
@@ -646,8 +735,8 @@ def _save_sky_visualization(
     if "sky_prob" not in outputs or not torch.is_tensor(sample.get("sky_mask")):
         return None
     image = _image_from_tensor(sample["images"][0, 0])
-    gt = _mask_overlay(image, sample["sky_mask"][0, 0, 0], (0, 200, 255))
-    pred = _mask_overlay(image, outputs["sky_prob"][0, 0, 0], (255, 80, 60))
+    gt = _binary_mask_image(sample["sky_mask"][0, 0, 0], (image.height, image.width))
+    pred = _binary_mask_image(outputs["sky_prob"][0, 0, 0], (image.height, image.width))
     canvas = Image.new("RGB", (image.width * 3, image.height), (0, 0, 0))
     canvas.paste(image, (0, 0))
     canvas.paste(gt, (image.width, 0))
@@ -735,12 +824,42 @@ def _save_matching_visualization(
         sx, sy = float(s[0]), float(s[1])
         gx, gy = float(gt[0]) + image_src.width, float(gt[1])
         px, py = float(pred[0]) + image_src.width, float(pred[1])
-        draw.line((sx, sy, px, py), fill=(255, 180, 0), width=1)
-        draw.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=(80, 180, 255))
-        draw.ellipse((gx - 3, gy - 3, gx + 3, gy + 3), outline=(0, 255, 80), width=2)
-        draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(255, 60, 60))
+        draw.line((sx, sy, px, py), fill=(255, 180, 0), width=3)
+        draw.ellipse((sx - 3, sy - 3, sx + 3, sy + 3), fill=(80, 180, 255))
+        draw.ellipse((gx - 5, gy - 5, gx + 5, gy + 5), outline=(0, 255, 80), width=3)
+        draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=(255, 60, 60))
     draw.rectangle((6, 6, 205, 28), fill=(0, 0, 0))
     draw.text((12, 10), "blue=src green=gt red=pred", fill=(255, 255, 255))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return path
+
+
+def _save_match_confidence_visualization(
+    *,
+    sample: dict[str, Any],
+    outputs: dict[str, torch.Tensor],
+    corr: Any | None,
+    path: Path,
+) -> Path | None:
+    if corr is None or "match_confidence" not in outputs:
+        return None
+    valid_idx = torch.nonzero(corr.valid_mask.reshape(-1).bool(), as_tuple=False).flatten()
+    if valid_idx.numel() == 0:
+        return None
+    src_frame = int(corr.src_indices.reshape(-1)[valid_idx[0]].detach().cpu())
+    tgt_frame = int(corr.tgt_indices.reshape(-1)[valid_idx[0]].detach().cpu())
+    image_src = _image_from_tensor(sample["images"][0, src_frame])
+    image_tgt = _image_from_tensor(sample["images"][0, tgt_frame])
+    conf = outputs["match_confidence"][0]
+    src_heat = _heatmap_image(conf[src_frame, 0], (image_src.height, image_src.width))
+    tgt_heat = _heatmap_image(conf[tgt_frame, 0], (image_tgt.height, image_tgt.width))
+    canvas = Image.new("RGB", (image_src.width + image_tgt.width, max(image_src.height, image_tgt.height)), (0, 0, 0))
+    canvas.paste(src_heat, (0, 0))
+    canvas.paste(tgt_heat, (image_src.width, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((6, 6, 210, 28), fill=(0, 0, 0))
+    draw.text((12, 10), "match confidence heatmap", fill=(255, 255, 255))
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
     return path
@@ -794,6 +913,12 @@ def _maybe_write_visualizations(
             path=vis_dir / f"step_{step:07d}_matching.png",
             max_matches=int(vis_cfg.get("max_matches", 40)),
         )
+        paths["match_confidence"] = _save_match_confidence_visualization(
+            sample=sample,
+            outputs=outputs,
+            corr=correspondences[0] if correspondences else None,
+            path=vis_dir / f"step_{step:07d}_match_confidence.png",
+        )
     _log_visualization_paths(wandb_run, paths, step=step)
 
 
@@ -809,6 +934,7 @@ def _run_validation(
     output_dir: Path,
     step: int,
     wandb_run: Any,
+    is_main: bool = True,
 ) -> dict[str, float]:
     val_cfg = config.get("Validation", {})
     if not bool(val_cfg.get("enabled", False)):
@@ -854,7 +980,7 @@ def _run_validation(
             for key, value in metrics.items():
                 accum[key] = accum.get(key, 0.0) + float(value)
             count += 1
-            if count == 1:
+            if count == 1 and is_main:
                 _maybe_write_visualizations(
                     config=config,
                     output_dir=output_dir,
@@ -870,24 +996,42 @@ def _run_validation(
                 break
     if was_training:
         wrapper.train()
-    metrics = {f"val/{key}": value / max(count, 1) for key, value in accum.items()}
-    if wandb_run is not None and metrics:
-        wandb_run.log(metrics, step=step)
+    if mode == "sky_only":
+        keep = ("sky_iou", "sky_pixel_acc")
+    elif mode == "matching_only":
+        keep = ("matching_recall", "precision_at_0_5deg")
+    else:
+        keep = ("sky_iou", "sky_pixel_acc", "matching_recall", "precision_at_0_5deg")
+    metrics = {f"val/{key}": value / max(count, 1) for key, value in accum.items() if key in keep}
     return metrics
 
 
 def train_matching(config: dict[str, Any]) -> dict[str, Any]:
     """Run staged PanoVGGT-M3-Sphere head training."""
 
+    ddp_state = _distributed_state()
+    _init_distributed_if_needed(ddp_state)
+    is_main = bool(ddp_state["is_main"])
     torch.manual_seed(int(config.get("Training", {}).get("seed", 1234)))
     mode = normalize_training_mode(str(config.get("Training", {}).get("mode", "matching_only")))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", int(ddp_state["local_rank"]) if bool(ddp_state["distributed"]) else 0)
+    else:
+        device = torch.device("cpu")
     dataset = build_matching_dataset_from_config(config)
     tr_cfg = config.get("Training", {})
+    train_sampler = DistributedSampler(
+        dataset,
+        num_replicas=int(ddp_state["world_size"]),
+        rank=int(ddp_state["rank"]),
+        shuffle=True,
+        drop_last=False,
+    ) if bool(ddp_state["distributed"]) else None
     loader = DataLoader(
         dataset,
         batch_size=int(tr_cfg.get("batch_size", 1)),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=int(tr_cfg.get("num_workers", 0)),
         collate_fn=matching_collate,
         drop_last=False,
@@ -911,8 +1055,10 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
     loss_fn = PanoVGGTMatchingSkyLoss(_loss_weights_from_config(config))
     output_dir = Path(tr_cfg.get("output_dir", "outputs/panovggt_m3_sphere_omni360"))
     ckpt_dir = output_dir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    wandb_run = _init_wandb(config, output_dir)
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    _barrier_if_distributed(ddp_state)
+    wandb_run = _init_wandb(config, output_dir) if is_main else None
     max_steps = int(tr_cfg.get("steps", tr_cfg.get("max_steps", 1)))
     save_interval = max(1, int(tr_cfg.get("save_interval", 1000)))
     log_interval = max(1, int(tr_cfg.get("log_interval", 50)))
@@ -921,8 +1067,12 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
     best = float("inf")
     latest_metrics: dict[str, float] = {}
     start = time.time()
+    epoch = 0
 
     while step < max_steps:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        epoch += 1
         for batch in loader:
             sample = _to_device(batch, device)
             validate_training_sample(sample, mode, allow_fallback_mode=bool(config.get("Dataset", {}).get("allow_fallback_mode", False)))
@@ -939,6 +1089,7 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
                     feature_dim=feature_dim,
                     mode=mode,
                     device=device,
+                    distributed_state=ddp_state,
                 )
                 wrapper.train()
             outputs = wrapper(features)
@@ -964,22 +1115,23 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
             torch.nn.utils.clip_grad_norm_(trainable, float(tr_cfg.get("grad_clip", 1.0)))
             optimizer.step()
             step += 1
-            latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
-            if wandb_run is not None and (step == 1 or step % int(config.get("WeightsAndBiases", {}).get("log_every", 10)) == 0):
+            latest_metrics = _reduce_float_metrics(_float_metrics({"loss": loss.detach(), **metrics_t}), ddp_state, device)
+            if is_main and wandb_run is not None and (step == 1 or step % int(config.get("WeightsAndBiases", {}).get("log_every", 10)) == 0):
                 wandb_run.log({f"train/{key}": value for key, value in latest_metrics.items()}, step=step)
-            if step == 1 or step % log_interval == 0:
+            if is_main and (step == 1 or step % log_interval == 0):
                 print(yaml.safe_dump({"step": step, "mode": mode, "metrics": latest_metrics}, sort_keys=False).strip())
-            _maybe_write_visualizations(
-                config=config,
-                output_dir=output_dir,
-                step=step,
-                mode=mode,
-                sample=sample,
-                outputs=outputs,
-                correspondences=correspondences,
-                image_hw=image_hw,
-                wandb_run=wandb_run,
-            )
+            if is_main:
+                _maybe_write_visualizations(
+                    config=config,
+                    output_dir=output_dir,
+                    step=step,
+                    mode=mode,
+                    sample=sample,
+                    outputs=outputs,
+                    correspondences=correspondences,
+                    image_hw=image_hw,
+                    wandb_run=wandb_run,
+                )
             if val_loader is not None and (step == 1 or step % val_interval == 0):
                 val_metrics = _run_validation(
                     config=config,
@@ -992,10 +1144,14 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
                     output_dir=output_dir,
                     step=step,
                     wandb_run=wandb_run,
+                    is_main=is_main,
                 )
+                val_metrics = _reduce_float_metrics(val_metrics, ddp_state, device)
                 if val_metrics:
                     latest_metrics.update(val_metrics)
-            if step % save_interval == 0 or step == max_steps:
+                    if is_main and wandb_run is not None:
+                        wandb_run.log(val_metrics, step=step)
+            if is_main and (step % save_interval == 0 or step == max_steps):
                 if mode == "sky_only":
                     save_sky_head_checkpoint(ckpt_dir / "sky_head.pt", wrapper=wrapper, config=config, global_step=step, metrics=latest_metrics)
                 elif mode == "matching_only":
@@ -1010,15 +1166,20 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Training finished without initializing PanoVGGT-M3-Sphere heads.")
     if mode == "sky_only":
         checkpoint = ckpt_dir / "sky_head.pt"
-        save_sky_head_checkpoint(checkpoint, wrapper=wrapper, config=config, global_step=step, metrics=latest_metrics)
+        if is_main:
+            save_sky_head_checkpoint(checkpoint, wrapper=wrapper, config=config, global_step=step, metrics=latest_metrics)
     elif mode == "matching_only":
         checkpoint = ckpt_dir / "matching_head.pt"
-        save_matching_head_checkpoint(checkpoint, wrapper=wrapper, config=config, global_step=step, metrics=latest_metrics)
+        if is_main:
+            save_matching_head_checkpoint(checkpoint, wrapper=wrapper, config=config, global_step=step, metrics=latest_metrics)
     else:
         checkpoint = ckpt_dir / "matching_sky_bundle.pt"
-        save_combined_head_bundle(checkpoint, wrapper=wrapper, config=config)
+        if is_main:
+            save_combined_head_bundle(checkpoint, wrapper=wrapper, config=config)
     if wandb_run is not None:
         wandb_run.finish()
+    _barrier_if_distributed(ddp_state)
+    _cleanup_distributed()
     return {
         "mode": mode,
         "steps": step,
@@ -1036,6 +1197,9 @@ def main() -> None:
     parser.add_argument("--config", default=None)
     parser.add_argument("--mode", default=None, choices=["sky_only", "matching_only", "head_joint_calibration"])
     parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--wandb-mode", default=None, choices=["online", "offline", "disabled"])
@@ -1046,6 +1210,12 @@ def main() -> None:
         config.setdefault("Training", {})["mode"] = args.mode
     if args.steps is not None:
         config.setdefault("Training", {})["steps"] = int(args.steps)
+    if args.batch_size is not None:
+        config.setdefault("Training", {})["batch_size"] = int(args.batch_size)
+    if args.num_workers is not None:
+        config.setdefault("Training", {})["num_workers"] = int(args.num_workers)
+    if args.val_batch_size is not None:
+        config.setdefault("Validation", {})["batch_size"] = int(args.val_batch_size)
     if args.output_dir is not None:
         config.setdefault("Training", {})["output_dir"] = args.output_dir
     if args.run_name is not None:

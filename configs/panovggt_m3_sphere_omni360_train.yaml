@@ -5,7 +5,9 @@ Training:
   #   head_joint_calibration: optional low-LR head-only calibration.
   mode: matching_only
   steps: 200000
-  batch_size: 1
+  # Per-process/per-GPU batch size. With torchrun --nproc_per_node=2 the
+  # effective batch size is 4.
+  batch_size: 2
   frames_per_sample: 4
   num_workers: 4
   amp: true
@@ -40,7 +42,6 @@ Heads:
   num_conv_blocks: 2
   train_matching: true
   train_sky: false
-  train_static: true
   feature_key: null
 
 Dataset:
@@ -85,7 +86,6 @@ Loss:
   nce_weight: 1.0
   confidence_weight: 0.1
   spherical_regression_weight: 0.2
-  static_weight: 0.05
   sky_weight: 0.2
   sky_dice_weight: 0.5
   smoothness_weight: 0.01
@@ -105,7 +105,7 @@ WeightsAndBiases:
 
 Validation:
   enabled: true
-  batch_size: 1
+  batch_size: 2
   num_workers: 0
   max_batches: 2
 

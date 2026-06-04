@@ -66,7 +66,7 @@ class _ConvNormGELU(nn.Module):
 
 
 class PanoVGGTMatchingHead(nn.Module):
-    """Dense descriptor, match-confidence, and static-confidence head.
+    """Dense descriptor and match-confidence head.
 
     The output spatial resolution always follows the input feature resolution.
     For 5D input ``[B, N, C, Hf, Wf]`` the outputs are 5D. For 4D input
@@ -101,7 +101,6 @@ class PanoVGGTMatchingHead(nn.Module):
         self.trunk = nn.Sequential(*blocks)
         self.descriptor_proj = nn.Conv2d(self.hidden_dim, self.descriptor_dim, kernel_size=1)
         self.match_confidence_proj = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
-        self.static_confidence_proj = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
 
     def forward(self, feature: torch.Tensor | dict[str, torch.Tensor] | Sequence[torch.Tensor]) -> dict[str, torch.Tensor]:
         """Run the matching head on a PanoVGGT feature tensor."""
@@ -113,11 +112,9 @@ class PanoVGGTMatchingHead(nn.Module):
         hidden = self.trunk(flat)
         descriptors = F.normalize(self.descriptor_proj(hidden), dim=1, eps=1.0e-6)
         match_confidence = torch.sigmoid(self.match_confidence_proj(hidden))
-        static_confidence = torch.sigmoid(self.static_confidence_proj(hidden))
         return {
             "dense_descriptors": _restore_feature_shape(descriptors, batch_frames),
             "match_confidence": _restore_feature_shape(match_confidence, batch_frames),
-            "static_confidence": _restore_feature_shape(static_confidence, batch_frames),
         }
 
 
@@ -175,7 +172,6 @@ class PanoVGGTMatchingSkyHead(nn.Module):
         feature_key: str | int | None = None,
         train_matching: bool = True,
         train_sky: bool = True,
-        train_static: bool = True,
     ) -> None:
         super().__init__()
         self.feature_dim = int(feature_dim)
@@ -185,7 +181,6 @@ class PanoVGGTMatchingSkyHead(nn.Module):
         self.feature_key = feature_key
         self.train_matching = bool(train_matching)
         self.train_sky = bool(train_sky)
-        self.train_static = bool(train_static)
         self.matching_head = PanoVGGTMatchingHead(
             self.feature_dim,
             descriptor_dim=self.descriptor_dim,
@@ -204,7 +199,7 @@ class PanoVGGTMatchingSkyHead(nn.Module):
         """Return the union of enabled matching and sky predictions."""
 
         out: dict[str, torch.Tensor] = {}
-        if self.train_matching or self.train_static:
+        if self.train_matching:
             out.update(self.matching_head(feature))
         if self.train_sky:
             out.update(self.sky_head(feature))
@@ -221,5 +216,4 @@ class PanoVGGTMatchingSkyHead(nn.Module):
             "feature_key": self.feature_key,
             "train_matching": self.train_matching,
             "train_sky": self.train_sky,
-            "train_static": self.train_static,
         }
