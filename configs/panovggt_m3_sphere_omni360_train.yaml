@@ -1,0 +1,97 @@
+Training:
+  # Staged training modes:
+  #   sky_only: train only PanoVGGTSkyMaskHead.
+  #   matching_only: train only PanoVGGTMatchingHead.
+  #   head_joint_calibration: optional low-LR head-only calibration.
+  mode: matching_only
+  steps: 200000
+  batch_size: 1
+  frames_per_sample: 4
+  num_workers: 4
+  amp: true
+  seed: 1234
+  log_interval: 50
+  save_interval: 5000
+  output_dir: outputs/panovggt_m3_sphere_omni360
+  grad_clip: 1.0
+  resume_checkpoint: null
+
+Model:
+  panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
+  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  use_synthetic_features: false
+  freeze_panovggt: true
+  # Must name a real module in the external PanoVGGT model. Missing hooks raise
+  # a clear error; no random/fake features are used in real training.
+  feature_hook: decoder
+  feature_dim: null
+  feature_stride: 4
+
+Heads:
+  descriptor_dim: 24
+  hidden_dim: 128
+  num_conv_blocks: 2
+  train_matching: true
+  train_sky: false
+  train_static: true
+  feature_key: null
+
+Dataset:
+  synthetic: false
+  root: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene
+  pose_root: /mnt/disk1/lanboyang/Datasets/Airsim360/UE_Raw_sample_pts
+  # First real training source: only the continuous Omni360-Scene trajectories.
+  scenes: ["DTW", "NYC"]
+  erp_resize_height: null
+  erp_resize_width: null
+  clip_stride: 1
+  temporal_radius: 2
+  bidirectional_pairs: false
+  depth_format: euclidean_range
+  depth_scale: 1.0
+  depth_invalid_value: 1000.0
+  pose_format: position_euler
+  pose_translation_scale: 0.01
+  allow_fallback_mode: false
+  class_map:
+    sky_names: ["Sky", "sky"]
+    sky_ids: []
+    sky_colors: []
+
+Pairs:
+  strategy: temporal
+  samples_per_edge: 4096
+  min_valid_corr_ratio: 0.03
+  min_baseline_deg: 0.0
+  max_baseline_deg: 60.0
+  sky_filter: true
+
+Optimizer:
+  type: adamw
+  lr: 2.0e-4
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_steps: 1000
+
+Loss:
+  nce_weight: 1.0
+  confidence_weight: 0.1
+  spherical_regression_weight: 0.2
+  static_weight: 0.05
+  sky_weight: 0.2
+  sky_dice_weight: 0.5
+  smoothness_weight: 0.01
+  temperature: 0.07
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: panovggt_m3_sphere_omni360_matching
+  mode: online
+  log_every: 10
+  tags:
+    - panovggt-m3-sphere
+    - omni360-scene
+    - dtw-nyc
