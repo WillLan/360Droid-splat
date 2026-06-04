@@ -211,8 +211,11 @@ def _load_semantic(path: Path, resize: tuple[int, int] | None) -> tuple[torch.Te
     arr = np.asarray(image)
     if arr.ndim == 2:
         return torch.from_numpy(arr.astype(np.int64)).contiguous(), None
-    if arr.ndim == 3 and arr.shape[-1] == 4 and np.all(arr[..., :3] == arr[..., :3][..., :1]):
-        return torch.from_numpy(arr[..., 3].astype(np.int64)).contiguous(), None
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        alpha = arr[..., 3]
+        alpha_values = np.unique(alpha)
+        if alpha_values.size > 1 or int(alpha_values[0]) != 255:
+            return torch.from_numpy(alpha.astype(np.int64)).contiguous(), None
     if arr.ndim == 3:
         rgb = torch.from_numpy(arr[..., :3].astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
         return None, rgb
@@ -335,7 +338,8 @@ class Omni360SceneTrainingDataset(Dataset):
         depth_paths = _collect_id_paths(scene_dir / str(layout["depth_dir"]), _DEPTH_ID_RE)
         semantic_paths: dict[int, Path] = {}
         for semantic_dir in layout["semantic_dirs"]:
-            semantic_paths.update(_collect_id_paths(scene_dir / str(semantic_dir), _IMAGE_ID_RE))
+            for frame_id, path in _collect_id_paths(scene_dir / str(semantic_dir), _IMAGE_ID_RE).items():
+                semantic_paths.setdefault(frame_id, path)
         pose_file = self.pose_root / str(layout["pose_file"]) if self.pose_root is not None else Path("")
         poses = _load_pose_csv(pose_file, translation_scale=self.pose_translation_scale) if self.pose_root is not None else {}
 

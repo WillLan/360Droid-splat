@@ -120,6 +120,7 @@ def test_sky_class_map_id_name_and_color_paths_work():
 
 def test_omni360_rgba_alpha_semantic_labels_are_supported(tmp_path: Path):
     arr = np.zeros((3, 4, 4), dtype=np.uint8)
+    arr[..., :3] = np.array([10, 80, 200], dtype=np.uint8)
     arr[..., 3] = np.array(
         [
             [0, 3, 3, 0],
