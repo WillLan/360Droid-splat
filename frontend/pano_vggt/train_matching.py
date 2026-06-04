@@ -386,7 +386,10 @@ def _cleanup_distributed() -> None:
 
 def _barrier_if_distributed(state: dict[str, int | bool]) -> None:
     if bool(state["distributed"]) and dist.is_initialized():
-        dist.barrier()
+        if torch.cuda.is_available():
+            dist.barrier(device_ids=[int(state["local_rank"])])
+        else:
+            dist.barrier()
 
 
 def _reduce_float_metrics(metrics: dict[str, float], state: dict[str, int | bool], device: torch.device) -> dict[str, float]:
@@ -1229,7 +1232,8 @@ def main() -> None:
     if args.max_clips is not None:
         config.setdefault("Dataset", {})["max_clips"] = int(args.max_clips)
     result = train_matching(config)
-    print(yaml.safe_dump(result, sort_keys=False))
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(yaml.safe_dump(result, sort_keys=False))
 
 
 if __name__ == "__main__":
