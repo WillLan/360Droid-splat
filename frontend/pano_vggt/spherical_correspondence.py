@@ -170,7 +170,11 @@ def generate_gt_spherical_correspondences(
         & (depth_error <= float(depth_consistency_abs) + float(depth_consistency_rel) * tgt_depth.abs().clamp_min(1.0e-6))
     )
 
-    dot = (src_bearing * tgt_bearing).sum(dim=-1).clamp(-1.0, 1.0)
+    src_center = src_pose[:, :3, 3].view(edge_count, 1, 3)
+    tgt_center = tgt_pose[:, :3, 3].view(edge_count, 1, 3)
+    src_ray_world = F.normalize(world - src_center, dim=-1, eps=1.0e-12)
+    tgt_ray_world = F.normalize(world - tgt_center, dim=-1, eps=1.0e-12)
+    dot = (src_ray_world * tgt_ray_world).sum(dim=-1).clamp(-1.0, 1.0)
     angular_baseline = torch.acos(dot)
     baseline_deg = torch.rad2deg(angular_baseline)
     baseline_ok = (baseline_deg >= float(min_baseline_deg)) & (baseline_deg <= float(max_baseline_deg))

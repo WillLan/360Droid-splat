@@ -178,6 +178,24 @@ def test_yaw_seam_correspondence_wraps_horizontally():
     assert torch.all((corr.tgt_uv[..., 1] >= 0.0) & (corr.tgt_uv[..., 1] < 8.0))
 
 
+def test_angular_baseline_is_world_parallax_not_camera_frame_delta():
+    depths = torch.full((2, 1, 8, 16), 2.0)
+    poses = _eye_poses(2)
+    poses[1] = _yaw_c2w(math.radians(120.0))
+    corr = generate_gt_spherical_correspondences(
+        depths,
+        poses,
+        torch.tensor([[0, 1]]),
+        feature_hw=(4, 8),
+        image_hw=(8, 16),
+        min_baseline_deg=1.0,
+        max_baseline_deg=180.0,
+        use_wraparound=True,
+    )
+    assert corr.angular_baseline.abs().max() < 1.0e-4
+    assert not corr.valid_mask.any()
+
+
 def test_depth_inconsistent_correspondence_is_invalid():
     depths = torch.full((2, 1, 8, 16), 2.0)
     depths[1] = 9.0

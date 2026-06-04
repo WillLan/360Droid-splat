@@ -80,7 +80,7 @@ def _default_config() -> dict[str, Any]:
         "Pairs": {
             "samples_per_edge": 128,
             "min_baseline_deg": 0.0,
-            "max_baseline_deg": 60.0,
+            "max_baseline_deg": 180.0,
             "sky_filter": True,
             "pair_sampling": "all",
             "pairs_per_sample": None,

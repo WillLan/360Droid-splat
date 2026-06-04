@@ -83,7 +83,9 @@ Pairs:
   pairs_per_sample: 12
   min_valid_corr_ratio: 0.03
   min_baseline_deg: 0.0
-  max_baseline_deg: 60.0
+  # This is world-frame parallax now. Keep the first training pass permissive;
+  # only min_baseline_deg removes degenerate zero-parallax matches.
+  max_baseline_deg: 180.0
   sky_filter: true
 
 Optimizer:

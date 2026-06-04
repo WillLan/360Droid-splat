@@ -32,6 +32,13 @@ class Omni360Frame:
     c2w: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class _PoseCsvData:
+    poses: dict[int, torch.Tensor]
+    used_row_index: bool
+    path: Path
+
+
 _SCENE_LAYOUTS: dict[str, dict[str, Any]] = {
     "DTW": {
         "rgb_dirs": ("dtw_Raw",),
@@ -54,6 +61,7 @@ _SCENE_LAYOUTS: dict[str, dict[str, Any]] = {
 }
 _IMAGE_ID_RE = re.compile(r"panorama_(\d+)\.(?:png|jpg|jpeg)$", re.IGNORECASE)
 _DEPTH_ID_RE = re.compile(r"Depth_(\d+)\.h5$", re.IGNORECASE)
+_POSE_FRAME_ID_COLUMNS = ("frame_id", "frame", "image_id", "image", "id", "index", "filename", "file", "name")
 
 
 def normalize_training_mode(mode: str) -> TrainingMode:
@@ -283,14 +291,37 @@ def _euler_degrees_to_c2w(
     return torch.from_numpy(pose)
 
 
-def _load_pose_csv(path: Path, *, translation_scale: float, coordinate_system: str = "ue_airsim") -> dict[int, torch.Tensor]:
+def _pose_row_frame_id(row: dict[str, Any]) -> int | None:
+    lower = {str(key).lower(): str(value) for key, value in row.items() if key is not None and value not in (None, "")}
+    for column in _POSE_FRAME_ID_COLUMNS:
+        value = lower.get(column)
+        if value is None:
+            continue
+        try:
+            return int(float(value))
+        except ValueError:
+            match = re.search(r"(\d+)", Path(value).stem)
+            if match is not None:
+                return int(match.group(1))
+    return None
+
+
+def _load_pose_csv(path: Path, *, translation_scale: float, coordinate_system: str = "ue_airsim") -> _PoseCsvData:
     if not path.is_file():
-        return {}
+        return _PoseCsvData(poses={}, used_row_index=True, path=path)
     poses: dict[int, torch.Tensor] = {}
+    used_row_index = True
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for idx, row in enumerate(reader):
-            lower = {str(k).lower(): float(v) for k, v in row.items() if k is not None and str(v) != ""}
+            frame_id = _pose_row_frame_id(row)
+            if frame_id is None:
+                frame_id = idx
+            else:
+                used_row_index = False
+            if frame_id in poses:
+                raise ValueError(f"Duplicate pose frame id {frame_id} in {path}.")
+            lower = {str(k).lower(): float(v) for k, v in row.items() if k is not None and str(v) != "" and str(k).lower() not in _POSE_FRAME_ID_COLUMNS}
             if {"x", "y", "z", "roll", "pitch", "yaw"}.issubset(lower):
                 roll = lower["roll"]
                 pitch = lower["pitch"]
@@ -299,7 +330,7 @@ def _load_pose_csv(path: Path, *, translation_scale: float, coordinate_system: s
                 pitch = lower["pitch"]
             else:
                 raise ValueError(f"Unsupported pose CSV header in {path}: {reader.fieldnames}")
-            poses[idx] = _euler_degrees_to_c2w(
+            poses[frame_id] = _euler_degrees_to_c2w(
                 lower["x"],
                 lower["y"],
                 lower["z"],
@@ -309,7 +340,25 @@ def _load_pose_csv(path: Path, *, translation_scale: float, coordinate_system: s
                 scale=translation_scale,
                 coordinate_system=coordinate_system,
             )
-    return poses
+    return _PoseCsvData(poses=poses, used_row_index=used_row_index, path=path)
+
+
+def _validate_pose_frame_alignment(scene: str, frame_ids: list[int], pose_data: _PoseCsvData) -> None:
+    if not pose_data.poses:
+        return
+    if pose_data.used_row_index:
+        expected = list(range(len(frame_ids)))
+        if frame_ids != expected or len(pose_data.poses) != len(frame_ids):
+            raise ValueError(
+                "Pose CSV has no explicit frame id/filename column, so row-index pose alignment requires "
+                f"scene {scene!r} image frame ids to be exactly 0..{len(frame_ids) - 1} and pose rows to match. "
+                f"Got first/last frame ids {frame_ids[:3]}...{frame_ids[-3:]} and {len(pose_data.poses)} pose rows "
+                f"from {pose_data.path}."
+            )
+    missing = sorted(set(frame_ids) - set(pose_data.poses))
+    if missing:
+        preview = missing[:8]
+        raise ValueError(f"Pose CSV {pose_data.path} is missing {len(missing)} poses for scene {scene}; examples: {preview}.")
 
 
 def validate_pose_rotation(poses_c2w: torch.Tensor, *, atol: float = 1.0e-3) -> None:
@@ -495,17 +544,19 @@ class Omni360SceneTrainingDataset(Dataset):
             for frame_id, path in _collect_id_paths(scene_dir / str(semantic_dir), _IMAGE_ID_RE).items():
                 semantic_paths.setdefault(frame_id, path)
         pose_file = self.pose_root / str(layout["pose_file"]) if self.pose_root is not None else Path("")
-        poses = (
+        pose_data = (
             _load_pose_csv(
                 pose_file,
                 translation_scale=self.pose_translation_scale,
                 coordinate_system=self.pose_coordinate_system,
             )
             if self.pose_root is not None
-            else {}
+            else _PoseCsvData(poses={}, used_row_index=True, path=pose_file)
         )
 
         frame_ids = sorted(images)
+        _validate_pose_frame_alignment(scene, frame_ids, pose_data)
+        poses = pose_data.poses
         frames: list[Omni360Frame] = []
         for frame_id in frame_ids:
             frames.append(

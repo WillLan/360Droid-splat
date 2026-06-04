@@ -178,7 +178,7 @@ def test_depth_format_is_explicit_and_z_depth_converts_to_range():
         _convert_depth_to_euclidean_range(torch.ones(1, 1, 1), "silent_guess")
 
 
-def _write_fake_omni_scene(root: Path, pose_root: Path, *, n_frames: int = 20) -> None:
+def _write_fake_omni_scene(root: Path, pose_root: Path, *, n_frames: int = 20, frame_start: int = 0, include_frame_id: bool = False) -> None:
     import h5py
 
     raw_dir = root / "DTW" / "dtw_Raw"
@@ -186,17 +186,25 @@ def _write_fake_omni_scene(root: Path, pose_root: Path, *, n_frames: int = 20) -
     raw_dir.mkdir(parents=True)
     depth_dir.mkdir(parents=True)
     for idx in range(n_frames):
+        frame_id = int(frame_start) + idx
         image = np.zeros((4, 8, 3), dtype=np.uint8)
         image[..., 0] = idx
-        Image.fromarray(image, mode="RGB").save(raw_dir / f"panorama_{idx}.png")
-        with h5py.File(depth_dir / f"Depth_{idx}.h5", "w") as handle:
+        Image.fromarray(image, mode="RGB").save(raw_dir / f"panorama_{frame_id}.png")
+        with h5py.File(depth_dir / f"Depth_{frame_id}.h5", "w") as handle:
             handle.create_dataset("depth", data=np.full((4, 8), 2.0, dtype=np.float32))
     pose_root.mkdir(parents=True)
     with (pose_root / "DowntownWest_record.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["x", "y", "z", "pitch", "roll", "yaw"])
+        base_fieldnames = ["x", "y", "z", "pitch", "roll", "yaw"]
+        fieldnames = list(base_fieldnames)
+        if include_frame_id:
+            fieldnames = ["frame_id", *base_fieldnames]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for idx in range(n_frames):
-            writer.writerow({"x": idx, "y": 0.0, "z": 0.0, "pitch": 0.0, "roll": 0.0, "yaw": 0.0})
+            row = {"x": idx, "y": 0.0, "z": 0.0, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
+            if include_frame_id:
+                row["frame_id"] = int(frame_start) + idx
+            writer.writerow(row)
 
 
 def test_omni360_tail_validation_split_uses_held_out_final_frames(tmp_path: Path):
@@ -247,6 +255,32 @@ def test_validation_pair_sampling_is_deterministic(tmp_path: Path):
     )
     assert torch.equal(val_ds[0]["pair_indices"], val_ds[0]["pair_indices"])
     assert val_ds[0]["pair_indices"].shape == (12, 2)
+
+
+def test_pose_row_index_alignment_requires_contiguous_zero_based_frames(tmp_path: Path):
+    root = tmp_path / "omni"
+    pose_root = tmp_path / "poses"
+    _write_fake_omni_scene(root, pose_root, n_frames=8, frame_start=5, include_frame_id=False)
+    with pytest.raises(ValueError, match="no explicit frame id"):
+        Omni360SceneTrainingDataset(
+            str(root),
+            pose_root=str(pose_root),
+            scenes=["DTW"],
+            mode="matching_only",
+            frames_per_sample=4,
+        )
+
+    explicit_root = tmp_path / "omni_explicit"
+    explicit_pose_root = tmp_path / "poses_explicit"
+    _write_fake_omni_scene(explicit_root, explicit_pose_root, n_frames=8, frame_start=5, include_frame_id=True)
+    ds = Omni360SceneTrainingDataset(
+        str(explicit_root),
+        pose_root=str(explicit_pose_root),
+        scenes=["DTW"],
+        mode="matching_only",
+        frames_per_sample=4,
+    )
+    assert ds[0]["frame_ids"] == ["5", "6", "7", "8"]
 
 
 def test_pose_validation_catches_invalid_rotation():
