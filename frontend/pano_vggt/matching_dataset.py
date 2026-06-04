@@ -84,9 +84,13 @@ def validate_training_sample(sample: dict[str, Any], mode: str, *, allow_fallbac
     """Validate that a sample contains supervision required by ``mode``."""
 
     training_mode = normalize_training_mode(mode)
-    has_pose = bool(sample.get("has_pose", False)) and torch.is_tensor(sample.get("poses_c2w"))
+    has_pose_value = sample.get("has_pose", False)
+    has_sky_value = sample.get("has_sky", False)
+    has_pose_flag = bool(has_pose_value.all()) if torch.is_tensor(has_pose_value) else bool(has_pose_value)
+    has_sky_flag = bool(has_sky_value.all()) if torch.is_tensor(has_sky_value) else bool(has_sky_value)
+    has_pose = has_pose_flag and torch.is_tensor(sample.get("poses_c2w"))
     has_depth = torch.is_tensor(sample.get("depths")) and torch.is_tensor(sample.get("valid_depth"))
-    has_sky = bool(sample.get("has_sky", False)) and torch.is_tensor(sample.get("sky_mask"))
+    has_sky = has_sky_flag and torch.is_tensor(sample.get("sky_mask"))
     if training_mode in ("matching_only", "head_joint_calibration") and not (has_pose and has_depth):
         if allow_fallback_mode:
             return

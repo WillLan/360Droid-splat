@@ -45,7 +45,7 @@ def _config(tmp_path: Path, *, mode: str, variant: str = "complete") -> dict:
         {
             "mode": mode,
             "steps": 1,
-            "batch_size": 1,
+            "batch_size": 2,
             "frames_per_sample": 3,
             "num_workers": 0,
             "output_dir": str(tmp_path),
