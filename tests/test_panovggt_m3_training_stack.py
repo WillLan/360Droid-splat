@@ -4,11 +4,14 @@ from dataclasses import replace
 import inspect
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
 import pytest
 import torch
 
 from frontend.pano_vggt.matching_dataset import (
     SyntheticOmni360TrainingDataset,
+    _load_semantic,
     sky_mask_from_semantic,
     validate_pose_rotation,
 )
@@ -64,6 +67,8 @@ def _config(tmp_path: Path, *, mode: str, variant: str = "complete") -> dict:
     )
     cfg["Pairs"].update({"samples_per_edge": 32, "min_baseline_deg": 0.0, "max_baseline_deg": 60.0})
     cfg["WeightsAndBiases"]["enabled"] = False
+    cfg["Validation"].update({"enabled": True, "max_batches": 1, "num_workers": 0})
+    cfg["Visualization"].update({"enabled": True, "interval": 1, "max_matches": 8})
     return cfg
 
 
@@ -110,6 +115,25 @@ def test_sky_class_map_id_name_and_color_paths_work():
     rgb[:, 0, 1] = torch.tensor([0.1, 0.4, 0.9])
     mask_from_color = sky_mask_from_semantic(None, rgb, {"sky_colors": [[25.5, 102.0, 229.5]]})
     assert bool(mask_from_color[0, 0, 1])
+
+
+def test_omni360_rgba_alpha_semantic_labels_are_supported(tmp_path: Path):
+    arr = np.zeros((3, 4, 4), dtype=np.uint8)
+    arr[..., 3] = np.array(
+        [
+            [0, 3, 3, 0],
+            [1, 1, 3, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    path = tmp_path / "semantic.png"
+    Image.fromarray(arr, mode="RGBA").save(path)
+    labels, rgb = _load_semantic(path, None)
+    assert rgb is None
+    assert labels is not None
+    mask = sky_mask_from_semantic(labels, None, {"sky_ids": [3]})
+    assert int(mask.sum()) == 3
 
 
 def test_pose_validation_catches_invalid_rotation():
@@ -200,8 +224,12 @@ def test_total_losses_backward_only_updates_selected_heads():
 def test_training_one_step_modes_and_missing_supervision_errors(tmp_path: Path):
     sky_result = train_matching(_config(tmp_path / "sky", mode="sky_only", variant="no_pose"))
     assert Path(sky_result["checkpoint"]).name == "sky_head.pt"
+    assert any((tmp_path / "sky" / "visualizations").glob("*sky.png"))
+    assert "val/sky_iou" in sky_result["last_metrics"]
     matching_result = train_matching(_config(tmp_path / "matching", mode="matching_only", variant="complete"))
     assert Path(matching_result["checkpoint"]).name == "matching_head.pt"
+    assert any((tmp_path / "matching" / "visualizations").glob("*matching.png"))
+    assert "val/match_angular_error_deg" in matching_result["last_metrics"]
     with pytest.raises(ValueError, match="requires RGB, depth, and pose"):
         train_matching(_config(tmp_path / "bad", mode="matching_only", variant="no_pose"))
 

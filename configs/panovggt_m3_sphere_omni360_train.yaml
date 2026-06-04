@@ -18,15 +18,19 @@ Training:
 
 Model:
   panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
+  panovggt_config: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
   panovggt_checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   use_synthetic_features: false
   freeze_panovggt: true
   # Must name a real module in the external PanoVGGT model. Missing hooks raise
   # a clear error; no random/fake features are used in real training.
-  feature_hook: decoder
-  feature_dim: null
+  feature_hook: aggregator
+  feature_dim: 2048
   feature_stride: 4
+  image_size: [518, 1036]
+  patch_size: 14
+  patch_multiple: 14
 
 Heads:
   descriptor_dim: 24
@@ -56,7 +60,8 @@ Dataset:
   allow_fallback_mode: false
   class_map:
     sky_names: ["Sky", "sky"]
-    sky_ids: []
+    # Omni360-Scene semantic PNGs store class id in RGBA alpha; id 3 is sky.
+    sky_ids: [3]
     sky_colors: []
 
 Pairs:
@@ -95,3 +100,15 @@ WeightsAndBiases:
     - panovggt-m3-sphere
     - omni360-scene
     - dtw-nyc
+
+Validation:
+  enabled: true
+  batch_size: 1
+  num_workers: 0
+  max_batches: 2
+
+Visualization:
+  enabled: true
+  interval: 250
+  max_matches: 48
+  save_dir: visualizations

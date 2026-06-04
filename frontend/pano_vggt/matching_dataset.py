@@ -211,6 +211,8 @@ def _load_semantic(path: Path, resize: tuple[int, int] | None) -> tuple[torch.Te
     arr = np.asarray(image)
     if arr.ndim == 2:
         return torch.from_numpy(arr.astype(np.int64)).contiguous(), None
+    if arr.ndim == 3 and arr.shape[-1] == 4 and np.all(arr[..., :3] == arr[..., :3][..., :1]):
+        return torch.from_numpy(arr[..., 3].astype(np.int64)).contiguous(), None
     if arr.ndim == 3:
         rgb = torch.from_numpy(arr[..., :3].astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
         return None, rgb
