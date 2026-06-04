@@ -48,6 +48,20 @@ def _flatten_correspondence(corr: SphericalCorrespondenceBatch) -> dict[str, tor
     }
 
 
+def _filter_flat_with_non_sky(
+    flat: dict[str, torch.Tensor],
+    non_sky_mask: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    if non_sky_mask is None:
+        return flat
+    non_sky = _as_single_sample_maps(non_sky_mask.float(), name="non_sky_mask")
+    src_non_sky = sample_feature_values(non_sky, flat["src_idx"], flat["src_uv"])[:, 0] > 0.5
+    tgt_non_sky = sample_feature_values(non_sky, flat["tgt_idx"], flat["tgt_uv"])[:, 0] > 0.5
+    out = dict(flat)
+    out["valid"] = flat["valid"] & src_non_sky & tgt_non_sky
+    return out
+
+
 def _select_valid(flat: dict[str, torch.Tensor], max_correspondences: int | None) -> torch.Tensor:
     valid_idx = torch.nonzero(flat["valid"], as_tuple=False).flatten()
     if max_correspondences is not None and valid_idx.numel() > int(max_correspondences):
@@ -91,13 +105,14 @@ def symmetric_info_nce_loss(
     dense_descriptors: torch.Tensor,
     correspondences: SphericalCorrespondenceBatch,
     *,
+    non_sky_mask: torch.Tensor | None = None,
     temperature: float = 0.07,
     max_correspondences: int = 1024,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute bidirectional M3-style InfoNCE on dense descriptor positives."""
 
     descriptors = _as_single_sample_maps(dense_descriptors, name="dense_descriptors")
-    flat = _flatten_correspondence(correspondences)
+    flat = _filter_flat_with_non_sky(_flatten_correspondence(correspondences), non_sky_mask)
     valid_idx = _select_valid(flat, max_correspondences)
     if valid_idx.numel() < 2:
         return _zero_loss(dense_descriptors, n_pos=float(valid_idx.numel()), n_neg=0.0, mean_pos_sim=0.0, mean_neg_sim=0.0)
@@ -130,13 +145,8 @@ def confidence_calibration_loss(
     """Calibrate match confidence against valid non-sky correspondence labels."""
 
     confidence = _as_single_sample_maps(match_confidence, name="match_confidence")
-    flat = _flatten_correspondence(correspondences)
+    flat = _filter_flat_with_non_sky(_flatten_correspondence(correspondences), non_sky_mask)
     target = flat["valid"].float()
-    if non_sky_mask is not None:
-        non_sky = _as_single_sample_maps(non_sky_mask.float(), name="non_sky_mask")
-        src_non_sky = sample_feature_values(non_sky, flat["src_idx"], flat["src_uv"])[:, 0] > 0.5
-        tgt_non_sky = sample_feature_values(non_sky, flat["tgt_idx"], flat["tgt_uv"])[:, 0] > 0.5
-        target = target * (src_non_sky & tgt_non_sky).float()
     src_conf = sample_feature_values(confidence, flat["src_idx"], flat["src_uv"])[:, 0]
     tgt_conf = sample_feature_values(confidence, flat["tgt_idx"], flat["tgt_uv"])[:, 0]
     pred = (src_conf * tgt_conf).clamp(1.0e-5, 1.0 - 1.0e-5)
@@ -152,6 +162,7 @@ def spherical_match_regression_loss(
     correspondences: SphericalCorrespondenceBatch,
     *,
     image_hw: tuple[int, int],
+    non_sky_mask: torch.Tensor | None = None,
     search_radius: int = 2,
     max_correspondences: int = 512,
     huber_delta: float = 0.05,
@@ -159,7 +170,7 @@ def spherical_match_regression_loss(
     """Regress local descriptor soft matches with an S2 tangent residual."""
 
     descriptors = _as_single_sample_maps(dense_descriptors, name="dense_descriptors")
-    flat = _flatten_correspondence(correspondences)
+    flat = _filter_flat_with_non_sky(_flatten_correspondence(correspondences), non_sky_mask)
     valid_idx = _select_valid(flat, max_correspondences)
     if valid_idx.numel() == 0:
         return _zero_loss(dense_descriptors, spherical_residual_deg=0.0, spherical_n=0.0)
@@ -283,12 +294,14 @@ class PanoVGGTMatchingSkyLoss:
         nce, nce_stats = symmetric_info_nce_loss(
             outputs["dense_descriptors"],
             correspondences,
+            non_sky_mask=non_sky_mask,
             temperature=self.weights.temperature,
         )
         sph, sph_stats = spherical_match_regression_loss(
             outputs["dense_descriptors"],
             correspondences,
             image_hw=image_hw,
+            non_sky_mask=non_sky_mask,
         )
         conf, conf_stats = confidence_calibration_loss(
             outputs["match_confidence"],

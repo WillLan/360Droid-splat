@@ -69,6 +69,12 @@ def _default_config() -> dict[str, Any]:
             "synthetic_variant": "complete",
             "height": 32,
             "width": 64,
+            "depth_format": "euclidean_range",
+            "pose_coordinate_system": "ue_airsim",
+            "validation_fraction": 0.0,
+            "validation_split": "tail",
+            "pair_sampling": "all",
+            "pairs_per_sample": None,
             "class_map": {"sky_ids": [1], "classes": {"sky": 1}},
         },
         "Pairs": {
@@ -76,6 +82,8 @@ def _default_config() -> dict[str, Any]:
             "min_baseline_deg": 0.0,
             "max_baseline_deg": 60.0,
             "sky_filter": True,
+            "pair_sampling": "all",
+            "pairs_per_sample": None,
         },
         "Optimizer": {
             "type": "adamw",
@@ -593,11 +601,21 @@ def _descriptor_recall_metrics(
     corr: Any,
     *,
     image_hw: tuple[int, int],
+    non_sky_mask: torch.Tensor | None = None,
     search_radius: int = 2,
     max_correspondences: int = 256,
 ) -> dict[str, torch.Tensor]:
     descriptors = dense_descriptors[0] if dense_descriptors.ndim == 5 else dense_descriptors
     valid = corr.valid_mask.reshape(-1).bool()
+    if non_sky_mask is not None:
+        non_sky = non_sky_mask[0] if non_sky_mask.ndim == 5 else non_sky_mask
+        flat_src_idx = corr.src_indices.reshape(-1).long()
+        flat_tgt_idx = corr.tgt_indices.reshape(-1).long()
+        flat_src_uv = corr.src_uv.reshape(-1, 2).to(device=descriptors.device, dtype=descriptors.dtype)
+        flat_tgt_uv = corr.tgt_uv.reshape(-1, 2).to(device=descriptors.device, dtype=descriptors.dtype)
+        src_non_sky = sample_feature_values(non_sky.float(), flat_src_idx, flat_src_uv)[:, 0] > 0.5
+        tgt_non_sky = sample_feature_values(non_sky.float(), flat_tgt_idx, flat_tgt_uv)[:, 0] > 0.5
+        valid = valid.to(device=src_non_sky.device) & src_non_sky & tgt_non_sky
     valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
     if valid_idx.numel() == 0:
         zero = descriptors.sum() * 0.0
@@ -675,7 +693,7 @@ def _compute_matching_batch_loss(
         out_b = {key: value[b : b + 1] for key, value in outputs.items() if torch.is_tensor(value)}
         mask_b = non_sky[b : b + 1] if non_sky is not None else None
         loss_b, metrics_b = loss_fn.matching_only(out_b, corr, image_hw=image_hw, non_sky_mask=mask_b)
-        recall_b = _descriptor_recall_metrics(out_b["dense_descriptors"], corr, image_hw=image_hw)
+        recall_b = _descriptor_recall_metrics(out_b["dense_descriptors"], corr, image_hw=image_hw, non_sky_mask=mask_b)
         metrics_b.update(recall_b)
         total = total + loss_b / float(batch_size)
         for key, value in metrics_b.items():
@@ -1021,7 +1039,7 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
         device = torch.device("cuda", int(ddp_state["local_rank"]) if bool(ddp_state["distributed"]) else 0)
     else:
         device = torch.device("cpu")
-    dataset = build_matching_dataset_from_config(config)
+    dataset = build_matching_dataset_from_config(config, split="train")
     tr_cfg = config.get("Training", {})
     train_sampler = DistributedSampler(
         dataset,
@@ -1042,8 +1060,9 @@ def train_matching(config: dict[str, Any]) -> dict[str, Any]:
     val_cfg = config.get("Validation", {})
     val_loader = None
     if bool(val_cfg.get("enabled", False)):
+        val_dataset = build_matching_dataset_from_config(config, split="val")
         val_loader = DataLoader(
-            dataset,
+            val_dataset,
             batch_size=int(val_cfg.get("batch_size", tr_cfg.get("batch_size", 1))),
             shuffle=False,
             num_workers=int(val_cfg.get("num_workers", 0)),

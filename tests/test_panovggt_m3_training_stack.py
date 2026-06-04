@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import replace
 import inspect
 from pathlib import Path
@@ -10,8 +11,12 @@ import pytest
 import torch
 
 from frontend.pano_vggt.matching_dataset import (
+    Omni360SceneTrainingDataset,
     SyntheticOmni360TrainingDataset,
+    _convert_depth_to_euclidean_range,
+    _euler_degrees_to_c2w,
     _load_semantic,
+    build_temporal_pair_indices,
     sky_mask_from_semantic,
     validate_pose_rotation,
 )
@@ -137,6 +142,113 @@ def test_omni360_rgba_alpha_semantic_labels_are_supported(tmp_path: Path):
     assert int(mask.sum()) == 3
 
 
+def test_temporal_pair_sampling_supports_large_radius_without_all_pairs():
+    all_pairs = build_temporal_pair_indices(8, radius=8, bidirectional=False)
+    assert all_pairs.shape == (28, 2)
+    gen_a = torch.Generator().manual_seed(5)
+    gen_b = torch.Generator().manual_seed(5)
+    sampled_a = build_temporal_pair_indices(8, radius=8, max_pairs=12, sampling="random", generator=gen_a)
+    sampled_b = build_temporal_pair_indices(8, radius=8, max_pairs=12, sampling="random", generator=gen_b)
+    assert sampled_a.shape == (12, 2)
+    assert torch.equal(sampled_a, sampled_b)
+    assert torch.unique(sampled_a, dim=0).shape[0] == 12
+    fixed = build_temporal_pair_indices(8, radius=8, max_pairs=12, sampling="linspace")
+    assert fixed.shape == (12, 2)
+    assert torch.equal(fixed, build_temporal_pair_indices(8, radius=8, max_pairs=12, sampling="linspace"))
+
+
+def test_ue_airsim_pose_conversion_uses_project_camera_convention():
+    pose = _euler_degrees_to_c2w(1.0, 2.0, 3.0, 0.0, 0.0, 0.0, scale=1.0, coordinate_system="ue_airsim")
+    assert torch.allclose(pose[:3, 3], torch.tensor([2.0, -3.0, 1.0]))
+    assert torch.allclose(pose[:3, :3], torch.eye(3), atol=1.0e-6)
+    validate_pose_rotation(pose.unsqueeze(0))
+    raw = _euler_degrees_to_c2w(1.0, 2.0, 3.0, 0.0, 0.0, 0.0, scale=1.0, coordinate_system="project_erp")
+    assert torch.allclose(raw[:3, 3], torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_depth_format_is_explicit_and_z_depth_converts_to_range():
+    range_depth, range_valid = _convert_depth_to_euclidean_range(torch.full((1, 1, 4), 2.0), "euclidean_range")
+    assert torch.allclose(range_depth, torch.full((1, 1, 4), 2.0))
+    assert range_valid.all()
+    z_range, z_valid = _convert_depth_to_euclidean_range(torch.full((1, 1, 4), 2.0), "z_depth")
+    assert not bool(z_valid[0, 0, 0])
+    assert bool(z_valid[0, 0, 1])
+    assert torch.allclose(z_range[0, 0, 1], torch.tensor(2.0**0.5 * 2.0), atol=1.0e-5)
+    with pytest.raises(ValueError, match="Unsupported Dataset.depth_format"):
+        _convert_depth_to_euclidean_range(torch.ones(1, 1, 1), "silent_guess")
+
+
+def _write_fake_omni_scene(root: Path, pose_root: Path, *, n_frames: int = 20) -> None:
+    import h5py
+
+    raw_dir = root / "DTW" / "dtw_Raw"
+    depth_dir = root / "DTW" / "dtw_Depth"
+    raw_dir.mkdir(parents=True)
+    depth_dir.mkdir(parents=True)
+    for idx in range(n_frames):
+        image = np.zeros((4, 8, 3), dtype=np.uint8)
+        image[..., 0] = idx
+        Image.fromarray(image, mode="RGB").save(raw_dir / f"panorama_{idx}.png")
+        with h5py.File(depth_dir / f"Depth_{idx}.h5", "w") as handle:
+            handle.create_dataset("depth", data=np.full((4, 8), 2.0, dtype=np.float32))
+    pose_root.mkdir(parents=True)
+    with (pose_root / "DowntownWest_record.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["x", "y", "z", "pitch", "roll", "yaw"])
+        writer.writeheader()
+        for idx in range(n_frames):
+            writer.writerow({"x": idx, "y": 0.0, "z": 0.0, "pitch": 0.0, "roll": 0.0, "yaw": 0.0})
+
+
+def test_omni360_tail_validation_split_uses_held_out_final_frames(tmp_path: Path):
+    root = tmp_path / "omni"
+    pose_root = tmp_path / "poses"
+    _write_fake_omni_scene(root, pose_root, n_frames=20)
+    train_ds = Omni360SceneTrainingDataset(
+        str(root),
+        pose_root=str(pose_root),
+        scenes=["DTW"],
+        mode="matching_only",
+        frames_per_sample=4,
+        temporal_radius=2,
+        validation_fraction=0.2,
+        split="train",
+    )
+    val_ds = Omni360SceneTrainingDataset(
+        str(root),
+        pose_root=str(pose_root),
+        scenes=["DTW"],
+        mode="matching_only",
+        frames_per_sample=4,
+        temporal_radius=2,
+        validation_fraction=0.2,
+        split="val",
+    )
+    assert train_ds.clips[-1] == ("DTW", 12)
+    assert val_ds.clips[0] == ("DTW", 16)
+    assert train_ds[0]["split"] == "train"
+    assert val_ds[0]["frame_ids"] == ["16", "17", "18", "19"]
+
+
+def test_validation_pair_sampling_is_deterministic(tmp_path: Path):
+    root = tmp_path / "omni"
+    pose_root = tmp_path / "poses"
+    _write_fake_omni_scene(root, pose_root, n_frames=20)
+    val_ds = Omni360SceneTrainingDataset(
+        str(root),
+        pose_root=str(pose_root),
+        scenes=["DTW"],
+        mode="matching_only",
+        frames_per_sample=8,
+        temporal_radius=8,
+        validation_fraction=0.5,
+        split="val",
+        pairs_per_sample=12,
+        pair_sampling="random",
+    )
+    assert torch.equal(val_ds[0]["pair_indices"], val_ds[0]["pair_indices"])
+    assert val_ds[0]["pair_indices"].shape == (12, 2)
+
+
 def test_pose_validation_catches_invalid_rotation():
     pose = torch.eye(4).view(1, 4, 4)
     pose[0, 0, 0] = 2.0
@@ -179,6 +291,19 @@ def test_info_nce_prefers_correct_positives_over_shuffled_positives():
     bad_corr = replace(corr, tgt_uv=torch.roll(corr.tgt_uv, shifts=3, dims=1))
     bad, _ = symmetric_info_nce_loss(desc, bad_corr)
     assert good < bad
+
+
+def test_non_sky_filter_removes_main_matching_supervision():
+    corr = _make_correspondence((4, 6))
+    desc = torch.rand(1, 2, 24, 4, 6)
+    desc = torch.nn.functional.normalize(desc, dim=2)
+    non_sky = torch.zeros(1, 2, 1, 4, 6)
+    nce, nce_stats = symmetric_info_nce_loss(desc, corr, non_sky_mask=non_sky)
+    sph, sph_stats = spherical_match_regression_loss(desc, corr, image_hw=(8, 12), non_sky_mask=non_sky)
+    assert torch.isfinite(nce)
+    assert torch.isfinite(sph)
+    assert float(nce_stats["n_pos"]) == 0.0
+    assert float(sph_stats["spherical_n"]) == 0.0
 
 
 def test_spherical_regression_confidence_and_sky_losses_are_finite():

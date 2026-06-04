@@ -15,8 +15,10 @@ import torch
 from torch.utils.data import Dataset
 
 from frontend.pano_droid.dataset import load_erp_image
+from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 
 TrainingMode = Literal["sky_only", "matching_only", "head_joint_calibration"]
+TrainingSplit = Literal["train", "val", "all"]
 
 
 @dataclass(frozen=True)
@@ -63,8 +65,21 @@ def normalize_training_mode(mode: str) -> TrainingMode:
     return value  # type: ignore[return-value]
 
 
-def build_temporal_pair_indices(n_frames: int, *, radius: int = 1, bidirectional: bool = False) -> torch.Tensor:
-    """Create temporal training edges for a clip of ``n_frames`` frames."""
+def build_temporal_pair_indices(
+    n_frames: int,
+    *,
+    radius: int = 1,
+    bidirectional: bool = False,
+    max_pairs: int | None = None,
+    sampling: Literal["all", "random", "linspace"] = "all",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Create temporal training edges for a clip of ``n_frames`` frames.
+
+    ``radius`` defines the candidate temporal neighborhood. ``max_pairs`` can
+    then sub-sample that candidate set so larger windows do not force all
+    pairwise edges into every optimization step.
+    """
 
     edges: list[tuple[int, int]] = []
     for i in range(int(n_frames)):
@@ -77,7 +92,20 @@ def build_temporal_pair_indices(n_frames: int, *, radius: int = 1, bidirectional
                 edges.append((j, i))
     if not edges:
         raise ValueError("No temporal pair indices could be built.")
-    return torch.tensor(edges, dtype=torch.long)
+    pairs = torch.tensor(edges, dtype=torch.long)
+    if max_pairs is None or int(max_pairs) <= 0 or int(max_pairs) >= int(pairs.shape[0]):
+        return pairs
+    count = int(max_pairs)
+    mode = str(sampling).lower()
+    if mode == "all":
+        return pairs[:count]
+    if mode == "random":
+        keep = torch.randperm(int(pairs.shape[0]), generator=generator)[:count]
+        return pairs[keep]
+    if mode == "linspace":
+        keep = torch.linspace(0, int(pairs.shape[0]) - 1, steps=count).round().long()
+        return pairs[keep]
+    raise ValueError(f"Unsupported pair sampling mode: {sampling!r}")
 
 
 def validate_training_sample(sample: dict[str, Any], mode: str, *, allow_fallback_mode: bool = False) -> None:
@@ -141,6 +169,43 @@ def _read_h5_depth(path: Path) -> torch.Tensor:
     return torch.from_numpy(array).unsqueeze(0).contiguous()
 
 
+def _normalize_depth_format(depth_format: str) -> str:
+    value = str(depth_format).lower()
+    aliases = {
+        "range": "euclidean_range",
+        "spherical_range": "euclidean_range",
+        "euclidean": "euclidean_range",
+        "euclidean_range": "euclidean_range",
+        "z": "z_depth",
+        "z_depth": "z_depth",
+        "planar_depth": "z_depth",
+        "orthogonal_z": "z_depth",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "Unsupported Dataset.depth_format. Expected euclidean_range or z_depth, "
+            f"got {depth_format!r}."
+        )
+    return aliases[value]
+
+
+def _convert_depth_to_euclidean_range(depth: torch.Tensor, depth_format: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert an ERP depth map to spherical euclidean range depth."""
+
+    if depth.ndim != 3 or int(depth.shape[0]) != 1:
+        raise ValueError(f"depth must have shape 1xHxW, got {tuple(depth.shape)}")
+    fmt = _normalize_depth_format(depth_format)
+    valid = torch.ones_like(depth, dtype=torch.bool)
+    if fmt == "euclidean_range":
+        return depth, valid
+    height, width = int(depth.shape[-2]), int(depth.shape[-1])
+    uv = pixel_grid(height, width, device=depth.device, dtype=depth.dtype)
+    bearing_z = erp_pixel_to_bearing(uv, height, width)[..., 2].to(device=depth.device, dtype=depth.dtype)
+    front = bearing_z > 1.0e-6
+    converted = depth / bearing_z.clamp_min(1.0e-6).unsqueeze(0)
+    return converted, front.unsqueeze(0)
+
+
 def _rotation_x(angle: float) -> np.ndarray:
     c, s = math.cos(angle), math.sin(angle)
     return np.asarray([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float32)
@@ -156,18 +221,69 @@ def _rotation_z(angle: float) -> np.ndarray:
     return np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
 
 
-def _euler_degrees_to_c2w(x: float, y: float, z: float, roll: float, pitch: float, yaw: float, *, scale: float) -> torch.Tensor:
+def _normalize_pose_coordinate_system(value: str) -> str:
+    system = str(value).lower()
+    aliases = {
+        "project": "project_erp",
+        "project_erp": "project_erp",
+        "erp": "project_erp",
+        "raw": "project_erp",
+        "ue": "ue_airsim",
+        "ue5": "ue_airsim",
+        "airsim": "ue_airsim",
+        "ue_airsim": "ue_airsim",
+    }
+    if system not in aliases:
+        raise ValueError(
+            "Unsupported Dataset.pose_coordinate_system. Expected project_erp or ue_airsim, "
+            f"got {value!r}."
+        )
+    return aliases[system]
+
+
+def _ue_to_project_axis_matrix() -> np.ndarray:
+    """Return matrix mapping project ERP coordinates into UE/AirSim axes."""
+
+    return np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _euler_degrees_to_c2w(
+    x: float,
+    y: float,
+    z: float,
+    roll: float,
+    pitch: float,
+    yaw: float,
+    *,
+    scale: float,
+    coordinate_system: str = "ue_airsim",
+) -> torch.Tensor:
+    """Convert pose CSV Euler fields into a project-convention c2w matrix."""
+
     r = math.radians(float(roll))
     p = math.radians(float(pitch))
     yw = math.radians(float(yaw))
     rotation = _rotation_z(yw) @ _rotation_y(p) @ _rotation_x(r)
+    translation = np.asarray([x, y, z], dtype=np.float32) * float(scale)
+    system = _normalize_pose_coordinate_system(coordinate_system)
+    if system == "ue_airsim":
+        axes = _ue_to_project_axis_matrix()
+        rotation = axes.T @ rotation @ axes
+        translation = axes.T @ translation
     pose = np.eye(4, dtype=np.float32)
     pose[:3, :3] = rotation
-    pose[:3, 3] = np.asarray([x, y, z], dtype=np.float32) * float(scale)
+    pose[:3, 3] = translation
     return torch.from_numpy(pose)
 
 
-def _load_pose_csv(path: Path, *, translation_scale: float) -> dict[int, torch.Tensor]:
+def _load_pose_csv(path: Path, *, translation_scale: float, coordinate_system: str = "ue_airsim") -> dict[int, torch.Tensor]:
     if not path.is_file():
         return {}
     poses: dict[int, torch.Tensor] = {}
@@ -191,6 +307,7 @@ def _load_pose_csv(path: Path, *, translation_scale: float) -> dict[int, torch.T
                 pitch,
                 lower["yaw"],
                 scale=translation_scale,
+                coordinate_system=coordinate_system,
             )
     return poses
 
@@ -292,27 +409,46 @@ class Omni360SceneTrainingDataset(Dataset):
         temporal_radius: int = 1,
         bidirectional_pairs: bool = False,
         resize: tuple[int, int] | None = None,
+        depth_format: str = "euclidean_range",
         depth_scale: float = 1.0,
         depth_invalid_value: float | None = 1000.0,
+        pose_coordinate_system: str = "ue_airsim",
         pose_translation_scale: float = 0.01,
+        split: TrainingSplit = "train",
+        validation_fraction: float = 0.0,
+        validation_split: Literal["tail"] = "tail",
         class_map: dict[str, Any] | None = None,
         allow_fallback_mode: bool = False,
         max_clips: int | None = None,
+        pairs_per_sample: int | None = None,
+        pair_sampling: Literal["all", "random", "linspace"] = "all",
     ) -> None:
         self.root = Path(root)
         self.pose_root = Path(pose_root) if pose_root is not None else None
         self.scenes = [str(scene) for scene in scenes]
         self.mode = normalize_training_mode(mode)
+        self.split = str(split).lower()
+        if self.split not in {"train", "val", "all"}:
+            raise ValueError(f"Unsupported training split: {split!r}")
         self.frames_per_sample = int(frames_per_sample)
         self.clip_stride = max(1, int(clip_stride))
         self.temporal_radius = max(1, int(temporal_radius))
         self.bidirectional_pairs = bool(bidirectional_pairs)
         self.resize = resize
+        self.depth_format = _normalize_depth_format(depth_format)
         self.depth_scale = float(depth_scale)
         self.depth_invalid_value = depth_invalid_value
+        self.pose_coordinate_system = _normalize_pose_coordinate_system(pose_coordinate_system)
         self.pose_translation_scale = float(pose_translation_scale)
+        self.validation_fraction = max(0.0, min(0.95, float(validation_fraction)))
+        if str(validation_split).lower() != "tail":
+            raise ValueError(f"Unsupported validation split mode: {validation_split!r}")
         self.class_map = class_map or {}
         self.allow_fallback_mode = bool(allow_fallback_mode)
+        self.pairs_per_sample = None if pairs_per_sample is None else max(1, int(pairs_per_sample))
+        self.pair_sampling = str(pair_sampling).lower()
+        if self.pair_sampling not in {"all", "random", "linspace"}:
+            raise ValueError(f"Unsupported pair_sampling mode: {pair_sampling!r}")
         if self.frames_per_sample < 2:
             raise ValueError("frames_per_sample must be at least 2.")
         if not self.root.is_dir():
@@ -326,12 +462,26 @@ class Omni360SceneTrainingDataset(Dataset):
             if len(frames) < span:
                 continue
             self.frames_by_scene[scene] = frames
-            for start in range(0, len(frames) - span + 1):
+            starts = self._split_starts(len(frames), span)
+            for start in starts:
                 self.clips.append((scene, start))
         if max_clips is not None:
             self.clips = self.clips[: int(max_clips)]
         if not self.clips:
             raise ValueError("No Omni360 training clips were built.")
+
+    def _split_starts(self, n_frames: int, span: int) -> range:
+        if self.validation_fraction <= 0.0 or self.split == "all":
+            return range(0, int(n_frames) - int(span) + 1)
+        val_start = int(math.floor(float(n_frames) * (1.0 - self.validation_fraction)))
+        val_start = min(max(0, val_start), int(n_frames))
+        if self.split == "val":
+            last = int(n_frames) - int(span)
+            if val_start > last:
+                return range(0, 0)
+            return range(val_start, last + 1)
+        train_last_exclusive = max(0, val_start - int(span) + 1)
+        return range(0, train_last_exclusive)
 
     def _load_scene(self, scene: str) -> list[Omni360Frame]:
         if scene not in _SCENE_LAYOUTS:
@@ -345,7 +495,15 @@ class Omni360SceneTrainingDataset(Dataset):
             for frame_id, path in _collect_id_paths(scene_dir / str(semantic_dir), _IMAGE_ID_RE).items():
                 semantic_paths.setdefault(frame_id, path)
         pose_file = self.pose_root / str(layout["pose_file"]) if self.pose_root is not None else Path("")
-        poses = _load_pose_csv(pose_file, translation_scale=self.pose_translation_scale) if self.pose_root is not None else {}
+        poses = (
+            _load_pose_csv(
+                pose_file,
+                translation_scale=self.pose_translation_scale,
+                coordinate_system=self.pose_coordinate_system,
+            )
+            if self.pose_root is not None
+            else {}
+        )
 
         frame_ids = sorted(images)
         frames: list[Omni360Frame] = []
@@ -373,6 +531,7 @@ class Omni360SceneTrainingDataset(Dataset):
         valid_depth: torch.Tensor | None = None
         if all(frame.depth_path is not None for frame in selected):
             depth_list = []
+            depth_format_valid_list = []
             for frame in selected:
                 depth = _read_h5_depth(frame.depth_path) * self.depth_scale  # type: ignore[arg-type]
                 if self.resize is not None:
@@ -381,9 +540,12 @@ class Omni360SceneTrainingDataset(Dataset):
                         size=self.resize,
                         mode="nearest",
                     ).squeeze(0)
+                depth, format_valid = _convert_depth_to_euclidean_range(depth, self.depth_format)
                 depth_list.append(depth)
+                depth_format_valid_list.append(format_valid)
             depths = torch.stack(depth_list, dim=0)
-            valid_depth = torch.isfinite(depths) & (depths > 0.0)
+            depth_format_valid = torch.stack(depth_format_valid_list, dim=0)
+            valid_depth = torch.isfinite(depths) & (depths > 0.0) & depth_format_valid
             if self.depth_invalid_value is not None:
                 valid_depth &= depths < float(self.depth_invalid_value)
                 depths = torch.where(valid_depth, depths, torch.zeros_like(depths))
@@ -424,10 +586,13 @@ class Omni360SceneTrainingDataset(Dataset):
                 self.frames_per_sample,
                 radius=self.temporal_radius,
                 bidirectional=self.bidirectional_pairs,
+                max_pairs=self.pairs_per_sample,
+                sampling="linspace" if self.split == "val" and self.pair_sampling == "random" else self.pair_sampling,
             ),
             "frame_ids": [str(frame.frame_id) for frame in selected],
             "sequence_id": scene,
             "dataset_name": "omni360_scene",
+            "split": self.split,
             "has_pose": poses is not None,
             "has_sky": sky_mask is not None,
         }
@@ -507,7 +672,7 @@ class SyntheticOmni360TrainingDataset(Dataset):
         return sample
 
 
-def build_matching_dataset_from_config(config: dict[str, Any]) -> Dataset:
+def build_matching_dataset_from_config(config: dict[str, Any], *, split: TrainingSplit = "train") -> Dataset:
     """Build a real or synthetic staged matching/sky training dataset."""
 
     ds_cfg = config.get("Dataset", {})
@@ -541,10 +706,17 @@ def build_matching_dataset_from_config(config: dict[str, Any]) -> Dataset:
         temporal_radius=int(ds_cfg.get("temporal_radius", ds_cfg.get("pair_radius", 1))),
         bidirectional_pairs=bool(ds_cfg.get("bidirectional_pairs", False)),
         resize=resize,
+        depth_format=str(ds_cfg.get("depth_format", "euclidean_range")),
         depth_scale=float(ds_cfg.get("depth_scale", 1.0)),
         depth_invalid_value=ds_cfg.get("depth_invalid_value", 1000.0),
+        pose_coordinate_system=str(ds_cfg.get("pose_coordinate_system", "ue_airsim")),
         pose_translation_scale=float(ds_cfg.get("pose_translation_scale", 0.01)),
+        split=split,
+        validation_fraction=float(ds_cfg.get("validation_fraction", config.get("Validation", {}).get("fraction", 0.0))),
+        validation_split=str(ds_cfg.get("validation_split", config.get("Validation", {}).get("split", "tail"))),
         class_map=dict(ds_cfg.get("class_map", {})),
         allow_fallback_mode=bool(ds_cfg.get("allow_fallback_mode", False)),
         max_clips=ds_cfg.get("max_clips"),
+        pairs_per_sample=ds_cfg.get("pairs_per_sample", config.get("Pairs", {}).get("pairs_per_sample")),
+        pair_sampling=str(ds_cfg.get("pair_sampling", config.get("Pairs", {}).get("pair_sampling", "all"))),
     )
