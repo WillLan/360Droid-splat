@@ -1,5 +1,37 @@
 # Project Operating Rules
 
+## PanoVGGT-M3-Sphere implementation guardrails
+
+- Current task goal: plan and implement a config-gated PanoVGGT-M3-Sphere
+  extension for ERP Gaussian-SLAM that adds M3-style dense matching, dense
+  correspondence factors, and spherical dense BA before existing PanoVGGT chunk
+  alignment.
+- The new functionality must be config-gated. Default behavior must remain off
+  unless the config explicitly enables the PanoVGGT-M3-Sphere path.
+- The disabled path must preserve the existing `panovggt_long` behavior.
+  Existing configs and tests that do not opt into the new path should keep the
+  same tracker, engine, alignment, and output behavior.
+- Do not break or expand the public `FrontendOutput` API. Refined
+  pose/depth/world-points must enter the existing fields already consumed by
+  mapping and backend code.
+- The matching head output spatial size must equal the matching head input
+  feature spatial size. Any resize to ERP image resolution must be explicit and
+  local to a caller that needs it.
+- `descriptor_dim` defaults to `24`.
+- Do not hard-code any input image resolution. Infer height, width, and feature
+  grid size from tensors or config values at runtime.
+- The dense BA main residual must be an `S^2` tangent residual,
+  `r = Log_b_star(b_hat)` in `R^2`, where `b_star` is the matched target
+  bearing and `b_hat` is the predicted target bearing from current pose/depth.
+- ERP pixel residuals are allowed only for debug, diagnostics, or explicit
+  ablations. They must not be the main dense BA residual for
+  PanoVGGT-M3-Sphere.
+- Fake descriptors are allowed only in explicit fake or synthetic test modes.
+  Real inference must raise a clear error or use an explicitly configured
+  fallback when matching features or the matching head are unavailable.
+- Unit tests must not depend on real PanoCity data, AirSim360-Scene data, or a
+  real external PanoVGGT checkpoint.
+
 ## Remote experiment safety
 
 - For experiments on server `50902` at `lanboyang@172.19.53.39`, always run jobs inside `tmux` so the experiment survives terminal disconnects.

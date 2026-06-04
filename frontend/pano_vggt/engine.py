@@ -56,6 +56,15 @@ def _resize_prediction(pred: PanoVGGTLocalPrediction, image_size: tuple[int, int
         local_points=local_points,
         global_points=global_points,
         descriptors=pred.descriptors,
+        dense_descriptors=pred.dense_descriptors,
+        match_confidence=pred.match_confidence,
+        static_confidence=pred.static_confidence,
+        feature_hw=pred.feature_hw,
+        image_hw=image_size,
+        descriptor_dim=pred.descriptor_dim,
+        ba_residual_angular=pred.ba_residual_angular,
+        ba_valid_ratio=pred.ba_valid_ratio,
+        ba_update_norm=pred.ba_update_norm,
     )
 
 
@@ -111,6 +120,14 @@ def _as_dict(output: Any) -> dict[str, Any]:
         "extrinsics",
         "extrinsic",
         "descriptors",
+        "dense_descriptors",
+        "dense_descriptor",
+        "match_confidence",
+        "matching_confidence",
+        "static_confidence",
+        "feature_hw",
+        "image_hw",
+        "descriptor_dim",
         "tokens",
         "features",
     )
@@ -224,6 +241,41 @@ def _normalize_points_shape(points: torch.Tensor | None, depth: torch.Tensor) ->
     return points.float()
 
 
+def _normalize_optional_confidence(confidence: torch.Tensor | None) -> torch.Tensor | None:
+    if confidence is None:
+        return None
+    confidence = _drop_batch_dim(confidence)
+    if confidence.ndim == 3:
+        confidence = confidence.unsqueeze(1)
+    elif confidence.ndim == 4 and confidence.shape[-1] == 1:
+        confidence = confidence.permute(0, 3, 1, 2)
+    if confidence.ndim != 4 or confidence.shape[1] != 1:
+        raise ValueError(f"Expected optional confidence as Nx1xHxW, got {tuple(confidence.shape)}")
+    return confidence.float().clamp(0.0, 1.0)
+
+
+def _normalize_dense_descriptors(descriptors: torch.Tensor | None) -> torch.Tensor | None:
+    if descriptors is None:
+        return None
+    descriptors = _drop_batch_dim(descriptors)
+    if descriptors.ndim != 4:
+        raise ValueError(f"Expected dense descriptors as NxCxHxW, got {tuple(descriptors.shape)}")
+    return descriptors.float()
+
+
+def _normalize_hw_value(value: Any, *, name: str) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if len(value) != 2:
+        raise ValueError(f"Expected {name} as two values, got {value!r}")
+    height, width = int(value[0]), int(value[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"{name} must be positive, got {(height, width)}")
+    return height, width
+
+
 def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLocalPrediction:
     out = _as_dict(output)
     depth = _first_present(out, ("depth", "depths", "depth_map", "depth_maps", "pred_depth"))
@@ -250,6 +302,36 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
         chunk_world_t = _local_points_to_world(local_points_t, poses_t)
     descriptors = _first_present(out, ("descriptors", "descriptor", "tokens", "features"))
     descriptors_t = None if descriptors is None else _drop_batch_dim(torch.as_tensor(descriptors, device=images.device)).float()
+    dense_descriptor_value = _first_present(out, ("dense_descriptors", "dense_descriptor"))
+    if dense_descriptor_value is None and descriptors_t is not None and descriptors_t.ndim == 4:
+        dense_descriptor_value = descriptors_t
+    dense_descriptors_t = _normalize_dense_descriptors(
+        None if dense_descriptor_value is None else torch.as_tensor(dense_descriptor_value, device=images.device)
+    )
+    match_confidence_t = _normalize_optional_confidence(
+        None
+        if _first_present(out, ("match_confidence", "matching_confidence")) is None
+        else torch.as_tensor(_first_present(out, ("match_confidence", "matching_confidence")), device=images.device)
+    )
+    static_confidence_t = _normalize_optional_confidence(
+        None
+        if _first_present(out, ("static_confidence",)) is None
+        else torch.as_tensor(_first_present(out, ("static_confidence",)), device=images.device)
+    )
+    feature_hw = _normalize_hw_value(_first_present(out, ("feature_hw",)), name="feature_hw")
+    if feature_hw is None and dense_descriptors_t is not None:
+        feature_hw = tuple(int(v) for v in dense_descriptors_t.shape[-2:])
+    if feature_hw is None and match_confidence_t is not None:
+        feature_hw = tuple(int(v) for v in match_confidence_t.shape[-2:])
+    if feature_hw is None and static_confidence_t is not None:
+        feature_hw = tuple(int(v) for v in static_confidence_t.shape[-2:])
+    image_hw = _normalize_hw_value(_first_present(out, ("image_hw",)), name="image_hw")
+    if image_hw is None:
+        image_hw = tuple(int(v) for v in depth_t.shape[-2:])
+    descriptor_dim_value = _first_present(out, ("descriptor_dim",))
+    if descriptor_dim_value is None and dense_descriptors_t is not None:
+        descriptor_dim_value = int(dense_descriptors_t.shape[1])
+    descriptor_dim = int(descriptor_dim_value) if descriptor_dim_value is not None else 24
     return PanoVGGTLocalPrediction(
         poses_c2w=poses_t,
         depth=depth_t,
@@ -258,6 +340,12 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
         local_points=local_points_t,
         global_points=global_points_t,
         descriptors=descriptors_t,
+        dense_descriptors=dense_descriptors_t,
+        match_confidence=match_confidence_t,
+        static_confidence=static_confidence_t,
+        feature_hw=feature_hw,
+        image_hw=image_hw,
+        descriptor_dim=descriptor_dim,
     )
 
 

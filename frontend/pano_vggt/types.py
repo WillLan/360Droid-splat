@@ -18,6 +18,15 @@ class PanoVGGTLocalPrediction:
     local_points: torch.Tensor | None = None
     global_points: torch.Tensor | None = None
     descriptors: torch.Tensor | None = None
+    dense_descriptors: torch.Tensor | None = None
+    match_confidence: torch.Tensor | None = None
+    static_confidence: torch.Tensor | None = None
+    feature_hw: tuple[int, int] | None = None
+    image_hw: tuple[int, int] | None = None
+    descriptor_dim: int = 24
+    ba_residual_angular: float | None = None
+    ba_valid_ratio: float | None = None
+    ba_update_norm: dict[str, float] | None = None
 
     @property
     def point_maps(self) -> torch.Tensor:

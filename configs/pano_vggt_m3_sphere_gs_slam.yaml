@@ -1,0 +1,117 @@
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/lanboyang/Datasets/360uav/seqs
+  sequence: null
+  # Keep null in this M3-Sphere contract config: image resolution is inferred
+  # from the input stream instead of being fixed in the config.
+  erp_resize_height: null
+  erp_resize_width: null
+  begin: 0
+  end: null
+
+Frontend:
+  mode: panovggt_long
+  checkpoint: null
+  keyframe_threshold: 0.5
+  force_keyframe_interval: 8
+
+PanoVGGT:
+  engine: external
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  strict_checkpoint: false
+  image_size: null
+  patch_multiple: 14
+  chunk_size: 4
+  overlap: 2
+  emit_delay: 1
+  align_mode: sim3
+  require_aligned_world_points: true
+  emit_unaligned: false
+  min_overlap_points: 4096
+  max_align_rmse: 0.25
+  min_inlier_ratio: 0.35
+  max_scale_jump: 2.0
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 128
+  amp: true
+  input_batch_dim: true
+
+  M3Sphere:
+    enabled: false
+    descriptor_dim: 24
+
+  MatchingHead:
+    enabled: false
+    checkpoint: null
+    descriptor_dim: 24
+    feature_hook: null
+    # Matching output Hf,Wf follows the input feature tensor Hf,Wf.
+    # Do not configure or assume a fixed descriptor output_hw.
+
+  DenseMatching:
+    enabled: false
+    search_radius: 4
+    topk: 1
+    min_match_confidence: 0.2
+    min_static_confidence: 0.2
+    max_factors: 65536
+    use_wraparound: true
+
+  DenseBA:
+    enabled: false
+    residual_mode: tangent
+    debug_pixel_residual: false
+    iters: 3
+    lm: 0.0001
+    fixed_frames: 1
+    sample_stride: 1
+    max_pose_step: 0.05
+    max_depth_step: 0.10
+
+  InferenceWindow:
+    size: 4
+    overlap: 2
+    temporal_radius: 2
+    max_edges: 24
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Hierarchical:
+  voxel_size_lis: [0.12, 0.45, 1.8]
+
+Mapping:
+  seed_source: world_points_only
+  max_seeds_per_keyframe: 0
+  min_depth_confidence: 0.2
+  sky_mask_enable: true
+  sky_mask_top_ratio: 0.58
+  sky_mask_min_blue: 0.35
+  sky_mask_blue_margin: 0.05
+  sky_mask_cloud_brightness: 0.72
+  sky_mask_cloud_saturation: 0.22
+  sky_mask_texture_threshold: 0.08
+  lr: 0.002
+  refine_steps_per_keyframe: 0
+
+Renderer:
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+
+Results:
+  save_dir: outputs/pano_vggt_m3_sphere_gs_slam
