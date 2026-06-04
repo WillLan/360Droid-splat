@@ -361,6 +361,8 @@ def test_training_one_step_modes_and_missing_supervision_errors(tmp_path: Path):
     matching_result = train_matching(_config(tmp_path / "matching", mode="matching_only", variant="complete"))
     assert Path(matching_result["checkpoint"]).name == "matching_head.pt"
     assert any((tmp_path / "matching" / "visualizations").glob("*matching.png"))
+    assert any((tmp_path / "matching" / "visualizations").glob("*gt_matching.png"))
+    assert any((tmp_path / "matching" / "visualizations").glob("*depth_consistency.png"))
     assert any((tmp_path / "matching" / "visualizations").glob("*match_confidence.png"))
     assert "val/precision_at_0_5deg" in matching_result["last_metrics"]
     with pytest.raises(ValueError, match="requires RGB, depth, and pose"):

@@ -814,6 +814,69 @@ def _predict_match_uv(
     return src_idx.detach(), tgt_idx.detach(), src_uv.detach(), tgt_uv.detach(), pred_uv.detach()
 
 
+def _select_gt_match_uv(
+    corr: Any,
+    *,
+    max_matches: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    valid_idx = torch.nonzero(corr.valid_mask.reshape(-1).bool(), as_tuple=False).flatten()
+    if valid_idx.numel() == 0:
+        return None
+    all_src_idx = corr.src_indices.reshape(-1).long()
+    all_tgt_idx = corr.tgt_indices.reshape(-1).long()
+    first_src = all_src_idx[valid_idx[0]]
+    first_tgt = all_tgt_idx[valid_idx[0]]
+    same_pair = (all_src_idx[valid_idx] == first_src) & (all_tgt_idx[valid_idx] == first_tgt)
+    valid_idx = valid_idx[same_pair]
+    if valid_idx.numel() > int(max_matches):
+        keep = torch.linspace(0, valid_idx.numel() - 1, steps=int(max_matches), device=valid_idx.device).round().long()
+        valid_idx = valid_idx[keep]
+    src_idx = all_src_idx[valid_idx]
+    tgt_idx = all_tgt_idx[valid_idx]
+    src_uv = corr.src_uv.reshape(-1, 2)[valid_idx]
+    tgt_uv = corr.tgt_uv.reshape(-1, 2)[valid_idx]
+    return src_idx.detach(), tgt_idx.detach(), src_uv.detach(), tgt_uv.detach()
+
+
+def _save_gt_matching_visualization(
+    *,
+    sample: dict[str, Any],
+    outputs: dict[str, torch.Tensor],
+    corr: Any | None,
+    image_hw: tuple[int, int],
+    path: Path,
+    max_matches: int,
+) -> Path | None:
+    if corr is None or "dense_descriptors" not in outputs:
+        return None
+    selected = _select_gt_match_uv(corr, max_matches=max_matches)
+    if selected is None:
+        return None
+    src_idx, tgt_idx, src_uv, tgt_uv = selected
+    src_frame = int(src_idx[0].detach().cpu()) if src_idx.numel() else 0
+    tgt_frame = int(tgt_idx[0].detach().cpu()) if tgt_idx.numel() else 0
+    image_src = _image_from_tensor(sample["images"][0, src_frame])
+    image_tgt = _image_from_tensor(sample["images"][0, tgt_frame])
+    canvas = Image.new("RGB", (image_src.width + image_tgt.width, max(image_src.height, image_tgt.height)), (0, 0, 0))
+    canvas.paste(image_src, (0, 0))
+    canvas.paste(image_tgt, (image_src.width, 0))
+    draw = ImageDraw.Draw(canvas)
+    feature_hw = tuple(int(v) for v in outputs["dense_descriptors"].shape[-2:])
+    src_img_uv = feature_uv_to_image_uv(src_uv.cpu(), feature_hw, image_hw)
+    tgt_img_uv = feature_uv_to_image_uv(tgt_uv.cpu(), feature_hw, image_hw)
+    for s, gt in zip(src_img_uv, tgt_img_uv):
+        sx, sy = float(s[0]), float(s[1])
+        gx, gy = float(gt[0]) + image_src.width, float(gt[1])
+        draw.line((sx, sy, gx, gy), fill=(0, 255, 120), width=3)
+        draw.ellipse((sx - 3, sy - 3, sx + 3, sy + 3), fill=(80, 180, 255))
+        draw.ellipse((gx - 4, gy - 4, gx + 4, gy + 4), fill=(0, 255, 120))
+    draw.rectangle((6, 6, 168, 28), fill=(0, 0, 0))
+    draw.text((12, 10), "GT matching lines", fill=(255, 255, 255))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return path
+
+
 def _save_matching_visualization(
     *,
     sample: dict[str, Any],
@@ -851,6 +914,52 @@ def _save_matching_visualization(
         draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=(255, 60, 60))
     draw.rectangle((6, 6, 205, 28), fill=(0, 0, 0))
     draw.text((12, 10), "blue=src green=gt red=pred", fill=(255, 255, 255))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return path
+
+
+def _save_depth_consistency_visualization(
+    *,
+    sample: dict[str, Any],
+    outputs: dict[str, torch.Tensor],
+    corr: Any | None,
+    path: Path,
+) -> Path | None:
+    if corr is None or "dense_descriptors" not in outputs:
+        return None
+    flat_src_idx = corr.src_indices.reshape(-1).long()
+    flat_tgt_idx = corr.tgt_indices.reshape(-1).long()
+    if flat_src_idx.numel() == 0:
+        return None
+    valid_idx = torch.nonzero(corr.valid_mask.reshape(-1).bool(), as_tuple=False).flatten()
+    seed_idx = valid_idx[0] if valid_idx.numel() else torch.tensor(0, device=flat_src_idx.device)
+    src_frame = int(flat_src_idx[seed_idx].detach().cpu())
+    tgt_frame = int(flat_tgt_idx[seed_idx].detach().cpu())
+    same_pair = (flat_src_idx == int(src_frame)) & (flat_tgt_idx == int(tgt_frame))
+    if not bool(same_pair.any()):
+        return None
+    feature_hw = tuple(int(v) for v in outputs["dense_descriptors"].shape[-2:])
+    height_f, width_f = feature_hw
+    src_uv = corr.src_uv.reshape(-1, 2)[same_pair].detach().cpu()
+    consistency = corr.depth_consistency.reshape(-1)[same_pair].detach().float().cpu()
+    heat = torch.zeros(height_f, width_f, dtype=torch.float32)
+    count = torch.zeros(height_f, width_f, dtype=torch.float32)
+    x = (src_uv[:, 0] - 0.5).round().long().clamp(0, width_f - 1)
+    y = (src_uv[:, 1] - 0.5).round().long().clamp(0, height_f - 1)
+    heat.index_put_((y, x), consistency, accumulate=True)
+    count.index_put_((y, x), torch.ones_like(consistency), accumulate=True)
+    heat = heat / count.clamp_min(1.0)
+    image = _image_from_tensor(sample["images"][0, src_frame])
+    heat_img = _heatmap_image(heat, (image.height, image.width))
+    canvas = Image.new("RGB", (image.width * 2, image.height), (0, 0, 0))
+    canvas.paste(image, (0, 0))
+    canvas.paste(heat_img, (image.width, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((6, 6, 236, 28), fill=(0, 0, 0))
+    draw.text((12, 10), f"depth consistency src={src_frame} tgt={tgt_frame}", fill=(255, 255, 255))
+    draw.rectangle((image.width + 6, 6, image.width + 178, 28), fill=(0, 0, 0))
+    draw.text((image.width + 12, 10), "blue=bad warm=ok", fill=(255, 255, 255))
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
     return path
@@ -933,6 +1042,20 @@ def _maybe_write_visualizations(
             image_hw=image_hw,
             path=vis_dir / f"step_{step:07d}_matching.png",
             max_matches=int(vis_cfg.get("max_matches", 40)),
+        )
+        paths["gt_matching"] = _save_gt_matching_visualization(
+            sample=sample,
+            outputs=outputs,
+            corr=correspondences[0] if correspondences else None,
+            image_hw=image_hw,
+            path=vis_dir / f"step_{step:07d}_gt_matching.png",
+            max_matches=int(vis_cfg.get("max_matches", 40)),
+        )
+        paths["depth_consistency"] = _save_depth_consistency_visualization(
+            sample=sample,
+            outputs=outputs,
+            corr=correspondences[0] if correspondences else None,
+            path=vis_dir / f"step_{step:07d}_depth_consistency.png",
         )
         paths["match_confidence"] = _save_match_confidence_visualization(
             sample=sample,
