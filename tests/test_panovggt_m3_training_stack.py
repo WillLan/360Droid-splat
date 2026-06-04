@@ -29,6 +29,7 @@ from frontend.pano_vggt.spherical_correspondence import (
     spherical_tangent_residual,
 )
 from frontend.pano_vggt.train_matching import (
+    ExternalPanoVGGTFeatureExtractor,
     FrozenSyntheticFeatureExtractor,
     load_head_checkpoint,
     load_matching_train_config,
@@ -156,6 +157,16 @@ def test_matching_and_sky_head_shapes_ranges_and_descriptor_norms():
     assert out["match_confidence"].min() >= 0.0 and out["match_confidence"].max() <= 1.0
     assert out["static_confidence"].min() >= 0.0 and out["static_confidence"].max() <= 1.0
     assert out["sky_prob"].min() >= 0.0 and out["sky_prob"].max() <= 1.0
+
+
+def test_external_feature_hook_accepts_5d_channel_first_and_last_grids():
+    extractor = object.__new__(ExternalPanoVGGTFeatureExtractor)
+    extractor._input_hw = (56, 84)
+    extractor._patch_size = 14
+    channel_first = torch.rand(1, 2, 8, 4, 6)
+    assert extractor._tokens_to_feature(channel_first).shape == (1, 2, 8, 4, 6)
+    channel_last = torch.rand(1, 2, 4, 6, 8)
+    assert extractor._tokens_to_feature(channel_last).shape == (1, 2, 8, 4, 6)
 
 
 def test_info_nce_prefers_correct_positives_over_shuffled_positives():

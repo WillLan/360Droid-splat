@@ -230,7 +230,7 @@ class ExternalPanoVGGTFeatureExtractor(nn.Module):
 
     def _tokens_to_feature(self, tokens: torch.Tensor, patch_start_idx: int = 0) -> torch.Tensor:
         if tokens.ndim == 5:
-            if tokens.shape[2] < tokens.shape[-1]:
+            if tokens.shape[2] > tokens.shape[-1]:
                 return tokens
             return tokens.permute(0, 1, 4, 2, 3).contiguous()
         if tokens.ndim != 4:
