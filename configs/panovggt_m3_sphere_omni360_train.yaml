@@ -31,6 +31,7 @@ Model:
   image_size: [518, 1036]
   patch_size: 14
   patch_multiple: 14
+  skip_dinov2_pretrain: true
 
 Heads:
   descriptor_dim: 24
