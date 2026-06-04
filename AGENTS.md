@@ -38,7 +38,12 @@
 - Do not run more than 2 experiment groups at the same time.
 - Run these experiments in the `pfgs360` conda environment:
   `/mnt/disk1/lanboyang/miniconda3/envs/pfgs360/bin/python`
-- Each concurrent experiment group should use one GPU; at most 2 GPUs may be used by this experiment queue at once.
+- Full SLAM / end-to-end mapping experiment groups should use one GPU per group;
+  at most 2 GPUs may be used by those full-pipeline experiment queues at once.
+- PanoVGGT-M3-Sphere head training is the exception: it may use up to 2 GPUs
+  per head-training experiment group, and at most 4 GPUs total across the
+  concurrent head-training queue. Keep this to at most 2 concurrent groups
+  such as one `sky_only` group and one `matching_only` group.
 - CPU and system memory are the primary safety constraints. Monitor CPU load, RAM, and swap while experiments are running. If the server is under heavy CPU load, close to memory pressure, or swap begins growing, pause launching new runs and report the status.
 - Avoid commands or job layouts that can occupy excessive CPU/RAM and make the server unresponsive or prevent SSH login, even if GPU memory appears available.
 - Preserve existing experiment outputs. Do not delete or overwrite result directories unless the user explicitly asks.
