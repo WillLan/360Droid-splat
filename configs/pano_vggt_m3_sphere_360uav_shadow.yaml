@@ -146,6 +146,8 @@ WeightsAndBiases:
 Visualization:
   save_local: true
   log_every: 5
+  m3_log_every: 5
+  m3_max_matches: 80
 
 Results:
   save_dir: outputs/pano_vggt_m3_sphere_360uav_shadow_seq1

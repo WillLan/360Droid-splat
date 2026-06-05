@@ -10,6 +10,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image, ImageDraw
 
@@ -17,6 +18,7 @@ from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.adapter import build_frontend_from_config
 from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
+from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from mapping.gaussian_initializer import GaussianInitializer
 
 
@@ -129,6 +131,16 @@ def _image_tensor_to_pil(image: torch.Tensor) -> Image.Image:
         raise ValueError(f"Expected source image as 3xHxW, got {tuple(img.shape)}")
     arr = (255.0 * img.permute(1, 2, 0).numpy()).astype(np.uint8)
     return Image.fromarray(arr, mode="RGB")
+
+
+def _scalar_tensor_to_pil(value: torch.Tensor) -> Image.Image:
+    tensor = value.detach().cpu().float()
+    if tensor.ndim == 3:
+        tensor = tensor[0]
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected scalar image as HxW or 1xHxW, got {tuple(tensor.shape)}")
+    valid = torch.isfinite(tensor)
+    return Image.fromarray(_scalar_to_rgb(tensor.numpy(), valid.numpy()), mode="RGB")
 
 
 def _inverse_depth_to_pil(inverse_depth: torch.Tensor) -> Image.Image:
@@ -309,6 +321,8 @@ class SlamRuntimeLogger:
         vis_cfg = config.get("Visualization", {})
         self.output_dir = output_dir
         self.log_every = max(1, int(wb_cfg.get("log_every", vis_cfg.get("log_every", 10))))
+        self.m3_log_every = max(1, int(vis_cfg.get("m3_log_every", self.log_every)))
+        self.m3_max_matches = max(1, int(vis_cfg.get("m3_max_matches", 80)))
         self.log_keyframes = bool(wb_cfg.get("log_keyframes", True))
         mode = str(wb_cfg.get("mode") or "online")
         self.wandb_enabled = bool(wb_cfg.get("enabled", False)) and mode != "disabled"
@@ -319,6 +333,7 @@ class SlamRuntimeLogger:
         self.run = None
         self._wandb = None
         self._step = 0
+        self._last_m3_chunk_logged: int | None = None
         self._frontend_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_pose_history: list[tuple[int, np.ndarray]] = []
         self._gt_pose_history: list[tuple[int, np.ndarray]] = []
@@ -360,6 +375,7 @@ class SlamRuntimeLogger:
         backend_loss: float | None,
         backend_pose_c2w: torch.Tensor | None = None,
         backend_render_pkg: dict | None = None,
+        m3_debug: dict | None = None,
     ) -> None:
         self._step += 1
         pose = output.pose_c2w.detach().cpu().float()
@@ -393,6 +409,7 @@ class SlamRuntimeLogger:
 
         if self.run is not None:
             self.run.log(payload, step=self._step)
+        self._observe_m3_debug(m3_debug)
 
         if not self._should_visualize(output):
             return
@@ -433,6 +450,112 @@ class SlamRuntimeLogger:
             image_payload["frontend/trajectory_png"] = str(frontend_traj_path)
             image_payload["backend/trajectory_png"] = str(backend_traj_path)
             self.run.log(image_payload, step=self._step)
+
+    def _observe_m3_debug(self, m3_debug: dict | None) -> None:
+        if not m3_debug:
+            return
+        stats = m3_debug.get("stats")
+        if stats is None or not bool(getattr(stats, "enabled", False)):
+            return
+        chunk_index = int(m3_debug.get("chunk_index", -1))
+        if self._last_m3_chunk_logged == chunk_index:
+            return
+        self._last_m3_chunk_logged = chunk_index
+
+        initial = float(getattr(stats, "initial_mean_residual_deg", 0.0))
+        mean = float(getattr(stats, "mean_residual_deg", 0.0))
+        payload: dict[str, float | int] = {
+            "m3/chunk": int(chunk_index),
+            "m3/ba_success": int(bool(getattr(stats, "success", False))),
+            "m3/valid_factor_ratio": float(getattr(stats, "valid_factor_ratio", 0.0)),
+            "m3/residual_drop_deg": float(initial - mean),
+        }
+        if self.run is not None:
+            self.run.log(payload, step=self._step)
+
+        should_log_images = self.save_local and (
+            chunk_index == 0 or chunk_index % self.m3_log_every == 0
+        )
+        if not should_log_images:
+            return
+        paths = self._save_m3_debug_images(m3_debug, chunk_index=chunk_index)
+        if self.run is not None and self._wandb is not None and paths:
+            image_payload = {}
+            if paths.get("match_lines") is not None:
+                image_payload["m3/match_lines"] = self._wandb.Image(str(paths["match_lines"]))
+            if paths.get("sky_prob") is not None:
+                image_payload["m3/sky_prob"] = self._wandb.Image(str(paths["sky_prob"]))
+            if image_payload:
+                self.run.log(image_payload, step=self._step)
+
+    def _save_m3_debug_images(self, m3_debug: dict, *, chunk_index: int) -> dict[str, Path | None]:
+        paths: dict[str, Path | None] = {"match_lines": None, "sky_prob": None}
+        images = m3_debug.get("images")
+        image_hw = m3_debug.get("image_hw")
+        feature_hw = m3_debug.get("feature_hw")
+        sky_prob = m3_debug.get("sky_prob")
+        graph = m3_debug.get("factor_graph")
+        if image_hw is None and torch.is_tensor(images):
+            image_hw = tuple(int(v) for v in images.shape[-2:])
+
+        if torch.is_tensor(sky_prob) and sky_prob.numel():
+            sky_path = self.visualization_dir / f"m3_chunk_{int(chunk_index):06d}_sky_prob.png"
+            _scalar_tensor_to_pil(sky_prob[0, 0]).save(sky_path)
+            paths["sky_prob"] = sky_path
+
+        if graph is not None and torch.is_tensor(images) and image_hw is not None and feature_hw is not None:
+            match_path = self._save_m3_match_lines(
+                images.float(),
+                graph,
+                image_hw=tuple(int(v) for v in image_hw),
+                feature_hw=tuple(int(v) for v in feature_hw),
+                chunk_index=chunk_index,
+            )
+            paths["match_lines"] = match_path
+        return paths
+
+    def _save_m3_match_lines(
+        self,
+        images: torch.Tensor,
+        graph,
+        *,
+        image_hw: tuple[int, int],
+        feature_hw: tuple[int, int],
+        chunk_index: int,
+    ) -> Path | None:
+        factors = list(getattr(graph, "factors", []) or [])
+        if not factors:
+            return None
+        factor = factors[0]
+        src_idx = int(getattr(factor, "src", 0))
+        tgt_idx = int(getattr(factor, "tgt", min(1, int(images.shape[0]) - 1)))
+        if src_idx >= int(images.shape[0]) or tgt_idx >= int(images.shape[0]):
+            return None
+        if tuple(images.shape[-2:]) != tuple(image_hw):
+            images = F.interpolate(images, size=image_hw, mode="bilinear", align_corners=False)
+        src_image = _image_tensor_to_pil(images[src_idx])
+        tgt_image = _image_tensor_to_pil(images[tgt_idx])
+        canvas = Image.new("RGB", (src_image.width + tgt_image.width, max(src_image.height, tgt_image.height)))
+        canvas.paste(src_image, (0, 0))
+        canvas.paste(tgt_image, (src_image.width, 0))
+        draw = ImageDraw.Draw(canvas)
+
+        valid = factor.valid_mask.detach().cpu().bool().reshape(-1)
+        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()[: self.m3_max_matches]
+        if valid_idx.numel() == 0:
+            return None
+        src_uv = feature_uv_to_image_uv(factor.src_uv.detach().cpu()[valid_idx], feature_hw, image_hw)
+        tgt_uv = feature_uv_to_image_uv(factor.tgt_uv.detach().cpu()[valid_idx], feature_hw, image_hw)
+        for src, tgt in zip(src_uv.tolist(), tgt_uv.tolist()):
+            sx, sy = float(src[0]), float(src[1])
+            tx, ty = src_image.width + float(tgt[0]), float(tgt[1])
+            draw.line([(sx, sy), (tx, ty)], fill=(64, 220, 120), width=1)
+            draw.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=(255, 80, 80))
+            draw.ellipse((tx - 2, ty - 2, tx + 2, ty + 2), fill=(80, 180, 255))
+
+        path = self.visualization_dir / f"m3_chunk_{int(chunk_index):06d}_match_lines.png"
+        _resize_to_max_width(canvas, 1800).save(path)
+        return path
 
     def _should_visualize(self, output: FrontendOutput) -> bool:
         if not self.save_local:
@@ -814,6 +937,7 @@ class PanoDroidGSSlamSystem:
                 backend_loss=backend_loss,
                 backend_pose_c2w=backend_pose,
                 backend_render_pkg=backend_render_pkg,
+                m3_debug=getattr(self.frontend, "last_m3_debug", None),
             )
 
         try:

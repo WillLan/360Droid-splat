@@ -114,6 +114,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_shadow.dense_ba.iters == 3
     assert parsed_shadow.dense_ba.min_num_factors == 128
     assert parsed_shadow.dense_ba.factor_chunk_size == 512
+    assert shadow_cfg["Visualization"]["m3_log_every"] == 5
+    assert shadow_cfg["Visualization"]["m3_max_matches"] == 80
     assert parsed_active.dense_ba.shadow_mode is False
     assert active_cfg["Results"]["save_dir"].endswith("_active_seq1")
 

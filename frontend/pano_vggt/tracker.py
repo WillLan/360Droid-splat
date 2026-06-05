@@ -120,6 +120,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.chunk_count = 0
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
+        self.last_m3_debug: dict | None = None
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -205,6 +206,18 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.last_dense_ba_stats = ba_stats
         if ba_stats.enabled:
             self.dense_ba_stats_history.append(ba_stats)
+            self.last_m3_debug = {
+                "chunk_index": int(self.chunk_count),
+                "frame_ids": frame_ids,
+                "stats": ba_stats,
+                "factor_graph": factor_graph,
+                "sky_prob": pred0.sky_prob.detach().cpu() if pred0.sky_prob is not None else None,
+                "feature_hw": pred0.feature_hw,
+                "image_hw": pred0.image_hw,
+                "images": images.detach().cpu(),
+            }
+        else:
+            self.last_m3_debug = None
         pred = pred_refined if ba_stats.used_refined else pred0
         transform = self._align_chunk(pred, frame_ids)
         backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)

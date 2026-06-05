@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import torch
 
-from frontend.pano_droid.interfaces import PanoFrame
+from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_vggt.alignment import SimilarityTransform
 from frontend.pano_vggt.dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from frontend.pano_vggt.engine import PanoVGGTInferenceEngine
@@ -13,7 +13,7 @@ from frontend.pano_vggt.spherical_correspondence import generate_gt_spherical_co
 from frontend.pano_vggt.spherical_dense_ba import SphericalTangentDenseBA
 from frontend.pano_vggt.tracker import PanoVGGTLongTracker
 from frontend.pano_vggt.types import PanoVGGTLocalPrediction
-from system.pano_droid_gs_slam import _summarize_dense_ba_stats
+from system.pano_droid_gs_slam import SlamRuntimeLogger, _summarize_dense_ba_stats
 
 
 def _poses(tx: float = 0.2) -> torch.Tensor:
@@ -442,3 +442,66 @@ def test_slam_dense_ba_summary_aggregates_tracker_internal_stats():
     assert abs(summary["mean_valid_factor_ratio"] - 0.13) < 1e-8
     assert summary["max_pose_update"] == 0.02
     assert summary["max_depth_update"] == 0.04
+
+
+def test_slam_logger_saves_minimal_m3_debug_visualizations(tmp_path):
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": True, "m3_log_every": 1, "m3_max_matches": 4},
+        },
+        tmp_path,
+    )
+    factor = DenseSphereFactor(
+        src=0,
+        tgt=1,
+        src_uv=torch.tensor([[1.5, 1.5], [2.5, 2.5]]),
+        tgt_uv=torch.tensor([[2.5, 1.5], [3.5, 2.5]]),
+        src_bearing=torch.randn(2, 3),
+        tgt_bearing=torch.randn(2, 3),
+        weight=torch.ones(2),
+        match_score=torch.ones(2),
+        valid_mask=torch.ones(2, dtype=torch.bool),
+    )
+    debug = {
+        "chunk_index": 0,
+        "stats": DenseBARefinerStats(
+            enabled=True,
+            shadow_mode=True,
+            success=True,
+            mean_residual_deg=0.25,
+            initial_mean_residual_deg=0.75,
+            valid_factor_ratio=0.5,
+        ),
+        "factor_graph": DenseSphereFactorGraph([factor]),
+        "sky_prob": torch.linspace(0.0, 1.0, steps=64).view(2, 1, 4, 8),
+        "feature_hw": (4, 8),
+        "image_hw": (4, 8),
+        "images": torch.rand(2, 3, 4, 8),
+    }
+    output = FrontendOutput(
+        frame_id=0,
+        timestamp=0.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=0.0,
+        is_keyframe=False,
+        ba_residual=None,
+        tracking_status="tracked_panovggt_long|dense_ba_shadow_success",
+    )
+
+    logger.observe(
+        output,
+        PanoFrame(image=torch.rand(3, 4, 8), timestamp=0.0, frame_id=0),
+        anchor_count=0,
+        keyframe_count=0,
+        backend_loss=None,
+        m3_debug=debug,
+    )
+
+    assert (tmp_path / "visualizations" / "m3_chunk_000000_match_lines.png").is_file()
+    assert (tmp_path / "visualizations" / "m3_chunk_000000_sky_prob.png").is_file()
