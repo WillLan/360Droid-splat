@@ -20,6 +20,7 @@ PanoVGGT:
   checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   strict_checkpoint: false
+  skip_dinov2_pretrain: true
   image_size: [518, 1036]
   patch_multiple: 14
   chunk_size: 4

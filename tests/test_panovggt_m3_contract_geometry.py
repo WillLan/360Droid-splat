@@ -105,6 +105,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert shadow_cfg["Dataset"]["dataset_path"].endswith("/360uav/seqs/seq1")
     assert shadow_cfg["Dataset"]["sequence"] is None
     assert shadow_cfg["PanoVGGT"]["image_size"] == [518, 1036]
+    assert shadow_cfg["PanoVGGT"]["skip_dinov2_pretrain"] is True
     assert parsed_shadow.matching_head.matching_checkpoint.endswith("/matching_head.pt")
     assert parsed_shadow.matching_head.sky_checkpoint.endswith("/sky_head.pt")
     assert parsed_shadow.matching_head.feature_hook == "aggregator"
