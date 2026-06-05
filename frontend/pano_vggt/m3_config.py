@@ -24,25 +24,38 @@ def _positive_int(value: Any, *, name: str) -> int:
 
 @dataclass(frozen=True)
 class MatchingHeadConfig:
-    """Configuration for the future dense matching head contract."""
+    """Configuration for the gated dense matching and sky heads."""
 
     enabled: bool = False
     checkpoint: str | None = None
+    matching_checkpoint: str | None = None
+    sky_checkpoint: str | None = None
     descriptor_dim: int = 24
     feature_hook: str | None = None
+    feature_key: str | int | None = None
+    strict: bool = True
+    allow_fake_matching: bool = False
+    fake_feature_stride: int = 4
 
 
 @dataclass(frozen=True)
 class DenseMatchingConfig:
-    """Configuration for future pose-guided dense matching."""
+    """Configuration for pose-guided dense matching."""
 
     enabled: bool = False
     search_radius: int = 4
     topk: int = 1
     min_match_confidence: float = 0.2
     min_static_confidence: float = 0.2
+    min_match_score: float = 0.0
     max_factors: int = 65536
+    max_samples_per_edge: int | None = None
     use_wraparound: bool = True
+    forward_backward: bool = True
+    fb_tolerance: float = 1.5
+    use_depth_consistency: bool = True
+    depth_consistency_rel: float = 0.03
+    depth_consistency_abs: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -109,17 +122,38 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     matching_head = MatchingHeadConfig(
         enabled=bool(head_raw.get("enabled", False)),
         checkpoint=head_raw.get("checkpoint"),
+        matching_checkpoint=head_raw.get("matching_checkpoint"),
+        sky_checkpoint=head_raw.get("sky_checkpoint"),
         descriptor_dim=descriptor_dim,
         feature_hook=head_raw.get("feature_hook"),
+        feature_key=head_raw.get("feature_key"),
+        strict=bool(head_raw.get("strict", True)),
+        allow_fake_matching=bool(head_raw.get("allow_fake_matching", False)),
+        fake_feature_stride=_positive_int(
+            head_raw.get("fake_feature_stride", 4),
+            name="PanoVGGT.MatchingHead.fake_feature_stride",
+        ),
     )
+    max_samples_per_edge_raw = dense_raw.get("max_samples_per_edge")
     dense_matching = DenseMatchingConfig(
         enabled=bool(dense_raw.get("enabled", False)),
         search_radius=_positive_int(dense_raw.get("search_radius", 4), name="PanoVGGT.DenseMatching.search_radius"),
         topk=_positive_int(dense_raw.get("topk", 1), name="PanoVGGT.DenseMatching.topk"),
         min_match_confidence=float(dense_raw.get("min_match_confidence", 0.2)),
         min_static_confidence=float(dense_raw.get("min_static_confidence", 0.2)),
+        min_match_score=float(dense_raw.get("min_match_score", 0.0)),
         max_factors=_positive_int(dense_raw.get("max_factors", 65536), name="PanoVGGT.DenseMatching.max_factors"),
+        max_samples_per_edge=(
+            None
+            if max_samples_per_edge_raw is None
+            else _positive_int(max_samples_per_edge_raw, name="PanoVGGT.DenseMatching.max_samples_per_edge")
+        ),
         use_wraparound=bool(dense_raw.get("use_wraparound", True)),
+        forward_backward=bool(dense_raw.get("forward_backward", True)),
+        fb_tolerance=float(dense_raw.get("fb_tolerance", 1.5)),
+        use_depth_consistency=bool(dense_raw.get("use_depth_consistency", True)),
+        depth_consistency_rel=float(dense_raw.get("depth_consistency_rel", 0.03)),
+        depth_consistency_abs=float(dense_raw.get("depth_consistency_abs", 0.05)),
     )
     dense_ba = DenseBAConfig(
         enabled=bool(ba_raw.get("enabled", False)),

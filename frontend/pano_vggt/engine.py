@@ -7,6 +7,7 @@ smoke runs use the fake engine so this repository stays self contained.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 import inspect
@@ -19,6 +20,17 @@ import torch.nn.functional as F
 
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 
+from .dense_matcher import PoseGuidedDenseMatcher
+from .factor_graph import DenseSphereFactorGraph
+from .m3_config import M3SphereConfig, parse_m3_sphere_config
+from .matching_adapter import (
+    MatchingSkyAdapter,
+    call_forward_with_features,
+    extract_features_with_hook,
+    load_matching_sky_checkpoint,
+    make_fake_matching_outputs,
+    run_matching_sky_head,
+)
 from .types import PanoVGGTLocalPrediction
 
 
@@ -59,13 +71,98 @@ def _resize_prediction(pred: PanoVGGTLocalPrediction, image_size: tuple[int, int
         dense_descriptors=pred.dense_descriptors,
         match_confidence=pred.match_confidence,
         static_confidence=pred.static_confidence,
+        sky_logits=pred.sky_logits,
+        sky_prob=pred.sky_prob,
         feature_hw=pred.feature_hw,
         image_hw=image_size,
         descriptor_dim=pred.descriptor_dim,
+        matching_debug=pred.matching_debug,
         ba_residual_angular=pred.ba_residual_angular,
         ba_valid_ratio=pred.ba_valid_ratio,
         ba_update_norm=pred.ba_update_norm,
     )
+
+
+def _prediction_with_matching(
+    pred: PanoVGGTLocalPrediction,
+    matching: dict[str, Any],
+    *,
+    image_hw: tuple[int, int],
+) -> PanoVGGTLocalPrediction:
+    dense = matching.get("dense_descriptors", pred.dense_descriptors)
+    match_conf = matching.get("match_confidence", pred.match_confidence)
+    sky_logits = matching.get("sky_logits", pred.sky_logits)
+    sky_prob = matching.get("sky_prob", pred.sky_prob)
+    feature_hw = matching.get("feature_hw", pred.feature_hw)
+    descriptor_dim = int(matching.get("descriptor_dim", pred.descriptor_dim))
+    if dense is not None and int(dense.shape[0]) != int(pred.poses_c2w.shape[0]):
+        raise ValueError("dense_descriptors frame count does not match PanoVGGT poses.")
+    if match_conf is not None and int(match_conf.shape[0]) != int(pred.poses_c2w.shape[0]):
+        raise ValueError("match_confidence frame count does not match PanoVGGT poses.")
+    if sky_prob is not None and int(sky_prob.shape[0]) != int(pred.poses_c2w.shape[0]):
+        raise ValueError("sky_prob frame count does not match PanoVGGT poses.")
+    return replace(
+        pred,
+        dense_descriptors=dense,
+        match_confidence=match_conf,
+        sky_logits=sky_logits,
+        sky_prob=sky_prob,
+        feature_hw=feature_hw,
+        image_hw=image_hw,
+        descriptor_dim=descriptor_dim,
+    )
+
+
+def _dense_matcher_from_config(config: M3SphereConfig) -> PoseGuidedDenseMatcher:
+    dense = config.dense_matching
+    return PoseGuidedDenseMatcher(
+        search_radius=dense.search_radius,
+        topk=dense.topk,
+        min_match_confidence=dense.min_match_confidence,
+        min_static_confidence=dense.min_static_confidence,
+        min_match_score=dense.min_match_score,
+        max_factors=dense.max_factors,
+        max_samples_per_edge=dense.max_samples_per_edge,
+        use_wraparound=dense.use_wraparound,
+        forward_backward=dense.forward_backward,
+        fb_tolerance=dense.fb_tolerance,
+        use_depth_consistency=dense.use_depth_consistency,
+        depth_consistency_rel=dense.depth_consistency_rel,
+        depth_consistency_abs=dense.depth_consistency_abs,
+    )
+
+
+def _run_dense_matching_if_enabled(
+    pred: PanoVGGTLocalPrediction,
+    config: M3SphereConfig,
+) -> tuple[PanoVGGTLocalPrediction, DenseSphereFactorGraph | None]:
+    if not (config.enabled and config.dense_matching.enabled):
+        return pred, None
+    if pred.dense_descriptors is None or pred.match_confidence is None:
+        raise RuntimeError("PanoVGGT.DenseMatching.enabled=true requires dense_descriptors and match_confidence.")
+    if pred.sky_prob is None:
+        raise RuntimeError("PanoVGGT.DenseMatching.enabled=true requires sky_prob so sky can affect factor validity/weight.")
+    if pred.feature_hw is None or pred.image_hw is None:
+        raise RuntimeError("PanoVGGT.DenseMatching.enabled=true requires feature_hw and image_hw.")
+    edges = DenseSphereFactorGraph.build_edges(
+        int(pred.poses_c2w.shape[0]),
+        temporal_radius=config.inference_window.temporal_radius,
+        max_edges=config.inference_window.max_edges,
+        device=pred.depth.device,
+    )
+    matcher = _dense_matcher_from_config(config)
+    graph = matcher.match(
+        poses_c2w=pred.poses_c2w,
+        depth=pred.depth,
+        dense_descriptors=pred.dense_descriptors,
+        match_confidence=pred.match_confidence,
+        sky_prob=pred.sky_prob,
+        static_confidence=pred.static_confidence,
+        image_hw=pred.image_hw,
+        feature_hw=pred.feature_hw,
+        edge_pairs=edges,
+    )
+    return replace(pred, matching_debug=graph.metrics()), graph
 
 
 def _import_attr(path: str) -> Any:
@@ -125,9 +222,12 @@ def _as_dict(output: Any) -> dict[str, Any]:
         "match_confidence",
         "matching_confidence",
         "static_confidence",
+        "sky_logits",
+        "sky_prob",
         "feature_hw",
         "image_hw",
         "descriptor_dim",
+        "matching_debug",
         "tokens",
         "features",
     )
@@ -254,6 +354,20 @@ def _normalize_optional_confidence(confidence: torch.Tensor | None) -> torch.Ten
     return confidence.float().clamp(0.0, 1.0)
 
 
+def _normalize_optional_map(value: torch.Tensor | None, *, name: str, clamp_unit: bool = False) -> torch.Tensor | None:
+    if value is None:
+        return None
+    value = _drop_batch_dim(value)
+    if value.ndim == 3:
+        value = value.unsqueeze(1)
+    elif value.ndim == 4 and value.shape[-1] == 1:
+        value = value.permute(0, 3, 1, 2)
+    if value.ndim != 4 or value.shape[1] != 1:
+        raise ValueError(f"Expected {name} as Nx1xHxW, got {tuple(value.shape)}")
+    value = value.float()
+    return value.clamp(0.0, 1.0) if clamp_unit else value
+
+
 def _normalize_dense_descriptors(descriptors: torch.Tensor | None) -> torch.Tensor | None:
     if descriptors is None:
         return None
@@ -318,6 +432,19 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
         if _first_present(out, ("static_confidence",)) is None
         else torch.as_tensor(_first_present(out, ("static_confidence",)), device=images.device)
     )
+    sky_logits_t = _normalize_optional_map(
+        None
+        if _first_present(out, ("sky_logits",)) is None
+        else torch.as_tensor(_first_present(out, ("sky_logits",)), device=images.device),
+        name="sky_logits",
+    )
+    sky_prob_t = _normalize_optional_map(
+        None
+        if _first_present(out, ("sky_prob", "sky_probability")) is None
+        else torch.as_tensor(_first_present(out, ("sky_prob", "sky_probability")), device=images.device),
+        name="sky_prob",
+        clamp_unit=True,
+    )
     feature_hw = _normalize_hw_value(_first_present(out, ("feature_hw",)), name="feature_hw")
     if feature_hw is None and dense_descriptors_t is not None:
         feature_hw = tuple(int(v) for v in dense_descriptors_t.shape[-2:])
@@ -325,6 +452,8 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
         feature_hw = tuple(int(v) for v in match_confidence_t.shape[-2:])
     if feature_hw is None and static_confidence_t is not None:
         feature_hw = tuple(int(v) for v in static_confidence_t.shape[-2:])
+    if feature_hw is None and sky_prob_t is not None:
+        feature_hw = tuple(int(v) for v in sky_prob_t.shape[-2:])
     image_hw = _normalize_hw_value(_first_present(out, ("image_hw",)), name="image_hw")
     if image_hw is None:
         image_hw = tuple(int(v) for v in depth_t.shape[-2:])
@@ -332,6 +461,10 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
     if descriptor_dim_value is None and dense_descriptors_t is not None:
         descriptor_dim_value = int(dense_descriptors_t.shape[1])
     descriptor_dim = int(descriptor_dim_value) if descriptor_dim_value is not None else 24
+    matching_debug_value = _first_present(out, ("matching_debug",))
+    matching_debug = None
+    if isinstance(matching_debug_value, dict):
+        matching_debug = {str(key): float(value) for key, value in matching_debug_value.items()}
     return PanoVGGTLocalPrediction(
         poses_c2w=poses_t,
         depth=depth_t,
@@ -343,14 +476,19 @@ def normalize_panovggt_output(output: Any, images: torch.Tensor) -> PanoVGGTLoca
         dense_descriptors=dense_descriptors_t,
         match_confidence=match_confidence_t,
         static_confidence=static_confidence_t,
+        sky_logits=sky_logits_t,
+        sky_prob=sky_prob_t,
         feature_hw=feature_hw,
         image_hw=image_hw,
         descriptor_dim=descriptor_dim,
+        matching_debug=matching_debug,
     )
 
 
 class PanoVGGTInferenceEngine:
     """Base PanoVGGT inference engine."""
+
+    last_dense_factor_graph: DenseSphereFactorGraph | None = None
 
     def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
         raise NotImplementedError
@@ -362,9 +500,17 @@ class PanoVGGTInferenceEngine:
 class FakePanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
     """Deterministic geometry prior for tests and local smoke runs."""
 
-    def __init__(self, image_size: tuple[int, int] | None = (64, 128), translation_step: float = 0.08) -> None:
+    def __init__(
+        self,
+        image_size: tuple[int, int] | None = (64, 128),
+        translation_step: float = 0.08,
+        *,
+        m3_config: M3SphereConfig | None = None,
+    ) -> None:
         self.image_size = image_size
         self.translation_step = float(translation_step)
+        self.m3_config = m3_config or M3SphereConfig()
+        self.last_dense_factor_graph: DenseSphereFactorGraph | None = None
 
     def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
         images = _resize_images(images.float(), self.image_size)
@@ -387,7 +533,7 @@ class FakePanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
             [images.mean(dim=(2, 3)), images.std(dim=(2, 3), unbiased=False)],
             dim=1,
         )
-        return PanoVGGTLocalPrediction(
+        pred = PanoVGGTLocalPrediction(
             poses_c2w=poses,
             depth=depth,
             confidence=confidence,
@@ -395,6 +541,20 @@ class FakePanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
             local_points=local_points,
             descriptors=descriptors,
         )
+        if self.m3_config.enabled and self.m3_config.matching_head.enabled:
+            if not self.m3_config.matching_head.allow_fake_matching:
+                raise RuntimeError(
+                    "PanoVGGT MatchingHead is enabled with engine=fake, but "
+                    "MatchingHead.allow_fake_matching is false."
+                )
+            matching = make_fake_matching_outputs(
+                images,
+                descriptor_dim=self.m3_config.matching_head.descriptor_dim,
+                feature_stride=self.m3_config.matching_head.fake_feature_stride,
+            )
+            pred = _prediction_with_matching(pred, matching, image_hw=(height, width))
+        pred, self.last_dense_factor_graph = _run_dense_matching_if_enabled(pred, self.m3_config)
+        return pred
 
     def load_checkpoint(self, path: str) -> None:
         return None
@@ -425,6 +585,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         strict_checkpoint: bool = False,
         skip_dinov2_pretrain: bool = False,
         patch_multiple: int = 14,
+        m3_config: M3SphereConfig | None = None,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.config_path = config_path
@@ -434,6 +595,9 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         self.strict_checkpoint = bool(strict_checkpoint)
         self.skip_dinov2_pretrain = bool(skip_dinov2_pretrain)
         self.patch_multiple = int(patch_multiple)
+        self.m3_config = m3_config or M3SphereConfig()
+        self.matching_adapter: MatchingSkyAdapter | None = None
+        self.last_dense_factor_graph: DenseSphereFactorGraph | None = None
         if repo_path:
             repo = str(Path(repo_path).expanduser().resolve())
             if repo not in sys.path:
@@ -443,6 +607,18 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         if checkpoint:
             self.load_checkpoint(checkpoint)
         self.model.eval()
+        if self.m3_config.enabled and self.m3_config.matching_head.enabled:
+            head_cfg = self.m3_config.matching_head
+            self.matching_adapter = load_matching_sky_checkpoint(
+                head_cfg.checkpoint,
+                matching_checkpoint=head_cfg.matching_checkpoint,
+                sky_checkpoint=head_cfg.sky_checkpoint,
+                device=self.device,
+                descriptor_dim=head_cfg.descriptor_dim,
+                feature_hook=head_cfg.feature_hook,
+                feature_key=head_cfg.feature_key,
+                strict=head_cfg.strict,
+            )
 
     def _build_model(self, class_path: str | None, model_kwargs: dict[str, Any]) -> torch.nn.Module:
         paths = (class_path,) if class_path else self.DEFAULT_CLASS_PATHS
@@ -535,11 +711,39 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         with torch.no_grad():
             if self.amp and self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    output = self._call_model(model_input)
+                    output, feature = self._call_model_and_maybe_capture_feature(model_input)
             else:
-                output = self._call_model(model_input)
+                output, feature = self._call_model_and_maybe_capture_feature(model_input)
         pred = normalize_panovggt_output(output, model_images)
-        return _resize_prediction(pred, target_size)
+        if self.matching_adapter is not None:
+            if feature is None:
+                raise RuntimeError("PanoVGGT matching adapter is enabled but no feature tensor was captured.")
+            matching = run_matching_sky_head(self.matching_adapter, feature.to(self.device))
+            pred = _prediction_with_matching(pred, matching, image_hw=model_size)
+        pred = _resize_prediction(pred, target_size)
+        pred, self.last_dense_factor_graph = _run_dense_matching_if_enabled(pred, self.m3_config)
+        return pred
+
+    def _call_model_and_maybe_capture_feature(self, model_input: torch.Tensor) -> tuple[Any, torch.Tensor | None]:
+        if self.matching_adapter is None:
+            return self._call_model(model_input), None
+        feature_hook = self.matching_adapter.feature_hook
+        if feature_hook:
+            output, feature = extract_features_with_hook(
+                self.model,
+                feature_hook,
+                lambda: self._call_model(model_input),
+                patch_size=self.patch_multiple,
+                feature_key=self.m3_config.matching_head.feature_key,
+            )
+            return output, feature
+        explicit = call_forward_with_features(self.model, model_input, patch_size=self.patch_multiple)
+        if explicit is not None:
+            return explicit
+        raise RuntimeError(
+            "PanoVGGT MatchingHead is enabled, but no feature_hook was configured or stored in the checkpoint, "
+            "and the external model does not expose forward_with_features/infer_with_features."
+        )
 
     def _call_model(self, model_input: torch.Tensor) -> Any:
         for name in ("infer", "inference", "predict", "forward"):
@@ -554,6 +758,9 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
 
 
 def build_panovggt_engine(config: dict, *, device: torch.device | str | None = None) -> PanoVGGTInferenceEngine:
+    m3_config = parse_m3_sphere_config({"PanoVGGT": config})
+    if m3_config.enabled and m3_config.dense_ba.enabled:
+        raise NotImplementedError("PanoVGGT-M3-Sphere dense BA is not implemented in the inference+matching stage.")
     engine_name = str(config.get("engine", "external")).lower()
     size_cfg = config.get("image_size", [518, 1036])
     image_size = None if size_cfg is None else (int(size_cfg[0]), int(size_cfg[1]))
@@ -561,6 +768,7 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         return FakePanoVGGTInferenceEngine(
             image_size=image_size,
             translation_step=float(config.get("fake_translation_step", 0.08)),
+            m3_config=m3_config,
         )
     return ExternalPanoVGGTInferenceEngine(
         repo_path=config.get("repo_path"),
@@ -575,4 +783,5 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         strict_checkpoint=bool(config.get("strict_checkpoint", False)),
         skip_dinov2_pretrain=bool(config.get("skip_dinov2_pretrain", False)),
         patch_multiple=int(config.get("patch_multiple", 14)),
+        m3_config=m3_config,
     )

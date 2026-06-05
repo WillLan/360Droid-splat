@@ -21,9 +21,12 @@ class PanoVGGTLocalPrediction:
     dense_descriptors: torch.Tensor | None = None
     match_confidence: torch.Tensor | None = None
     static_confidence: torch.Tensor | None = None
+    sky_logits: torch.Tensor | None = None
+    sky_prob: torch.Tensor | None = None
     feature_hw: tuple[int, int] | None = None
     image_hw: tuple[int, int] | None = None
     descriptor_dim: int = 24
+    matching_debug: dict[str, float] | None = None
     ba_residual_angular: float | None = None
     ba_valid_ratio: float | None = None
     ba_update_norm: dict[str, float] | None = None

@@ -1,7 +1,9 @@
 """PanoVGGT long-sequence frontend."""
 
 from .alignment import SimilarityTransform, SubmapAligner
+from .dense_matcher import PoseGuidedDenseMatcher
 from .engine import ExternalPanoVGGTInferenceEngine, FakePanoVGGTInferenceEngine, PanoVGGTInferenceEngine
+from .factor_graph import DenseSphereFactor, DenseSphereFactorGraph
 from .matching_dataset import Omni360SceneTrainingDataset, SyntheticOmni360TrainingDataset
 from .matching_head import PanoVGGTMatchingHead, PanoVGGTMatchingSkyHead, PanoVGGTSkyMaskHead
 from .matching_losses import PanoVGGTMatchingLossWeights, PanoVGGTMatchingSkyLoss
@@ -14,6 +16,8 @@ __all__ = [
     "Omni360SceneTrainingDataset",
     "PanoVGGTInferenceEngine",
     "PanoVGGTAlignmentError",
+    "DenseSphereFactor",
+    "DenseSphereFactorGraph",
     "PanoVGGTLocalPrediction",
     "PanoVGGTLongTracker",
     "PanoVGGTMatchingHead",
@@ -21,6 +25,7 @@ __all__ = [
     "PanoVGGTMatchingSkyHead",
     "PanoVGGTMatchingSkyLoss",
     "PanoVGGTSkyMaskHead",
+    "PoseGuidedDenseMatcher",
     "SimilarityTransform",
     "SubmapAligner",
     "SyntheticOmni360TrainingDataset",
