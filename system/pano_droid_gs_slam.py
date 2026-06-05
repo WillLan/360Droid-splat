@@ -224,6 +224,83 @@ def _xyz_to_y_up_plot(xyz: np.ndarray) -> np.ndarray:
     return np.stack([xyz[:, 0], xyz[:, 2], xyz[:, 1]], axis=1)
 
 
+def _finite_mean(values: list[float]) -> float:
+    finite = [float(v) for v in values if np.isfinite(float(v))]
+    if not finite:
+        return 0.0
+    return float(np.mean(np.asarray(finite, dtype=np.float64)))
+
+
+def _summarize_dense_ba_stats(frontend) -> dict:
+    """Aggregate internal PanoVGGT-M3 dense BA diagnostics without changing public outputs."""
+
+    history = list(getattr(frontend, "dense_ba_stats_history", []) or [])
+    last = getattr(frontend, "last_dense_ba_stats", None)
+    enabled = bool(getattr(last, "enabled", False)) if last is not None else bool(history)
+    if not history:
+        return {
+            "enabled": enabled,
+            "shadow_mode": bool(getattr(last, "shadow_mode", True)) if last is not None else True,
+            "chunks": 0,
+            "successes": 0,
+            "fallbacks": 0,
+            "success_ratio": 0.0,
+            "used_refined": 0,
+            "used_refined_ratio": 0.0,
+            "fallback_reasons": {},
+            "mean_angular_residual_deg": 0.0,
+            "mean_initial_angular_residual_deg": 0.0,
+            "mean_valid_factor_ratio": 0.0,
+            "mean_pose_update": 0.0,
+            "max_pose_update": 0.0,
+            "mean_pose_rot_update_deg": 0.0,
+            "mean_depth_update": 0.0,
+            "max_depth_update": 0.0,
+        }
+
+    successes = [item for item in history if bool(getattr(item, "success", False))]
+    fallbacks = [item for item in history if not bool(getattr(item, "success", False))]
+    reasons: dict[str, int] = {}
+    for item in fallbacks:
+        reason = str(getattr(item, "fallback_reason", None) or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    pose_update = [float(getattr(item, "pose_update_norm", {}).get("mean", 0.0)) for item in history]
+    pose_update_max = [float(getattr(item, "pose_update_norm", {}).get("max", 0.0)) for item in history]
+    pose_rot_update = [float(getattr(item, "pose_update_norm", {}).get("rot_max_deg", 0.0)) for item in history]
+    depth_update = [float(getattr(item, "depth_update_norm", {}).get("mean", 0.0)) for item in history]
+    depth_update_max = [float(getattr(item, "depth_update_norm", {}).get("max", 0.0)) for item in history]
+    chunk_count = len(history)
+    used_refined = sum(int(bool(getattr(item, "used_refined", False))) for item in history)
+    return {
+        "enabled": True,
+        "shadow_mode": bool(getattr(history[-1], "shadow_mode", True)),
+        "chunks": int(chunk_count),
+        "successes": int(len(successes)),
+        "fallbacks": int(len(fallbacks)),
+        "success_ratio": float(len(successes) / chunk_count) if chunk_count else 0.0,
+        "used_refined": int(used_refined),
+        "used_refined_ratio": float(used_refined / chunk_count) if chunk_count else 0.0,
+        "fallback_reasons": reasons,
+        "mean_angular_residual_deg": _finite_mean([float(getattr(item, "mean_residual_deg", 0.0)) for item in history]),
+        "mean_initial_angular_residual_deg": _finite_mean([float(getattr(item, "initial_mean_residual_deg", 0.0)) for item in history]),
+        "mean_valid_factor_ratio": _finite_mean([float(getattr(item, "valid_factor_ratio", 0.0)) for item in history]),
+        "mean_pose_update": _finite_mean(pose_update),
+        "max_pose_update": float(max(pose_update_max)) if pose_update_max else 0.0,
+        "mean_pose_rot_update_deg": _finite_mean(pose_rot_update),
+        "mean_depth_update": _finite_mean(depth_update),
+        "max_depth_update": float(max(depth_update_max)) if depth_update_max else 0.0,
+    }
+
+
+def _flatten_dense_ba_summary(summary: dict) -> dict[str, float | int | bool]:
+    return {
+        f"dense_ba_{key}": value
+        for key, value in summary.items()
+        if isinstance(value, (bool, int, float))
+    }
+
+
 class SlamRuntimeLogger:
     """Runtime W&B and local visualization logger for online SLAM runs."""
 
@@ -762,6 +839,7 @@ class PanoDroidGSSlamSystem:
                 self.mapper.refined_keyframe_poses(),
                 step=frame_count,
             )
+            dense_ba_summary = _summarize_dense_ba_stats(self.frontend)
             summary = {
                 "frames": frame_count,
                 "keyframes": keyframes,
@@ -775,6 +853,8 @@ class PanoDroidGSSlamSystem:
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_final_metrics": final_metrics,
                 "backend_final_trajectory_png": final_backend_traj,
+                "dense_ba": dense_ba_summary,
+                **_flatten_dense_ba_summary(dense_ba_summary),
                 "wandb_run_url": logger.run_url,
                 "visualization_dir": str(logger.visualization_dir) if logger.save_local else None,
                 "notes": self.mapper.stats.notes,

@@ -98,6 +98,25 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.matching_head.descriptor_dim == 24
     assert file_cfg["PanoVGGT"]["image_size"] is None
 
+    shadow_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_shadow.yaml").read_text())
+    active_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_active.yaml").read_text())
+    parsed_shadow = parse_m3_sphere_config(shadow_cfg)
+    parsed_active = parse_m3_sphere_config(active_cfg)
+    assert shadow_cfg["Dataset"]["dataset_path"].endswith("/360uav/seqs/seq1")
+    assert shadow_cfg["Dataset"]["sequence"] is None
+    assert shadow_cfg["PanoVGGT"]["image_size"] == [518, 1036]
+    assert parsed_shadow.matching_head.matching_checkpoint.endswith("/matching_head.pt")
+    assert parsed_shadow.matching_head.sky_checkpoint.endswith("/sky_head.pt")
+    assert parsed_shadow.matching_head.feature_hook == "aggregator"
+    assert parsed_shadow.dense_matching.max_factors == 4096
+    assert parsed_shadow.dense_matching.max_samples_per_edge == 512
+    assert parsed_shadow.dense_ba.shadow_mode is True
+    assert parsed_shadow.dense_ba.iters == 3
+    assert parsed_shadow.dense_ba.min_num_factors == 128
+    assert parsed_shadow.dense_ba.factor_chunk_size == 512
+    assert parsed_active.dense_ba.shadow_mode is False
+    assert active_cfg["Results"]["save_dir"].endswith("_active_seq1")
+
 
 def test_feature_image_uv_roundtrip_equal_and_unequal_grids():
     for feature_hw, image_hw in [((4, 8), (4, 8)), ((5, 7), (13, 29)), ((3, 11), (17, 19))]:

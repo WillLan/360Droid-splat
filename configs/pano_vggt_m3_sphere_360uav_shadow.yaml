@@ -1,0 +1,151 @@
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/lanboyang/Datasets/360uav/seqs/seq1
+  sequence: null
+  erp_resize_height: 518
+  erp_resize_width: 1036
+  begin: 0
+  end: null
+
+Frontend:
+  mode: panovggt_long
+  checkpoint: null
+  keyframe_threshold: 0.5
+  force_keyframe_interval: 8
+
+PanoVGGT:
+  engine: external
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  strict_checkpoint: false
+  image_size: [518, 1036]
+  patch_multiple: 14
+  chunk_size: 4
+  overlap: 2
+  emit_delay: 1
+  align_mode: sim3
+  require_aligned_world_points: true
+  emit_unaligned: false
+  min_overlap_points: 4096
+  max_align_rmse: 0.25
+  min_inlier_ratio: 0.35
+  max_scale_jump: 2.0
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 128
+  amp: true
+  input_batch_dim: true
+
+  M3Sphere:
+    enabled: true
+    descriptor_dim: 24
+
+  MatchingHead:
+    enabled: true
+    checkpoint: null
+    matching_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_matching_ddp_b2_20k_8f_parallaxfix_dtw_nyc_20260604_1036/checkpoints/matching_head.pt
+    sky_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_sky_ddp_b4_10k_dtw_nyc_20260604_0845/checkpoints/sky_head.pt
+    descriptor_dim: 24
+    feature_hook: aggregator
+    feature_key: null
+    strict: true
+    allow_fake_matching: false
+
+  DenseMatching:
+    enabled: true
+    search_radius: 8
+    topk: 1
+    min_match_confidence: 0.2
+    min_static_confidence: 0.2
+    min_match_score: 0.2
+    max_factors: 4096
+    max_samples_per_edge: 512
+    use_wraparound: true
+    forward_backward: true
+    fb_tolerance: 0.5
+    use_depth_consistency: true
+    depth_consistency_rel: 0.08
+    depth_consistency_abs: 0.20
+
+  DenseBA:
+    enabled: true
+    shadow_mode: true
+    mode: local_chunk
+    residual_mode: tangent
+    debug_pixel_residual: false
+    iters: 3
+    lm: 0.0001
+    fixed_policy: first_frame
+    fixed_frames: 1
+    sample_stride: 1
+    min_valid_factor_ratio: 0.03
+    min_num_factors: 128
+    huber_delta_deg: 0.5
+    pose_prior_weight: 0.001
+    depth_prior_weight: 0.01
+    max_pose_update_deg: 5.0
+    max_logdepth_update: 0.35
+    fallback_if_residual_worse: true
+    residual_worse_tolerance: 1.05
+    factor_chunk_size: 512
+    optimize_pose: true
+    optimize_depth: true
+
+  InferenceWindow:
+    size: 4
+    overlap: 2
+    temporal_radius: 2
+    max_edges: 24
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Hierarchical:
+  voxel_size_lis: [0.12, 0.45, 1.8]
+
+Mapping:
+  seed_source: world_points_only
+  max_seeds_per_keyframe: 0
+  min_depth_confidence: 0.2
+  sky_mask_enable: true
+  sky_mask_top_ratio: 0.58
+  sky_mask_min_blue: 0.35
+  sky_mask_blue_margin: 0.05
+  sky_mask_cloud_brightness: 0.72
+  sky_mask_cloud_saturation: 0.22
+  sky_mask_texture_threshold: 0.08
+  lr: 0.002
+  refine_steps_per_keyframe: 0
+
+Renderer:
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  project: 360Droid-splat
+  group: panovggt_m3_sphere_360uav
+  run_name: panovggt_m3_sphere_shadow_seq1
+  log_every: 5
+  log_keyframes: true
+
+Visualization:
+  save_local: true
+  log_every: 5
+
+Results:
+  save_dir: outputs/pano_vggt_m3_sphere_360uav_shadow_seq1

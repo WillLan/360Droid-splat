@@ -13,6 +13,7 @@ from frontend.pano_vggt.spherical_correspondence import generate_gt_spherical_co
 from frontend.pano_vggt.spherical_dense_ba import SphericalTangentDenseBA
 from frontend.pano_vggt.tracker import PanoVGGTLongTracker
 from frontend.pano_vggt.types import PanoVGGTLocalPrediction
+from system.pano_droid_gs_slam import _summarize_dense_ba_stats
 
 
 def _poses(tx: float = 0.2) -> torch.Tensor:
@@ -397,3 +398,47 @@ def test_tracker_enabled_descriptors_missing_fallback_still_emits_frontend_outpu
     assert captured[0] is pred0
     assert outputs
     assert outputs[0].tracking_status.startswith("tracked_panovggt_long|dense_ba_active_fallback:missing_dense_descriptors")
+
+
+def test_slam_dense_ba_summary_aggregates_tracker_internal_stats():
+    class Frontend:
+        dense_ba_stats_history = [
+            DenseBARefinerStats(
+                enabled=True,
+                shadow_mode=True,
+                success=True,
+                used_refined=False,
+                mean_residual_deg=0.4,
+                initial_mean_residual_deg=1.0,
+                valid_factor_ratio=0.25,
+                pose_update_norm={"mean": 0.01, "max": 0.02, "rot_max_deg": 0.3},
+                depth_update_norm={"mean": 0.03, "max": 0.04},
+            ),
+            DenseBARefinerStats(
+                enabled=True,
+                shadow_mode=True,
+                success=False,
+                used_refined=False,
+                fallback_reason="too_few_factors",
+                mean_residual_deg=0.0,
+                initial_mean_residual_deg=0.0,
+                valid_factor_ratio=0.01,
+                pose_update_norm={},
+                depth_update_norm={},
+            ),
+        ]
+        last_dense_ba_stats = dense_ba_stats_history[-1]
+
+    summary = _summarize_dense_ba_stats(Frontend())
+
+    assert summary["enabled"] is True
+    assert summary["shadow_mode"] is True
+    assert summary["chunks"] == 2
+    assert summary["successes"] == 1
+    assert summary["fallbacks"] == 1
+    assert summary["success_ratio"] == 0.5
+    assert summary["used_refined"] == 0
+    assert summary["fallback_reasons"] == {"too_few_factors": 1}
+    assert abs(summary["mean_valid_factor_ratio"] - 0.13) < 1e-8
+    assert summary["max_pose_update"] == 0.02
+    assert summary["max_depth_update"] == 0.04
