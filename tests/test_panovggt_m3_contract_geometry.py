@@ -90,7 +90,11 @@ def test_m3_config_parser_defaults_and_explicit_values():
 
     file_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_gs_slam.yaml").read_text())
     parsed_file = parse_m3_sphere_config(file_cfg)
-    assert parsed_file.enabled is False
+    assert parsed_file.enabled is True
+    assert parsed_file.matching_head.enabled is True
+    assert parsed_file.dense_matching.enabled is True
+    assert parsed_file.dense_ba.enabled is True
+    assert parsed_file.dense_ba.shadow_mode is True
     assert parsed_file.matching_head.descriptor_dim == 24
     assert file_cfg["PanoVGGT"]["image_size"] is None
 

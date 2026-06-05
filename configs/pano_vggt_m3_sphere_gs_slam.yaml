@@ -41,36 +41,60 @@ PanoVGGT:
   input_batch_dim: true
 
   M3Sphere:
-    enabled: false
+    enabled: true
     descriptor_dim: 24
 
   MatchingHead:
-    enabled: false
+    enabled: true
     checkpoint: null
+    matching_checkpoint: null
+    sky_checkpoint: null
     descriptor_dim: 24
     feature_hook: null
+    feature_key: null
+    strict: true
+    allow_fake_matching: false
     # Matching output Hf,Wf follows the input feature tensor Hf,Wf.
     # Do not configure or assume a fixed descriptor output_hw.
 
   DenseMatching:
-    enabled: false
-    search_radius: 4
+    enabled: true
+    search_radius: 8
     topk: 1
     min_match_confidence: 0.2
     min_static_confidence: 0.2
+    min_match_score: 0.2
     max_factors: 65536
     use_wraparound: true
+    forward_backward: true
+    fb_tolerance: 0.5
+    use_depth_consistency: true
+    depth_consistency_rel: 0.08
+    depth_consistency_abs: 0.20
 
   DenseBA:
-    enabled: false
+    enabled: true
+    shadow_mode: true
+    mode: local_chunk
     residual_mode: tangent
     debug_pixel_residual: false
-    iters: 3
+    iters: 6
     lm: 0.0001
+    fixed_policy: first_frame
     fixed_frames: 1
     sample_stride: 1
-    max_pose_step: 0.05
-    max_depth_step: 0.10
+    min_valid_factor_ratio: 0.03
+    min_num_factors: 256
+    huber_delta_deg: 0.5
+    pose_prior_weight: 0.001
+    depth_prior_weight: 0.01
+    max_pose_update_deg: 5.0
+    max_logdepth_update: 0.35
+    fallback_if_residual_worse: true
+    residual_worse_tolerance: 1.05
+    factor_chunk_size: 2048
+    optimize_pose: true
+    optimize_depth: true
 
   InferenceWindow:
     size: 4

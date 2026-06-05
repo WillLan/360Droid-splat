@@ -1,0 +1,399 @@
+import inspect
+from dataclasses import replace
+
+import torch
+
+from frontend.pano_droid.interfaces import PanoFrame
+from frontend.pano_vggt.alignment import SimilarityTransform
+from frontend.pano_vggt.dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
+from frontend.pano_vggt.engine import PanoVGGTInferenceEngine
+from frontend.pano_vggt.factor_graph import DenseSphereFactor, DenseSphereFactorGraph
+from frontend.pano_vggt.m3_config import parse_m3_sphere_config
+from frontend.pano_vggt.spherical_correspondence import generate_gt_spherical_correspondences
+from frontend.pano_vggt.spherical_dense_ba import SphericalTangentDenseBA
+from frontend.pano_vggt.tracker import PanoVGGTLongTracker
+from frontend.pano_vggt.types import PanoVGGTLocalPrediction
+
+
+def _poses(tx: float = 0.2) -> torch.Tensor:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = float(tx)
+    return poses
+
+
+def _depth(feature_hw: tuple[int, int], value: float = 2.0) -> torch.Tensor:
+    return torch.full((2, 1, feature_hw[0], feature_hw[1]), float(value))
+
+
+def _graph_from_truth(
+    poses: torch.Tensor,
+    depth: torch.Tensor,
+    *,
+    feature_hw: tuple[int, int] = (5, 8),
+    samples: int = 16,
+) -> DenseSphereFactorGraph:
+    corr = generate_gt_spherical_correspondences(
+        depth,
+        poses,
+        [(0, 1)],
+        feature_hw,
+        feature_hw,
+        samples_per_edge=samples,
+        depth_consistency_abs=10.0,
+        depth_consistency_rel=10.0,
+        min_baseline_deg=0.0,
+        max_baseline_deg=180.0,
+    )
+    valid = corr.valid_mask[0]
+    assert bool(valid.any())
+    factor = DenseSphereFactor(
+        src=0,
+        tgt=1,
+        src_uv=corr.src_uv[0],
+        tgt_uv=corr.tgt_uv[0],
+        src_bearing=corr.src_bearing[0],
+        tgt_bearing=corr.tgt_bearing[0],
+        weight=torch.ones_like(valid, dtype=torch.float32),
+        match_score=torch.ones_like(valid, dtype=torch.float32),
+        valid_mask=valid,
+        metadata={"depth_consistency_mask": corr.depth_consistency[0]},
+    )
+    return DenseSphereFactorGraph(factors=[factor], edges=torch.tensor([[0, 1]], dtype=torch.long))
+
+
+def _prediction(
+    *,
+    poses: torch.Tensor | None = None,
+    depth: torch.Tensor | None = None,
+    dense: bool = True,
+    sky: bool = True,
+    feature_hw: tuple[int, int] = (5, 8),
+) -> PanoVGGTLocalPrediction:
+    poses_t = _poses(0.05) if poses is None else poses
+    depth_t = _depth(feature_hw, 2.0) if depth is None else depth
+    local_points = torch.zeros(2, feature_hw[0], feature_hw[1], 3)
+    pred = PanoVGGTLocalPrediction(
+        poses_c2w=poses_t.clone(),
+        depth=depth_t.clone(),
+        confidence=torch.ones_like(depth_t),
+        chunk_world_points=local_points.clone(),
+        local_points=local_points.clone(),
+        feature_hw=feature_hw if dense else None,
+        image_hw=feature_hw if dense else None,
+    )
+    if dense:
+        pred.dense_descriptors = torch.ones(2, 4, feature_hw[0], feature_hw[1])
+        pred.match_confidence = torch.ones(2, 1, feature_hw[0], feature_hw[1])
+    if sky:
+        pred.sky_prob = torch.zeros(2, 1, feature_hw[0], feature_hw[1])
+    return pred
+
+
+def _m3_config(*, shadow: bool = False, min_num_factors: int = 1, residual_worse: bool = False) -> dict:
+    return {
+        "PanoVGGT": {
+            "M3Sphere": {"enabled": True},
+            "DenseMatching": {
+                "enabled": False,
+                "max_samples_per_edge": 16,
+                "search_radius": 1,
+                "use_depth_consistency": False,
+            },
+            "DenseBA": {
+                "enabled": True,
+                "shadow_mode": shadow,
+                "iters": 3,
+                "min_num_factors": min_num_factors,
+                "min_valid_factor_ratio": 0.1,
+                "huber_delta_deg": 10.0,
+                "pose_prior_weight": 0.0,
+                "depth_prior_weight": 0.0,
+                "max_pose_update_deg": 20.0,
+                "max_logdepth_update": 0.5,
+                "fallback_if_residual_worse": residual_worse,
+                "residual_worse_tolerance": 1.0,
+                "factor_chunk_size": 64,
+            },
+        }
+    }
+
+
+def test_spherical_dense_ba_two_frame_pose_perturbation_residual_decreases():
+    feature_hw = (5, 8)
+    true_poses = _poses(0.2)
+    true_depth = _depth(feature_hw, 2.0)
+    graph = _graph_from_truth(true_poses, true_depth, feature_hw=feature_hw)
+    init_poses = _poses(0.05)
+    log_inv_depth = torch.log(true_depth.reciprocal())
+
+    solver = SphericalTangentDenseBA(factor_chunk_size=64, huber_delta_deg=10.0)
+    before = solver(init_poses, log_inv_depth, graph, fixed_frames=1, iters=0, optimize_depth=False)
+    after = solver(init_poses, log_inv_depth, graph, fixed_frames=1, iters=3, optimize_depth=False)
+
+    assert not after.failed
+    assert after.mean_angular_residual_deg < before.mean_angular_residual_deg * 0.1
+    assert torch.allclose(after.poses_c2w[1, :3, 3], true_poses[1, :3, 3], atol=1e-3)
+
+
+def test_spherical_dense_ba_fixed_first_frame_unchanged():
+    feature_hw = (5, 8)
+    graph = _graph_from_truth(_poses(0.2), _depth(feature_hw, 2.0), feature_hw=feature_hw)
+    init_poses = _poses(0.05)
+    log_inv_depth = torch.log(_depth(feature_hw, 2.0).reciprocal())
+
+    out = SphericalTangentDenseBA(factor_chunk_size=64, huber_delta_deg=10.0)(
+        init_poses,
+        log_inv_depth,
+        graph,
+        fixed_frames=1,
+        iters=3,
+        optimize_depth=False,
+    )
+
+    assert not out.failed
+    assert torch.allclose(out.poses_c2w[0], init_poses[0], atol=1e-7)
+
+
+def test_spherical_dense_ba_depth_only_perturbation_residual_decreases():
+    feature_hw = (5, 8)
+    true_poses = _poses(0.2)
+    true_depth = _depth(feature_hw, 2.0)
+    graph = _graph_from_truth(true_poses, true_depth, feature_hw=feature_hw)
+    wrong_log_depth = torch.log(_depth(feature_hw, 1.5).reciprocal())
+
+    solver = SphericalTangentDenseBA(factor_chunk_size=64, huber_delta_deg=10.0)
+    before = solver(true_poses, wrong_log_depth, graph, fixed_frames=2, iters=0, optimize_pose=False)
+    after = solver(true_poses, wrong_log_depth, graph, fixed_frames=2, iters=5, optimize_pose=False)
+
+    assert not after.failed
+    assert after.mean_angular_residual_deg < before.mean_angular_residual_deg * 0.1
+    factor = graph.factors[0]
+    uv = factor.src_uv[factor.valid_mask]
+    src_x = uv[:, 0].floor().long().clamp(0, feature_hw[1] - 1)
+    src_y = uv[:, 1].floor().long().clamp(0, feature_hw[0] - 1)
+    refined_mean = after.inverse_depth[0, 0, src_y, src_x].mean()
+    initial_mean = torch.tensor(1.0 / 1.5)
+    assert (refined_mean - 0.5).abs() < (initial_mean - 0.5).abs()
+    assert refined_mean < 0.55
+
+
+def test_spherical_dense_ba_seam_case_stable():
+    feature_hw = (4, 8)
+    poses = _poses(0.2)
+    depth = _depth(feature_hw, 2.0)
+    graph = _graph_from_truth(poses, depth, feature_hw=feature_hw, samples=8)
+    factor = graph.factors[0]
+    factor.src_uv = factor.src_uv.clone()
+    factor.tgt_uv = factor.tgt_uv.clone()
+    factor.src_uv[:, 0] = torch.remainder(factor.src_uv[:, 0] + float(feature_hw[1]) - 0.2, float(feature_hw[1]))
+    factor.tgt_uv[:, 0] = torch.remainder(factor.tgt_uv[:, 0] + float(feature_hw[1]) - 0.1, float(feature_hw[1]))
+
+    out = SphericalTangentDenseBA(factor_chunk_size=64, huber_delta_deg=10.0)(
+        _poses(0.05),
+        torch.log(depth.reciprocal()),
+        graph,
+        fixed_frames=1,
+        iters=1,
+        optimize_depth=False,
+    )
+
+    assert torch.isfinite(out.residual_angular).all()
+    assert torch.isfinite(out.poses_c2w).all()
+
+
+def test_spherical_dense_ba_empty_or_invalid_factors_safe_fallback():
+    invalid = DenseSphereFactor(
+        src=0,
+        tgt=1,
+        src_uv=torch.zeros(3, 2),
+        tgt_uv=torch.zeros(3, 2),
+        src_bearing=torch.zeros(3, 3),
+        tgt_bearing=torch.zeros(3, 3),
+        weight=torch.zeros(3),
+        match_score=torch.zeros(3),
+        valid_mask=torch.zeros(3, dtype=torch.bool),
+    )
+
+    out = SphericalTangentDenseBA()(
+        _poses(0.1),
+        torch.log(_depth((3, 4), 2.0).reciprocal()),
+        DenseSphereFactorGraph([invalid]),
+        fixed_frames=1,
+    )
+
+    assert out.failed
+    assert out.debug["fallback_reason"] == "empty_or_invalid_factors"
+
+
+def test_spherical_dense_ba_source_uses_s2_tangent_residual_not_pixel_delta():
+    source = inspect.getsource(SphericalTangentDenseBA._residual_for_state)
+    assert "spherical_tangent_residual" in source
+    assert "seam_aware_delta" not in source
+
+
+def test_dense_ba_refiner_missing_descriptors_or_sky_fallback():
+    refiner = PanoVGGTDenseBARefiner(parse_m3_sphere_config(_m3_config()))
+    pred = _prediction(dense=False)
+
+    refined, stats = refiner.refine(pred, (0, 1))
+
+    assert refined is pred
+    assert not stats.success
+    assert stats.fallback_reason == "missing_dense_descriptors"
+
+    pred_missing_sky = _prediction(sky=False)
+    refined, stats = refiner.refine(pred_missing_sky, (0, 1))
+    assert refined is pred_missing_sky
+    assert stats.fallback_reason == "missing_sky_prob"
+
+
+def test_dense_ba_refiner_synthetic_prediction_returns_refined_prediction_and_finite_points():
+    true_poses = _poses(0.2)
+    true_depth = _depth((5, 8), 2.0)
+    graph = _graph_from_truth(true_poses, true_depth)
+    pred = _prediction(poses=_poses(0.05), depth=true_depth)
+    refiner = PanoVGGTDenseBARefiner(parse_m3_sphere_config(_m3_config()))
+
+    refined, stats = refiner.refine(pred, (0, 1), factor_graph=graph)
+
+    assert stats.success
+    assert stats.used_refined
+    assert refined is not pred
+    assert refined.ba_residual_angular is not None
+    assert refined.ba_valid_ratio is not None
+    assert torch.isfinite(refined.chunk_world_points).all()
+    assert torch.allclose(refined.poses_c2w[1, :3, 3], true_poses[1, :3, 3], atol=1e-3)
+
+
+def test_dense_ba_refiner_residual_worse_threshold_triggers_fallback():
+    true_poses = _poses(0.2)
+    true_depth = _depth((5, 8), 2.0)
+    graph = _graph_from_truth(true_poses, true_depth)
+    pred = _prediction(poses=true_poses, depth=true_depth)
+    cfg = _m3_config(residual_worse=True)
+    cfg["PanoVGGT"]["DenseBA"]["iters"] = 1
+    cfg["PanoVGGT"]["DenseBA"]["residual_worse_tolerance"] = 0.0
+    refiner = PanoVGGTDenseBARefiner(parse_m3_sphere_config(cfg))
+
+    refined, stats = refiner.refine(pred, (0, 1), factor_graph=graph)
+
+    assert refined is pred
+    assert not stats.success
+    assert stats.fallback_reason == "residual_worse"
+
+
+class _StaticEngine(PanoVGGTInferenceEngine):
+    def __init__(self, pred: PanoVGGTLocalPrediction) -> None:
+        self.pred = pred
+        self.last_dense_factor_graph = None
+
+    def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
+        _ = images
+        return self.pred
+
+    def load_checkpoint(self, path: str) -> None:
+        _ = path
+
+
+class _FakeRefiner:
+    def __init__(self, refined: PanoVGGTLocalPrediction, stats: DenseBARefinerStats) -> None:
+        self.refined = refined
+        self.stats = stats
+        self.calls = 0
+
+    def refine(self, pred, frame_ids, *, factor_graph=None, keyframe_memory=None):
+        _ = pred, frame_ids, factor_graph, keyframe_memory
+        self.calls += 1
+        return self.refined, self.stats
+
+
+def _tracker_with_fake_alignment(pred: PanoVGGTLocalPrediction, cfg: dict) -> tuple[PanoVGGTLongTracker, list[PanoVGGTLocalPrediction]]:
+    tracker = PanoVGGTLongTracker(
+        engine=_StaticEngine(pred),
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=2,
+        overlap=0,
+        emit_delay=0,
+        min_overlap_points=1,
+        require_aligned_world_points=False,
+        emit_unaligned=True,
+    )
+    captured = []
+
+    def fake_align(aligned_pred, frame_ids):
+        _ = frame_ids
+        captured.append(aligned_pred)
+        return SimilarityTransform.identity(device=aligned_pred.depth.device, dtype=aligned_pred.depth.dtype)
+
+    tracker._align_chunk = fake_align
+    return tracker, captured
+
+
+def _feed_two_frames(tracker: PanoVGGTLongTracker):
+    for idx in range(2):
+        tracker.track(PanoFrame(image=torch.zeros(3, 5, 8), timestamp=float(idx), frame_id=idx))
+    return tracker.pop_ready_outputs()
+
+
+def test_tracker_disabled_path_status_unchanged():
+    pred = _prediction(dense=False)
+    cfg = {"PanoVGGT": {"M3Sphere": {"enabled": False}, "DenseBA": {"enabled": False}}}
+    tracker, captured = _tracker_with_fake_alignment(pred, cfg)
+
+    outputs = _feed_two_frames(tracker)
+
+    assert len(captured) == 1
+    assert captured[0] is pred
+    assert outputs
+    assert all(out.tracking_status == "tracked_panovggt_long" for out in outputs)
+    assert tracker.last_dense_ba_stats is not None
+    assert tracker.last_dense_ba_stats.enabled is False
+
+
+def test_tracker_shadow_mode_runs_ba_but_alignment_receives_original_prediction():
+    pred0 = _prediction()
+    refined = replace(pred0, poses_c2w=pred0.poses_c2w.clone())
+    refined.poses_c2w[1, 0, 3] = 0.7
+    cfg = _m3_config(shadow=True)
+    tracker, captured = _tracker_with_fake_alignment(pred0, cfg)
+    stats = DenseBARefinerStats(enabled=True, shadow_mode=True, success=True, used_refined=False)
+    tracker.dense_ba_refiner = _FakeRefiner(refined, stats)
+
+    outputs = _feed_two_frames(tracker)
+
+    assert len(captured) == 1
+    assert captured[0] is pred0
+    assert tracker.dense_ba_refiner.calls == 1
+    assert outputs
+    assert "dense_ba_shadow_success" in outputs[0].tracking_status
+
+
+def test_tracker_non_shadow_success_sends_refined_prediction_into_align_chunk():
+    pred0 = _prediction()
+    refined = replace(pred0, poses_c2w=pred0.poses_c2w.clone())
+    refined.poses_c2w[1, 0, 3] = 0.7
+    cfg = _m3_config(shadow=False)
+    tracker, captured = _tracker_with_fake_alignment(pred0, cfg)
+    stats = DenseBARefinerStats(enabled=True, shadow_mode=False, success=True, used_refined=True)
+    tracker.dense_ba_refiner = _FakeRefiner(refined, stats)
+
+    outputs = _feed_two_frames(tracker)
+
+    assert len(captured) == 1
+    assert captured[0] is refined
+    assert outputs
+    assert "dense_ba_active_success" in outputs[0].tracking_status
+
+
+def test_tracker_enabled_descriptors_missing_fallback_still_emits_frontend_output():
+    pred0 = _prediction(dense=False)
+    cfg = _m3_config(shadow=False)
+    tracker, captured = _tracker_with_fake_alignment(pred0, cfg)
+
+    outputs = _feed_two_frames(tracker)
+
+    assert len(captured) == 1
+    assert captured[0] is pred0
+    assert outputs
+    assert outputs[0].tracking_status.startswith("tracked_panovggt_long|dense_ba_active_fallback:missing_dense_descriptors")

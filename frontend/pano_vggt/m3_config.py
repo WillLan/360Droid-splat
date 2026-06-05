@@ -60,17 +60,32 @@ class DenseMatchingConfig:
 
 @dataclass(frozen=True)
 class DenseBAConfig:
-    """Configuration for future spherical dense bundle adjustment."""
+    """Configuration for spherical tangent dense bundle adjustment."""
 
     enabled: bool = False
     residual_mode: str = "tangent"
     debug_pixel_residual: bool = False
-    iters: int = 3
+    shadow_mode: bool = True
+    mode: str = "local_chunk"
+    fixed_policy: str = "first_frame"
+    iters: int = 6
     lm: float = 1.0e-4
     fixed_frames: int = 1
     sample_stride: int = 1
+    min_valid_factor_ratio: float = 0.03
+    min_num_factors: int = 256
+    huber_delta_deg: float = 0.5
+    pose_prior_weight: float = 1.0e-3
+    depth_prior_weight: float = 1.0e-2
     max_pose_step: float = 0.05
     max_depth_step: float = 0.10
+    max_pose_update_deg: float = 5.0
+    max_logdepth_update: float = 0.35
+    fallback_if_residual_worse: bool = True
+    residual_worse_tolerance: float = 1.05
+    factor_chunk_size: int = 2048
+    optimize_pose: bool = True
+    optimize_depth: bool = True
 
 
 @dataclass(frozen=True)
@@ -134,10 +149,14 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
             name="PanoVGGT.MatchingHead.fake_feature_stride",
         ),
     )
+    search_radius_raw = dense_raw.get("search_radius", dense_raw.get("radius", 4))
+    forward_backward_raw = dense_raw.get("forward_backward", dense_raw.get("forward_backward_check", True))
+    depth_consistency_raw = dense_raw.get("use_depth_consistency", dense_raw.get("depth_consistency_check", True))
+    fb_tolerance_raw = dense_raw.get("fb_tolerance", dense_raw.get("fb_thresh_deg", 1.5))
     max_samples_per_edge_raw = dense_raw.get("max_samples_per_edge")
     dense_matching = DenseMatchingConfig(
         enabled=bool(dense_raw.get("enabled", False)),
-        search_radius=_positive_int(dense_raw.get("search_radius", 4), name="PanoVGGT.DenseMatching.search_radius"),
+        search_radius=_positive_int(search_radius_raw, name="PanoVGGT.DenseMatching.search_radius"),
         topk=_positive_int(dense_raw.get("topk", 1), name="PanoVGGT.DenseMatching.topk"),
         min_match_confidence=float(dense_raw.get("min_match_confidence", 0.2)),
         min_static_confidence=float(dense_raw.get("min_static_confidence", 0.2)),
@@ -149,9 +168,9 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
             else _positive_int(max_samples_per_edge_raw, name="PanoVGGT.DenseMatching.max_samples_per_edge")
         ),
         use_wraparound=bool(dense_raw.get("use_wraparound", True)),
-        forward_backward=bool(dense_raw.get("forward_backward", True)),
-        fb_tolerance=float(dense_raw.get("fb_tolerance", 1.5)),
-        use_depth_consistency=bool(dense_raw.get("use_depth_consistency", True)),
+        forward_backward=bool(forward_backward_raw),
+        fb_tolerance=float(fb_tolerance_raw),
+        use_depth_consistency=bool(depth_consistency_raw),
         depth_consistency_rel=float(dense_raw.get("depth_consistency_rel", 0.03)),
         depth_consistency_abs=float(dense_raw.get("depth_consistency_abs", 0.05)),
     )
@@ -159,12 +178,27 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         enabled=bool(ba_raw.get("enabled", False)),
         residual_mode=str(ba_raw.get("residual_mode", "tangent")),
         debug_pixel_residual=bool(ba_raw.get("debug_pixel_residual", False)),
-        iters=_positive_int(ba_raw.get("iters", 3), name="PanoVGGT.DenseBA.iters"),
+        shadow_mode=bool(ba_raw.get("shadow_mode", True)),
+        mode=str(ba_raw.get("mode", "local_chunk")),
+        fixed_policy=str(ba_raw.get("fixed_policy", "first_frame")),
+        iters=_positive_int(ba_raw.get("iters", 6), name="PanoVGGT.DenseBA.iters"),
         lm=float(ba_raw.get("lm", 1.0e-4)),
         fixed_frames=_positive_int(ba_raw.get("fixed_frames", 1), name="PanoVGGT.DenseBA.fixed_frames"),
         sample_stride=_positive_int(ba_raw.get("sample_stride", 1), name="PanoVGGT.DenseBA.sample_stride"),
+        min_valid_factor_ratio=float(ba_raw.get("min_valid_factor_ratio", 0.03)),
+        min_num_factors=_positive_int(ba_raw.get("min_num_factors", 256), name="PanoVGGT.DenseBA.min_num_factors"),
+        huber_delta_deg=float(ba_raw.get("huber_delta_deg", 0.5)),
+        pose_prior_weight=float(ba_raw.get("pose_prior_weight", 1.0e-3)),
+        depth_prior_weight=float(ba_raw.get("depth_prior_weight", 1.0e-2)),
         max_pose_step=float(ba_raw.get("max_pose_step", 0.05)),
         max_depth_step=float(ba_raw.get("max_depth_step", 0.10)),
+        max_pose_update_deg=float(ba_raw.get("max_pose_update_deg", 5.0)),
+        max_logdepth_update=float(ba_raw.get("max_logdepth_update", 0.35)),
+        fallback_if_residual_worse=bool(ba_raw.get("fallback_if_residual_worse", True)),
+        residual_worse_tolerance=float(ba_raw.get("residual_worse_tolerance", 1.05)),
+        factor_chunk_size=_positive_int(ba_raw.get("factor_chunk_size", 2048), name="PanoVGGT.DenseBA.factor_chunk_size"),
+        optimize_pose=bool(ba_raw.get("optimize_pose", True)),
+        optimize_depth=bool(ba_raw.get("optimize_depth", True)),
     )
     inference_window = InferenceWindowConfig(
         size=_positive_int(window_raw.get("size", 4), name="PanoVGGT.InferenceWindow.size"),

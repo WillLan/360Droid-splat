@@ -759,8 +759,6 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
 
 def build_panovggt_engine(config: dict, *, device: torch.device | str | None = None) -> PanoVGGTInferenceEngine:
     m3_config = parse_m3_sphere_config({"PanoVGGT": config})
-    if m3_config.enabled and m3_config.dense_ba.enabled:
-        raise NotImplementedError("PanoVGGT-M3-Sphere dense BA is not implemented in the inference+matching stage.")
     engine_name = str(config.get("engine", "external")).lower()
     size_cfg = config.get("image_size", [518, 1036])
     image_size = None if size_cfg is None else (int(size_cfg[0]), int(size_cfg[1]))

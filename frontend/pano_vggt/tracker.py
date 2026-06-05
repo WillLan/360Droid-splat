@@ -11,8 +11,10 @@ import torch.nn.functional as F
 from frontend.pano_droid.interfaces import FrontendOutput, PanoDROIDFrontend, PanoFrame, ensure_chw_image
 
 from .alignment import SimilarityTransform, SubmapAligner, sample_overlap_points
+from .dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from .engine import PanoVGGTInferenceEngine, build_panovggt_engine
 from .loop import FrontendPoseGraph, LoopManager, PoseGraphEdge
+from .m3_config import parse_m3_sphere_config
 from .types import PanoVGGTLocalPrediction
 
 
@@ -84,6 +86,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.require_aligned_world_points = bool(require_aligned_world_points)
         self.emit_unaligned = bool(emit_unaligned)
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
+        self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
+        self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
         self.aligner = SubmapAligner(
             align_mode=align_mode,
             max_residual=float(max_align_rmse),
@@ -114,6 +118,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
         self.last_keyframe_id: Optional[int] = None
         self.chunk_count = 0
+        self.last_dense_ba_stats: DenseBARefinerStats | None = None
+        self.dense_ba_stats_history: list[DenseBARefinerStats] = []
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -193,7 +199,13 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.processed_ranges.add(range_key)
 
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
-        pred = self.engine.infer(images)
+        pred0 = self.engine.infer(images)
+        factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
+        pred_refined, ba_stats = self.dense_ba_refiner.refine(pred0, frame_ids, factor_graph=factor_graph)
+        self.last_dense_ba_stats = ba_stats
+        if ba_stats.enabled:
+            self.dense_ba_stats_history.append(ba_stats)
+        pred = pred_refined if ba_stats.used_refined else pred0
         transform = self._align_chunk(pred, frame_ids)
         backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)
         chunk_descriptor = self._chunk_descriptor(pred, images)
@@ -246,7 +258,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 points_full,
                 valid_world,
                 transform.residual,
-                "tracked_panovggt_long",
+                "tracked_panovggt_long" + ba_stats.status_suffix,
             )
 
         emit_end = end if final else max(start, end - self.emit_delay)
