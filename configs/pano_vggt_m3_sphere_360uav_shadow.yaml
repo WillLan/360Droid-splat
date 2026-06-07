@@ -149,6 +149,11 @@ Visualization:
   log_every: 5
   m3_log_every: 5
   m3_max_matches: 80
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  kf_opt_max_width: 1920
 
 Results:
   save_dir: outputs/pano_vggt_m3_sphere_360uav_shadow_seq1
+  kf_render_format: png
+  kf_jpeg_quality: 95

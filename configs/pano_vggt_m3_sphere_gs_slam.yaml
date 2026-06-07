@@ -138,5 +138,16 @@ Renderer:
   allow_smoke_fallback: false
   extra_gsplat360_roots: []
 
+Visualization:
+  save_local: true
+  log_every: 5
+  m3_log_every: 5
+  m3_max_matches: 80
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  kf_opt_max_width: 1920
+
 Results:
   save_dir: outputs/pano_vggt_m3_sphere_gs_slam
+  kf_render_format: png
+  kf_jpeg_quality: 95

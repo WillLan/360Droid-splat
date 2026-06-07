@@ -74,5 +74,14 @@ Renderer:
   allow_smoke_fallback: false
   extra_gsplat360_roots: []
 
+Visualization:
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  kf_opt_max_width: 1920
+
 Results:
   save_dir: outputs/pano_vggt_long_gs_slam
+  kf_render_format: png
+  kf_jpeg_quality: 95

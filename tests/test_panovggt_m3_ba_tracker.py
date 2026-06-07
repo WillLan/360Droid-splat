@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 
@@ -505,3 +506,75 @@ def test_slam_logger_saves_minimal_m3_debug_visualizations(tmp_path):
 
     assert (tmp_path / "visualizations" / "m3_chunk_000000_match_lines.png").is_file()
     assert (tmp_path / "visualizations" / "m3_chunk_000000_sky_prob.png").is_file()
+
+
+def test_slam_logger_saves_and_logs_keyframe_opt_visualizations(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value)
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": True, "save_kf_opt": True, "kf_opt_log_every": 1},
+            "Results": {"kf_render_format": "png"},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+    logger._step = 4
+    diagnostic = SimpleNamespace(
+        frame_id=3,
+        target=torch.rand(3, 4, 8),
+        render=torch.rand(3, 4, 8),
+        depth=torch.rand(1, 4, 8).clamp_min(0.1),
+        loss=0.125,
+        psnr=22.5,
+        anchor_count=42,
+        phase="local_submap",
+    )
+
+    logger.observe_keyframe_opt(diagnostic)
+
+    render_path = tmp_path / "kf_renders_opt" / "kf_0003.png"
+    depth_path = tmp_path / "kf_depths_opt" / "kf_0003.png"
+    assert render_path.is_file()
+    assert depth_path.is_file()
+    logged_keys = set().union(*(payload.keys() for payload, _ in logger.run.logged))
+    assert "backend/kf_opt_loss" in logged_keys
+    assert "backend/kf_render_opt" in logged_keys
+    assert "backend/kf_depth_opt" in logged_keys
+
+
+def test_slam_logger_can_disable_keyframe_opt_file_saves(tmp_path):
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": True, "save_kf_opt": False},
+        },
+        tmp_path,
+    )
+    diagnostic = SimpleNamespace(
+        frame_id=5,
+        target=torch.rand(3, 4, 8),
+        render=torch.rand(3, 4, 8),
+        depth=torch.rand(1, 4, 8),
+        loss=0.0,
+        psnr=0.0,
+        anchor_count=1,
+        phase="local_submap",
+    )
+
+    logger.observe_keyframe_opt(diagnostic)
+
+    assert not (tmp_path / "kf_renders_opt").exists()
+    assert not (tmp_path / "kf_depths_opt").exists()

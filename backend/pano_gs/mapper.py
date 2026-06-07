@@ -39,6 +39,18 @@ class MapperKeyframe:
     gaussian_end: int
 
 
+@dataclass
+class KeyframeRenderDiagnostic:
+    frame_id: int
+    target: torch.Tensor
+    render: torch.Tensor
+    depth: torch.Tensor | None
+    loss: float
+    psnr: float
+    anchor_count: int
+    phase: str | None
+
+
 class PanoGaussianMap(nn.Module):
     """Anchor-scaffold panorama map with gsplat360-compatible accessors."""
 
@@ -229,6 +241,37 @@ class PanoGaussianMapper:
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         with torch.no_grad():
             return self.renderer.render(camera, self.map)
+
+    def render_keyframe_diagnostic(self, frame_id: int) -> KeyframeRenderDiagnostic | None:
+        """Render an optimized keyframe for post-optimization diagnostics."""
+
+        if self.map.anchor_count() == 0:
+            return None
+        frame_id = int(frame_id)
+        keyframe = next((kf for kf in self.keyframes if int(kf.frame_id) == frame_id), None)
+        pose_delta = self.pose_deltas.get(frame_id)
+        if keyframe is None or pose_delta is None:
+            return None
+        target = keyframe.image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        with torch.no_grad():
+            camera = PanoRenderCamera(image_height=H, image_width=W, c2w=pose_delta().detach())
+            pkg = self.renderer.render(camera, self.map)
+            loss, _ = backend_render_loss(pkg, target, weights=self.loss_weights)
+            render = pkg["render"].detach()
+            mse = torch.mean((render - target).square()).clamp_min(1e-12)
+            psnr = -10.0 * torch.log10(mse)
+            depth = pkg.get("depth")
+            return KeyframeRenderDiagnostic(
+                frame_id=frame_id,
+                target=target.detach().cpu(),
+                render=render.cpu(),
+                depth=depth.detach().cpu() if torch.is_tensor(depth) else None,
+                loss=float(loss.detach().cpu()),
+                psnr=float(psnr.detach().cpu()),
+                anchor_count=self.map.anchor_count(),
+                phase=self.stats.last_phase,
+            )
 
     def refine_on_keyframe(
         self,

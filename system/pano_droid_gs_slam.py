@@ -323,7 +323,11 @@ class SlamRuntimeLogger:
         self.log_every = max(1, int(wb_cfg.get("log_every", vis_cfg.get("log_every", 10))))
         self.m3_log_every = max(1, int(vis_cfg.get("m3_log_every", self.log_every)))
         self.m3_max_matches = max(1, int(vis_cfg.get("m3_max_matches", 80)))
+        self.save_kf_opt = bool(vis_cfg.get("save_kf_opt", True))
+        self.kf_opt_log_every = max(1, int(vis_cfg.get("kf_opt_log_every", 1)))
+        self.kf_opt_max_width = max(320, int(vis_cfg.get("kf_opt_max_width", 1920)))
         self.log_keyframes = bool(wb_cfg.get("log_keyframes", True))
+        self.results_cfg = config.get("Results", {})
         mode = str(wb_cfg.get("mode") or "online")
         self.wandb_enabled = bool(wb_cfg.get("enabled", False)) and mode != "disabled"
         self.save_local = bool(vis_cfg.get("save_local", self.wandb_enabled))
@@ -334,6 +338,7 @@ class SlamRuntimeLogger:
         self._wandb = None
         self._step = 0
         self._last_m3_chunk_logged: int | None = None
+        self._kf_opt_count = 0
         self._frontend_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_pose_history: list[tuple[int, np.ndarray]] = []
         self._gt_pose_history: list[tuple[int, np.ndarray]] = []
@@ -487,6 +492,108 @@ class SlamRuntimeLogger:
                 image_payload["m3/sky_prob"] = self._wandb.Image(str(paths["sky_prob"]))
             if image_payload:
                 self.run.log(image_payload, step=self._step)
+
+    def observe_keyframe_opt(self, diagnostic) -> None:
+        """Save and log post-optimization keyframe render diagnostics."""
+
+        if diagnostic is None:
+            return
+        self._kf_opt_count += 1
+        frame_id = int(getattr(diagnostic, "frame_id"))
+        step = max(1, int(self._step))
+        payload: dict[str, float | int] = {
+            "backend/kf_opt_frame_id": frame_id,
+            "backend/kf_opt_loss": float(getattr(diagnostic, "loss", 0.0)),
+            "backend/kf_opt_psnr": float(getattr(diagnostic, "psnr", 0.0)),
+            "backend/kf_opt_anchor_count": int(getattr(diagnostic, "anchor_count", 0)),
+        }
+        if self.run is not None:
+            self.run.log(payload, step=step)
+
+        should_log_image = self.save_kf_opt and (
+            self._kf_opt_count == 1 or self._kf_opt_count % self.kf_opt_log_every == 0
+        )
+        if not should_log_image:
+            return
+
+        render_panel = self._make_keyframe_opt_render_panel(diagnostic)
+        depth_panel = self._make_keyframe_opt_depth_panel(diagnostic)
+        render_path = None
+        depth_path = None
+        if self.save_local:
+            render_path = self._save_keyframe_opt_image(
+                render_panel,
+                self.output_dir / "kf_renders_opt",
+                frame_id=frame_id,
+            )
+            depth_path = self._save_keyframe_opt_image(
+                depth_panel,
+                self.output_dir / "kf_depths_opt",
+                frame_id=frame_id,
+            )
+
+        if self.run is not None and self._wandb is not None:
+            image_payload = {
+                "backend/kf_render_opt": self._wandb.Image(str(render_path) if render_path is not None else render_panel),
+                "backend/kf_depth_opt": self._wandb.Image(str(depth_path) if depth_path is not None else depth_panel),
+            }
+            if render_path is not None:
+                image_payload["backend/kf_render_opt_png"] = str(render_path)
+            if depth_path is not None:
+                image_payload["backend/kf_depth_opt_png"] = str(depth_path)
+            self.run.log(image_payload, step=step)
+
+    def _make_keyframe_opt_render_panel(self, diagnostic) -> Image.Image:
+        target = _image_tensor_to_pil(getattr(diagnostic, "target"))
+        render = _image_tensor_to_pil(getattr(diagnostic, "render"))
+        if render.size != target.size:
+            render = render.resize(target.size, Image.BILINEAR)
+        w, h = target.size
+        canvas = Image.new("RGB", (2 * w, h + 28), "white")
+        canvas.paste(target, (0, 28))
+        canvas.paste(render, (w, 28))
+        draw = ImageDraw.Draw(canvas)
+        phase = str(getattr(diagnostic, "phase", None) or "post-opt")
+        label = (
+            f"KF {int(getattr(diagnostic, 'frame_id')):04d} [{phase}] "
+            f"loss={float(getattr(diagnostic, 'loss', 0.0)):.4f} "
+            f"PSNR={float(getattr(diagnostic, 'psnr', 0.0)):.2f}dB "
+            f"anchors={int(getattr(diagnostic, 'anchor_count', 0))}"
+        )
+        draw.text((8, 7), "target panorama", fill=(0, 0, 0))
+        draw.text((w + 8, 7), label, fill=(0, 0, 0))
+        return _resize_to_max_width(canvas, self.kf_opt_max_width)
+
+    def _make_keyframe_opt_depth_panel(self, diagnostic) -> Image.Image:
+        depth = getattr(diagnostic, "depth", None)
+        if not torch.is_tensor(depth):
+            image = Image.new("RGB", (900, 480), "white")
+            ImageDraw.Draw(image).text((20, 20), "no optimized keyframe depth", fill=(0, 0, 0))
+            return image
+        depth_t = depth.detach().cpu().float()
+        if depth_t.ndim == 3:
+            depth_t = depth_t[0]
+        if depth_t.ndim != 2:
+            image = Image.new("RGB", (900, 480), "white")
+            ImageDraw.Draw(image).text((20, 20), f"bad depth shape: {tuple(depth.shape)}", fill=(0, 0, 0))
+            return image
+        valid = torch.isfinite(depth_t) & (depth_t > 1e-6)
+        depth_rgb = Image.fromarray(_scalar_to_rgb(depth_t.numpy(), valid.numpy()), mode="RGB")
+        draw = ImageDraw.Draw(depth_rgb)
+        draw.text((8, 7), f"KF {int(getattr(diagnostic, 'frame_id')):04d} optimized depth", fill=(255, 255, 255))
+        return _resize_to_max_width(depth_rgb, self.kf_opt_max_width)
+
+    def _save_keyframe_opt_image(self, image: Image.Image, directory: Path, *, frame_id: int) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        fmt = str(self.results_cfg.get("kf_render_format", "png")).lower().strip()
+        ext = "jpg" if fmt in {"jpg", "jpeg"} else "png"
+        path = directory / f"kf_{int(frame_id):04d}.{ext}"
+        if ext == "jpg":
+            quality = max(1, min(100, int(self.results_cfg.get("kf_jpeg_quality", 95))))
+            image.convert("RGB").save(path, quality=quality)
+        else:
+            image.save(path)
+        return path
 
     def _save_m3_debug_images(self, m3_debug: dict, *, chunk_index: int) -> dict[str, Path | None]:
         paths: dict[str, Path | None] = {"match_lines": None, "sky_prob": None}
@@ -904,6 +1011,7 @@ class PanoDroidGSSlamSystem:
                 self.mapper.stats.notes.append(f"frame {out.frame_id}: missing source frame for frontend output")
                 return
             backend_loss = None
+            keyframe_opt_diagnostic = None
             if out.is_keyframe and out.inverse_depth is not None:
                 seeds = self.initializer.from_frontend_output(out, source_frame.image)
                 if self.mapper.uses_joint_optimization:
@@ -914,6 +1022,12 @@ class PanoDroidGSSlamSystem:
                 if self.mapper.uses_joint_optimization:
                     metrics = self.mapper.optimize_after_keyframe()
                     backend_loss = metrics.get("loss")
+                    try:
+                        keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
+                    except Exception as exc:
+                        self.mapper.stats.notes.append(
+                            f"frame {out.frame_id}: keyframe optimized render failed: {exc!r}"
+                        )
                 elif refine_steps > 0:
                     metrics = self.mapper.refine_on_keyframe(
                         image=source_frame.image,
@@ -939,6 +1053,7 @@ class PanoDroidGSSlamSystem:
                 backend_render_pkg=backend_render_pkg,
                 m3_debug=getattr(self.frontend, "last_m3_debug", None),
             )
+            logger.observe_keyframe_opt(keyframe_opt_diagnostic)
 
         try:
             for frame in iter_sequence_frames(self.config):
