@@ -89,6 +89,20 @@ class DenseBAConfig:
 
 
 @dataclass(frozen=True)
+class KeyframeAnchorConfig:
+    """Configuration for previous-keyframe anchor matching."""
+
+    enabled: bool = False
+    prepend_previous_keyframe: bool = True
+    cell_pair_conf_threshold: float = 0.25
+    frame_mean_pair_conf_threshold: float = 0.30
+    frame_low_pair_conf_ratio: float = 0.45
+    translation_threshold: float = 0.75
+    translation_depth_ratio_threshold: float = 0.08
+    sky_threshold: float = 0.5
+
+
+@dataclass(frozen=True)
 class InferenceWindowConfig:
     """Configuration for the future local inference/refinement window."""
 
@@ -107,6 +121,7 @@ class M3SphereConfig:
     matching_head: MatchingHeadConfig = MatchingHeadConfig()
     dense_matching: DenseMatchingConfig = DenseMatchingConfig()
     dense_ba: DenseBAConfig = DenseBAConfig()
+    keyframe_anchor: KeyframeAnchorConfig = KeyframeAnchorConfig()
     inference_window: InferenceWindowConfig = InferenceWindowConfig()
 
 
@@ -123,6 +138,7 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     head_raw = _section(pano_cfg, "MatchingHead")
     dense_raw = _section(pano_cfg, "DenseMatching")
     ba_raw = _section(pano_cfg, "DenseBA")
+    keyframe_anchor_raw = _section(pano_cfg, "KeyframeAnchor")
     window_raw = _section(pano_cfg, "InferenceWindow")
 
     descriptor_dim = _positive_int(
@@ -200,6 +216,16 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         optimize_pose=bool(ba_raw.get("optimize_pose", True)),
         optimize_depth=bool(ba_raw.get("optimize_depth", True)),
     )
+    keyframe_anchor = KeyframeAnchorConfig(
+        enabled=bool(keyframe_anchor_raw.get("enabled", False)),
+        prepend_previous_keyframe=bool(keyframe_anchor_raw.get("prepend_previous_keyframe", True)),
+        cell_pair_conf_threshold=float(keyframe_anchor_raw.get("cell_pair_conf_threshold", 0.25)),
+        frame_mean_pair_conf_threshold=float(keyframe_anchor_raw.get("frame_mean_pair_conf_threshold", 0.30)),
+        frame_low_pair_conf_ratio=float(keyframe_anchor_raw.get("frame_low_pair_conf_ratio", 0.45)),
+        translation_threshold=float(keyframe_anchor_raw.get("translation_threshold", 0.75)),
+        translation_depth_ratio_threshold=float(keyframe_anchor_raw.get("translation_depth_ratio_threshold", 0.08)),
+        sky_threshold=float(keyframe_anchor_raw.get("sky_threshold", 0.5)),
+    )
     inference_window = InferenceWindowConfig(
         size=_positive_int(window_raw.get("size", 4), name="PanoVGGT.InferenceWindow.size"),
         overlap=int(window_raw.get("overlap", 2)),
@@ -215,5 +241,6 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         matching_head=matching_head,
         dense_matching=dense_matching,
         dense_ba=dense_ba,
+        keyframe_anchor=keyframe_anchor,
         inference_window=inference_window,
     )

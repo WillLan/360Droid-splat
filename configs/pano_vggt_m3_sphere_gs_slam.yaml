@@ -45,6 +45,16 @@ PanoVGGT:
     enabled: true
     descriptor_dim: 24
 
+  KeyframeAnchor:
+    enabled: true
+    prepend_previous_keyframe: true
+    cell_pair_conf_threshold: 0.25
+    frame_mean_pair_conf_threshold: 0.30
+    frame_low_pair_conf_ratio: 0.45
+    translation_threshold: 0.75
+    translation_depth_ratio_threshold: 0.08
+    sky_threshold: 0.5
+
   MatchingHead:
     enabled: true
     checkpoint: null
@@ -133,6 +143,12 @@ Mapping:
   sky_mask_texture_threshold: 0.08
   lr: 0.002
   refine_steps_per_keyframe: 0
+  NovelGaussianInsertion:
+    enabled: true
+    first_keyframe_max_seeds: 80000
+    keyframe_max_seeds: 20000
+    global_anchor_budget: 1500000
+    voxel_neighbor_radius: 1
 
 Renderer:
   allow_smoke_fallback: false

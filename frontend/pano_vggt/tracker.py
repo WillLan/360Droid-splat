@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -12,6 +12,7 @@ from frontend.pano_droid.interfaces import FrontendOutput, PanoDROIDFrontend, Pa
 
 from .alignment import SimilarityTransform, SubmapAligner, sample_overlap_points
 from .dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
+from .dense_matcher import PoseGuidedDenseMatcher
 from .engine import PanoVGGTInferenceEngine, build_panovggt_engine
 from .loop import FrontendPoseGraph, LoopManager, PoseGraphEdge
 from .m3_config import parse_m3_sphere_config
@@ -28,6 +29,32 @@ class _FrameRecord:
     image: torch.Tensor
 
 
+@dataclass
+class _KeyframeAnchorRecord:
+    frame_id: int
+    image: torch.Tensor
+    pose_c2w: torch.Tensor
+
+
+@dataclass
+class _ChunkAnchorContext:
+    record: _KeyframeAnchorRecord
+    full_index: int
+    prepended: bool
+    current_full_indices: tuple[int, ...]
+
+
+@dataclass
+class _AnchorFrameMetrics:
+    anchor_frame_id: int
+    frame_mean_pair_conf: float
+    low_pair_conf_ratio: float
+    pair_confidence: torch.Tensor
+    low_pair_conf: torch.Tensor
+    non_sky: torch.Tensor
+    anchor_pose_c2w: torch.Tensor
+
+
 def _relative_from_c2w(c2w_i: torch.Tensor, c2w_j: torch.Tensor) -> torch.Tensor:
     return torch.linalg.inv(c2w_j) @ c2w_i
 
@@ -36,6 +63,12 @@ def _resize_field(field: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     if tuple(field.shape[-2:]) == tuple(size):
         return field
     return F.interpolate(field.unsqueeze(0), size=size, mode="bilinear", align_corners=False)[0]
+
+
+def _resize_nearest(field: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    if tuple(field.shape[-2:]) == tuple(size):
+        return field
+    return F.interpolate(field.unsqueeze(0).float(), size=size, mode="nearest")[0]
 
 
 def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
@@ -47,6 +80,66 @@ def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
         mode="bilinear",
         align_corners=False,
     )[0].permute(1, 2, 0)
+
+
+def _slice_prediction(pred: PanoVGGTLocalPrediction, indices: torch.Tensor) -> PanoVGGTLocalPrediction:
+    """Return a frame-subset prediction while preserving per-prediction metadata."""
+
+    count = int(pred.poses_c2w.shape[0])
+
+    def maybe_slice(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if value.ndim > 0 and int(value.shape[0]) == count:
+            return value.index_select(0, indices.to(device=value.device))
+        return value
+
+    return replace(
+        pred,
+        poses_c2w=pred.poses_c2w.index_select(0, indices.to(device=pred.poses_c2w.device)),
+        depth=pred.depth.index_select(0, indices.to(device=pred.depth.device)),
+        confidence=pred.confidence.index_select(0, indices.to(device=pred.confidence.device)),
+        chunk_world_points=pred.chunk_world_points.index_select(0, indices.to(device=pred.chunk_world_points.device)),
+        local_points=maybe_slice(pred.local_points),
+        global_points=maybe_slice(pred.global_points),
+        descriptors=maybe_slice(pred.descriptors),
+        dense_descriptors=maybe_slice(pred.dense_descriptors),
+        match_confidence=maybe_slice(pred.match_confidence),
+        static_confidence=maybe_slice(pred.static_confidence),
+        sky_logits=maybe_slice(pred.sky_logits),
+        sky_prob=maybe_slice(pred.sky_prob),
+    )
+
+
+def _feature_uv_to_grid(uv: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    norm_x = 2.0 * (uv[..., 0] - 0.5) / max(width - 1, 1) - 1.0
+    norm_y = 2.0 * (uv[..., 1] - 0.5) / max(height - 1, 1) - 1.0
+    return torch.stack([norm_x, norm_y], dim=-1)
+
+
+def _sample_feature_map(map_tensor: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    if map_tensor.ndim != 4 or int(map_tensor.shape[0]) != 1:
+        raise ValueError(f"map_tensor must have shape 1xCxHxW, got {tuple(map_tensor.shape)}.")
+    height, width = int(map_tensor.shape[-2]), int(map_tensor.shape[-1])
+    selected = map_tensor.expand(int(uv.shape[0]), -1, -1, -1)
+    grid = _feature_uv_to_grid(uv.to(device=map_tensor.device, dtype=map_tensor.dtype), height, width).view(-1, 1, 1, 2)
+    sampled = F.grid_sample(selected, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    return sampled[:, :, 0, 0]
+
+
+def _scatter_feature_values(
+    uv: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    feature_hw: tuple[int, int],
+) -> torch.Tensor:
+    out = torch.zeros(1, int(feature_hw[0]), int(feature_hw[1]), device=values.device, dtype=values.dtype)
+    if uv.numel() == 0:
+        return out
+    x = (uv[:, 0] - 0.5).round().long().clamp(0, int(feature_hw[1]) - 1)
+    y = (uv[:, 1] - 0.5).round().long().clamp(0, int(feature_hw[0]) - 1)
+    out[0, y, x] = values.reshape(-1).to(out)
+    return out
 
 
 class PanoVGGTLongTracker(PanoDROIDFrontend):
@@ -73,6 +166,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         max_scale_jump: float = 2.0,
         require_aligned_world_points: bool = True,
         emit_unaligned: bool = False,
+        novel_insertion_enabled: bool = False,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.chunk_size = max(1, int(chunk_size))
@@ -85,6 +179,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.min_overlap_points = int(min_overlap_points)
         self.require_aligned_world_points = bool(require_aligned_world_points)
         self.emit_unaligned = bool(emit_unaligned)
+        self.novel_insertion_enabled = bool(novel_insertion_enabled)
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
         self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
         self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
@@ -117,10 +212,15 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
         self.last_keyframe_id: Optional[int] = None
+        self.last_keyframe_anchor: _KeyframeAnchorRecord | None = None
         self.chunk_count = 0
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
         self.last_m3_debug: dict | None = None
+
+    @property
+    def keyframe_anchor_enabled(self) -> bool:
+        return bool(self.m3_config.enabled and self.m3_config.keyframe_anchor.enabled)
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -200,8 +300,20 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.processed_ranges.add(range_key)
 
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
-        pred0 = self.engine.infer(images)
-        factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
+        infer_images, anchor_context = self._build_anchor_infer_batch(images, frame_ids)
+        pred0_full = self.engine.infer(infer_images)
+        full_factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
+        if anchor_context is not None and anchor_context.prepended:
+            current_indices = torch.tensor(
+                anchor_context.current_full_indices,
+                dtype=torch.long,
+                device=pred0_full.poses_c2w.device,
+            )
+            pred0 = _slice_prediction(pred0_full, current_indices)
+        else:
+            pred0 = pred0_full
+        anchor_metrics = self._compute_anchor_metrics(pred0_full, anchor_context) if anchor_context is not None else {}
+        factor_graph = None if anchor_context is not None and anchor_context.prepended else full_factor_graph
         pred_refined, ba_stats = self.dense_ba_refiner.refine(pred0, frame_ids, factor_graph=factor_graph)
         self.last_dense_ba_stats = ba_stats
         if ba_stats.enabled:
@@ -215,6 +327,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 "feature_hw": pred0.feature_hw,
                 "image_hw": pred0.image_hw,
                 "images": images.detach().cpu(),
+                "keyframe_anchor": {
+                    int(frame_ids[local_idx]): metrics.frame_mean_pair_conf
+                    for local_idx, metrics in anchor_metrics.items()
+                },
             }
         else:
             self.last_m3_debug = None
@@ -236,7 +352,17 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
 
         output_data: dict[
             int,
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, str],
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                _AnchorFrameMetrics | None,
+                torch.Tensor | None,
+                float,
+                str,
+            ],
         ] = {}
         for local_idx, record in enumerate(self.records[start:end]):
             frame_id = int(record.frame.frame_id)
@@ -270,6 +396,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 conf_full,
                 points_full,
                 valid_world,
+                anchor_metrics.get(local_idx),
+                pred.sky_prob[local_idx].detach() if pred.sky_prob is not None else None,
                 transform.residual,
                 "tracked_panovggt_long" + ba_stats.status_suffix,
             )
@@ -281,7 +409,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 continue
             data = output_data.get(frame_id)
             if data is not None:
-                pose, inverse_depth, confidence, world_points, valid_world, residual, status = data
+                pose, inverse_depth, confidence, world_points, valid_world, anchor_metric, sky_prob, residual, status = data
                 self.pending_outputs.append(
                     self._make_output(
                         record.frame,
@@ -290,6 +418,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                         confidence=confidence,
                         world_points=world_points,
                         valid_world_points_mask=valid_world,
+                        anchor_metrics=anchor_metric,
+                        sky_prob=sky_prob,
                         residual=residual,
                         status=status,
                     )
@@ -297,6 +427,130 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 self.emitted_frame_ids.add(frame_id)
         self.chunk_count += 1
         self._trim_alignment_cache()
+
+    def _build_anchor_infer_batch(
+        self,
+        images: torch.Tensor,
+        frame_ids: tuple[int, ...],
+    ) -> tuple[torch.Tensor, _ChunkAnchorContext | None]:
+        if not self.keyframe_anchor_enabled or self.last_keyframe_anchor is None:
+            return images, None
+        anchor = self.last_keyframe_anchor
+        if int(anchor.frame_id) in frame_ids:
+            anchor_idx = frame_ids.index(int(anchor.frame_id))
+            return images, _ChunkAnchorContext(
+                record=anchor,
+                full_index=int(anchor_idx),
+                prepended=False,
+                current_full_indices=tuple(range(len(frame_ids))),
+            )
+        if not self.m3_config.keyframe_anchor.prepend_previous_keyframe:
+            return images, None
+
+        anchor_image = anchor.image.to(device=images.device, dtype=images.dtype)
+        if tuple(anchor_image.shape[-2:]) != tuple(images.shape[-2:]):
+            anchor_image = F.interpolate(
+                anchor_image.unsqueeze(0),
+                size=tuple(int(v) for v in images.shape[-2:]),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+        infer_images = torch.cat([anchor_image.unsqueeze(0), images], dim=0)
+        return infer_images, _ChunkAnchorContext(
+            record=anchor,
+            full_index=0,
+            prepended=True,
+            current_full_indices=tuple(range(1, len(frame_ids) + 1)),
+        )
+
+    def _compute_anchor_metrics(
+        self,
+        pred_full: PanoVGGTLocalPrediction,
+        anchor_context: _ChunkAnchorContext,
+    ) -> dict[int, _AnchorFrameMetrics]:
+        if (
+            pred_full.dense_descriptors is None
+            or pred_full.match_confidence is None
+            or pred_full.sky_prob is None
+            or pred_full.feature_hw is None
+            or pred_full.image_hw is None
+        ):
+            return {}
+        edges = [
+            (int(full_idx), int(anchor_context.full_index))
+            for full_idx in anchor_context.current_full_indices
+            if int(full_idx) != int(anchor_context.full_index)
+        ]
+        if not edges:
+            return {}
+        dense = self.m3_config.dense_matching
+        feature_hw = tuple(int(v) for v in pred_full.feature_hw)
+        full_factor_cap = max(1, len(edges) * int(feature_hw[0]) * int(feature_hw[1]))
+        matcher = PoseGuidedDenseMatcher(
+            search_radius=dense.search_radius,
+            topk=dense.topk,
+            min_match_confidence=0.0,
+            min_static_confidence=0.0,
+            min_match_score=0.0,
+            max_factors=full_factor_cap,
+            max_samples_per_edge=None,
+            use_wraparound=dense.use_wraparound,
+            forward_backward=dense.forward_backward,
+            fb_tolerance=dense.fb_tolerance,
+            use_depth_consistency=dense.use_depth_consistency,
+            depth_consistency_rel=dense.depth_consistency_rel,
+            depth_consistency_abs=dense.depth_consistency_abs,
+        )
+        graph = matcher.match(
+            poses_c2w=pred_full.poses_c2w,
+            depth=pred_full.depth,
+            dense_descriptors=pred_full.dense_descriptors,
+            match_confidence=pred_full.match_confidence,
+            sky_prob=pred_full.sky_prob,
+            static_confidence=pred_full.static_confidence,
+            image_hw=pred_full.image_hw,
+            feature_hw=feature_hw,
+            edge_pairs=torch.tensor(edges, dtype=torch.long, device=pred_full.poses_c2w.device),
+        )
+        full_to_local = {int(full_idx): local_idx for local_idx, full_idx in enumerate(anchor_context.current_full_indices)}
+        out: dict[int, _AnchorFrameMetrics] = {}
+        for factor in graph.factors:
+            src_full = int(factor.src)
+            local_idx = full_to_local.get(src_full)
+            if local_idx is None:
+                continue
+            src_conf = _sample_feature_map(pred_full.match_confidence[src_full : src_full + 1], factor.src_uv)[:, 0]
+            tgt_conf = _sample_feature_map(pred_full.match_confidence[int(factor.tgt) : int(factor.tgt) + 1], factor.tgt_uv)[:, 0]
+            pair_conf = (factor.match_score.to(src_conf) * src_conf * tgt_conf).clamp(0.0, 1.0)
+            ok = torch.isfinite(pair_conf)
+            for key in ("fb_pass_mask", "depth_consistency_mask"):
+                value = factor.metadata.get(key)
+                if torch.is_tensor(value) and value.numel() == pair_conf.numel():
+                    ok = ok & value.to(device=pair_conf.device).bool().reshape(-1)
+            pair_conf = torch.where(ok, pair_conf, torch.zeros_like(pair_conf))
+            pair_map = _scatter_feature_values(factor.src_uv.to(pair_conf.device), pair_conf, feature_hw=feature_hw)
+
+            sky = pred_full.sky_prob[src_full].detach().to(pair_map)
+            non_sky = (sky <= float(self.m3_config.keyframe_anchor.sky_threshold)).float()
+            low_pair = pair_map < float(self.m3_config.keyframe_anchor.cell_pair_conf_threshold)
+            valid_cells = non_sky > 0.5
+            if bool(valid_cells.any()):
+                values = pair_map[valid_cells]
+                mean_pair = float(values.mean().detach().cpu())
+                low_ratio = float(low_pair[valid_cells].float().mean().detach().cpu())
+            else:
+                mean_pair = 1.0
+                low_ratio = 0.0
+            out[local_idx] = _AnchorFrameMetrics(
+                anchor_frame_id=int(anchor_context.record.frame_id),
+                frame_mean_pair_conf=mean_pair,
+                low_pair_conf_ratio=low_ratio,
+                pair_confidence=pair_map.detach(),
+                low_pair_conf=low_pair.detach(),
+                non_sky=valid_cells.detach(),
+                anchor_pose_c2w=anchor_context.record.pose_c2w.detach(),
+            )
+        return out
 
     def _backend_feedback_correction(
         self,
@@ -431,6 +685,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         confidence: torch.Tensor,
         world_points: torch.Tensor,
         valid_world_points_mask: torch.Tensor,
+        anchor_metrics: _AnchorFrameMetrics | None,
+        sky_prob: torch.Tensor | None,
         residual: float,
         status: str,
     ) -> FrontendOutput:
@@ -438,14 +694,32 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         prev_pose = self.pose_by_frame.get(frame_id - 1)
         relative = None if prev_pose is None else _relative_from_c2w(prev_pose.unsqueeze(0), pose.unsqueeze(0))[0]
         key_score = float(confidence.mean().detach().cpu())
-        gap = (
-            frame_id - int(self.last_keyframe_id)
-            if self.last_keyframe_id is not None
-            else self.force_keyframe_interval
+        is_keyframe = self._decide_keyframe(
+            frame_id=frame_id,
+            pose=pose,
+            inverse_depth=inverse_depth,
+            confidence=confidence,
+            key_score=key_score,
+            anchor_metrics=anchor_metrics,
         )
-        is_keyframe = key_score >= self.keyframe_threshold or gap >= self.force_keyframe_interval
+        output_valid = valid_world_points_mask
+        output_world_confidence = confidence
+        if self.novel_insertion_enabled and self.keyframe_anchor_enabled and is_keyframe:
+            output_valid, output_world_confidence = self._novel_world_mask_and_confidence(
+                valid_world_points_mask=valid_world_points_mask,
+                confidence=confidence,
+                image_size=tuple(int(v) for v in world_points.shape[:2]),
+                anchor_metrics=anchor_metrics,
+                sky_prob=sky_prob,
+                first_keyframe=self.last_keyframe_id is None,
+            )
         if is_keyframe:
             self.last_keyframe_id = frame_id
+            self.last_keyframe_anchor = _KeyframeAnchorRecord(
+                frame_id=frame_id,
+                image=ensure_chw_image(frame.image).detach().cpu().float(),
+                pose_c2w=pose.detach().cpu().float(),
+            )
         return FrontendOutput(
             frame_id=frame.frame_id,
             timestamp=frame.timestamp,
@@ -460,9 +734,85 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             ba_residual=float(residual),
             tracking_status=status,
             world_points=world_points.detach().cpu(),
-            world_points_confidence=confidence.detach().cpu(),
-            valid_world_points_mask=valid_world_points_mask.detach().cpu(),
+            world_points_confidence=output_world_confidence.detach().cpu(),
+            valid_world_points_mask=output_valid.detach().cpu(),
         )
+
+    def _decide_keyframe(
+        self,
+        *,
+        frame_id: int,
+        pose: torch.Tensor,
+        inverse_depth: torch.Tensor,
+        confidence: torch.Tensor,
+        key_score: float,
+        anchor_metrics: _AnchorFrameMetrics | None,
+    ) -> bool:
+        if not self.keyframe_anchor_enabled:
+            gap = (
+                int(frame_id) - int(self.last_keyframe_id)
+                if self.last_keyframe_id is not None
+                else self.force_keyframe_interval
+            )
+            return bool(key_score >= self.keyframe_threshold or gap >= self.force_keyframe_interval)
+        if self.last_keyframe_id is None:
+            return True
+        cfg = self.m3_config.keyframe_anchor
+        if anchor_metrics is not None:
+            if float(anchor_metrics.frame_mean_pair_conf) <= float(cfg.frame_mean_pair_conf_threshold):
+                return True
+            if float(anchor_metrics.low_pair_conf_ratio) >= float(cfg.frame_low_pair_conf_ratio):
+                return True
+            anchor_pose = anchor_metrics.anchor_pose_c2w.to(device=pose.device, dtype=pose.dtype)
+        elif self.last_keyframe_anchor is not None:
+            anchor_pose = self.last_keyframe_anchor.pose_c2w.to(device=pose.device, dtype=pose.dtype)
+        else:
+            anchor_pose = None
+        if anchor_pose is not None and anchor_pose.shape == (4, 4):
+            translation = torch.linalg.norm(pose[:3, 3] - anchor_pose[:3, 3])
+            translation_value = float(translation.detach().cpu())
+            if translation_value >= float(cfg.translation_threshold):
+                return True
+            depth = inverse_depth.detach().float().clamp_min(1.0e-6).reciprocal()
+            valid_depth = depth[torch.isfinite(depth)]
+            if valid_depth.numel() > 0:
+                median_depth = float(valid_depth.median().detach().cpu())
+                if median_depth > 1.0e-6 and translation_value / median_depth >= float(cfg.translation_depth_ratio_threshold):
+                    return True
+        return False
+
+    def _novel_world_mask_and_confidence(
+        self,
+        *,
+        valid_world_points_mask: torch.Tensor,
+        confidence: torch.Tensor,
+        image_size: tuple[int, int],
+        anchor_metrics: _AnchorFrameMetrics | None,
+        sky_prob: torch.Tensor | None,
+        first_keyframe: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = valid_world_points_mask.bool()
+        if sky_prob is not None:
+            non_sky_feature = sky_prob.detach().float() <= float(self.m3_config.keyframe_anchor.sky_threshold)
+        elif anchor_metrics is not None:
+            non_sky_feature = anchor_metrics.non_sky.bool()
+        else:
+            non_sky_feature = None
+        if first_keyframe:
+            if non_sky_feature is None:
+                return valid, confidence
+            non_sky = _resize_nearest(non_sky_feature.float(), image_size) > 0.5
+            world_conf = confidence * _resize_nearest(non_sky_feature.float(), image_size).to(confidence)
+            return valid & non_sky.to(valid.device), world_conf.clamp(0.0, 1.0)
+        if anchor_metrics is None:
+            return torch.zeros_like(valid), torch.zeros_like(confidence)
+        low_pair = _resize_nearest(anchor_metrics.low_pair_conf.float(), image_size) > 0.5
+        non_sky_source = non_sky_feature if non_sky_feature is not None else anchor_metrics.non_sky
+        non_sky = _resize_nearest(non_sky_source.float(), image_size) > 0.5
+        pair_conf = _resize_nearest(anchor_metrics.pair_confidence.float(), image_size).clamp(0.0, 1.0)
+        sky_weight = _resize_nearest(non_sky_source.float(), image_size).clamp(0.0, 1.0)
+        world_conf = (1.0 - pair_conf.to(confidence)) * sky_weight.to(confidence)
+        return valid & low_pair.to(valid.device) & non_sky.to(valid.device), world_conf.clamp(0.0, 1.0)
 
     def _chunk_descriptor(self, pred: PanoVGGTLocalPrediction, images: torch.Tensor) -> torch.Tensor:
         if pred.descriptors is not None and pred.descriptors.numel() > 0:
@@ -498,6 +848,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
 def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
     frontend_cfg = config.get("Frontend", {})
     pano_cfg = config.get("PanoVGGT", {})
+    mapping_cfg = config.get("Mapping", {})
+    novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
     return PanoVGGTLongTracker(
         engine_config=pano_cfg,
         chunk_size=int(pano_cfg.get("chunk_size", 8)),
@@ -515,4 +867,5 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         max_scale_jump=float(pano_cfg.get("max_scale_jump", 2.0)),
         require_aligned_world_points=bool(pano_cfg.get("require_aligned_world_points", True)),
         emit_unaligned=bool(pano_cfg.get("emit_unaligned", False)),
+        novel_insertion_enabled=bool(novel_cfg.get("enabled", False)),
     )

@@ -28,6 +28,9 @@ class MapperStats:
     optimization_steps: int = 0
     last_backend: str = "pfgs360_gsplat"
     fallback_renderer: bool = False
+    last_inserted_anchors: int = 0
+    last_skipped_voxel: int = 0
+    last_skipped_budget: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -169,6 +172,13 @@ class PanoGaussianMapper:
         self.loss_weights = loss_weights or BackendLossWeights()
         self.stats = MapperStats()
         self.optim_cfg = gaussian_map.config.get("BackendOptimization", {}) if isinstance(gaussian_map.config, dict) else {}
+        mapping_cfg = gaussian_map.config.get("Mapping", {}) if isinstance(gaussian_map.config, dict) else {}
+        novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
+        self.novel_insertion_enabled = bool(novel_cfg.get("enabled", False))
+        self.first_keyframe_max_seeds = int(novel_cfg.get("first_keyframe_max_seeds", 80000))
+        self.keyframe_max_seeds = int(novel_cfg.get("keyframe_max_seeds", 20000))
+        self.global_anchor_budget = int(novel_cfg.get("global_anchor_budget", 1500000))
+        self.voxel_neighbor_radius = max(0, int(novel_cfg.get("voxel_neighbor_radius", 1)))
         self.keyframes: list[MapperKeyframe] = []
         self.pose_deltas: dict[int, PoseDelta] = {}
         self.last_inserted_range: tuple[int, int] = (0, 0)
@@ -184,6 +194,8 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput,
         image: torch.Tensor | None = None,
     ) -> int:
+        requested = len(seeds)
+        seeds, filter_stats = self._filter_novel_seeds(seeds)
         start = self.map.anchor_count()
         n = self.map.add_seeds(seeds)
         end = start + int(n)
@@ -191,11 +203,124 @@ class PanoGaussianMapper:
         self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
         self.stats.n_keyframes += 1
         self.stats.n_anchors = self.map.anchor_count()
+        self.stats.last_inserted_anchors = int(n)
+        self.stats.last_skipped_voxel = int(filter_stats.get("skipped_voxel", 0))
+        self.stats.last_skipped_budget = int(filter_stats.get("skipped_budget", 0))
         if image is not None:
             self._register_keyframe(frontend_output, image, start=start, end=end)
         if n == 0:
             self.stats.notes.append(f"frame {frontend_output.frame_id}: no seeds inserted")
+        if self.novel_insertion_enabled and requested != n:
+            self.stats.notes.append(
+                (
+                    f"frame {frontend_output.frame_id}: novel insertion kept {n}/{requested} "
+                    f"seeds, skipped_voxel={self.stats.last_skipped_voxel}, "
+                    f"skipped_budget={self.stats.last_skipped_budget}"
+                )
+            )
         return n
+
+    def _filter_novel_seeds(self, seeds: GaussianSeedBatch) -> tuple[GaussianSeedBatch, dict[str, int]]:
+        if not self.novel_insertion_enabled or len(seeds) == 0:
+            return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
+        per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
+        budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
+        if self.global_anchor_budget > 0:
+            budget = min(budget, max(0, int(self.global_anchor_budget) - self.map.anchor_count()))
+        budget = max(0, int(budget))
+
+        xyz_cpu = seeds.xyz.detach().cpu().float()
+        scale_cpu = seeds.scale.detach().cpu().float().clamp_min(1.0e-6)
+        level_cpu = seeds.level.detach().cpu()
+        conf_cpu = seeds.confidence.detach().cpu().float()
+        order = torch.argsort(conf_cpu, descending=True)
+        occupied = self._build_voxel_index()
+        kept: list[int] = []
+        skipped_voxel = 0
+        skipped_budget = 0
+        for seed_idx in order.tolist():
+            key = self._seed_voxel_key_from_cpu(xyz_cpu, scale_cpu, level_cpu, int(seed_idx))
+            hit = self._find_voxel_hit(occupied, key)
+            if hit is not None:
+                self._accumulate_existing_observation(hit, float(conf_cpu[seed_idx]))
+                skipped_voxel += 1
+                continue
+            if len(kept) >= budget:
+                skipped_budget += 1
+                continue
+            kept.append(int(seed_idx))
+            occupied[key] = -1
+        if not kept:
+            return self._empty_seed_like(seeds), {"skipped_voxel": skipped_voxel, "skipped_budget": skipped_budget}
+        keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
+        return self._subset_seeds(seeds, keep_idx), {"skipped_voxel": skipped_voxel, "skipped_budget": skipped_budget}
+
+    def _build_voxel_index(self) -> dict[tuple[int, int, int, int], int]:
+        occupied: dict[tuple[int, int, int, int], int] = {}
+        if self.map._anchor_grid_coord.numel() == 0:
+            return occupied
+        levels = self.map._anchor_level.detach().cpu().tolist()
+        coords = self.map._anchor_grid_coord.detach().cpu().tolist()
+        for idx, (level, coord) in enumerate(zip(levels, coords)):
+            occupied.setdefault((int(level), int(coord[0]), int(coord[1]), int(coord[2])), int(idx))
+        return occupied
+
+    @staticmethod
+    def _seed_voxel_key_from_cpu(
+        xyz_cpu: torch.Tensor,
+        scale_cpu: torch.Tensor,
+        level_cpu: torch.Tensor,
+        seed_idx: int,
+    ) -> tuple[int, int, int, int]:
+        level = int(level_cpu[seed_idx])
+        scale = float(scale_cpu[seed_idx])
+        coord = torch.floor(xyz_cpu[seed_idx] / scale).to(torch.int32)
+        return (level, int(coord[0]), int(coord[1]), int(coord[2]))
+
+    def _find_voxel_hit(
+        self,
+        occupied: dict[tuple[int, int, int, int], int],
+        key: tuple[int, int, int, int],
+    ) -> int | None:
+        level, x, y, z = key
+        radius = int(self.voxel_neighbor_radius)
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    hit = occupied.get((level, x + dx, y + dy, z + dz))
+                    if hit is not None:
+                        return int(hit)
+        return None
+
+    def _accumulate_existing_observation(self, anchor_idx: int, confidence: float) -> None:
+        if int(anchor_idx) < 0:
+            return
+        if int(anchor_idx) >= int(self.map._anchor_obs_count.shape[0]):
+            return
+        self.map._anchor_obs_count[int(anchor_idx)] += 1
+        self.map._anchor_conf_accum[int(anchor_idx)] += float(confidence)
+
+    @staticmethod
+    def _subset_seeds(seeds: GaussianSeedBatch, keep_idx: torch.Tensor) -> GaussianSeedBatch:
+        return GaussianSeedBatch(
+            xyz=seeds.xyz.index_select(0, keep_idx.to(device=seeds.xyz.device)),
+            rgb=seeds.rgb.index_select(0, keep_idx.to(device=seeds.rgb.device)),
+            confidence=seeds.confidence.index_select(0, keep_idx.to(device=seeds.confidence.device)),
+            scale=seeds.scale.index_select(0, keep_idx.to(device=seeds.scale.device)),
+            level=seeds.level.index_select(0, keep_idx.to(device=seeds.level.device)),
+            frame_id=int(seeds.frame_id),
+        )
+
+    @staticmethod
+    def _empty_seed_like(seeds: GaussianSeedBatch) -> GaussianSeedBatch:
+        return GaussianSeedBatch(
+            xyz=seeds.xyz[:0],
+            rgb=seeds.rgb[:0],
+            confidence=seeds.confidence[:0],
+            scale=seeds.scale[:0],
+            level=seeds.level[:0],
+            frame_id=int(seeds.frame_id),
+        )
 
     def _register_keyframe(
         self,

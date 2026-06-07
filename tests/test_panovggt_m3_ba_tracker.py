@@ -297,6 +297,64 @@ class _StaticEngine(PanoVGGTInferenceEngine):
         _ = path
 
 
+class _RecordingAnchorEngine(PanoVGGTInferenceEngine):
+    def __init__(
+        self,
+        *,
+        feature_hw: tuple[int, int] = (2, 4),
+        current_conf_by_call: tuple[float, ...] = (1.0, 1.0),
+        translation_by_call: tuple[float, ...] = (0.0, 0.05),
+        sky_high_cell: tuple[int, int] | None = None,
+    ) -> None:
+        self.feature_hw = feature_hw
+        self.current_conf_by_call = current_conf_by_call
+        self.translation_by_call = translation_by_call
+        self.sky_high_cell = sky_high_cell
+        self.batch_sizes: list[int] = []
+        self.calls = 0
+        self.last_dense_factor_graph = None
+
+    def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
+        n = int(images.shape[0])
+        self.batch_sizes.append(n)
+        call_idx = self.calls
+        self.calls += 1
+        h, w = self.feature_hw
+        poses = torch.eye(4).view(1, 4, 4).repeat(n, 1, 1)
+        poses[:, 0, 3] = float(self.translation_by_call[min(call_idx, len(self.translation_by_call) - 1)])
+        depth = torch.full((n, 1, h, w), 2.0)
+        confidence = torch.ones_like(depth)
+        yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+        points = torch.stack([xx.float(), yy.float(), torch.ones(h, w)], dim=-1).unsqueeze(0).repeat(n, 1, 1, 1)
+        descriptors = torch.ones(n, 4, h, w)
+        descriptors = torch.nn.functional.normalize(descriptors, dim=1)
+        match_conf = torch.ones(n, 1, h, w)
+        if call_idx > 0:
+            current_conf = float(self.current_conf_by_call[min(call_idx, len(self.current_conf_by_call) - 1)])
+            start = 1 if n > 1 else 0
+            match_conf[start:] = current_conf
+        sky_prob = torch.zeros(n, 1, h, w)
+        if self.sky_high_cell is not None and call_idx > 0:
+            row, col = self.sky_high_cell
+            start = 1 if n > 1 else 0
+            sky_prob[start:, :, row, col] = 0.95
+        return PanoVGGTLocalPrediction(
+            poses_c2w=poses,
+            depth=depth,
+            confidence=confidence,
+            chunk_world_points=points,
+            local_points=points,
+            dense_descriptors=descriptors,
+            match_confidence=match_conf,
+            sky_prob=sky_prob,
+            feature_hw=self.feature_hw,
+            image_hw=self.feature_hw,
+        )
+
+    def load_checkpoint(self, path: str) -> None:
+        _ = path
+
+
 class _FakeRefiner:
     def __init__(self, refined: PanoVGGTLocalPrediction, stats: DenseBARefinerStats) -> None:
         self.refined = refined
@@ -338,6 +396,57 @@ def _feed_two_frames(tracker: PanoVGGTLongTracker):
     return tracker.pop_ready_outputs()
 
 
+def _anchor_cfg() -> dict:
+    return {
+        "PanoVGGT": {
+            "M3Sphere": {"enabled": True},
+            "KeyframeAnchor": {
+                "enabled": True,
+                "prepend_previous_keyframe": True,
+                "cell_pair_conf_threshold": 0.25,
+                "frame_mean_pair_conf_threshold": 0.30,
+                "frame_low_pair_conf_ratio": 0.45,
+                "translation_threshold": 0.75,
+                "translation_depth_ratio_threshold": 0.08,
+                "sky_threshold": 0.5,
+            },
+            "DenseMatching": {
+                "enabled": True,
+                "search_radius": 1,
+                "min_match_confidence": 0.0,
+                "min_static_confidence": 0.0,
+                "min_match_score": 0.0,
+                "forward_backward": False,
+                "use_depth_consistency": False,
+            },
+            "DenseBA": {"enabled": False},
+        }
+    }
+
+
+def _tracker_for_anchor_tests(engine: _RecordingAnchorEngine, *, novel: bool = True) -> PanoVGGTLongTracker:
+    cfg = _anchor_cfg()
+    tracker = PanoVGGTLongTracker(
+        engine=engine,
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=2,
+        overlap=0,
+        emit_delay=0,
+        min_overlap_points=1,
+        require_aligned_world_points=False,
+        emit_unaligned=True,
+        novel_insertion_enabled=novel,
+    )
+
+    def fake_align(aligned_pred, frame_ids):
+        _ = frame_ids
+        return SimilarityTransform.identity(device=aligned_pred.depth.device, dtype=aligned_pred.depth.dtype)
+
+    tracker._align_chunk = fake_align
+    return tracker
+
+
 def test_tracker_disabled_path_status_unchanged():
     pred = _prediction(dense=False)
     cfg = {"PanoVGGT": {"M3Sphere": {"enabled": False}, "DenseBA": {"enabled": False}}}
@@ -351,6 +460,80 @@ def test_tracker_disabled_path_status_unchanged():
     assert all(out.tracking_status == "tracked_panovggt_long" for out in outputs)
     assert tracker.last_dense_ba_stats is not None
     assert tracker.last_dense_ba_stats.enabled is False
+
+
+def test_keyframe_anchor_prepends_previous_keyframe_after_first_chunk():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0))
+    tracker = _tracker_for_anchor_tests(engine)
+
+    _feed_two_frames(tracker)
+    for idx in range(2, 4):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+    tracker.pop_ready_outputs()
+
+    assert engine.batch_sizes == [2, 3]
+
+
+def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
+    engine = _RecordingAnchorEngine()
+    tracker = _tracker_for_anchor_tests(engine)
+    tracker.last_keyframe_id = 0
+    tracker.last_keyframe_anchor = SimpleNamespace(
+        frame_id=0,
+        image=torch.zeros(3, 2, 4),
+        pose_c2w=torch.eye(4),
+    )
+
+    _feed_two_frames(tracker)
+
+    assert engine.batch_sizes == [2]
+
+
+def test_low_pair_confidence_triggers_keyframe_and_novel_mask_filters_sky():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 0.1), sky_high_cell=(0, 0))
+    tracker = _tracker_for_anchor_tests(engine)
+
+    first = _feed_two_frames(tracker)
+    assert first[0].is_keyframe
+    for idx in range(2, 4):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+    outputs = tracker.pop_ready_outputs()
+
+    assert outputs[0].is_keyframe
+    mask = outputs[0].valid_world_points_mask
+    assert mask is not None
+    assert not bool(mask[0, 0, 0])
+    assert bool(mask[0, 1, 1])
+    assert outputs[0].world_points_confidence is not None
+    assert outputs[0].world_points_confidence[0, 1, 1] > 0.5
+
+
+def test_high_pair_confidence_and_small_translation_does_not_trigger_keyframe():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0), translation_by_call=(0.0, 0.01))
+    tracker = _tracker_for_anchor_tests(engine)
+
+    _feed_two_frames(tracker)
+    for idx in range(2, 4):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+    outputs = tracker.pop_ready_outputs()
+
+    assert outputs
+    assert not outputs[0].is_keyframe
+
+
+def test_large_translation_triggers_keyframe_even_with_high_pair_confidence():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0), translation_by_call=(0.0, 1.0))
+    tracker = _tracker_for_anchor_tests(engine)
+
+    _feed_two_frames(tracker)
+    for idx in range(2, 4):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+    outputs = tracker.pop_ready_outputs()
+
+    assert outputs[0].is_keyframe
+    mask = outputs[0].valid_world_points_mask
+    assert mask is not None
+    assert not bool(mask.any())
 
 
 def test_tracker_shadow_mode_runs_ba_but_alignment_receives_original_prediction():

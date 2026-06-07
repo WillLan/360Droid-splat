@@ -1,8 +1,9 @@
 import torch
 
+from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
-from mapping.gaussian_initializer import GaussianInitializer
+from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
 def test_gaussian_initializer_backprojects_keyframe():
@@ -153,3 +154,112 @@ def test_gaussian_initializer_world_points_only_requires_world_points():
         assert "world_points" in str(exc)
     else:
         raise AssertionError("world_points_only should reject missing world_points")
+
+
+def _seed_batch(xyz: torch.Tensor, confidence: torch.Tensor | None = None, *, frame_id: int = 0) -> GaussianSeedBatch:
+    n = int(xyz.shape[0])
+    if confidence is None:
+        confidence = torch.ones(n)
+    return GaussianSeedBatch(
+        xyz=xyz.float(),
+        rgb=torch.full((n, 3), 0.5),
+        confidence=confidence.float(),
+        scale=torch.ones(n),
+        level=torch.zeros(n, dtype=torch.int8),
+        frame_id=frame_id,
+    )
+
+
+def _frontend_output_for_mapper(frame_id: int) -> FrontendOutput:
+    return FrontendOutput(
+        frame_id=frame_id,
+        timestamp=float(frame_id),
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+    )
+
+
+def test_novel_gaussian_insertion_obeys_keyframe_and_global_budgets():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "first_keyframe_max_seeds": 2,
+                "keyframe_max_seeds": 2,
+                "global_anchor_budget": 3,
+                "voxel_neighbor_radius": 0,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    first = _seed_batch(
+        torch.tensor([[0.1, 0.0, 0.0], [2.1, 0.0, 0.0], [4.1, 0.0, 0.0], [6.1, 0.0, 0.0]]),
+        torch.tensor([0.1, 0.9, 0.8, 0.7]),
+    )
+    assert mapper.insert_keyframe(first, _frontend_output_for_mapper(0)) == 2
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_skipped_budget == 2
+
+    second = _seed_batch(torch.tensor([[8.1, 0.0, 0.0], [10.1, 0.0, 0.0]]), frame_id=1)
+    assert mapper.insert_keyframe(second, _frontend_output_for_mapper(1)) == 1
+    assert mapper.map.anchor_count() == 3
+    assert mapper.stats.last_skipped_budget == 1
+
+
+def test_novel_gaussian_insertion_voxel_dedup_updates_existing_observation():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "voxel_neighbor_radius": 0,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    assert mapper.insert_keyframe(_seed_batch(torch.tensor([[0.1, 0.0, 0.0]])), _frontend_output_for_mapper(0)) == 1
+    before_obs = int(mapper.map._anchor_obs_count[0])
+    before_conf = float(mapper.map._anchor_conf_accum[0])
+
+    duplicate = _seed_batch(torch.tensor([[0.2, 0.0, 0.0], [2.1, 0.0, 0.0]]), torch.tensor([0.6, 0.9]), frame_id=1)
+    assert mapper.insert_keyframe(duplicate, _frontend_output_for_mapper(1)) == 1
+
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_skipped_voxel == 1
+    assert int(mapper.map._anchor_obs_count[0]) == before_obs + 1
+    assert float(mapper.map._anchor_conf_accum[0]) > before_conf
+
+
+def test_novel_gaussian_insertion_updates_existing_voxel_when_global_budget_full():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 1,
+                "voxel_neighbor_radius": 0,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    assert mapper.insert_keyframe(_seed_batch(torch.tensor([[0.1, 0.0, 0.0]])), _frontend_output_for_mapper(0)) == 1
+    before_obs = int(mapper.map._anchor_obs_count[0])
+
+    seeds = _seed_batch(torch.tensor([[0.2, 0.0, 0.0], [2.1, 0.0, 0.0]]), torch.tensor([0.6, 0.9]), frame_id=1)
+    assert mapper.insert_keyframe(seeds, _frontend_output_for_mapper(1)) == 0
+
+    assert mapper.map.anchor_count() == 1
+    assert mapper.stats.last_skipped_voxel == 1
+    assert mapper.stats.last_skipped_budget == 1
+    assert int(mapper.map._anchor_obs_count[0]) == before_obs + 1

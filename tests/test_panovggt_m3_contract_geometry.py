@@ -60,6 +60,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert default_cfg.descriptor_dim == 24
     assert default_cfg.matching_head.descriptor_dim == 24
     assert default_cfg.dense_ba.residual_mode == "tangent"
+    assert default_cfg.keyframe_anchor.enabled is False
 
     cfg = parse_m3_sphere_config(
         {
@@ -71,6 +72,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
                     "descriptor_dim": 32,
                     "feature_hook": "aggregator",
                 },
+                "KeyframeAnchor": {"enabled": True, "cell_pair_conf_threshold": 0.2},
                 "DenseMatching": {"enabled": True, "search_radius": 7, "topk": 2},
                 "DenseBA": {"enabled": True, "iters": 4, "residual_mode": "tangent"},
                 "InferenceWindow": {"size": 5, "overlap": 1, "temporal_radius": 3},
@@ -86,6 +88,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert cfg.dense_matching.topk == 2
     assert cfg.dense_ba.enabled is True
     assert cfg.dense_ba.iters == 4
+    assert cfg.keyframe_anchor.enabled is True
+    assert cfg.keyframe_anchor.cell_pair_conf_threshold == 0.2
     assert cfg.inference_window.size == 5
 
     file_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_gs_slam.yaml").read_text())
@@ -95,6 +99,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.dense_matching.enabled is True
     assert parsed_file.dense_ba.enabled is True
     assert parsed_file.dense_ba.shadow_mode is True
+    assert parsed_file.keyframe_anchor.enabled is True
     assert parsed_file.matching_head.descriptor_dim == 24
     assert file_cfg["PanoVGGT"]["image_size"] is None
 
@@ -115,6 +120,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_shadow.dense_ba.iters == 3
     assert parsed_shadow.dense_ba.min_num_factors == 128
     assert parsed_shadow.dense_ba.factor_chunk_size == 512
+    assert parsed_shadow.keyframe_anchor.enabled is True
     assert shadow_cfg["Visualization"]["m3_log_every"] == 5
     assert shadow_cfg["Visualization"]["m3_max_matches"] == 80
     assert parsed_active.dense_ba.shadow_mode is False
