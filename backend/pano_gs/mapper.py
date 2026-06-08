@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import random
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -375,58 +376,46 @@ class PanoGaussianMap(nn.Module):
     def save_ply(self, path: str | Path) -> str:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        xyz = self.get_xyz.detach().cpu().float()
-        rgb = self.get_features.detach().cpu().float().clamp(0.0, 1.0)
-        opacity = self.get_opacity.detach().cpu().float()
-        scale = self.get_scaling.detach().cpu().float()
-        rot = self.get_rotation.detach().cpu().float()
-        levels = self._anchor_level.detach().cpu().to(torch.int32)
-        vox = self._anchor_grid_coord.detach().cpu().to(torch.int32)
-        obs = self._anchor_obs_count.detach().cpu().to(torch.int32)
-        conf = self._anchor_conf_accum.detach().cpu().float()
+        xyz = self.get_xyz.detach().cpu().float().numpy()
         n = int(xyz.shape[0])
-        header = [
-            "ply",
-            "format ascii 1.0",
-            f"element vertex {n}",
-            "property float x",
-            "property float y",
-            "property float z",
-            "property uchar red",
-            "property uchar green",
-            "property uchar blue",
-            "property float opacity",
-            "property float scale_x",
-            "property float scale_y",
-            "property float scale_z",
-            "property float rot_w",
-            "property float rot_x",
-            "property float rot_y",
-            "property float rot_z",
-            "property int level",
-            "property int voxel_x",
-            "property int voxel_y",
-            "property int voxel_z",
-            "property int obs_count",
-            "property float conf_accum",
-            "end_header",
+        normals = np.zeros_like(xyz, dtype=np.float32)
+        rgb = self.get_features.detach().cpu().float().clamp(0.0, 1.0).numpy()
+        f_dc = (rgb - 0.5) / 0.28209479177387814
+        f_rest = np.zeros((n, 24), dtype=np.float32)
+        opacity = self.opacity_logit.detach().cpu().float().numpy()
+        scale = self.get_scaling.detach().cpu().float().clamp_min(1.0e-8).log().numpy()
+        rot = self.get_rotation.detach().cpu().float().numpy()
+        attributes = [
+            "x",
+            "y",
+            "z",
+            "nx",
+            "ny",
+            "nz",
+            "f_dc_0",
+            "f_dc_1",
+            "f_dc_2",
+            *(f"f_rest_{idx}" for idx in range(24)),
+            "opacity",
+            "scale_0",
+            "scale_1",
+            "scale_2",
+            "rot_0",
+            "rot_1",
+            "rot_2",
+            "rot_3",
         ]
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header) + "\n")
-            for i in range(n):
-                color = (rgb[i] * 255.0).round().clamp(0, 255).to(torch.int32)
-                f.write(
-                    (
-                        f"{float(xyz[i,0]):.8f} {float(xyz[i,1]):.8f} {float(xyz[i,2]):.8f} "
-                        f"{int(color[0])} {int(color[1])} {int(color[2])} "
-                        f"{float(opacity[i,0]):.8f} "
-                        f"{float(scale[i,0]):.8f} {float(scale[i,1]):.8f} {float(scale[i,2]):.8f} "
-                        f"{float(rot[i,0]):.8f} {float(rot[i,1]):.8f} "
-                        f"{float(rot[i,2]):.8f} {float(rot[i,3]):.8f} "
-                        f"{int(levels[i])} {int(vox[i,0])} {int(vox[i,1])} {int(vox[i,2])} "
-                        f"{int(obs[i])} {float(conf[i]):.8f}\n"
-                    )
-                )
+        dtype = np.dtype([(name, "<f4") for name in attributes])
+        elements = np.empty(n, dtype=dtype)
+        values = np.concatenate((xyz, normals, f_dc, f_rest, opacity, scale, rot), axis=1).astype(np.float32, copy=False)
+        for idx, name in enumerate(attributes):
+            elements[name] = values[:, idx]
+        header = ["ply", "format binary_little_endian 1.0", f"element vertex {n}"]
+        header.extend(f"property float {name}" for name in attributes)
+        header.append("end_header")
+        with open(path, "wb") as f:
+            f.write(("\n".join(header) + "\n").encode("ascii"))
+            elements.tofile(f)
         return str(path)
 
     def save_checkpoint(self, path: str | Path) -> str:
@@ -673,17 +662,20 @@ class PanoGaussianMapper:
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         with torch.no_grad():
-            return self.renderer.render(camera, self.map)
+            pkg = self.renderer.render(camera, self.map)
+            return self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target))
 
     def _skybox_optimization_mask_enabled(self) -> bool:
+        return bool(self._skybox_mask_enabled() and getattr(self.map, "skybox_optimize", False))
+
+    def _skybox_mask_enabled(self) -> bool:
         return bool(
             self.map.has_skybox
-            and getattr(self.map, "skybox_optimize", False)
             and getattr(self.map, "skybox_optimization_mask_enable", True)
         )
 
     def _skybox_mask_from_image(self, image: torch.Tensor | None) -> torch.Tensor | None:
-        if image is None or not self._skybox_optimization_mask_enabled():
+        if image is None or not self._skybox_mask_enabled():
             return None
         img = image.detach().float()
         if img.ndim == 4:
@@ -724,7 +716,7 @@ class PanoGaussianMapper:
         target: torch.Tensor,
         sky_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        if not self._skybox_optimization_mask_enabled():
+        if not self._skybox_mask_enabled():
             return None
         H, W = int(target.shape[-2]), int(target.shape[-1])
         if sky_mask is None:
@@ -738,7 +730,7 @@ class PanoGaussianMapper:
         render_pkg: dict,
         sky_mask: torch.Tensor | None,
     ) -> dict:
-        if sky_mask is None or not self._skybox_optimization_mask_enabled():
+        if sky_mask is None or not self._skybox_mask_enabled():
             return render_pkg
         gs_rgb = render_pkg.get("gs_only")
         sky_rgb = render_pkg.get("sky_bg_only")
@@ -753,9 +745,9 @@ class PanoGaussianMapper:
             width=int(sky_rgb.shape[-1]),
             device=sky_rgb.device,
         ).to(dtype=sky_rgb.dtype)
-        sky_rgb_masked_grad = sky_rgb * mask + sky_rgb.detach() * (1.0 - mask)
+        sky_rgb_masked = sky_rgb * mask
         out = dict(render_pkg)
-        out["render"] = (gs_rgb + trans.to(sky_rgb) * sky_rgb_masked_grad).clamp(0.0, 1.0)
+        out["render"] = (gs_rgb + trans.to(sky_rgb) * sky_rgb_masked).clamp(0.0, 1.0)
         out["skybox_optimization_mask"] = mask
         return out
 
@@ -774,6 +766,7 @@ class PanoGaussianMapper:
         with torch.no_grad():
             camera = PanoRenderCamera(image_height=H, image_width=W, c2w=pose_delta().detach())
             pkg = self.renderer.render(camera, self.map)
+            pkg = self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, keyframe.sky_mask))
             loss, _ = backend_render_loss(pkg, target, weights=self.loss_weights)
             render = pkg["render"].detach()
             mse = torch.mean((render - target).square()).clamp_min(1e-12)

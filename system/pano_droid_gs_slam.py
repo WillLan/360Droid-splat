@@ -1340,6 +1340,9 @@ class PanoDroidGSSlamSystem:
                             init_ply = output_dir / "point_cloud" / "init" / f"frame_{int(out.frame_id):06d}.ply"
                             self.map.save_ply(init_ply)
                             logger.log_artifact_file(init_ply)
+                            init_alias = output_dir / "point_cloud" / "init" / "point_cloud.ply"
+                            self.map.save_ply(init_alias)
+                            logger.log_artifact_file(init_alias)
                         except Exception as exc:
                             self.mapper.stats.notes.append(f"frame {out.frame_id}: init ply save failed: {exc!r}")
                         if bool(results_cfg.get("save_skybox_previews", False)) and self.map.has_skybox:

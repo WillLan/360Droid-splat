@@ -138,6 +138,45 @@ def test_mapper_random_window_optimizes_one_sample_per_step():
     assert mapper.stats.last_trainable_pose_count == 2
 
 
+def test_pano_gaussian_map_saves_legacy_3dgs_ply_schema(tmp_path: Path):
+    config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    gaussian_map.add_seeds(_small_seed_batch(0))
+    ply_path = tmp_path / "point_cloud.ply"
+
+    gaussian_map.save_ply(ply_path)
+
+    data = ply_path.read_bytes()
+    header = data.split(b"end_header")[0].decode("ascii") + "end_header"
+    expected = [
+        "ply",
+        "format binary_little_endian 1.0",
+        "element vertex 1",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float nx",
+        "property float ny",
+        "property float nz",
+        "property float f_dc_0",
+        "property float f_dc_1",
+        "property float f_dc_2",
+        *[f"property float f_rest_{idx}" for idx in range(24)],
+        "property float opacity",
+        "property float scale_0",
+        "property float scale_1",
+        "property float scale_2",
+        "property float rot_0",
+        "property float rot_1",
+        "property float rot_2",
+        "property float rot_3",
+        "end_header",
+    ]
+    assert header.splitlines() == expected
+    assert b"red" not in data.split(b"end_header")[0]
+    assert ply_path.stat().st_size > len(header)
+
+
 def test_backend_feedback_se3_blend_and_hard_gate():
     source = torch.eye(4)
     target = torch.eye(4)
@@ -241,6 +280,8 @@ def test_skybox_optimization_mask_blocks_non_sky_gradients():
     loss, _ = backend_render_loss(masked_pkg, image)
     loss.backward()
 
+    assert torch.allclose(masked_pkg["render"][:, 4:, :], masked_pkg["gs_only"][:, 4:, :])
+    assert float(masked_pkg["render"][:, :4, :].detach().abs().sum()) > 0.0
     grad = sky_rgb.grad
     assert torch.is_tensor(grad)
     assert float(grad[:, :4, :].abs().sum()) > 0.0
@@ -371,6 +412,8 @@ def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
     summary = PanoDroidGSSlamSystem(cfg).run(max_frames=2)
 
     assert summary["artifacts"]["final_ply"]
+    assert (tmp_path / "point_cloud" / "init" / "point_cloud.ply").is_file()
+    assert any((tmp_path / "point_cloud" / "init").glob("frame_*.ply"))
     assert Path(summary["artifacts"]["final_ply"]).is_file()
     assert Path(summary["artifacts"]["final_checkpoint"]).is_file()
     assert summary["artifacts"]["final_keyframe_render_count"] >= 1
