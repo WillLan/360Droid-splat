@@ -8,6 +8,54 @@ from mapping.gaussian_initializer import GaussianSeedBatch
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
 
 
+class _CountingRenderer:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.frame_ids: list[int] = []
+
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        self.calls += 1
+        fid = int(round(float(camera.c2w.detach().cpu()[0, 3]) * 10.0))
+        self.frame_ids.append(fid)
+        H, W = int(camera.image_height), int(camera.image_width)
+        if gaussian_map.get_features.numel() == 0:
+            color = torch.zeros(3, device=camera.c2w.device, dtype=camera.c2w.dtype)
+        else:
+            color = gaussian_map.get_features.mean(dim=0).to(device=camera.c2w.device, dtype=camera.c2w.dtype)
+        render = color.view(3, 1, 1).expand(3, H, W)
+        return {"render": render, "depth": render.new_ones(1, H, W)}
+
+
+def _small_frontend_output(frame_id: int) -> FrontendOutput:
+    pose = torch.eye(4)
+    pose[0, 3] = float(frame_id) * 0.1
+    return FrontendOutput(
+        frame_id=frame_id,
+        timestamp=float(frame_id),
+        pose_c2w=pose,
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=torch.ones(1, 4, 8),
+        depth_confidence=torch.ones(1, 4, 8),
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=None,
+        tracking_status="tracked",
+    )
+
+
+def _small_seed_batch(frame_id: int) -> GaussianSeedBatch:
+    return GaussianSeedBatch(
+        xyz=torch.tensor([[0.05 * frame_id, 0.0, 1.0]], dtype=torch.float32),
+        rgb=torch.tensor([[0.2 + 0.1 * frame_id, 0.4, 0.7]], dtype=torch.float32),
+        confidence=torch.ones(1),
+        scale=torch.full((1,), 0.1),
+        level=torch.zeros(1, dtype=torch.long),
+        frame_id=frame_id,
+    )
+
+
 def test_mapper_renders_keyframe_diagnostic():
     config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
     gaussian_map = PanoGaussianMap(config=config, device="cpu")
@@ -48,6 +96,45 @@ def test_mapper_renders_keyframe_diagnostic():
     assert diagnostic.render.shape == image.shape
     assert diagnostic.depth is not None
     assert diagnostic.anchor_count == 2
+
+
+def test_mapper_random_window_optimizes_one_sample_per_step():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": True,
+            "keyframe_steps": 0,
+            "local_submap_steps": 0,
+            "sliding_window_steps": 5,
+            "window_keyframes": 3,
+            "random_window_frame_per_iter": True,
+            "sample_keyframes_per_step": 1,
+            "pose_window_keyframes": 3,
+            "fixed_window_frames": 1,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    for frame_id in range(3):
+        image = torch.full((3, 4, 8), 0.25 + 0.1 * frame_id, dtype=torch.float32)
+        mapper.insert_keyframe(_small_seed_batch(frame_id), _small_frontend_output(frame_id), image=image)
+
+    metrics = mapper.optimize_after_keyframe()
+
+    assert renderer.calls == 5
+    assert metrics["window_size"] == 3.0
+    assert metrics["sampled_window_size"] == 1.0
+    assert metrics["trainable_pose_count"] == 2.0
+    assert mapper.stats.last_phase == "sliding_window"
+    assert mapper.stats.last_window_size == 3
+    assert len(mapper.stats.last_sampled_keyframes) == 1
+    assert mapper.stats.last_trainable_pose_count == 2
 
 
 def test_skybox_renders_without_anchors():

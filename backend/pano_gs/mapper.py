@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import random
 
 import torch
 from torch import nn
@@ -34,6 +35,9 @@ class MapperStats:
     last_inserted_anchors: int = 0
     last_skipped_voxel: int = 0
     last_skipped_budget: int = 0
+    last_window_size: int = 0
+    last_sampled_keyframes: list[int] = field(default_factory=list)
+    last_trainable_pose_count: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -919,6 +923,50 @@ class PanoGaussianMapper:
             return 0.0, 0
         return float(cfg.get("min_delta", 0.0)), max(0, int(cfg.get("patience", 0)))
 
+    def _pose_trainable_keyframes(
+        self,
+        keyframes: list[MapperKeyframe],
+        *,
+        fixed: int,
+        pose_enabled: bool,
+    ) -> list[MapperKeyframe]:
+        if not pose_enabled:
+            return []
+        candidates = keyframes[max(0, int(fixed)) :]
+        pose_window = int(
+            self.optim_cfg.get(
+                "pose_window_keyframes",
+                self.optim_cfg.get("pose_window", 0),
+            )
+        )
+        if pose_window > 0:
+            candidates = candidates[-pose_window:]
+        return candidates
+
+    def _sample_keyframes_for_step(
+        self,
+        keyframes: list[MapperKeyframe],
+        *,
+        selected_ids: set[int],
+    ) -> tuple[list[MapperKeyframe], set[int]]:
+        random_window = bool(self.optim_cfg.get("random_window_frame_per_iter", False))
+        if random_window and len(keyframes) > 1:
+            sample_n = max(1, int(self.optim_cfg.get("sample_keyframes_per_step", 1)))
+            sample_n = min(sample_n, len(keyframes))
+            sampled = random.sample(keyframes, sample_n)
+        else:
+            sampled = list(keyframes)
+
+        replay_ids: set[int] = set()
+        replay_n = max(0, int(self.optim_cfg.get("replay_random_keyframes", 0)))
+        if replay_n > 0:
+            outside = [kf for kf in self.keyframes if int(kf.frame_id) not in selected_ids]
+            if outside:
+                replay = random.sample(outside, min(replay_n, len(outside)))
+                sampled.extend(replay)
+                replay_ids = {int(kf.frame_id) for kf in replay}
+        return sampled, replay_ids
+
     def _optimize_keyframe_set(
         self,
         keyframes: list[MapperKeyframe],
@@ -939,7 +987,14 @@ class PanoGaussianMapper:
         fixed = max(0, int(self.optim_cfg.get("fixed_window_frames", 1)))
         if phase == "final_global":
             fixed = max(1, fixed)
-        trainable_pose_ids = {kf.frame_id for kf in keyframes[fixed:]} if pose_enabled else set()
+        trainable_pose_ids = {
+            int(kf.frame_id)
+            for kf in self._pose_trainable_keyframes(
+                keyframes,
+                fixed=fixed,
+                pose_enabled=pose_enabled,
+            )
+        }
         pose_params = [
             self.pose_deltas[fid].delta
             for fid in trainable_pose_ids
@@ -966,17 +1021,28 @@ class PanoGaussianMapper:
         stale = 0
         min_delta, patience = self._early_stop_options()
         actual_steps = 0
+        selected_ids = {int(kf.frame_id) for kf in keyframes}
+        last_sampled_ids: list[int] = []
         for step_idx in range(int(steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
-            for kf in keyframes:
+            sampled_keyframes, replay_ids = self._sample_keyframes_for_step(
+                keyframes,
+                selected_ids=selected_ids,
+            )
+            last_sampled_ids = [int(kf.frame_id) for kf in sampled_keyframes]
+            for kf in sampled_keyframes:
                 target = kf.image.to(device=device, dtype=dtype)
                 H, W = int(target.shape[-2]), int(target.shape[-1])
                 pose_delta = self.pose_deltas.get(kf.frame_id)
                 if pose_delta is None:
                     continue
-                c2w = pose_delta() if kf.frame_id in trainable_pose_ids else pose_delta().detach()
+                frame_id = int(kf.frame_id)
+                if frame_id in trainable_pose_ids and frame_id not in replay_ids:
+                    c2w = pose_delta()
+                else:
+                    c2w = pose_delta().detach()
                 camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w)
                 pkg = self.renderer.render(camera, self.map)
                 loss_i, metrics_i = backend_render_loss(pkg, target, weights=self.loss_weights)
@@ -1020,9 +1086,16 @@ class PanoGaussianMapper:
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
         last["steps"] = float(actual_steps)
         last["pose_delta_norm"] = pose_norm
+        last["window_size"] = float(len(keyframes))
+        last["sampled_window_size"] = float(len(last_sampled_ids))
+        last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
+        last["trainable_pose_count"] = float(len(trainable_pose_ids))
         self.stats.last_loss = float(last.get("loss", 0.0))
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = pose_norm
+        self.stats.last_window_size = int(len(keyframes))
+        self.stats.last_sampled_keyframes = list(last_sampled_ids)
+        self.stats.last_trainable_pose_count = int(len(trainable_pose_ids))
         self.stats.optimization_steps += int(actual_steps)
         return last
 

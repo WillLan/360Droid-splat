@@ -162,11 +162,16 @@ BackendOptimization:
   enabled: true
   gaussian_refine_enable: true
   pose_refine_enable: true
-  keyframe_steps: 200
-  keyframe_optimize_pose: true
-  non_keyframe_steps: 100
+  keyframe_steps: 0
+  keyframe_optimize_pose: false
+  non_keyframe_steps: 0
   local_submap_steps: 0
-  sliding_window_steps: 0
+  sliding_window_steps: 200
+  window_keyframes: 8
+  random_window_frame_per_iter: true
+  sample_keyframes_per_step: 1
+  pose_window_keyframes: 8
+  replay_random_keyframes: 0
   final_global_steps: 0
   fixed_window_frames: 1
   gaussian_lr: 0.002
@@ -176,7 +181,7 @@ BackendOptimization:
   existing_gaussian_lr_scale: 0.15
   new_gaussian_lr_scale: 1.0
   early_stop:
-    enabled: true
+    enabled: false
     min_delta: 0.0002
     patience: 20
 
