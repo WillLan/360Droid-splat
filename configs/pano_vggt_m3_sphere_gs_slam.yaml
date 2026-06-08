@@ -185,6 +185,18 @@ BackendOptimization:
     min_delta: 0.0002
     patience: 20
 
+BackendFeedback:
+  enabled: true
+  keyframes_only: true
+  update_last_keyframe_anchor: true
+  blend_alpha: 1.0
+  reject_first_keyframe_pose_feedback: true
+  min_optimization_steps: 1
+  require_finite_loss: true
+  min_rotation_det: 0.5
+  max_rotation_det: 1.5
+  log_decisions: true
+
 SkyBox:
   enabled: true
   type: cubemap

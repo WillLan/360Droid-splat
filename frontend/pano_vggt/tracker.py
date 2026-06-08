@@ -232,13 +232,25 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
 
-    def apply_backend_pose_updates(self, updates: dict[int, torch.Tensor]) -> None:
+    def apply_backend_pose_updates(
+        self,
+        updates: dict[int, torch.Tensor],
+        *,
+        update_last_keyframe_anchor: bool = True,
+    ) -> None:
         """Inject refined backend keyframe poses for future chunk alignment."""
 
         for frame_id, pose in updates.items():
             pose_cpu = pose.detach().cpu().float()
-            self.backend_pose_overrides[int(frame_id)] = pose_cpu
-            self.pose_by_frame[int(frame_id)] = pose_cpu.to(self.device)
+            fid = int(frame_id)
+            self.backend_pose_overrides[fid] = pose_cpu
+            self.pose_by_frame[fid] = pose_cpu.to(self.device)
+            if (
+                update_last_keyframe_anchor
+                and self.last_keyframe_anchor is not None
+                and int(self.last_keyframe_anchor.frame_id) == fid
+            ):
+                self.last_keyframe_anchor.pose_c2w = pose_cpu
 
     def track(self, frame: PanoFrame) -> FrontendOutput:
         image = ensure_chw_image(frame.image).to(self.device)

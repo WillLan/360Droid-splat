@@ -9,6 +9,7 @@ from backend.legacy_360gs.online import LegacyBackendSnapshot, LegacyOnlineBacke
 from backend.legacy_360gs.viewpoint_adapter import LegacyViewpointAdapter
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_vggt import PanoVGGTLongTracker
+from frontend.pano_vggt.tracker import _KeyframeAnchorRecord
 from system.pano_droid_gs_slam import (
     PanoDroidGSSlamSystem,
     SlamRuntimeLogger,
@@ -220,10 +221,17 @@ def test_panovggt_backend_pose_feedback_updates_pose_cache():
         emit_delay=0,
         device="cpu",
     )
+    tracker.last_keyframe_anchor = _KeyframeAnchorRecord(
+        frame_id=0,
+        image=torch.zeros(3, 8, 16),
+        pose_c2w=torch.eye(4),
+    )
     refined = torch.eye(4)
     refined[0, 3] = 2.0
     tracker.apply_backend_pose_updates({0: refined})
     assert torch.allclose(tracker.pose_by_frame[0].cpu(), refined)
+    assert tracker.last_keyframe_anchor is not None
+    assert torch.allclose(tracker.last_keyframe_anchor.pose_c2w, refined)
 
 
 def test_legacy_online_system_fake_smoke(tmp_path: Path):

@@ -36,6 +36,7 @@ class MapperStats:
     last_skipped_voxel: int = 0
     last_skipped_budget: int = 0
     last_window_size: int = 0
+    last_window_keyframes: list[int] = field(default_factory=list)
     last_sampled_keyframes: list[int] = field(default_factory=list)
     last_trainable_pose_count: int = 0
     notes: list[str] = field(default_factory=list)
@@ -1195,6 +1196,7 @@ class PanoGaussianMapper:
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = pose_norm
         self.stats.last_window_size = int(len(keyframes))
+        self.stats.last_window_keyframes = [int(kf.frame_id) for kf in keyframes]
         self.stats.last_sampled_keyframes = list(last_sampled_ids)
         self.stats.last_trainable_pose_count = int(len(trainable_pose_ids))
         self.stats.optimization_steps += int(actual_steps)

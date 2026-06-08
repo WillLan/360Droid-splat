@@ -18,6 +18,7 @@ from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.adapter import build_frontend_from_config
 from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
+from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from mapping.gaussian_initializer import GaussianInitializer
 
@@ -25,6 +26,55 @@ from mapping.gaussian_initializer import GaussianInitializer
 def load_config(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _se3_log(T: torch.Tensor) -> torch.Tensor:
+    """SE(3) logarithm matching ``se3_exp``'s ``[tx, ty, tz, rx, ry, rz]`` convention."""
+
+    mat = T.detach().float()
+    if mat.shape != (4, 4):
+        raise ValueError(f"Expected a 4x4 transform, got {tuple(mat.shape)}")
+    R = mat[:3, :3]
+    t = mat[:3, 3]
+    cos_theta = ((torch.trace(R) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.acos(cos_theta)
+    vee = torch.stack(
+        [
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1],
+        ]
+    )
+    if float(theta.detach().cpu()) < 1.0e-5:
+        omega = 0.5 * vee
+    else:
+        omega = theta / (2.0 * torch.sin(theta).clamp_min(1.0e-8)) * vee
+    K = skew(omega)
+    theta_w = torch.linalg.norm(omega).clamp_min(1.0e-8)
+    theta2 = theta_w * theta_w
+    eye = torch.eye(3, device=mat.device, dtype=mat.dtype)
+    if float(theta_w.detach().cpu()) < 1.0e-5:
+        V = eye + 0.5 * K + (1.0 / 6.0) * (K @ K)
+    else:
+        V = eye + ((1.0 - torch.cos(theta_w)) / theta2) * K
+        V = V + ((theta_w - torch.sin(theta_w)) / (theta2 * theta_w)) * (K @ K)
+    rho = torch.linalg.solve(V, t)
+    return torch.cat([rho, omega], dim=0)
+
+
+def _se3_blend_pose(source_c2w: torch.Tensor, target_c2w: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Move ``source_c2w`` toward ``target_c2w`` by ``alpha`` on SE(3)."""
+
+    source = source_c2w.detach().float()
+    target = target_c2w.detach().float()
+    a = float(alpha)
+    if a >= 1.0:
+        return target.clone()
+    if a <= 0.0:
+        return source.clone()
+    delta = target @ torch.linalg.inv(source)
+    xi = _se3_log(delta).to(device=source.device, dtype=source.dtype)
+    return (se3_exp(a * xi) @ source).detach()
 
 
 def _load_panocity_gt_poses(root: str) -> dict[str, np.ndarray]:
@@ -1071,6 +1121,132 @@ class PanoDroidGSSlamSystem:
             lr=float(config.get("Mapping", {}).get("lr", 2e-3)),
         )
 
+    def _backend_feedback_cfg(self) -> dict:
+        cfg = self.config.get("BackendFeedback", {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _backend_feedback_enabled(self) -> bool:
+        return bool(self._backend_feedback_cfg().get("enabled", False))
+
+    @staticmethod
+    def _pose_det(pose: torch.Tensor) -> float:
+        return float(torch.linalg.det(pose[:3, :3].detach().float()).cpu())
+
+    def _backend_feedback_hard_gate(
+        self,
+        *,
+        frame_id: int,
+        pose_c2w: torch.Tensor,
+        metrics: dict,
+        first_keyframe_id: int | None,
+        registered_keyframes: set[int],
+    ) -> dict:
+        cfg = self._backend_feedback_cfg()
+        min_steps = int(cfg.get("min_optimization_steps", 1))
+        require_loss = bool(cfg.get("require_finite_loss", True))
+        reject_first = bool(cfg.get("reject_first_keyframe_pose_feedback", True))
+        min_det = float(cfg.get("min_rotation_det", 0.5))
+        max_det = float(cfg.get("max_rotation_det", 1.5))
+        steps_raw = metrics.get("steps", 0.0)
+        steps = float(steps_raw.detach().cpu()) if torch.is_tensor(steps_raw) else float(steps_raw or 0.0)
+        loss_raw = metrics.get("loss")
+        loss = float(loss_raw.detach().cpu()) if torch.is_tensor(loss_raw) else (float(loss_raw) if loss_raw is not None else None)
+        decision = {
+            "frame_id": int(frame_id),
+            "accepted": False,
+            "reason": "unknown",
+            "steps": steps,
+            "loss": loss,
+            "is_first_keyframe": bool(first_keyframe_id is not None and int(frame_id) == int(first_keyframe_id)),
+            "det_rotation": None,
+        }
+        if int(frame_id) not in registered_keyframes:
+            decision["reason"] = "not_registered_keyframe"
+            return decision
+        if decision["is_first_keyframe"] and reject_first:
+            decision["reason"] = "first_keyframe_rejected"
+            return decision
+        if steps < float(min_steps):
+            decision["reason"] = "insufficient_optimization_steps"
+            return decision
+        if require_loss and (loss is None or not np.isfinite(loss)):
+            decision["reason"] = "nonfinite_loss"
+            return decision
+        if not torch.is_tensor(pose_c2w) or tuple(pose_c2w.shape) != (4, 4):
+            decision["reason"] = "invalid_pose_shape"
+            return decision
+        pose = pose_c2w.detach().float()
+        if not bool(torch.isfinite(pose).all()):
+            decision["reason"] = "nonfinite_pose"
+            return decision
+        expected_bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=pose.device, dtype=pose.dtype)
+        if not bool(torch.allclose(pose[3], expected_bottom, atol=1.0e-4, rtol=1.0e-4)):
+            decision["reason"] = "invalid_homogeneous_row"
+            return decision
+        det = self._pose_det(pose)
+        decision["det_rotation"] = det
+        if not np.isfinite(det) or det < min_det or det > max_det:
+            decision["reason"] = "invalid_rotation_determinant"
+            return decision
+        decision["accepted"] = True
+        decision["reason"] = "accepted"
+        return decision
+
+    def _collect_backend_feedback_updates(
+        self,
+        metrics: dict,
+    ) -> tuple[dict[int, torch.Tensor], list[dict]]:
+        if not self._backend_feedback_enabled():
+            return {}, []
+        cfg = self._backend_feedback_cfg()
+        registered = {int(kf.frame_id) for kf in self.mapper.keyframes}
+        window_keyframes = set(int(fid) for fid in getattr(self.mapper.stats, "last_window_keyframes", []))
+        eligible = window_keyframes if window_keyframes else registered
+        first_id = int(self.mapper.keyframes[0].frame_id) if self.mapper.keyframes else None
+        alpha = float(cfg.get("blend_alpha", 1.0))
+        current_poses = getattr(self.frontend, "pose_by_frame", {})
+        updates: dict[int, torch.Tensor] = {}
+        decisions: list[dict] = []
+        for frame_id, refined_pose in self.mapper.refined_keyframe_poses():
+            fid = int(frame_id)
+            if fid not in eligible:
+                continue
+            decision = self._backend_feedback_hard_gate(
+                frame_id=fid,
+                pose_c2w=refined_pose,
+                metrics=metrics,
+                first_keyframe_id=first_id,
+                registered_keyframes=registered,
+            )
+            if decision["accepted"]:
+                current = current_poses.get(fid) if isinstance(current_poses, dict) else None
+                if torch.is_tensor(current) and tuple(current.shape) == (4, 4):
+                    update = _se3_blend_pose(current.detach().cpu(), refined_pose.detach().cpu(), alpha)
+                else:
+                    update = refined_pose.detach().cpu().float()
+                updates[fid] = update
+                decision["blend_alpha"] = alpha
+            decisions.append(decision)
+        return updates, decisions
+
+    def _apply_backend_feedback_updates(self, updates: dict[int, torch.Tensor]) -> int:
+        if not updates:
+            return 0
+        apply_updates = getattr(self.frontend, "apply_backend_pose_updates", None)
+        if not callable(apply_updates):
+            self.mapper.stats.notes.append("backend feedback skipped: frontend has no apply_backend_pose_updates")
+            return 0
+        try:
+            apply_updates(
+                updates,
+                update_last_keyframe_anchor=bool(
+                    self._backend_feedback_cfg().get("update_last_keyframe_anchor", True)
+                ),
+            )
+        except TypeError:
+            apply_updates(updates)
+        return len(updates)
+
     def run(self, *, max_frames: int | None = None) -> dict:
         if self._delegate is not None:
             return self._delegate.run(max_frames=max_frames)
@@ -1092,7 +1268,13 @@ class PanoDroidGSSlamSystem:
         decision_logging_enabled = bool(keyframe_anchor_cfg.get("enabled", False))
         decision_path = output_dir / "keyframe_decisions.jsonl"
         decision_file = open(decision_path, "w", encoding="utf-8") if decision_logging_enabled else None
+        feedback_cfg = self._backend_feedback_cfg()
+        feedback_logging_enabled = self._backend_feedback_enabled() and bool(feedback_cfg.get("log_decisions", True))
+        feedback_path = output_dir / "backend_feedback_decisions.jsonl"
+        feedback_file = open(feedback_path, "w", encoding="utf-8") if feedback_logging_enabled else None
         keyframe_decision_count = 0
+        backend_feedback_decision_count = 0
+        backend_feedback_applied_count = 0
         frame_cache: dict[int, PanoFrame] = {}
         frame_count = 0
         keyframes = 0
@@ -1112,7 +1294,7 @@ class PanoDroidGSSlamSystem:
                 logger.observe_keyframe_decision(decision)
 
         def process_output(out) -> None:
-            nonlocal keyframes, last_status
+            nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
             last_status = out.tracking_status
             source_frame = frame_cache.pop(int(out.frame_id), None)
             if source_frame is None:
@@ -1179,6 +1361,13 @@ class PanoDroidGSSlamSystem:
                     else:
                         metrics = self.mapper.optimize_after_keyframe()
                     backend_loss = metrics.get("loss")
+                    feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
+                    for feedback_decision in feedback_decisions:
+                        if feedback_file is not None:
+                            feedback_file.write(json.dumps(feedback_decision, sort_keys=True) + "\n")
+                            feedback_file.flush()
+                        backend_feedback_decision_count += 1
+                    backend_feedback_applied_count += self._apply_backend_feedback_updates(feedback_updates)
                     try:
                         keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
                     except Exception as exc:
@@ -1316,6 +1505,8 @@ class PanoDroidGSSlamSystem:
             final_metrics = self.mapper.finalize_optimization()
             if decision_file is not None:
                 decision_file.close()
+            if feedback_file is not None:
+                feedback_file.close()
             final_backend_traj = logger.log_final_backend_trajectory(
                 self.mapper.refined_keyframe_poses(),
                 step=frame_count,
@@ -1334,6 +1525,7 @@ class PanoDroidGSSlamSystem:
                 "backend_optimization_steps": self.mapper.stats.optimization_steps,
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_last_window_size": self.mapper.stats.last_window_size,
+                "backend_last_window_keyframes": self.mapper.stats.last_window_keyframes,
                 "backend_last_sampled_keyframes": self.mapper.stats.last_sampled_keyframes,
                 "backend_last_trainable_pose_count": self.mapper.stats.last_trainable_pose_count,
                 "backend_final_metrics": final_metrics,
@@ -1347,6 +1539,9 @@ class PanoDroidGSSlamSystem:
                 "visualization_dir": str(logger.visualization_dir) if logger.save_local else None,
                 "keyframe_decisions_path": str(decision_path) if decision_logging_enabled else None,
                 "keyframe_decision_count": int(keyframe_decision_count),
+                "backend_feedback_path": str(feedback_path) if feedback_logging_enabled else None,
+                "backend_feedback_decision_count": int(backend_feedback_decision_count),
+                "backend_feedback_applied_count": int(backend_feedback_applied_count),
                 "notes": self.mapper.stats.notes,
             }
             with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -1356,6 +1551,8 @@ class PanoDroidGSSlamSystem:
         except BaseException as exc:
             if decision_file is not None and not decision_file.closed:
                 decision_file.close()
+            if feedback_file is not None and not feedback_file.closed:
+                feedback_file.close()
             logger.finish({"failed": True, "error": repr(exc)})
             raise
 

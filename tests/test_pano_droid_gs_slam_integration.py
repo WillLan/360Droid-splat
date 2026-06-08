@@ -6,7 +6,7 @@ from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.losses import backend_render_loss
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
-from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
+from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, _se3_blend_pose
 
 
 class _CountingRenderer:
@@ -136,6 +136,58 @@ def test_mapper_random_window_optimizes_one_sample_per_step():
     assert mapper.stats.last_window_size == 3
     assert len(mapper.stats.last_sampled_keyframes) == 1
     assert mapper.stats.last_trainable_pose_count == 2
+
+
+def test_backend_feedback_se3_blend_and_hard_gate():
+    source = torch.eye(4)
+    target = torch.eye(4)
+    target[0, 3] = 2.0
+    blended = _se3_blend_pose(source, target, 0.5)
+    assert torch.allclose(blended[:3, 3], torch.tensor([1.0, 0.0, 0.0]), atol=1e-5)
+
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 1, "height": 8, "width": 16},
+        "Frontend": {"mode": "panovggt_long"},
+        "PanoVGGT": {
+            "engine": "fake",
+            "image_size": [8, 16],
+            "chunk_size": 2,
+            "overlap": 1,
+            "emit_delay": 0,
+        },
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendFeedback": {
+            "enabled": True,
+            "blend_alpha": 1.0,
+            "reject_first_keyframe_pose_feedback": True,
+            "log_decisions": True,
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+    }
+    system = PanoDroidGSSlamSystem(cfg)
+    assert hasattr(system.frontend, "pose_by_frame")
+
+    for frame_id in range(2):
+        system.mapper.insert_keyframe(
+            _small_seed_batch(frame_id),
+            _small_frontend_output(frame_id),
+            image=torch.full((3, 4, 8), 0.3 + 0.1 * frame_id),
+        )
+        system.frontend.pose_by_frame[frame_id] = _small_frontend_output(frame_id).pose_c2w
+
+    with torch.no_grad():
+        system.mapper.pose_deltas[1].delta[0] = 1.0
+
+    updates, decisions = system._collect_backend_feedback_updates({"steps": 1.0, "loss": 0.1})
+    by_id = {int(item["frame_id"]): item for item in decisions}
+
+    assert by_id[0]["accepted"] is False
+    assert by_id[0]["reason"] == "first_keyframe_rejected"
+    assert by_id[1]["accepted"] is True
+    assert set(updates) == {1}
+    assert torch.allclose(updates[1][0, 3], torch.tensor(1.1), atol=1e-5)
+    assert system._apply_backend_feedback_updates(updates) == 1
+    assert torch.allclose(system.frontend.pose_by_frame[1].cpu(), updates[1], atol=1e-5)
 
 
 def test_skybox_renders_without_anchors():
