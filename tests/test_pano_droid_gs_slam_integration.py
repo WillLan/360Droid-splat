@@ -177,6 +177,50 @@ def test_pano_gaussian_map_saves_legacy_3dgs_ply_schema(tmp_path: Path):
     assert ply_path.stat().st_size > len(header)
 
 
+def test_pfgs360_renderer_passes_direct_rgb_colors_to_rasterizer():
+    config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    seeds = GaussianSeedBatch(
+        xyz=torch.tensor([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]], dtype=torch.float32),
+        rgb=torch.tensor([[0.9, 0.2, 0.1], [0.1, 0.8, 0.3]], dtype=torch.float32),
+        confidence=torch.ones(2),
+        scale=torch.full((2,), 0.1),
+        level=torch.zeros(2, dtype=torch.long),
+        frame_id=0,
+    )
+    gaussian_map.add_seeds(seeds)
+    seen: dict[str, torch.Tensor | tuple[int, ...] | int] = {}
+
+    def fake_rasterization(**kwargs):
+        colors = kwargs["colors"]
+        seen["colors_shape"] = tuple(colors.shape)
+        seen["colors"] = colors.detach().clone()
+        seen["sh_degree"] = int(kwargs["sh_degree"])
+        height = int(kwargs["height"])
+        width = int(kwargs["width"])
+        device = colors.device
+        dtype = colors.dtype
+        render = torch.zeros(1, height, width, 4, device=device, dtype=dtype)
+        render[0, :, :, :3] = colors.mean(dim=0).view(1, 1, 3)
+        render[0, :, :, 3] = 1.0
+        alpha = torch.ones(1, height, width, 1, device=device, dtype=dtype)
+        info = {
+            "means2d": torch.zeros(1, colors.shape[0], 2, device=device, dtype=dtype),
+            "radii": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
+            "accum_times": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
+        }
+        return render, alpha, None, info
+
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    camera = PanoRenderCamera(image_height=4, image_width=8, c2w=torch.eye(4))
+    pkg = renderer._render_gsplat360(fake_rasterization, camera, gaussian_map, torch.zeros(3))
+
+    assert seen["colors_shape"] == (2, 3)
+    assert torch.allclose(seen["colors"], gaussian_map.get_features.detach())
+    assert seen["sh_degree"] == gaussian_map.active_sh_degree
+    assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
+
+
 def test_backend_feedback_se3_blend_and_hard_gate():
     source = torch.eye(4)
     target = torch.eye(4)
