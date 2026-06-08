@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel
+from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
 
 
 @dataclass
@@ -117,7 +117,7 @@ class PFGS360Renderer:
         if background is None:
             background = torch.zeros(3, device=gaussians.get_xyz.device, dtype=gaussians.get_xyz.dtype)
         if int(gaussians.get_xyz.shape[0]) == 0:
-            return _blank_package(camera, gaussians, background)
+            return self._compose_skybox(camera, gaussians, _blank_package(camera, gaussians, background))
 
         rasterization = _optional_gsplat360(self.extra_gsplat360_roots)
         if rasterization is None:
@@ -126,9 +126,32 @@ class PFGS360Renderer:
                     "gsplat360 is unavailable. Install/build the PFGS360 gsplat360 package "
                     "or enable the explicit smoke fallback."
                 )
-            return self._render_fallback(camera, gaussians, background)
+            return self._compose_skybox(camera, gaussians, self._render_fallback(camera, gaussians, background))
 
-        return self._render_gsplat360(rasterization, camera, gaussians, background)
+        return self._compose_skybox(camera, gaussians, self._render_gsplat360(rasterization, camera, gaussians, background))
+
+    def _compose_skybox(self, camera: PanoRenderCamera, gaussians, pkg: RenderPackage) -> RenderPackage:
+        if not bool(getattr(gaussians, "has_skybox", False)):
+            return pkg
+        rgb = pkg["render"]
+        alpha = pkg.get("alpha")
+        if not torch.is_tensor(rgb) or not torch.is_tensor(alpha):
+            return pkg
+        H = int(camera.image_height)
+        W = int(camera.image_width)
+        grid = pixel_grid(H, W, device=rgb.device, dtype=rgb.dtype).view(-1, 2)
+        dirs_cam = erp_pixel_to_bearing(grid, H, W).to(device=rgb.device, dtype=rgb.dtype)
+        c2w = camera.c2w.to(device=rgb.device, dtype=rgb.dtype)
+        dirs_world = (c2w[:3, :3] @ dirs_cam.T).T.view(H, W, 3)
+        sky_rgb = gaussians.sample_skybox(dirs_world).permute(2, 0, 1).contiguous().to(rgb)
+        trans = (1.0 - alpha).clamp(0.0, 1.0)
+        composed = rgb + trans * sky_rgb
+        out = dict(pkg)
+        out["render"] = composed.clamp(0.0, 1.0)
+        out["gs_only"] = rgb
+        out["sky_bg_only"] = sky_rgb
+        out["sky_bg_alpha"] = trans
+        return out
 
     def _render_gsplat360(
         self,

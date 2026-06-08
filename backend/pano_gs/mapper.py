@@ -7,14 +7,17 @@ PFGS360 adapter while keeping anchor-scaffold metadata local to this project.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from backend.pano_gs.adapter import PFGS360Renderer, PanoRenderCamera
 from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from backend.pano_gs.pose_param import PoseDelta
 from frontend.pano_droid.interfaces import FrontendOutput
+from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from mapping.gaussian_initializer import GaussianSeedBatch
 
 
@@ -70,6 +73,7 @@ class PanoGaussianMap(nn.Module):
         self.active_sh_degree = min(int(sh_degree), 0)
         self.device_hint = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._reset_parameters()
+        self._reset_skybox()
         self._anchor_level = torch.zeros(0, dtype=torch.int8)
         self._anchor_voxel_size = torch.zeros(0, dtype=torch.float32)
         self._anchor_grid_coord = torch.zeros(0, 3, dtype=torch.int32)
@@ -83,6 +87,23 @@ class PanoGaussianMap(nn.Module):
         self.scaling = nn.Parameter(torch.zeros(0, 3, device=device))
         self.opacity_logit = nn.Parameter(torch.zeros(0, 1, device=device))
         self.features = nn.Parameter(torch.zeros(0, 3, device=device))
+
+    def _reset_skybox(self) -> None:
+        cfg = self.config.get("SkyBox", {}) if isinstance(self.config, dict) else {}
+        self.skybox_enabled = bool(cfg.get("enabled", False))
+        self.skybox_optimize = bool(cfg.get("optimize", True))
+        self.skybox_resolution = max(4, int(cfg.get("resolution", 512)))
+        self.skybox_lr = float(cfg.get("lr", 1.0e-2))
+        self._skybox_initialized = False
+        self.skybox_logits: nn.Parameter | None = None
+        if self.skybox_enabled:
+            init = torch.full(
+                (6, 3, self.skybox_resolution, self.skybox_resolution),
+                0.5,
+                device=self.device_hint,
+                dtype=torch.float32,
+            )
+            self.skybox_logits = nn.Parameter(self._inv_sigmoid(init))
 
     @property
     def get_xyz(self) -> torch.Tensor:
@@ -106,6 +127,29 @@ class PanoGaussianMap(nn.Module):
     def get_features(self) -> torch.Tensor:
         return torch.sigmoid(self.features)
 
+    @staticmethod
+    def _inv_sigmoid(x: torch.Tensor) -> torch.Tensor:
+        x = x.clamp(1e-5, 1.0 - 1e-5)
+        return torch.log(x / (1.0 - x))
+
+    @property
+    def has_skybox(self) -> bool:
+        return bool(self.skybox_enabled and self.skybox_logits is not None)
+
+    @property
+    def get_skybox_faces(self) -> torch.Tensor | None:
+        if self.skybox_logits is None:
+            return None
+        return torch.sigmoid(self.skybox_logits)
+
+    def gaussian_parameters(self) -> list[nn.Parameter]:
+        return [self.xyz, self.rotation, self.scaling, self.opacity_logit, self.features]
+
+    def skybox_parameters(self) -> list[nn.Parameter]:
+        if self.skybox_logits is None or not self.skybox_optimize:
+            return []
+        return [self.skybox_logits]
+
     def anchor_count(self) -> int:
         return int(self.xyz.shape[0])
 
@@ -121,15 +165,11 @@ class PanoGaussianMap(nn.Module):
         quat = torch.zeros(xyz.shape[0], 4, device=device, dtype=dtype)
         quat[:, 0] = 1.0
 
-        def inv_sigmoid(x: torch.Tensor) -> torch.Tensor:
-            x = x.clamp(1e-5, 1.0 - 1e-5)
-            return torch.log(x / (1.0 - x))
-
         new_xyz = torch.cat([self.xyz.detach(), xyz], dim=0)
         new_rot = torch.cat([self.rotation.detach(), quat], dim=0)
         new_scaling = torch.cat([self.scaling.detach(), torch.log(torch.expm1(scale.clamp_min(1e-5)))], dim=0)
-        new_opacity = torch.cat([self.opacity_logit.detach(), inv_sigmoid(conf)], dim=0)
-        new_features = torch.cat([self.features.detach(), inv_sigmoid(rgb)], dim=0)
+        new_opacity = torch.cat([self.opacity_logit.detach(), self._inv_sigmoid(conf)], dim=0)
+        new_features = torch.cat([self.features.detach(), self._inv_sigmoid(rgb)], dim=0)
 
         self.xyz = nn.Parameter(new_xyz)
         self.rotation = nn.Parameter(new_rot)
@@ -152,7 +192,249 @@ class PanoGaussianMap(nn.Module):
         return int(xyz.shape[0])
 
     def make_optimizer(self, *, lr: float = 2e-3, weight_decay: float = 0.0) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(self.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+        param_groups = [{"params": self.gaussian_parameters(), "lr": float(lr), "name": "gaussians"}]
+        sky_params = self.skybox_parameters()
+        if sky_params:
+            param_groups.append({"params": sky_params, "lr": self.skybox_lr, "name": "skybox"})
+        return torch.optim.AdamW(param_groups, weight_decay=float(weight_decay))
+
+    def initialize_skybox_from_image(
+        self,
+        image: torch.Tensor,
+        c2w: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None = None,
+        force: bool = False,
+    ) -> bool:
+        if not self.has_skybox:
+            return False
+        if self._skybox_initialized and not force:
+            return False
+        img = image.detach().float()
+        if img.ndim == 4:
+            img = img[0]
+        if img.shape[0] != 3:
+            return False
+        device = self.skybox_logits.device
+        img = img.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+        _, H, W = img.shape
+        if sky_mask is None:
+            sky = self._sky_mask_from_image(img)
+        else:
+            sky = sky_mask.detach().bool().to(device=device)
+            if sky.ndim == 3:
+                sky = sky[0]
+            if tuple(sky.shape[-2:]) != (H, W):
+                sky = F.interpolate(sky.float().view(1, 1, *sky.shape[-2:]), size=(H, W), mode="nearest")[0, 0] > 0.5
+        if not bool(sky.any()):
+            sky = torch.ones(H, W, device=device, dtype=torch.bool)
+        dirs = self._world_dirs_for_erp(H, W, c2w.to(device=device, dtype=torch.float32))
+        face, uv = self._directions_to_cubemap(dirs.reshape(-1, 3))
+        sky_flat = sky.reshape(-1)
+        img_flat = img.permute(1, 2, 0).reshape(-1, 3)
+        selected = torch.nonzero(sky_flat, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            return False
+        face_sel = face[selected]
+        uv_sel = uv[selected]
+        s = int(self.skybox_resolution)
+        ix = ((uv_sel[:, 0] + 1.0) * 0.5 * (s - 1)).round().long().clamp(0, s - 1)
+        iy = ((uv_sel[:, 1] + 1.0) * 0.5 * (s - 1)).round().long().clamp(0, s - 1)
+        linear = face_sel.long() * (s * s) + iy * s + ix
+        accum = torch.zeros(6 * s * s, 3, device=device, dtype=torch.float32)
+        counts = torch.zeros(6 * s * s, 1, device=device, dtype=torch.float32)
+        accum.index_add_(0, linear, img_flat[selected])
+        counts.index_add_(0, linear, torch.ones(selected.numel(), 1, device=device, dtype=torch.float32))
+        mean_sky = img_flat[selected].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+        flat = mean_sky.expand(6 * s * s, 3).clone()
+        filled = counts[:, 0] > 0
+        flat[filled] = accum[filled] / counts[filled].clamp_min(1.0)
+        faces = flat.view(6, s, s, 3).permute(0, 3, 1, 2).contiguous().clamp(0.0, 1.0)
+        with torch.no_grad():
+            self.skybox_logits.copy_(self._inv_sigmoid(faces))
+        self._skybox_initialized = True
+        return True
+
+    def sample_skybox(self, world_dirs: torch.Tensor) -> torch.Tensor:
+        faces = self.get_skybox_faces
+        if faces is None:
+            raise RuntimeError("SkyBox is disabled.")
+        original_shape = world_dirs.shape[:-1]
+        dirs = torch.nn.functional.normalize(world_dirs.reshape(-1, 3).to(faces), dim=-1, eps=1e-8)
+        face, uv = self._directions_to_cubemap(dirs)
+        out = torch.zeros(dirs.shape[0], 3, device=faces.device, dtype=faces.dtype)
+        for face_idx in range(6):
+            mask = face == face_idx
+            if not bool(mask.any()):
+                continue
+            grid = uv[mask].view(1, -1, 1, 2).to(device=faces.device, dtype=faces.dtype)
+            sampled = F.grid_sample(
+                faces[face_idx : face_idx + 1],
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            out[mask] = sampled[0, :, :, 0].T
+        return out.view(*original_shape, 3)
+
+    def skybox_erp_preview(self, *, height: int = 256, width: int = 512, c2w: torch.Tensor | None = None) -> torch.Tensor | None:
+        if not self.has_skybox:
+            return None
+        pose = torch.eye(4, device=self.skybox_logits.device, dtype=torch.float32) if c2w is None else c2w
+        dirs = self._world_dirs_for_erp(int(height), int(width), pose.to(device=self.skybox_logits.device, dtype=torch.float32))
+        rgb = self.sample_skybox(dirs).permute(2, 0, 1).contiguous()
+        return rgb.detach().cpu().clamp(0.0, 1.0)
+
+    def _world_dirs_for_erp(self, H: int, W: int, c2w: torch.Tensor) -> torch.Tensor:
+        grid = pixel_grid(H, W, device=c2w.device, dtype=c2w.dtype).view(-1, 2)
+        dirs_cam = erp_pixel_to_bearing(grid, H, W).to(device=c2w.device, dtype=c2w.dtype)
+        rot = c2w[:3, :3]
+        dirs_world = (rot @ dirs_cam.T).T
+        return dirs_world.view(H, W, 3)
+
+    @staticmethod
+    def _directions_to_cubemap(directions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        dirs = torch.nn.functional.normalize(directions.float(), dim=-1, eps=1e-8)
+        x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+        ax, ay, az = x.abs(), y.abs(), z.abs()
+        face = torch.zeros(dirs.shape[0], device=dirs.device, dtype=torch.long)
+        u = torch.zeros_like(x)
+        v = torch.zeros_like(x)
+        is_x = (ax >= ay) & (ax >= az)
+        is_y = (ay > ax) & (ay >= az)
+        is_z = ~(is_x | is_y)
+        pos = is_x & (x >= 0)
+        neg = is_x & (x < 0)
+        face[pos] = 0
+        u[pos] = -z[pos] / ax[pos].clamp_min(1e-8)
+        v[pos] = -y[pos] / ax[pos].clamp_min(1e-8)
+        face[neg] = 1
+        u[neg] = z[neg] / ax[neg].clamp_min(1e-8)
+        v[neg] = -y[neg] / ax[neg].clamp_min(1e-8)
+        pos = is_y & (y >= 0)
+        neg = is_y & (y < 0)
+        face[pos] = 2
+        u[pos] = x[pos] / ay[pos].clamp_min(1e-8)
+        v[pos] = z[pos] / ay[pos].clamp_min(1e-8)
+        face[neg] = 3
+        u[neg] = x[neg] / ay[neg].clamp_min(1e-8)
+        v[neg] = -z[neg] / ay[neg].clamp_min(1e-8)
+        pos = is_z & (z >= 0)
+        neg = is_z & (z < 0)
+        face[pos] = 4
+        u[pos] = x[pos] / az[pos].clamp_min(1e-8)
+        v[pos] = -y[pos] / az[pos].clamp_min(1e-8)
+        face[neg] = 5
+        u[neg] = -x[neg] / az[neg].clamp_min(1e-8)
+        v[neg] = -y[neg] / az[neg].clamp_min(1e-8)
+        return face, torch.stack([u.clamp(-1.0, 1.0), v.clamp(-1.0, 1.0)], dim=-1)
+
+    def _sky_mask_from_image(self, image: torch.Tensor) -> torch.Tensor:
+        cfg = self.config.get("SkyBox", {}) if isinstance(self.config, dict) else {}
+        top_ratio = float(cfg.get("sky_mask_top_ratio", self.config.get("Mapping", {}).get("sky_mask_top_ratio", 0.58)))
+        min_blue = float(cfg.get("sky_mask_min_blue", self.config.get("Mapping", {}).get("sky_mask_min_blue", 0.35)))
+        blue_margin = float(cfg.get("sky_mask_blue_margin", self.config.get("Mapping", {}).get("sky_mask_blue_margin", 0.05)))
+        cloud_brightness = float(
+            cfg.get("sky_mask_cloud_brightness", self.config.get("Mapping", {}).get("sky_mask_cloud_brightness", 0.72))
+        )
+        cloud_saturation = float(
+            cfg.get("sky_mask_cloud_saturation", self.config.get("Mapping", {}).get("sky_mask_cloud_saturation", 0.22))
+        )
+        texture_threshold = float(
+            cfg.get("sky_mask_texture_threshold", self.config.get("Mapping", {}).get("sky_mask_texture_threshold", 0.08))
+        )
+        img = image.detach().float().clamp(0.0, 1.0)
+        _, H, _ = img.shape
+        rows = torch.arange(H, device=img.device, dtype=img.dtype).view(H, 1)
+        upper = rows < float(H) * top_ratio
+        r, g, b = img[0], img[1], img[2]
+        max_rgb = img.max(dim=0).values
+        min_rgb = img.min(dim=0).values
+        saturation = (max_rgb - min_rgb) / max_rgb.clamp_min(1e-6)
+        blue_sky = (b >= min_blue) & (b >= r + blue_margin) & (b >= g + 0.5 * blue_margin)
+        gray = img.mean(dim=0)
+        dx = torch.zeros_like(gray)
+        dy = torch.zeros_like(gray)
+        dx[:, 1:] = (gray[:, 1:] - gray[:, :-1]).abs()
+        dy[1:, :] = (gray[1:, :] - gray[:-1, :]).abs()
+        low_texture = (dx + dy) <= texture_threshold
+        cloud_sky = (max_rgb >= cloud_brightness) & (saturation <= cloud_saturation) & low_texture
+        return upper & (blue_sky | cloud_sky)
+
+    def save_ply(self, path: str | Path) -> str:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        xyz = self.get_xyz.detach().cpu().float()
+        rgb = self.get_features.detach().cpu().float().clamp(0.0, 1.0)
+        opacity = self.get_opacity.detach().cpu().float()
+        scale = self.get_scaling.detach().cpu().float()
+        rot = self.get_rotation.detach().cpu().float()
+        levels = self._anchor_level.detach().cpu().to(torch.int32)
+        vox = self._anchor_grid_coord.detach().cpu().to(torch.int32)
+        obs = self._anchor_obs_count.detach().cpu().to(torch.int32)
+        conf = self._anchor_conf_accum.detach().cpu().float()
+        n = int(xyz.shape[0])
+        header = [
+            "ply",
+            "format ascii 1.0",
+            f"element vertex {n}",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+            "property float opacity",
+            "property float scale_x",
+            "property float scale_y",
+            "property float scale_z",
+            "property float rot_w",
+            "property float rot_x",
+            "property float rot_y",
+            "property float rot_z",
+            "property int level",
+            "property int voxel_x",
+            "property int voxel_y",
+            "property int voxel_z",
+            "property int obs_count",
+            "property float conf_accum",
+            "end_header",
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(header) + "\n")
+            for i in range(n):
+                color = (rgb[i] * 255.0).round().clamp(0, 255).to(torch.int32)
+                f.write(
+                    (
+                        f"{float(xyz[i,0]):.8f} {float(xyz[i,1]):.8f} {float(xyz[i,2]):.8f} "
+                        f"{int(color[0])} {int(color[1])} {int(color[2])} "
+                        f"{float(opacity[i,0]):.8f} "
+                        f"{float(scale[i,0]):.8f} {float(scale[i,1]):.8f} {float(scale[i,2]):.8f} "
+                        f"{float(rot[i,0]):.8f} {float(rot[i,1]):.8f} "
+                        f"{float(rot[i,2]):.8f} {float(rot[i,3]):.8f} "
+                        f"{int(levels[i])} {int(vox[i,0])} {int(vox[i,1])} {int(vox[i,2])} "
+                        f"{int(obs[i])} {float(conf[i]):.8f}\n"
+                    )
+                )
+        return str(path)
+
+    def save_checkpoint(self, path: str | Path) -> str:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "state_dict": self.state_dict(),
+                "anchor_level": self._anchor_level,
+                "anchor_voxel_size": self._anchor_voxel_size,
+                "anchor_grid_coord": self._anchor_grid_coord,
+                "anchor_obs_count": self._anchor_obs_count,
+                "anchor_conf_accum": self._anchor_conf_accum,
+                "config": self.config,
+            },
+            path,
+        )
+        return str(path)
 
 
 class PanoGaussianMapper:
@@ -174,11 +456,17 @@ class PanoGaussianMapper:
         self.optim_cfg = gaussian_map.config.get("BackendOptimization", {}) if isinstance(gaussian_map.config, dict) else {}
         mapping_cfg = gaussian_map.config.get("Mapping", {}) if isinstance(gaussian_map.config, dict) else {}
         novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
-        self.novel_insertion_enabled = bool(novel_cfg.get("enabled", False))
+        pano_cfg = gaussian_map.config.get("PanoVGGT", {}) if isinstance(gaussian_map.config, dict) else {}
+        m3_enabled = bool((pano_cfg.get("M3Sphere", {}) or {}).get("enabled", False)) if isinstance(pano_cfg, dict) else False
+        self.novel_insertion_enabled = bool(novel_cfg.get("enabled", m3_enabled))
         self.first_keyframe_max_seeds = int(novel_cfg.get("first_keyframe_max_seeds", 80000))
-        self.keyframe_max_seeds = int(novel_cfg.get("keyframe_max_seeds", 20000))
+        self.keyframe_max_seeds = int(novel_cfg.get("keyframe_max_seeds", 30000))
         self.global_anchor_budget = int(novel_cfg.get("global_anchor_budget", 1500000))
-        self.voxel_neighbor_radius = max(0, int(novel_cfg.get("voxel_neighbor_radius", 1)))
+        self.first_keyframe_voxel_neighbor_radius = max(
+            0,
+            int(novel_cfg.get("first_keyframe_voxel_neighbor_radius", novel_cfg.get("voxel_neighbor_radius", 0))),
+        )
+        self.voxel_neighbor_radius = max(0, int(novel_cfg.get("voxel_neighbor_radius", 0)))
         self.keyframes: list[MapperKeyframe] = []
         self.pose_deltas: dict[int, PoseDelta] = {}
         self.last_inserted_range: tuple[int, int] = (0, 0)
@@ -195,6 +483,8 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
     ) -> int:
         requested = len(seeds)
+        if image is not None and self.map.has_skybox:
+            self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w)
         seeds, filter_stats = self._filter_novel_seeds(seeds)
         start = self.map.anchor_count()
         n = self.map.add_seeds(seeds)
@@ -235,12 +525,15 @@ class PanoGaussianMapper:
         conf_cpu = seeds.confidence.detach().cpu().float()
         order = torch.argsort(conf_cpu, descending=True)
         occupied = self._build_voxel_index()
+        neighbor_radius = (
+            self.first_keyframe_voxel_neighbor_radius if self.stats.n_keyframes == 0 else self.voxel_neighbor_radius
+        )
         kept: list[int] = []
         skipped_voxel = 0
         skipped_budget = 0
         for seed_idx in order.tolist():
             key = self._seed_voxel_key_from_cpu(xyz_cpu, scale_cpu, level_cpu, int(seed_idx))
-            hit = self._find_voxel_hit(occupied, key)
+            hit = self._find_voxel_hit(occupied, key, radius=neighbor_radius)
             if hit is not None:
                 self._accumulate_existing_observation(hit, float(conf_cpu[seed_idx]))
                 skipped_voxel += 1
@@ -281,9 +574,11 @@ class PanoGaussianMapper:
         self,
         occupied: dict[tuple[int, int, int, int], int],
         key: tuple[int, int, int, int],
+        *,
+        radius: int | None = None,
     ) -> int | None:
         level, x, y, z = key
-        radius = int(self.voxel_neighbor_radius)
+        radius = int(self.voxel_neighbor_radius if radius is None else radius)
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):
                 for dz in range(-radius, radius + 1):
@@ -359,7 +654,7 @@ class PanoGaussianMapper:
         return out
 
     def render_view(self, *, image: torch.Tensor, c2w: torch.Tensor) -> dict | None:
-        if self.map.anchor_count() == 0:
+        if self.map.anchor_count() == 0 and not self.map.has_skybox:
             return None
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
@@ -370,7 +665,7 @@ class PanoGaussianMapper:
     def render_keyframe_diagnostic(self, frame_id: int) -> KeyframeRenderDiagnostic | None:
         """Render an optimized keyframe for post-optimization diagnostics."""
 
-        if self.map.anchor_count() == 0:
+        if self.map.anchor_count() == 0 and not self.map.has_skybox:
             return None
         frame_id = int(frame_id)
         keyframe = next((kf for kf in self.keyframes if int(kf.frame_id) == frame_id), None)
@@ -429,6 +724,19 @@ class PanoGaussianMapper:
         if not self.uses_joint_optimization or not self.keyframes:
             return {}
         metrics: dict[str, float] = {}
+        keyframe_steps = int(self.optim_cfg.get("keyframe_steps", 0))
+        if keyframe_steps > 0:
+            optimize_pose = bool(self.optim_cfg.get("keyframe_optimize_pose", self.optim_cfg.get("pose_refine_enable", False)))
+            keyframe_metrics = self._optimize_keyframe_set(
+                [self.keyframes[-1]],
+                steps=keyframe_steps,
+                phase="keyframe",
+                gaussian_scales=self._gaussian_scales_for_phase("keyframe", [self.keyframes[-1]]),
+                pose_enabled=optimize_pose,
+            )
+            metrics.update(keyframe_metrics)
+            if "loss" in keyframe_metrics:
+                metrics["keyframe_loss"] = keyframe_metrics["loss"]
         local_steps = int(self.optim_cfg.get("local_submap_steps", 0))
         if local_steps > 0:
             local_window = int(self.optim_cfg.get("local_window_keyframes", 2))
@@ -458,6 +766,74 @@ class PanoGaussianMapper:
                 metrics["sliding_loss"] = sliding_metrics["loss"]
         return metrics
 
+    def bootstrap_latest_keyframe(self, *, steps: int, diagnostic_callback=None, diagnostic_every: int = 0) -> dict[str, float]:
+        if not self.keyframes or int(steps) <= 0:
+            return {}
+        selected = [self.keyframes[-1]]
+        return self._optimize_keyframe_set(
+            selected,
+            steps=int(steps),
+            phase="bootstrap",
+            gaussian_scales=self._gaussian_scales_for_phase("bootstrap", selected),
+            pose_enabled=False,
+            diagnostic_callback=diagnostic_callback,
+            diagnostic_every=diagnostic_every,
+        )
+
+    def optimize_frame_observation(
+        self,
+        *,
+        image: torch.Tensor,
+        c2w: torch.Tensor,
+        steps: int,
+        phase: str = "non_keyframe",
+    ) -> dict[str, float]:
+        if self.map.anchor_count() == 0 or int(steps) <= 0:
+            return {"loss": 0.0, "steps": 0.0}
+        target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
+        gaussian_scales = self._gaussian_scales_for_phase(phase, [])
+        param_groups = self._map_param_groups(
+            gaussian_enabled=gaussian_scales is not None and self.map.anchor_count() > 0,
+            phase=phase,
+        )
+        if not param_groups:
+            return {"loss": 0.0, "steps": 0.0}
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)))
+        last: dict[str, float] = {"loss": 0.0}
+        best = float("inf")
+        stale = 0
+        min_delta, patience = self._early_stop_options()
+        for step_idx in range(int(steps)):
+            optimizer.zero_grad(set_to_none=True)
+            pkg = self.renderer.render(camera, self.map)
+            loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
+            if loss.requires_grad:
+                loss.backward()
+                if gaussian_scales is not None:
+                    self._apply_gaussian_grad_scales(gaussian_scales)
+                optimizer.step()
+            last = {k: float(v.detach().cpu()) for k, v in metrics.items()}
+            last["loss"] = float(loss.detach().cpu())
+            current = float(last["loss"])
+            if min_delta > 0.0 and patience > 0:
+                if current < best - min_delta:
+                    best = current
+                    stale = 0
+                else:
+                    stale += 1
+                    if stale >= patience:
+                        last["early_stop_step"] = float(step_idx + 1)
+                        break
+        last["steps"] = float(steps if "early_stop_step" not in last else int(last["early_stop_step"]))
+        last["pose_delta_norm"] = 0.0
+        self.stats.last_loss = float(last.get("loss", 0.0))
+        self.stats.last_phase = phase
+        self.stats.last_pose_delta_norm = 0.0
+        self.stats.optimization_steps += int(last["steps"])
+        return last
+
     def finalize_optimization(self) -> dict[str, float]:
         """Run low-frequency global polish after the sequence/block is complete."""
         if not self.uses_joint_optimization or not self.keyframes:
@@ -486,6 +862,18 @@ class PanoGaussianMapper:
         if phase == "final_global":
             scales.fill_(float(self.optim_cfg.get("global_gaussian_lr_scale", 1.0)))
             return scales
+        if phase == "bootstrap":
+            scales.fill_(1.0)
+            return scales
+        if phase == "keyframe":
+            scales.fill_(float(self.optim_cfg.get("existing_gaussian_lr_scale", 0.15)))
+            new_start, new_end = self.last_inserted_range
+            if new_end > new_start:
+                scales[new_start:new_end] = float(self.optim_cfg.get("new_gaussian_lr_scale", 1.0))
+            return scales
+        if phase == "non_keyframe":
+            scales.fill_(float(self.optim_cfg.get("existing_gaussian_lr_scale", 0.15)))
+            return scales
 
         new_start, new_end = self.last_inserted_range
         mode = str(self.optim_cfg.get("optimize_existing_gaussians", "visible_recent")).lower()
@@ -503,6 +891,34 @@ class PanoGaussianMapper:
             scales[new_start:new_end] = 1.0
         return scales
 
+    def _map_param_groups(self, *, gaussian_enabled: bool, phase: str) -> list[dict]:
+        groups: list[dict] = []
+        if gaussian_enabled:
+            groups.append(
+                {
+                    "params": self.map.gaussian_parameters(),
+                    "lr": float(self.optim_cfg.get("gaussian_lr", self.optimizer.param_groups[0]["lr"])),
+                    "name": "gaussians",
+                }
+            )
+        if bool(self.optim_cfg.get("optimize_skybox", True)):
+            sky_params = self.map.skybox_parameters()
+            if sky_params:
+                groups.append(
+                    {
+                        "params": sky_params,
+                        "lr": float(self.optim_cfg.get("skybox_lr", getattr(self.map, "skybox_lr", 1.0e-2))),
+                        "name": "skybox",
+                    }
+                )
+        return groups
+
+    def _early_stop_options(self) -> tuple[float, int]:
+        cfg = self.optim_cfg.get("early_stop", {}) if isinstance(self.optim_cfg, dict) else {}
+        if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+            return 0.0, 0
+        return float(cfg.get("min_delta", 0.0)), max(0, int(cfg.get("patience", 0)))
+
     def _optimize_keyframe_set(
         self,
         keyframes: list[MapperKeyframe],
@@ -510,13 +926,16 @@ class PanoGaussianMapper:
         steps: int,
         phase: str,
         gaussian_scales: torch.Tensor | None,
+        pose_enabled: bool | None = None,
+        diagnostic_callback=None,
+        diagnostic_every: int = 0,
     ) -> dict[str, float]:
         if not keyframes or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
         gaussian_enabled = gaussian_scales is not None and self.map.anchor_count() > 0
-        pose_enabled = bool(self.optim_cfg.get("pose_refine_enable", False))
+        pose_enabled = bool(self.optim_cfg.get("pose_refine_enable", False)) if pose_enabled is None else bool(pose_enabled)
         fixed = max(0, int(self.optim_cfg.get("fixed_window_frames", 1)))
         if phase == "final_global":
             fixed = max(1, fixed)
@@ -526,14 +945,7 @@ class PanoGaussianMapper:
             for fid in trainable_pose_ids
             if fid in self.pose_deltas
         ]
-        param_groups = []
-        if gaussian_enabled:
-            param_groups.append(
-                {
-                    "params": list(self.map.parameters()),
-                    "lr": float(self.optim_cfg.get("gaussian_lr", self.optimizer.param_groups[0]["lr"])),
-                }
-            )
+        param_groups = self._map_param_groups(gaussian_enabled=gaussian_enabled, phase=phase)
         if pose_params:
             param_groups.append(
                 {
@@ -550,7 +962,11 @@ class PanoGaussianMapper:
         )
         pose_prior_weight = float(self.optim_cfg.get("pose_prior_weight", 1e-3))
         last: dict[str, float] = {"loss": 0.0}
-        for _ in range(int(steps)):
+        best = float("inf")
+        stale = 0
+        min_delta, patience = self._early_stop_options()
+        actual_steps = 0
+        for step_idx in range(int(steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
@@ -578,25 +994,42 @@ class PanoGaussianMapper:
                 if gaussian_enabled:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+            actual_steps = step_idx + 1
             last = {
                 key: float(torch.stack(values).mean().detach().cpu())
                 for key, values in metric_accum.items()
                 if values
             }
             last["loss"] = float(loss.detach().cpu())
+            if diagnostic_callback is not None and len(keyframes) == 1:
+                every = max(1, int(diagnostic_every))
+                if actual_steps == 1 or actual_steps % every == 0 or actual_steps == int(steps):
+                    diagnostic = self.render_keyframe_diagnostic(int(keyframes[0].frame_id))
+                    if diagnostic is not None:
+                        diagnostic_callback(actual_steps, diagnostic)
+            current = float(last["loss"])
+            if min_delta > 0.0 and patience > 0:
+                if current < best - min_delta:
+                    best = current
+                    stale = 0
+                else:
+                    stale += 1
+                    if stale >= patience:
+                        last["early_stop_step"] = float(actual_steps)
+                        break
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
-        last["steps"] = float(steps)
+        last["steps"] = float(actual_steps)
         last["pose_delta_norm"] = pose_norm
         self.stats.last_loss = float(last.get("loss", 0.0))
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = pose_norm
-        self.stats.optimization_steps += int(steps)
+        self.stats.optimization_steps += int(actual_steps)
         return last
 
     def _apply_gaussian_grad_scales(self, scales: torch.Tensor) -> None:
         if scales.numel() != self.map.anchor_count():
             return
-        for param in (self.map.xyz, self.map.rotation, self.map.scaling, self.map.opacity_logit, self.map.features):
+        for param in self.map.gaussian_parameters():
             if param.grad is None or param.grad.shape[0] != scales.shape[0]:
                 continue
             view_shape = (scales.shape[0],) + (1,) * (param.grad.ndim - 1)

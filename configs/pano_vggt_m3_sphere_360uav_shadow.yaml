@@ -46,11 +46,13 @@ PanoVGGT:
   KeyframeAnchor:
     enabled: true
     prepend_previous_keyframe: true
-    cell_pair_conf_threshold: 0.25
-    frame_mean_pair_conf_threshold: 0.30
-    frame_low_pair_conf_ratio: 0.45
-    translation_threshold: 0.75
-    translation_depth_ratio_threshold: 0.08
+    pair_confidence_mode: geometric_mean
+    cell_pair_conf_threshold: 0.45
+    frame_mean_pair_conf_threshold: 0.38
+    frame_low_pair_conf_ratio: 0.75
+    match_coverage_threshold: 0.0
+    translation_threshold: 1.5
+    translation_depth_ratio_threshold: 0.15
     sky_threshold: 0.5
 
   MatchingHead:
@@ -143,9 +145,51 @@ Mapping:
   NovelGaussianInsertion:
     enabled: true
     first_keyframe_max_seeds: 80000
-    keyframe_max_seeds: 20000
+    keyframe_max_seeds: 30000
     global_anchor_budget: 1500000
-    voxel_neighbor_radius: 1
+    first_keyframe_voxel_neighbor_radius: 0
+    voxel_neighbor_radius: 0
+
+  BootstrapOptimization:
+    enabled: true
+    first_keyframe_steps: 300
+    save_every: 25
+
+BackendOptimization:
+  enabled: true
+  gaussian_refine_enable: true
+  pose_refine_enable: true
+  keyframe_steps: 200
+  keyframe_optimize_pose: true
+  non_keyframe_steps: 100
+  local_submap_steps: 0
+  sliding_window_steps: 0
+  final_global_steps: 0
+  fixed_window_frames: 1
+  gaussian_lr: 0.002
+  pose_lr: 0.001
+  skybox_lr: 0.01
+  optimize_skybox: true
+  existing_gaussian_lr_scale: 0.15
+  new_gaussian_lr_scale: 1.0
+  early_stop:
+    enabled: true
+    min_delta: 0.0002
+    patience: 20
+
+SkyBox:
+  enabled: true
+  type: cubemap
+  resolution: 512
+  init_from_first_keyframe: true
+  optimize: true
+  lr: 0.01
+  sky_mask_top_ratio: 0.58
+  sky_mask_min_blue: 0.35
+  sky_mask_blue_margin: 0.05
+  sky_mask_cloud_brightness: 0.72
+  sky_mask_cloud_saturation: 0.22
+  sky_mask_texture_threshold: 0.08
 
 Renderer:
   allow_smoke_fallback: false
@@ -173,3 +217,11 @@ Results:
   save_dir: outputs/pano_vggt_m3_sphere_360uav_shadow_seq1
   kf_render_format: png
   kf_jpeg_quality: 95
+  save_final_ply: true
+  save_final_checkpoint: true
+  save_final_keyframe_renders: true
+  final_keyframe_render_stride: 1
+  final_keyframe_render_max: 50
+  save_skybox_previews: true
+  skybox_preview_height: 256
+  skybox_preview_width: 512

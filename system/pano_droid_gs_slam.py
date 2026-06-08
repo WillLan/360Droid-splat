@@ -133,6 +133,24 @@ def _image_tensor_to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
+def _cubemap_faces_to_pil(faces: torch.Tensor) -> Image.Image:
+    tensor = faces.detach().cpu().float().clamp(0.0, 1.0)
+    if tensor.ndim != 4 or tensor.shape[0] != 6 or tensor.shape[1] != 3:
+        raise ValueError(f"Expected cubemap faces as 6x3xSxS, got {tuple(tensor.shape)}")
+    tiles = [_image_tensor_to_pil(tensor[i]) for i in range(6)]
+    width = sum(tile.width for tile in tiles)
+    height = max(tile.height for tile in tiles) + 24
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    labels = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
+    for label, tile in zip(labels, tiles):
+        canvas.paste(tile, (x, 24))
+        draw.text((x + 6, 6), label, fill=(0, 0, 0))
+        x += tile.width
+    return canvas
+
+
 def _scalar_tensor_to_pil(value: torch.Tensor) -> Image.Image:
     tensor = value.detach().cpu().float()
     if tensor.ndim == 3:
@@ -336,6 +354,8 @@ class SlamRuntimeLogger:
             self.visualization_dir.mkdir(parents=True, exist_ok=True)
         self.run = None
         self._wandb = None
+        self.wandb_mode = mode
+        self.wandb_init_error: str | None = None
         self._step = 0
         self._last_m3_chunk_logged: int | None = None
         self._kf_opt_count = 0
@@ -352,16 +372,23 @@ class SlamRuntimeLogger:
                     "Install it or set WeightsAndBiases.mode=disabled."
                 ) from exc
             self._wandb = wandb
-            self.run = wandb.init(
-                project=str(wb_cfg.get("project") or "360Droid-splat"),
-                entity=wb_cfg.get("entity") or None,
-                name=wb_cfg.get("run_name") or None,
-                mode=mode,
-                dir=str(output_dir),
-                config=config,
-                tags=wb_cfg.get("tags") or None,
-                group=wb_cfg.get("group") or None,
-            )
+            init_kwargs = {
+                "project": str(wb_cfg.get("project") or "360Droid-splat"),
+                "entity": wb_cfg.get("entity") or None,
+                "name": wb_cfg.get("run_name") or None,
+                "dir": str(output_dir),
+                "config": config,
+                "tags": wb_cfg.get("tags") or None,
+                "group": wb_cfg.get("group") or None,
+            }
+            try:
+                self.run = wandb.init(mode=mode, **init_kwargs)
+            except Exception as exc:
+                if mode != "online":
+                    raise
+                self.wandb_init_error = repr(exc)
+                self.wandb_mode = "offline"
+                self.run = wandb.init(mode="offline", **init_kwargs)
 
     @property
     def run_url(self) -> str | None:
@@ -542,6 +569,60 @@ class SlamRuntimeLogger:
             if depth_path is not None:
                 image_payload["backend/kf_depth_opt_png"] = str(depth_path)
             self.run.log(image_payload, step=step)
+
+    def observe_keyframe_decision(self, decision: dict) -> None:
+        if self.run is None:
+            return
+        payload: dict[str, float | int | str] = {
+            "kf/frame_id": int(decision.get("frame_id", -1)),
+            "kf/accepted": int(bool(decision.get("accepted", False))),
+            "kf/keyframe_score": float(decision.get("keyframe_score", 0.0)),
+        }
+        for source, target in (
+            ("frame_mean_pair_conf", "kf/frame_mean_pair_conf"),
+            ("low_pair_conf_ratio", "kf/low_pair_conf_ratio"),
+            ("match_coverage", "kf/match_coverage"),
+            ("translation_delta", "kf/translation_delta"),
+            ("median_depth", "kf/median_depth"),
+            ("translation_depth_ratio", "kf/translation_depth_ratio"),
+        ):
+            value = decision.get(source)
+            if value is not None:
+                payload[target] = float(value)
+        quantiles = decision.get("pair_conf_quantiles")
+        if isinstance(quantiles, dict):
+            for key, value in quantiles.items():
+                payload[f"kf/pair_conf_{key}"] = float(value)
+        reasons = decision.get("reasons") or []
+        if reasons:
+            payload["kf/reason"] = ",".join(str(item) for item in reasons)
+        self.run.log(payload, step=max(1, int(self._step)))
+
+    def save_keyframe_diagnostic(self, diagnostic, *, render_dir: Path, depth_dir: Path) -> tuple[Path | None, Path | None]:
+        if diagnostic is None:
+            return None, None
+        render_panel = self._make_keyframe_opt_render_panel(diagnostic)
+        depth_panel = self._make_keyframe_opt_depth_panel(diagnostic)
+        frame_id = int(getattr(diagnostic, "frame_id"))
+        render_path = self._save_keyframe_opt_image(render_panel, render_dir, frame_id=frame_id)
+        depth_path = self._save_keyframe_opt_image(depth_panel, depth_dir, frame_id=frame_id)
+        return render_path, depth_path
+
+    def log_image_file(self, key: str, path: Path, *, step: int | None = None) -> None:
+        if self.run is None or self._wandb is None:
+            return
+        try:
+            self.run.log({key: self._wandb.Image(str(path)), f"{key}_png": str(path)}, step=step or max(1, self._step))
+        except Exception:
+            return
+
+    def log_artifact_file(self, path: Path) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.save(str(path), base_path=str(self.output_dir))
+        except Exception:
+            return
 
     def _make_keyframe_opt_render_panel(self, diagnostic) -> Image.Image:
         target = _image_tensor_to_pil(getattr(diagnostic, "target"))
@@ -994,14 +1075,41 @@ class PanoDroidGSSlamSystem:
         if self._delegate is not None:
             return self._delegate.run(max_frames=max_frames)
         self.frontend.initialize({"config": self.config})
-        output_dir = Path(self.config.get("Results", {}).get("save_dir", "outputs/pano_droid_gs_slam"))
+        results_cfg = self.config.get("Results", {})
+        output_dir = Path(results_cfg.get("save_dir", "outputs/pano_droid_gs_slam"))
         output_dir.mkdir(parents=True, exist_ok=True)
         logger = SlamRuntimeLogger(self.config, output_dir)
         refine_steps = int(self.config.get("Mapping", {}).get("refine_steps_per_keyframe", 0))
+        mapping_cfg = self.config.get("Mapping", {})
+        bootstrap_cfg = mapping_cfg.get("BootstrapOptimization", {}) if isinstance(mapping_cfg, dict) else {}
+        bootstrap_enabled = bool(bootstrap_cfg.get("enabled", False))
+        bootstrap_steps = int(bootstrap_cfg.get("first_keyframe_steps", 0))
+        bootstrap_save_every = max(1, int(bootstrap_cfg.get("save_every", 25)))
+        backend_cfg = self.config.get("BackendOptimization", {})
+        non_keyframe_steps = int(backend_cfg.get("non_keyframe_steps", 0))
+        pano_cfg = self.config.get("PanoVGGT", {})
+        keyframe_anchor_cfg = pano_cfg.get("KeyframeAnchor", {}) if isinstance(pano_cfg, dict) else {}
+        decision_logging_enabled = bool(keyframe_anchor_cfg.get("enabled", False))
+        decision_path = output_dir / "keyframe_decisions.jsonl"
+        decision_file = open(decision_path, "w", encoding="utf-8") if decision_logging_enabled else None
+        keyframe_decision_count = 0
         frame_cache: dict[int, PanoFrame] = {}
         frame_count = 0
         keyframes = 0
         last_status = None
+
+        def drain_keyframe_decisions() -> None:
+            nonlocal keyframe_decision_count
+            if decision_file is None:
+                return
+            pop_decisions = getattr(self.frontend, "pop_keyframe_decisions", None)
+            if not callable(pop_decisions):
+                return
+            for decision in pop_decisions():
+                decision_file.write(json.dumps(decision, sort_keys=True) + "\n")
+                decision_file.flush()
+                keyframe_decision_count += 1
+                logger.observe_keyframe_decision(decision)
 
         def process_output(out) -> None:
             nonlocal keyframes, last_status
@@ -1020,7 +1128,56 @@ class PanoDroidGSSlamSystem:
                     self.mapper.insert_keyframe(seeds, out)
                 keyframes += 1
                 if self.mapper.uses_joint_optimization:
-                    metrics = self.mapper.optimize_after_keyframe()
+                    if bootstrap_enabled and keyframes == 1 and bootstrap_steps > 0:
+                        init_dir = output_dir / "init_vis" / f"frame_{int(out.frame_id):06d}"
+                        init_dir.mkdir(parents=True, exist_ok=True)
+
+                        def save_bootstrap(step: int, diagnostic) -> None:
+                            render_panel = logger._make_keyframe_opt_render_panel(diagnostic)
+                            depth_panel = logger._make_keyframe_opt_depth_panel(diagnostic)
+                            render_path = init_dir / f"iter_{int(step):04d}_render.png"
+                            depth_path = init_dir / f"iter_{int(step):04d}_depth.png"
+                            render_panel.save(render_path)
+                            depth_panel.save(depth_path)
+                            if logger.run is not None and logger._wandb is not None:
+                                logger.run.log(
+                                    {
+                                        "backend/bootstrap_render": logger._wandb.Image(str(render_path)),
+                                        "backend/bootstrap_depth": logger._wandb.Image(str(depth_path)),
+                                        "backend/bootstrap_step": int(step),
+                                    },
+                                    step=max(1, int(logger._step)),
+                                )
+
+                        metrics = self.mapper.bootstrap_latest_keyframe(
+                            steps=bootstrap_steps,
+                            diagnostic_callback=save_bootstrap,
+                            diagnostic_every=bootstrap_save_every,
+                        )
+                        try:
+                            init_ply = output_dir / "point_cloud" / "init" / f"frame_{int(out.frame_id):06d}.ply"
+                            self.map.save_ply(init_ply)
+                            logger.log_artifact_file(init_ply)
+                        except Exception as exc:
+                            self.mapper.stats.notes.append(f"frame {out.frame_id}: init ply save failed: {exc!r}")
+                        if bool(results_cfg.get("save_skybox_previews", False)) and self.map.has_skybox:
+                            try:
+                                sky_dir = output_dir / "skybox"
+                                sky_dir.mkdir(parents=True, exist_ok=True)
+                                preview = self.map.skybox_erp_preview(
+                                    height=int(results_cfg.get("skybox_preview_height", 256)),
+                                    width=int(results_cfg.get("skybox_preview_width", 512)),
+                                )
+                                if preview is not None:
+                                    preview_path = sky_dir / f"init_frame_{int(out.frame_id):06d}_erp.png"
+                                    _image_tensor_to_pil(preview).save(preview_path)
+                                    logger.log_image_file("skybox/init_erp_preview", preview_path)
+                            except Exception as exc:
+                                self.mapper.stats.notes.append(
+                                    f"frame {out.frame_id}: init skybox preview save failed: {exc!r}"
+                                )
+                    else:
+                        metrics = self.mapper.optimize_after_keyframe()
                     backend_loss = metrics.get("loss")
                     try:
                         keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
@@ -1035,6 +1192,14 @@ class PanoDroidGSSlamSystem:
                         steps=refine_steps,
                     )
                     backend_loss = metrics.get("loss")
+            elif self.mapper.uses_joint_optimization and non_keyframe_steps > 0:
+                metrics = self.mapper.optimize_frame_observation(
+                    image=source_frame.image,
+                    c2w=out.pose_c2w,
+                    steps=non_keyframe_steps,
+                    phase="non_keyframe",
+                )
+                backend_loss = metrics.get("loss")
             backend_pose = self.mapper.refined_pose_c2w(int(out.frame_id))
             render_pose = backend_pose if backend_pose is not None else out.pose_c2w.detach().cpu()
             backend_render_pkg = None
@@ -1054,6 +1219,81 @@ class PanoDroidGSSlamSystem:
                 m3_debug=getattr(self.frontend, "last_m3_debug", None),
             )
             logger.observe_keyframe_opt(keyframe_opt_diagnostic)
+            drain_keyframe_decisions()
+
+        def save_final_artifacts() -> dict:
+            artifacts: dict[str, str | int | list[str] | None] = {
+                "final_ply": None,
+                "final_checkpoint": None,
+                "final_keyframe_render_count": 0,
+                "final_skybox_erp_preview": None,
+                "final_skybox_faces": None,
+            }
+            if bool(results_cfg.get("save_final_ply", False)):
+                try:
+                    ply_path = output_dir / "point_cloud" / "final" / "point_cloud.ply"
+                    self.map.save_ply(ply_path)
+                    artifacts["final_ply"] = str(ply_path)
+                    logger.log_artifact_file(ply_path)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(f"final ply save failed: {exc!r}")
+            if bool(results_cfg.get("save_final_checkpoint", False)):
+                try:
+                    ckpt_path = output_dir / "checkpoints" / "final_gaussian_map.pt"
+                    self.map.save_checkpoint(ckpt_path)
+                    artifacts["final_checkpoint"] = str(ckpt_path)
+                    logger.log_artifact_file(ckpt_path)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(f"final checkpoint save failed: {exc!r}")
+            if bool(results_cfg.get("save_final_keyframe_renders", False)):
+                stride = max(1, int(results_cfg.get("final_keyframe_render_stride", 1)))
+                max_count = int(results_cfg.get("final_keyframe_render_max", 0))
+                selected = self.mapper.keyframes[::stride]
+                if max_count > 0 and len(selected) > max_count:
+                    selected = selected[-max_count:]
+                render_dir = output_dir / "final_kf_renders"
+                depth_dir = output_dir / "final_kf_depths"
+                saved = 0
+                for keyframe in selected:
+                    try:
+                        diagnostic = self.mapper.render_keyframe_diagnostic(int(keyframe.frame_id))
+                        render_path, depth_path = logger.save_keyframe_diagnostic(
+                            diagnostic,
+                            render_dir=render_dir,
+                            depth_dir=depth_dir,
+                        )
+                        if render_path is not None:
+                            saved += 1
+                            logger.log_image_file("backend/final_kf_render", render_path)
+                        if depth_path is not None:
+                            logger.log_image_file("backend/final_kf_depth", depth_path)
+                    except Exception as exc:
+                        self.mapper.stats.notes.append(
+                            f"frame {keyframe.frame_id}: final keyframe render save failed: {exc!r}"
+                        )
+                artifacts["final_keyframe_render_count"] = int(saved)
+            if bool(results_cfg.get("save_skybox_previews", False)) and self.map.has_skybox:
+                try:
+                    sky_dir = output_dir / "skybox"
+                    sky_dir.mkdir(parents=True, exist_ok=True)
+                    preview = self.map.skybox_erp_preview(
+                        height=int(results_cfg.get("skybox_preview_height", 256)),
+                        width=int(results_cfg.get("skybox_preview_width", 512)),
+                    )
+                    if preview is not None:
+                        preview_path = sky_dir / "final_erp_preview.png"
+                        _image_tensor_to_pil(preview).save(preview_path)
+                        artifacts["final_skybox_erp_preview"] = str(preview_path)
+                        logger.log_image_file("skybox/final_erp_preview", preview_path)
+                    faces = self.map.get_skybox_faces
+                    if torch.is_tensor(faces):
+                        faces_path = sky_dir / "final_cubemap_faces.png"
+                        _cubemap_faces_to_pil(faces).save(faces_path)
+                        artifacts["final_skybox_faces"] = str(faces_path)
+                        logger.log_image_file("skybox/final_cubemap_faces", faces_path)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(f"final skybox preview save failed: {exc!r}")
+            return artifacts
 
         try:
             for frame in iter_sequence_frames(self.config):
@@ -1074,10 +1314,13 @@ class PanoDroidGSSlamSystem:
                     process_output(ready)
 
             final_metrics = self.mapper.finalize_optimization()
+            if decision_file is not None:
+                decision_file.close()
             final_backend_traj = logger.log_final_backend_trajectory(
                 self.mapper.refined_keyframe_poses(),
                 step=frame_count,
             )
+            final_artifacts = save_final_artifacts()
             dense_ba_summary = _summarize_dense_ba_stats(self.frontend)
             summary = {
                 "frames": frame_count,
@@ -1092,10 +1335,15 @@ class PanoDroidGSSlamSystem:
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_final_metrics": final_metrics,
                 "backend_final_trajectory_png": final_backend_traj,
+                "artifacts": final_artifacts,
                 "dense_ba": dense_ba_summary,
                 **_flatten_dense_ba_summary(dense_ba_summary),
                 "wandb_run_url": logger.run_url,
+                "wandb_mode": logger.wandb_mode,
+                "wandb_init_error": logger.wandb_init_error,
                 "visualization_dir": str(logger.visualization_dir) if logger.save_local else None,
+                "keyframe_decisions_path": str(decision_path) if decision_logging_enabled else None,
+                "keyframe_decision_count": int(keyframe_decision_count),
                 "notes": self.mapper.stats.notes,
             }
             with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -1103,6 +1351,8 @@ class PanoDroidGSSlamSystem:
             logger.finish(summary)
             return summary
         except BaseException as exc:
+            if decision_file is not None and not decision_file.closed:
+                decision_file.close()
             logger.finish({"failed": True, "error": repr(exc)})
             raise
 

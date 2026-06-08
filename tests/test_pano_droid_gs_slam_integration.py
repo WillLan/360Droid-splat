@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
+from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper, PanoRenderCamera
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
@@ -50,6 +50,26 @@ def test_mapper_renders_keyframe_diagnostic():
     assert diagnostic.anchor_count == 2
 
 
+def test_skybox_renders_without_anchors():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "SkyBox": {"enabled": True, "resolution": 8, "optimize": True},
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    image = torch.zeros(3, 8, 16)
+    image[1] = 0.35
+    image[2] = 1.0
+    assert gaussian_map.initialize_skybox_from_image(image, torch.eye(4))
+
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    camera = PanoRenderCamera(image_height=8, image_width=16, c2w=torch.eye(4))
+    pkg = renderer.render(camera, gaussian_map)
+
+    assert pkg["render"].shape == image.shape
+    assert float(pkg["render"][2].detach().mean()) > 0.5
+    assert float(pkg["sky_bg_alpha"].detach().mean()) > 0.9
+
+
 def test_system_runs_synthetic_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 3, "height": 16, "width": 32},
@@ -71,6 +91,7 @@ def test_system_runs_synthetic_smoke(tmp_path: Path):
     assert summary["keyframes"] >= 1
     assert summary["anchors"] > 0
     assert (tmp_path / "summary.json").is_file()
+    assert summary["keyframe_decisions_path"] is None
 
 
 def test_system_saves_keyframe_optimized_render_and_depth(tmp_path: Path):
@@ -108,3 +129,55 @@ def test_system_saves_keyframe_optimized_render_and_depth(tmp_path: Path):
     assert summary["backend_optimization_steps"] > 0
     assert any((tmp_path / "kf_renders_opt").glob("kf_*.png"))
     assert any((tmp_path / "kf_depths_opt").glob("kf_*.png"))
+
+
+def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 1, "height": 10, "width": 20},
+        "Frontend": {"keyframe_threshold": 0.0, "force_keyframe_interval": 1},
+        "Model": {"feature_dim": 16, "context_dim": 16, "hidden_dim": 16, "update_iters": 1},
+        "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Hierarchical": {"voxel_size_lis": [0.2, 0.6, 1.8]},
+        "Mapping": {
+            "max_seeds_per_keyframe": 8,
+            "min_depth_confidence": 0.0,
+            "refine_steps_per_keyframe": 0,
+            "BootstrapOptimization": {"enabled": True, "first_keyframe_steps": 1, "save_every": 1},
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "keyframe_steps": 0,
+            "non_keyframe_steps": 0,
+            "local_submap_steps": 0,
+            "sliding_window_steps": 0,
+            "final_global_steps": 0,
+            "optimize_skybox": True,
+        },
+        "SkyBox": {"enabled": True, "resolution": 8, "optimize": True},
+        "Renderer": {"allow_smoke_fallback": True},
+        "WeightsAndBiases": {"mode": "disabled"},
+        "Visualization": {"save_local": True, "save_kf_opt": True},
+        "Results": {
+            "save_dir": str(tmp_path),
+            "kf_render_format": "png",
+            "save_final_ply": True,
+            "save_final_checkpoint": True,
+            "save_final_keyframe_renders": True,
+            "save_skybox_previews": True,
+            "skybox_preview_height": 16,
+            "skybox_preview_width": 32,
+        },
+    }
+
+    summary = PanoDroidGSSlamSystem(cfg).run(max_frames=2)
+
+    assert summary["artifacts"]["final_ply"]
+    assert Path(summary["artifacts"]["final_ply"]).is_file()
+    assert Path(summary["artifacts"]["final_checkpoint"]).is_file()
+    assert summary["artifacts"]["final_keyframe_render_count"] >= 1
+    assert Path(summary["artifacts"]["final_skybox_erp_preview"]).is_file()
+    assert Path(summary["artifacts"]["final_skybox_faces"]).is_file()
+    assert any((tmp_path / "init_vis").rglob("iter_*_render.png"))

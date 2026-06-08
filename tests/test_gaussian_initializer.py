@@ -263,3 +263,27 @@ def test_novel_gaussian_insertion_updates_existing_voxel_when_global_budget_full
     assert mapper.stats.last_skipped_voxel == 1
     assert mapper.stats.last_skipped_budget == 1
     assert int(mapper.map._anchor_obs_count[0]) == before_obs + 1
+
+
+def test_novel_gaussian_insertion_uses_separate_first_keyframe_neighbor_radius():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "first_keyframe_voxel_neighbor_radius": 0,
+                "voxel_neighbor_radius": 1,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    first = _seed_batch(torch.tensor([[0.1, 0.0, 0.0], [1.1, 0.0, 0.0]]), frame_id=0)
+    assert mapper.insert_keyframe(first, _frontend_output_for_mapper(0)) == 2
+    assert mapper.map.anchor_count() == 2
+
+    near_existing = _seed_batch(torch.tensor([[2.1, 0.0, 0.0]]), frame_id=1)
+    assert mapper.insert_keyframe(near_existing, _frontend_output_for_mapper(1)) == 0
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_skipped_voxel == 1

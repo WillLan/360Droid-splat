@@ -94,9 +94,11 @@ class KeyframeAnchorConfig:
 
     enabled: bool = False
     prepend_previous_keyframe: bool = True
+    pair_confidence_mode: str = "product"
     cell_pair_conf_threshold: float = 0.25
     frame_mean_pair_conf_threshold: float = 0.30
     frame_low_pair_conf_ratio: float = 0.45
+    match_coverage_threshold: float = 0.0
     translation_threshold: float = 0.75
     translation_depth_ratio_threshold: float = 0.08
     sky_threshold: float = 0.5
@@ -219,9 +221,11 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     keyframe_anchor = KeyframeAnchorConfig(
         enabled=bool(keyframe_anchor_raw.get("enabled", False)),
         prepend_previous_keyframe=bool(keyframe_anchor_raw.get("prepend_previous_keyframe", True)),
+        pair_confidence_mode=str(keyframe_anchor_raw.get("pair_confidence_mode", "product")),
         cell_pair_conf_threshold=float(keyframe_anchor_raw.get("cell_pair_conf_threshold", 0.25)),
         frame_mean_pair_conf_threshold=float(keyframe_anchor_raw.get("frame_mean_pair_conf_threshold", 0.30)),
         frame_low_pair_conf_ratio=float(keyframe_anchor_raw.get("frame_low_pair_conf_ratio", 0.45)),
+        match_coverage_threshold=float(keyframe_anchor_raw.get("match_coverage_threshold", 0.0)),
         translation_threshold=float(keyframe_anchor_raw.get("translation_threshold", 0.75)),
         translation_depth_ratio_threshold=float(keyframe_anchor_raw.get("translation_depth_ratio_threshold", 0.08)),
         sky_threshold=float(keyframe_anchor_raw.get("sky_threshold", 0.5)),

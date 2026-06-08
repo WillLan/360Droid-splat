@@ -49,8 +49,11 @@ class _AnchorFrameMetrics:
     anchor_frame_id: int
     frame_mean_pair_conf: float
     low_pair_conf_ratio: float
+    match_coverage: float
+    pair_conf_quantiles: dict[str, float]
     pair_confidence: torch.Tensor
     low_pair_conf: torch.Tensor
+    matched_cells: torch.Tensor
     non_sky: torch.Tensor
     anchor_pose_c2w: torch.Tensor
 
@@ -142,6 +145,37 @@ def _scatter_feature_values(
     return out
 
 
+def _scatter_feature_values_and_mask(
+    uv: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    feature_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.zeros(1, int(feature_hw[0]), int(feature_hw[1]), device=values.device, dtype=values.dtype)
+    seen = torch.zeros(1, int(feature_hw[0]), int(feature_hw[1]), device=values.device, dtype=torch.bool)
+    if uv.numel() == 0:
+        return out, seen
+    x = (uv[:, 0] - 0.5).round().long().clamp(0, int(feature_hw[1]) - 1)
+    y = (uv[:, 1] - 0.5).round().long().clamp(0, int(feature_hw[0]) - 1)
+    out[0, y, x] = values.reshape(-1).to(out)
+    seen[0, y, x] = True
+    return out, seen
+
+
+def _quantiles(values: torch.Tensor) -> dict[str, float]:
+    if values.numel() == 0:
+        return {}
+    vals = values.detach().float().reshape(-1).cpu()
+    qs = torch.quantile(vals, torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90]))
+    return {
+        "p10": float(qs[0]),
+        "p25": float(qs[1]),
+        "p50": float(qs[2]),
+        "p75": float(qs[3]),
+        "p90": float(qs[4]),
+    }
+
+
 class PanoVGGTLongTracker(PanoDROIDFrontend):
     """Chunked PanoVGGT tracker with overlap alignment and delayed emission."""
 
@@ -217,6 +251,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
         self.last_m3_debug: dict | None = None
+        self.keyframe_decision_history: list[dict] = []
+        self._pending_keyframe_decisions: list[dict] = []
 
     @property
     def keyframe_anchor_enabled(self) -> bool:
@@ -242,6 +278,11 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     def pop_ready_outputs(self) -> list[FrontendOutput]:
         out = self.pending_outputs
         self.pending_outputs = []
+        return out
+
+    def pop_keyframe_decisions(self) -> list[dict]:
+        out = self._pending_keyframe_decisions
+        self._pending_keyframe_decisions = []
         return out
 
     def flush(self) -> list[FrontendOutput]:
@@ -521,33 +562,57 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 continue
             src_conf = _sample_feature_map(pred_full.match_confidence[src_full : src_full + 1], factor.src_uv)[:, 0]
             tgt_conf = _sample_feature_map(pred_full.match_confidence[int(factor.tgt) : int(factor.tgt) + 1], factor.tgt_uv)[:, 0]
-            pair_conf = (factor.match_score.to(src_conf) * src_conf * tgt_conf).clamp(0.0, 1.0)
+            match_score = factor.match_score.to(src_conf).clamp(0.0, 1.0)
+            src_conf = src_conf.clamp(0.0, 1.0)
+            tgt_conf = tgt_conf.clamp(0.0, 1.0)
+            mode = str(self.m3_config.keyframe_anchor.pair_confidence_mode).lower()
+            if mode in {"geometric_mean", "geomean", "geom"}:
+                pair_conf = (match_score * src_conf * tgt_conf).clamp_min(1.0e-8).pow(1.0 / 3.0)
+            elif mode in {"min", "minimum"}:
+                pair_conf = torch.minimum(match_score, torch.minimum(src_conf, tgt_conf))
+            elif mode in {"match_score", "score"}:
+                pair_conf = match_score
+            else:
+                pair_conf = match_score * src_conf * tgt_conf
+            pair_conf = pair_conf.clamp(0.0, 1.0)
             ok = torch.isfinite(pair_conf)
+            if torch.is_tensor(factor.valid_mask) and factor.valid_mask.numel() == pair_conf.numel():
+                ok = ok & factor.valid_mask.to(device=pair_conf.device).bool().reshape(-1)
             for key in ("fb_pass_mask", "depth_consistency_mask"):
                 value = factor.metadata.get(key)
                 if torch.is_tensor(value) and value.numel() == pair_conf.numel():
                     ok = ok & value.to(device=pair_conf.device).bool().reshape(-1)
-            pair_conf = torch.where(ok, pair_conf, torch.zeros_like(pair_conf))
-            pair_map = _scatter_feature_values(factor.src_uv.to(pair_conf.device), pair_conf, feature_hw=feature_hw)
+            valid_uv = factor.src_uv.to(pair_conf.device)[ok]
+            valid_pair = pair_conf[ok]
+            pair_map, matched_cells = _scatter_feature_values_and_mask(valid_uv, valid_pair, feature_hw=feature_hw)
 
             sky = pred_full.sky_prob[src_full].detach().to(pair_map)
             non_sky = (sky <= float(self.m3_config.keyframe_anchor.sky_threshold)).float()
-            low_pair = pair_map < float(self.m3_config.keyframe_anchor.cell_pair_conf_threshold)
-            valid_cells = non_sky > 0.5
+            low_pair = (pair_map < float(self.m3_config.keyframe_anchor.cell_pair_conf_threshold)) & matched_cells
+            non_sky_cells = non_sky > 0.5
+            valid_cells = non_sky_cells & matched_cells
             if bool(valid_cells.any()):
                 values = pair_map[valid_cells]
                 mean_pair = float(values.mean().detach().cpu())
                 low_ratio = float(low_pair[valid_cells].float().mean().detach().cpu())
+                pair_quantiles = _quantiles(values)
             else:
                 mean_pair = 1.0
                 low_ratio = 0.0
+                pair_quantiles = {}
+            non_sky_count = int(non_sky_cells.sum().detach().cpu())
+            matched_count = int((non_sky_cells & matched_cells).sum().detach().cpu())
+            match_coverage = float(matched_count / max(1, non_sky_count))
             out[local_idx] = _AnchorFrameMetrics(
                 anchor_frame_id=int(anchor_context.record.frame_id),
                 frame_mean_pair_conf=mean_pair,
                 low_pair_conf_ratio=low_ratio,
+                match_coverage=match_coverage,
+                pair_conf_quantiles=pair_quantiles,
                 pair_confidence=pair_map.detach(),
                 low_pair_conf=low_pair.detach(),
-                non_sky=valid_cells.detach(),
+                matched_cells=matched_cells.detach(),
+                non_sky=non_sky_cells.detach(),
                 anchor_pose_c2w=anchor_context.record.pose_c2w.detach(),
             )
         return out
@@ -694,7 +759,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         prev_pose = self.pose_by_frame.get(frame_id - 1)
         relative = None if prev_pose is None else _relative_from_c2w(prev_pose.unsqueeze(0), pose.unsqueeze(0))[0]
         key_score = float(confidence.mean().detach().cpu())
-        is_keyframe = self._decide_keyframe(
+        is_keyframe, decision = self._decide_keyframe(
             frame_id=frame_id,
             pose=pose,
             inverse_depth=inverse_depth,
@@ -702,6 +767,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             key_score=key_score,
             anchor_metrics=anchor_metrics,
         )
+        if self.keyframe_anchor_enabled:
+            self._record_keyframe_decision(decision)
         output_valid = valid_world_points_mask
         output_world_confidence = confidence
         if self.novel_insertion_enabled and self.keyframe_anchor_enabled and is_keyframe:
@@ -747,22 +814,64 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         confidence: torch.Tensor,
         key_score: float,
         anchor_metrics: _AnchorFrameMetrics | None,
-    ) -> bool:
+    ) -> tuple[bool, dict]:
+        last_keyframe_id = int(self.last_keyframe_id) if self.last_keyframe_id is not None else None
         if not self.keyframe_anchor_enabled:
             gap = (
                 int(frame_id) - int(self.last_keyframe_id)
                 if self.last_keyframe_id is not None
                 else self.force_keyframe_interval
             )
-            return bool(key_score >= self.keyframe_threshold or gap >= self.force_keyframe_interval)
+            reasons = []
+            if key_score >= self.keyframe_threshold:
+                reasons.append("key_score")
+            if gap >= self.force_keyframe_interval:
+                reasons.append("force_keyframe_interval")
+            accepted = bool(reasons)
+            return accepted, {
+                "frame_id": int(frame_id),
+                "last_keyframe_id": last_keyframe_id,
+                "accepted": accepted,
+                "reasons": reasons,
+                "keyframe_score": float(key_score),
+                "legacy_gap": int(gap),
+            }
         if self.last_keyframe_id is None:
-            return True
+            return True, {
+                "frame_id": int(frame_id),
+                "last_keyframe_id": None,
+                "accepted": True,
+                "reasons": ["first_frame"],
+                "keyframe_score": float(key_score),
+            }
         cfg = self.m3_config.keyframe_anchor
+        reasons: list[str] = []
+        decision: dict = {
+            "frame_id": int(frame_id),
+            "last_keyframe_id": last_keyframe_id,
+            "accepted": False,
+            "reasons": reasons,
+            "keyframe_score": float(key_score),
+        }
         if anchor_metrics is not None:
+            decision.update(
+                {
+                    "anchor_frame_id": int(anchor_metrics.anchor_frame_id),
+                    "frame_mean_pair_conf": float(anchor_metrics.frame_mean_pair_conf),
+                    "low_pair_conf_ratio": float(anchor_metrics.low_pair_conf_ratio),
+                    "match_coverage": float(anchor_metrics.match_coverage),
+                    "pair_conf_quantiles": dict(anchor_metrics.pair_conf_quantiles),
+                }
+            )
             if float(anchor_metrics.frame_mean_pair_conf) <= float(cfg.frame_mean_pair_conf_threshold):
-                return True
+                reasons.append("low_mean_pair_conf")
             if float(anchor_metrics.low_pair_conf_ratio) >= float(cfg.frame_low_pair_conf_ratio):
-                return True
+                reasons.append("high_low_pair_conf_ratio")
+            if (
+                float(cfg.match_coverage_threshold) > 0.0
+                and float(anchor_metrics.match_coverage) <= float(cfg.match_coverage_threshold)
+            ):
+                reasons.append("low_match_coverage")
             anchor_pose = anchor_metrics.anchor_pose_c2w.to(device=pose.device, dtype=pose.dtype)
         elif self.last_keyframe_anchor is not None:
             anchor_pose = self.last_keyframe_anchor.pose_c2w.to(device=pose.device, dtype=pose.dtype)
@@ -771,15 +880,28 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         if anchor_pose is not None and anchor_pose.shape == (4, 4):
             translation = torch.linalg.norm(pose[:3, 3] - anchor_pose[:3, 3])
             translation_value = float(translation.detach().cpu())
+            decision["translation_delta"] = translation_value
             if translation_value >= float(cfg.translation_threshold):
-                return True
+                reasons.append("translation")
             depth = inverse_depth.detach().float().clamp_min(1.0e-6).reciprocal()
             valid_depth = depth[torch.isfinite(depth)]
             if valid_depth.numel() > 0:
                 median_depth = float(valid_depth.median().detach().cpu())
+                decision["median_depth"] = median_depth
                 if median_depth > 1.0e-6 and translation_value / median_depth >= float(cfg.translation_depth_ratio_threshold):
-                    return True
-        return False
+                    decision["translation_depth_ratio"] = float(translation_value / median_depth)
+                    reasons.append("translation_depth_ratio")
+                elif median_depth > 1.0e-6:
+                    decision["translation_depth_ratio"] = float(translation_value / median_depth)
+        accepted = bool(reasons)
+        decision["accepted"] = accepted
+        return accepted, decision
+
+    def _record_keyframe_decision(self, decision: dict) -> None:
+        serializable = dict(decision)
+        serializable["reasons"] = list(serializable.get("reasons", []))
+        self.keyframe_decision_history.append(serializable)
+        self._pending_keyframe_decisions.append(serializable)
 
     def _novel_world_mask_and_confidence(
         self,
@@ -850,6 +972,7 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
     pano_cfg = config.get("PanoVGGT", {})
     mapping_cfg = config.get("Mapping", {})
     novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
+    m3_enabled = bool((pano_cfg.get("M3Sphere", {}) or {}).get("enabled", False)) if isinstance(pano_cfg, dict) else False
     return PanoVGGTLongTracker(
         engine_config=pano_cfg,
         chunk_size=int(pano_cfg.get("chunk_size", 8)),
@@ -867,5 +990,5 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         max_scale_jump=float(pano_cfg.get("max_scale_jump", 2.0)),
         require_aligned_world_points=bool(pano_cfg.get("require_aligned_world_points", True)),
         emit_unaligned=bool(pano_cfg.get("emit_unaligned", False)),
-        novel_insertion_enabled=bool(novel_cfg.get("enabled", False)),
+        novel_insertion_enabled=bool(novel_cfg.get("enabled", m3_enabled)),
     )

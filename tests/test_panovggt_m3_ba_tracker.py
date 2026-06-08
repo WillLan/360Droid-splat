@@ -460,6 +460,7 @@ def test_tracker_disabled_path_status_unchanged():
     assert all(out.tracking_status == "tracked_panovggt_long" for out in outputs)
     assert tracker.last_dense_ba_stats is not None
     assert tracker.last_dense_ba_stats.enabled is False
+    assert tracker.pop_keyframe_decisions() == []
 
 
 def test_keyframe_anchor_prepends_previous_keyframe_after_first_chunk():
@@ -506,6 +507,9 @@ def test_low_pair_confidence_triggers_keyframe_and_novel_mask_filters_sky():
     assert bool(mask[0, 1, 1])
     assert outputs[0].world_points_confidence is not None
     assert outputs[0].world_points_confidence[0, 1, 1] > 0.5
+    decisions = tracker.pop_keyframe_decisions()
+    assert any(item.get("accepted") and "frame_mean_pair_conf" in item for item in decisions)
+    assert any("pair_conf_quantiles" in item for item in decisions)
 
 
 def test_high_pair_confidence_and_small_translation_does_not_trigger_keyframe():
