@@ -53,8 +53,10 @@ PanoVGGT:
     frame_mean_pair_conf_threshold: 0.38
     frame_low_pair_conf_ratio: 0.75
     match_coverage_threshold: 0.0
-    translation_threshold: 1.5
-    translation_depth_ratio_threshold: 0.15
+    translation_threshold: 2.0
+    translation_depth_ratio_threshold: 0.30
+    min_keyframe_interval: 4
+    max_keyframe_interval: 12
     sky_threshold: 0.5
 
   MatchingHead:
@@ -130,12 +132,12 @@ Training:
   pfgs360_distloss: false
 
 Hierarchical:
-  voxel_size_lis: [0.12, 0.45, 1.8]
+  voxel_size_lis: [0.06, 0.18, 0.6]
 
 Mapping:
   seed_source: world_points_only
   max_seeds_per_keyframe: 0
-  min_depth_confidence: 0.2
+  min_depth_confidence: 0.08
   sky_mask_enable: true
   sky_mask_top_ratio: 0.58
   sky_mask_min_blue: 0.35
@@ -147,11 +149,15 @@ Mapping:
   refine_steps_per_keyframe: 0
   NovelGaussianInsertion:
     enabled: true
-    first_keyframe_max_seeds: 80000
-    keyframe_max_seeds: 30000
-    global_anchor_budget: 1500000
+    first_keyframe_max_seeds: 160000
+    keyframe_max_seeds: 60000
+    global_anchor_budget: 3000000
     first_keyframe_voxel_neighbor_radius: 0
     voxel_neighbor_radius: 0
+    pair_conf_insert_threshold: 0.985
+    insert_confidence_floor: 0.20
+    spatial_cell_size: 8
+    max_seeds_per_cell: 2
 
   BootstrapOptimization:
     enabled: true

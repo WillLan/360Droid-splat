@@ -148,6 +148,45 @@ def _quantiles(values: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _limit_mask_per_cell(
+    mask: torch.Tensor,
+    score: torch.Tensor,
+    *,
+    cell_size: int,
+    max_per_cell: int,
+) -> torch.Tensor:
+    if int(cell_size) <= 0 or int(max_per_cell) <= 0:
+        return mask.bool()
+    mask_t = mask.bool()
+    if mask_t.ndim == 2:
+        mask_t = mask_t.unsqueeze(0)
+    if mask_t.ndim != 3 or int(mask_t.shape[0]) != 1:
+        raise ValueError(f"mask must have shape HxW or 1xHxW, got {tuple(mask.shape)}.")
+    score_t = score.detach().float()
+    if score_t.ndim == 2:
+        score_t = score_t.unsqueeze(0)
+    if tuple(score_t.shape) != tuple(mask_t.shape):
+        raise ValueError(f"score shape {tuple(score.shape)} does not match mask shape {tuple(mask_t.shape)}.")
+    _, height, width = mask_t.shape
+    out = torch.zeros_like(mask_t)
+    cell = max(1, int(cell_size))
+    k = max(1, int(max_per_cell))
+    for y0 in range(0, int(height), cell):
+        y1 = min(int(height), y0 + cell)
+        for x0 in range(0, int(width), cell):
+            x1 = min(int(width), x0 + cell)
+            ys, xs = torch.nonzero(mask_t[0, y0:y1, x0:x1], as_tuple=True)
+            if ys.numel() == 0:
+                continue
+            if ys.numel() > k:
+                cell_scores = score_t[0, y0 + ys, x0 + xs]
+                _, order = torch.topk(cell_scores, k=k, largest=True)
+                ys = ys.index_select(0, order)
+                xs = xs.index_select(0, order)
+            out[0, y0 + ys, x0 + xs] = True
+    return out
+
+
 class PanoVGGTLongTracker(PanoDROIDFrontend):
     """Chunked PanoVGGT tracker with overlap alignment and delayed emission."""
 
@@ -173,6 +212,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         require_aligned_world_points: bool = True,
         emit_unaligned: bool = False,
         novel_insertion_enabled: bool = False,
+        novel_pair_conf_insert_threshold: float = 0.0,
+        novel_insert_confidence_floor: float = 0.0,
+        novel_spatial_cell_size: int = 0,
+        novel_max_seeds_per_cell: int = 0,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.chunk_size = max(1, int(chunk_size))
@@ -186,6 +229,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.require_aligned_world_points = bool(require_aligned_world_points)
         self.emit_unaligned = bool(emit_unaligned)
         self.novel_insertion_enabled = bool(novel_insertion_enabled)
+        self.novel_pair_conf_insert_threshold = float(novel_pair_conf_insert_threshold)
+        self.novel_insert_confidence_floor = float(novel_insert_confidence_floor)
+        self.novel_spatial_cell_size = max(0, int(novel_spatial_cell_size))
+        self.novel_max_seeds_per_cell = max(0, int(novel_max_seeds_per_cell))
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
         self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
         self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
@@ -932,12 +979,14 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             }
         cfg = self.m3_config.keyframe_anchor
         reasons: list[str] = []
+        keyframe_gap = int(frame_id) - int(self.last_keyframe_id)
         decision: dict = {
             "frame_id": int(frame_id),
             "last_keyframe_id": last_keyframe_id,
             "accepted": False,
             "reasons": reasons,
             "keyframe_score": float(key_score),
+            "keyframe_gap": int(keyframe_gap),
         }
         if anchor_metrics is not None:
             decision.update(
@@ -979,6 +1028,17 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     reasons.append("translation_depth_ratio")
                 elif median_depth > 1.0e-6:
                     decision["translation_depth_ratio"] = float(translation_value / median_depth)
+        min_interval = max(0, int(cfg.min_keyframe_interval))
+        max_interval = max(0, int(cfg.max_keyframe_interval))
+        quality_reasons = {"low_mean_pair_conf", "high_low_pair_conf_ratio", "low_match_coverage"}
+        if min_interval > 0 and keyframe_gap < min_interval and not any(r in quality_reasons for r in reasons):
+            decision["suppressed_by_min_keyframe_interval"] = True
+            decision["suppressed_reasons"] = list(reasons)
+            decision["min_keyframe_interval"] = int(min_interval)
+            reasons.clear()
+        if max_interval > 0 and keyframe_gap >= max_interval and not reasons:
+            reasons.append("max_keyframe_interval")
+            decision["max_keyframe_interval"] = int(max_interval)
         accepted = bool(reasons)
         decision["accepted"] = accepted
         return accepted, decision
@@ -1016,13 +1076,28 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             return valid & non_sky.to(valid.device), world_conf.clamp(0.0, 1.0)
         if anchor_metrics is None:
             return torch.zeros_like(valid), torch.zeros_like(confidence)
-        low_pair = _resize_nearest(anchor_metrics.low_pair_conf.float(), image_size) > 0.5
         non_sky_source = non_sky_feature if non_sky_feature is not None else anchor_metrics.non_sky
+        low_pair = _resize_nearest(anchor_metrics.low_pair_conf.float(), image_size) > 0.5
         non_sky = _resize_nearest(non_sky_source.float(), image_size) > 0.5
         pair_conf = _resize_nearest(anchor_metrics.pair_confidence.float(), image_size).clamp(0.0, 1.0)
         sky_weight = _resize_nearest(non_sky_source.float(), image_size).clamp(0.0, 1.0)
+        candidate = low_pair.to(device=valid.device) & non_sky.to(device=valid.device)
+        if self.novel_pair_conf_insert_threshold > 0.0:
+            loose_pair = pair_conf <= float(self.novel_pair_conf_insert_threshold)
+            candidate = candidate | (loose_pair.to(device=valid.device) & non_sky.to(device=valid.device))
         world_conf = (1.0 - pair_conf.to(confidence)) * sky_weight.to(confidence)
-        return valid & low_pair.to(valid.device) & non_sky.to(valid.device), world_conf.clamp(0.0, 1.0)
+        if self.novel_insert_confidence_floor > 0.0:
+            floor = torch.full_like(world_conf, float(self.novel_insert_confidence_floor))
+            world_conf = torch.where(candidate.to(device=world_conf.device), torch.maximum(world_conf, floor), world_conf)
+        candidate = valid & candidate
+        if self.novel_spatial_cell_size > 0 and self.novel_max_seeds_per_cell > 0:
+            candidate = _limit_mask_per_cell(
+                candidate,
+                world_conf.to(device=candidate.device),
+                cell_size=self.novel_spatial_cell_size,
+                max_per_cell=self.novel_max_seeds_per_cell,
+            ).to(device=valid.device)
+        return candidate, world_conf.clamp(0.0, 1.0)
 
     def _chunk_descriptor(self, pred: PanoVGGTLocalPrediction, images: torch.Tensor) -> torch.Tensor:
         if pred.descriptors is not None and pred.descriptors.numel() > 0:
@@ -1079,4 +1154,8 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         require_aligned_world_points=bool(pano_cfg.get("require_aligned_world_points", True)),
         emit_unaligned=bool(pano_cfg.get("emit_unaligned", False)),
         novel_insertion_enabled=bool(novel_cfg.get("enabled", m3_enabled)),
+        novel_pair_conf_insert_threshold=float(novel_cfg.get("pair_conf_insert_threshold", 0.0)),
+        novel_insert_confidence_floor=float(novel_cfg.get("insert_confidence_floor", 0.0)),
+        novel_spatial_cell_size=int(novel_cfg.get("spatial_cell_size", 0)),
+        novel_max_seeds_per_cell=int(novel_cfg.get("max_seeds_per_cell", 0)),
     )

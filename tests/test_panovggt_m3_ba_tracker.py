@@ -441,8 +441,8 @@ def _feed_two_frames(tracker: PanoVGGTLongTracker):
     return tracker.pop_ready_outputs()
 
 
-def _anchor_cfg() -> dict:
-    return {
+def _anchor_cfg(anchor_overrides: dict | None = None) -> dict:
+    cfg = {
         "PanoVGGT": {
             "M3Sphere": {"enabled": True},
             "KeyframeAnchor": {
@@ -467,10 +467,20 @@ def _anchor_cfg() -> dict:
             "DenseBA": {"enabled": False},
         }
     }
+    if anchor_overrides:
+        cfg["PanoVGGT"]["KeyframeAnchor"].update(anchor_overrides)
+    return cfg
 
 
-def _tracker_for_anchor_tests(engine: _RecordingAnchorEngine, *, novel: bool = True) -> PanoVGGTLongTracker:
-    cfg = _anchor_cfg()
+def _tracker_for_anchor_tests(
+    engine: _RecordingAnchorEngine,
+    *,
+    novel: bool = True,
+    anchor_overrides: dict | None = None,
+    novel_insert_options: dict | None = None,
+) -> PanoVGGTLongTracker:
+    cfg = _anchor_cfg(anchor_overrides)
+    novel_insert_options = novel_insert_options or {}
     tracker = PanoVGGTLongTracker(
         engine=engine,
         engine_config=cfg["PanoVGGT"],
@@ -482,6 +492,7 @@ def _tracker_for_anchor_tests(engine: _RecordingAnchorEngine, *, novel: bool = T
         require_aligned_world_points=False,
         emit_unaligned=True,
         novel_insertion_enabled=novel,
+        **novel_insert_options,
     )
 
     def fake_align(aligned_pred, frame_ids):
@@ -583,6 +594,93 @@ def test_large_translation_triggers_keyframe_even_with_high_pair_confidence():
     mask = outputs[0].valid_world_points_mask
     assert mask is not None
     assert not bool(mask.any())
+
+
+def test_keyframe_anchor_min_interval_suppresses_motion_only_keyframe():
+    tracker = _tracker_for_anchor_tests(
+        _RecordingAnchorEngine(),
+        anchor_overrides={
+            "min_keyframe_interval": 4,
+            "translation_threshold": 0.1,
+            "translation_depth_ratio_threshold": 0.01,
+        },
+    )
+    tracker.last_keyframe_id = 0
+    tracker.last_keyframe_anchor = SimpleNamespace(
+        frame_id=0,
+        image=torch.zeros(3, 2, 4),
+        pose_c2w=torch.eye(4),
+    )
+    pose = torch.eye(4)
+    pose[0, 3] = 1.0
+
+    accepted, decision = tracker._decide_keyframe(
+        frame_id=2,
+        pose=pose,
+        inverse_depth=torch.ones(1, 2, 4),
+        confidence=torch.ones(1, 2, 4),
+        key_score=1.0,
+        anchor_metrics=None,
+    )
+
+    assert not accepted
+    assert decision["keyframe_gap"] == 2
+    assert decision["suppressed_by_min_keyframe_interval"] is True
+    assert "translation_depth_ratio" in decision["suppressed_reasons"]
+
+
+def test_keyframe_anchor_max_interval_forces_keyframe():
+    tracker = _tracker_for_anchor_tests(
+        _RecordingAnchorEngine(),
+        anchor_overrides={"max_keyframe_interval": 4, "translation_threshold": 10.0, "translation_depth_ratio_threshold": 10.0},
+    )
+    tracker.last_keyframe_id = 0
+    tracker.last_keyframe_anchor = SimpleNamespace(
+        frame_id=0,
+        image=torch.zeros(3, 2, 4),
+        pose_c2w=torch.eye(4),
+    )
+
+    accepted, decision = tracker._decide_keyframe(
+        frame_id=4,
+        pose=torch.eye(4),
+        inverse_depth=torch.ones(1, 2, 4),
+        confidence=torch.ones(1, 2, 4),
+        key_score=1.0,
+        anchor_metrics=None,
+    )
+
+    assert accepted
+    assert decision["reasons"] == ["max_keyframe_interval"]
+
+
+def test_novel_insert_pair_threshold_adds_spatially_limited_candidates():
+    tracker = _tracker_for_anchor_tests(
+        _RecordingAnchorEngine(),
+        novel_insert_options={
+            "novel_pair_conf_insert_threshold": 0.95,
+            "novel_insert_confidence_floor": 0.2,
+            "novel_spatial_cell_size": 2,
+            "novel_max_seeds_per_cell": 1,
+        },
+    )
+    anchor_metrics = SimpleNamespace(
+        pair_confidence=torch.full((1, 2, 4), 0.90),
+        low_pair_conf=torch.zeros(1, 2, 4, dtype=torch.bool),
+        non_sky=torch.ones(1, 2, 4, dtype=torch.bool),
+    )
+
+    mask, conf = tracker._novel_world_mask_and_confidence(
+        valid_world_points_mask=torch.ones(1, 4, 8, dtype=torch.bool),
+        confidence=torch.ones(1, 4, 8),
+        image_size=(4, 8),
+        anchor_metrics=anchor_metrics,
+        sky_prob=None,
+        first_keyframe=False,
+    )
+
+    assert int(mask.sum()) == 8
+    assert float(conf[mask].min()) >= 0.2
 
 
 def test_tracker_shadow_mode_runs_ba_but_alignment_receives_original_prediction():

@@ -109,6 +109,8 @@ class KeyframeAnchorConfig:
     match_coverage_threshold: float = 0.0
     translation_threshold: float = 0.75
     translation_depth_ratio_threshold: float = 0.08
+    min_keyframe_interval: int = 0
+    max_keyframe_interval: int = 0
     sky_threshold: float = 0.5
 
 
@@ -240,6 +242,14 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         match_coverage_threshold=float(keyframe_anchor_raw.get("match_coverage_threshold", 0.0)),
         translation_threshold=float(keyframe_anchor_raw.get("translation_threshold", 0.75)),
         translation_depth_ratio_threshold=float(keyframe_anchor_raw.get("translation_depth_ratio_threshold", 0.08)),
+        min_keyframe_interval=_nonnegative_int(
+            keyframe_anchor_raw.get("min_keyframe_interval", 0),
+            name="PanoVGGT.KeyframeAnchor.min_keyframe_interval",
+        ),
+        max_keyframe_interval=_nonnegative_int(
+            keyframe_anchor_raw.get("max_keyframe_interval", 0),
+            name="PanoVGGT.KeyframeAnchor.max_keyframe_interval",
+        ),
         sky_threshold=float(keyframe_anchor_raw.get("sky_threshold", 0.5)),
     )
     inference_window = InferenceWindowConfig(
