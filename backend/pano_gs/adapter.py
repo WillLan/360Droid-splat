@@ -29,6 +29,7 @@ class PanoRenderCamera:
 
 
 RenderPackage = dict[str, torch.Tensor | None]
+SH_C0 = 0.28209479177387814
 
 
 def _optional_gsplat360(extra_roots: list[str] | None = None):
@@ -178,12 +179,13 @@ class PFGS360Renderer:
             device=device,
             dtype=dtype,
         )
+        colors_sh = ((gaussians.get_features - 0.5) / SH_C0).unsqueeze(1)
         render, alpha, render_distort, info = rasterization(
             means=xyz,
             quats=gaussians.get_rotation,
             scales=gaussians.get_scaling,
             opacities=gaussians.get_opacity.squeeze(-1),
-            colors=gaussians.get_features,
+            colors=colors_sh,
             viewmats=viewmat.unsqueeze(0),
             Ks=K.unsqueeze(0),
             width=W,

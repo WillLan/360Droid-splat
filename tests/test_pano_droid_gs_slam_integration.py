@@ -177,7 +177,7 @@ def test_pano_gaussian_map_saves_legacy_3dgs_ply_schema(tmp_path: Path):
     assert ply_path.stat().st_size > len(header)
 
 
-def test_pfgs360_renderer_passes_direct_rgb_colors_to_rasterizer():
+def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
     gaussian_map = PanoGaussianMap(config=config, device="cpu")
     seeds = GaussianSeedBatch(
@@ -201,7 +201,8 @@ def test_pfgs360_renderer_passes_direct_rgb_colors_to_rasterizer():
         device = colors.device
         dtype = colors.dtype
         render = torch.zeros(1, height, width, 4, device=device, dtype=dtype)
-        render[0, :, :, :3] = colors.mean(dim=0).view(1, 1, 3)
+        rgb = colors[:, 0, :] * 0.28209479177387814 + 0.5
+        render[0, :, :, :3] = rgb.mean(dim=0).view(1, 1, 3)
         render[0, :, :, 3] = 1.0
         alpha = torch.ones(1, height, width, 1, device=device, dtype=dtype)
         info = {
@@ -215,8 +216,9 @@ def test_pfgs360_renderer_passes_direct_rgb_colors_to_rasterizer():
     camera = PanoRenderCamera(image_height=4, image_width=8, c2w=torch.eye(4))
     pkg = renderer._render_gsplat360(fake_rasterization, camera, gaussian_map, torch.zeros(3))
 
-    assert seen["colors_shape"] == (2, 3)
-    assert torch.allclose(seen["colors"], gaussian_map.get_features.detach())
+    expected_sh = ((gaussian_map.get_features.detach() - 0.5) / 0.28209479177387814).unsqueeze(1)
+    assert seen["colors_shape"] == (2, 1, 3)
+    assert torch.allclose(seen["colors"], expected_sh)
     assert seen["sh_degree"] == gaussian_map.active_sh_degree
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
 
