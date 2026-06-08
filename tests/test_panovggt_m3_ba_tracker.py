@@ -463,8 +463,8 @@ def test_tracker_disabled_path_status_unchanged():
     assert tracker.pop_keyframe_decisions() == []
 
 
-def test_keyframe_anchor_prepends_previous_keyframe_after_first_chunk():
-    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0))
+def test_keyframe_anchor_uses_sidepath_without_prepending_main_forward():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 1.0))
     tracker = _tracker_for_anchor_tests(engine)
 
     _feed_two_frames(tracker)
@@ -472,7 +472,7 @@ def test_keyframe_anchor_prepends_previous_keyframe_after_first_chunk():
         tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
     tracker.pop_ready_outputs()
 
-    assert engine.batch_sizes == [2, 3]
+    assert engine.batch_sizes == [2, 2, 3]
 
 
 def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
@@ -491,7 +491,7 @@ def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
 
 
 def test_low_pair_confidence_triggers_keyframe_and_novel_mask_filters_sky():
-    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 0.1), sky_high_cell=(0, 0))
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 0.1), sky_high_cell=(0, 0))
     tracker = _tracker_for_anchor_tests(engine)
 
     first = _feed_two_frames(tracker)
@@ -513,7 +513,7 @@ def test_low_pair_confidence_triggers_keyframe_and_novel_mask_filters_sky():
 
 
 def test_high_pair_confidence_and_small_translation_does_not_trigger_keyframe():
-    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0), translation_by_call=(0.0, 0.01))
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 1.0), translation_by_call=(0.0, 0.01, 0.01))
     tracker = _tracker_for_anchor_tests(engine)
 
     _feed_two_frames(tracker)
@@ -526,7 +526,7 @@ def test_high_pair_confidence_and_small_translation_does_not_trigger_keyframe():
 
 
 def test_large_translation_triggers_keyframe_even_with_high_pair_confidence():
-    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0), translation_by_call=(0.0, 1.0))
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 1.0), translation_by_call=(0.0, 1.0, 1.0))
     tracker = _tracker_for_anchor_tests(engine)
 
     _feed_two_frames(tracker)

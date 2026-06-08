@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -83,35 +83,6 @@ def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
         mode="bilinear",
         align_corners=False,
     )[0].permute(1, 2, 0)
-
-
-def _slice_prediction(pred: PanoVGGTLocalPrediction, indices: torch.Tensor) -> PanoVGGTLocalPrediction:
-    """Return a frame-subset prediction while preserving per-prediction metadata."""
-
-    count = int(pred.poses_c2w.shape[0])
-
-    def maybe_slice(value: torch.Tensor | None) -> torch.Tensor | None:
-        if value is None:
-            return None
-        if value.ndim > 0 and int(value.shape[0]) == count:
-            return value.index_select(0, indices.to(device=value.device))
-        return value
-
-    return replace(
-        pred,
-        poses_c2w=pred.poses_c2w.index_select(0, indices.to(device=pred.poses_c2w.device)),
-        depth=pred.depth.index_select(0, indices.to(device=pred.depth.device)),
-        confidence=pred.confidence.index_select(0, indices.to(device=pred.confidence.device)),
-        chunk_world_points=pred.chunk_world_points.index_select(0, indices.to(device=pred.chunk_world_points.device)),
-        local_points=maybe_slice(pred.local_points),
-        global_points=maybe_slice(pred.global_points),
-        descriptors=maybe_slice(pred.descriptors),
-        dense_descriptors=maybe_slice(pred.dense_descriptors),
-        match_confidence=maybe_slice(pred.match_confidence),
-        static_confidence=maybe_slice(pred.static_confidence),
-        sky_logits=maybe_slice(pred.sky_logits),
-        sky_prob=maybe_slice(pred.sky_prob),
-    )
 
 
 def _feature_uv_to_grid(uv: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -341,20 +312,14 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.processed_ranges.add(range_key)
 
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
-        infer_images, anchor_context = self._build_anchor_infer_batch(images, frame_ids)
-        pred0_full = self.engine.infer(infer_images)
+        pred0 = self.engine.infer(images)
         full_factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
-        if anchor_context is not None and anchor_context.prepended:
-            current_indices = torch.tensor(
-                anchor_context.current_full_indices,
-                dtype=torch.long,
-                device=pred0_full.poses_c2w.device,
-            )
-            pred0 = _slice_prediction(pred0_full, current_indices)
+        anchor_context = self._anchor_context_from_current_chunk(frame_ids)
+        if anchor_context is not None:
+            anchor_metrics = self._compute_anchor_metrics(pred0, anchor_context)
         else:
-            pred0 = pred0_full
-        anchor_metrics = self._compute_anchor_metrics(pred0_full, anchor_context) if anchor_context is not None else {}
-        factor_graph = None if anchor_context is not None and anchor_context.prepended else full_factor_graph
+            anchor_metrics = self._compute_anchor_metrics_sidepath(images, frame_ids)
+        factor_graph = full_factor_graph
         pred_refined, ba_stats = self.dense_ba_refiner.refine(pred0, frame_ids, factor_graph=factor_graph)
         self.last_dense_ba_stats = ba_stats
         if ba_stats.enabled:
@@ -469,24 +434,35 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.chunk_count += 1
         self._trim_alignment_cache()
 
-    def _build_anchor_infer_batch(
+    def _anchor_context_from_current_chunk(
         self,
-        images: torch.Tensor,
         frame_ids: tuple[int, ...],
-    ) -> tuple[torch.Tensor, _ChunkAnchorContext | None]:
+    ) -> _ChunkAnchorContext | None:
         if not self.keyframe_anchor_enabled or self.last_keyframe_anchor is None:
-            return images, None
+            return None
         anchor = self.last_keyframe_anchor
         if int(anchor.frame_id) in frame_ids:
             anchor_idx = frame_ids.index(int(anchor.frame_id))
-            return images, _ChunkAnchorContext(
+            return _ChunkAnchorContext(
                 record=anchor,
                 full_index=int(anchor_idx),
                 prepended=False,
                 current_full_indices=tuple(range(len(frame_ids))),
             )
+        return None
+
+    def _build_anchor_sidepath_batch(
+        self,
+        images: torch.Tensor,
+        frame_ids: tuple[int, ...],
+    ) -> tuple[torch.Tensor | None, _ChunkAnchorContext | None]:
+        if not self.keyframe_anchor_enabled or self.last_keyframe_anchor is None:
+            return None, None
+        anchor = self.last_keyframe_anchor
+        if int(anchor.frame_id) in frame_ids:
+            return None, None
         if not self.m3_config.keyframe_anchor.prepend_previous_keyframe:
-            return images, None
+            return None, None
 
         anchor_image = anchor.image.to(device=images.device, dtype=images.dtype)
         if tuple(anchor_image.shape[-2:]) != tuple(images.shape[-2:]):
@@ -503,6 +479,17 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             prepended=True,
             current_full_indices=tuple(range(1, len(frame_ids) + 1)),
         )
+
+    def _compute_anchor_metrics_sidepath(
+        self,
+        images: torch.Tensor,
+        frame_ids: tuple[int, ...],
+    ) -> dict[int, _AnchorFrameMetrics]:
+        infer_images, anchor_context = self._build_anchor_sidepath_batch(images, frame_ids)
+        if infer_images is None or anchor_context is None:
+            return {}
+        pred_anchor = self.engine.infer(infer_images)
+        return self._compute_anchor_metrics(pred_anchor, anchor_context)
 
     def _compute_anchor_metrics(
         self,
@@ -914,10 +901,12 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         first_keyframe: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         valid = valid_world_points_mask.bool()
-        if sky_prob is not None:
+        if first_keyframe and sky_prob is not None:
             non_sky_feature = sky_prob.detach().float() <= float(self.m3_config.keyframe_anchor.sky_threshold)
         elif anchor_metrics is not None:
             non_sky_feature = anchor_metrics.non_sky.bool()
+        elif sky_prob is not None:
+            non_sky_feature = sky_prob.detach().float() <= float(self.m3_config.keyframe_anchor.sky_threshold)
         else:
             non_sky_feature = None
         if first_keyframe:
