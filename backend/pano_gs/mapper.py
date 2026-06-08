@@ -47,6 +47,7 @@ class MapperKeyframe:
     image: torch.Tensor
     gaussian_start: int
     gaussian_end: int
+    sky_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -96,6 +97,8 @@ class PanoGaussianMap(nn.Module):
         cfg = self.config.get("SkyBox", {}) if isinstance(self.config, dict) else {}
         self.skybox_enabled = bool(cfg.get("enabled", False))
         self.skybox_optimize = bool(cfg.get("optimize", True))
+        self.skybox_optimization_mask_enable = bool(cfg.get("optimization_mask_enable", True))
+        self.skybox_init_fallback_to_full_image = bool(cfg.get("init_fallback_to_full_image", False))
         self.skybox_resolution = max(4, int(cfg.get("resolution", 512)))
         self.skybox_lr = float(cfg.get("lr", 1.0e-2))
         self._skybox_initialized = False
@@ -231,6 +234,8 @@ class PanoGaussianMap(nn.Module):
             if tuple(sky.shape[-2:]) != (H, W):
                 sky = F.interpolate(sky.float().view(1, 1, *sky.shape[-2:]), size=(H, W), mode="nearest")[0, 0] > 0.5
         if not bool(sky.any()):
+            if not self.skybox_init_fallback_to_full_image:
+                return False
             sky = torch.ones(H, W, device=device, dtype=torch.bool)
         dirs = self._world_dirs_for_erp(H, W, c2w.to(device=device, dtype=torch.float32))
         face, uv = self._directions_to_cubemap(dirs.reshape(-1, 3))
@@ -487,8 +492,9 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
     ) -> int:
         requested = len(seeds)
+        sky_mask = self._skybox_mask_from_image(image) if image is not None else None
         if image is not None and self.map.has_skybox:
-            self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w)
+            self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
         seeds, filter_stats = self._filter_novel_seeds(seeds)
         start = self.map.anchor_count()
         n = self.map.add_seeds(seeds)
@@ -501,7 +507,7 @@ class PanoGaussianMapper:
         self.stats.last_skipped_voxel = int(filter_stats.get("skipped_voxel", 0))
         self.stats.last_skipped_budget = int(filter_stats.get("skipped_budget", 0))
         if image is not None:
-            self._register_keyframe(frontend_output, image, start=start, end=end)
+            self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
         if n == 0:
             self.stats.notes.append(f"frame {frontend_output.frame_id}: no seeds inserted")
         if self.novel_insertion_enabled and requested != n:
@@ -628,6 +634,7 @@ class PanoGaussianMapper:
         *,
         start: int,
         end: int,
+        sky_mask: torch.Tensor | None = None,
     ) -> None:
         frame_id = int(frontend_output.frame_id)
         device = self.map.get_xyz.device
@@ -639,6 +646,7 @@ class PanoGaussianMapper:
             image=image.detach().cpu().float(),
             gaussian_start=int(start),
             gaussian_end=int(end),
+            sky_mask=sky_mask.detach().cpu().bool() if torch.is_tensor(sky_mask) else None,
         )
         self.keyframes = [kf for kf in self.keyframes if kf.frame_id != frame_id]
         self.keyframes.append(record)
@@ -665,6 +673,90 @@ class PanoGaussianMapper:
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         with torch.no_grad():
             return self.renderer.render(camera, self.map)
+
+    def _skybox_optimization_mask_enabled(self) -> bool:
+        return bool(
+            self.map.has_skybox
+            and getattr(self.map, "skybox_optimize", False)
+            and getattr(self.map, "skybox_optimization_mask_enable", True)
+        )
+
+    def _skybox_mask_from_image(self, image: torch.Tensor | None) -> torch.Tensor | None:
+        if image is None or not self._skybox_optimization_mask_enabled():
+            return None
+        img = image.detach().float()
+        if img.ndim == 4:
+            img = img[0]
+        if img.ndim != 3 or int(img.shape[0]) != 3:
+            return None
+        mask = self.map._sky_mask_from_image(img.clamp(0.0, 1.0))
+        return mask.detach().bool().view(1, int(img.shape[-2]), int(img.shape[-1]))
+
+    @staticmethod
+    def _normalize_skybox_mask(
+        sky_mask: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        mask = sky_mask.detach().bool()
+        if mask.ndim == 4:
+            mask = mask[0]
+        if mask.ndim == 3:
+            mask = mask[0]
+        if mask.ndim != 2:
+            raise ValueError(f"Expected sky mask as HxW, 1xHxW, or Bx1xHxW, got {tuple(sky_mask.shape)}")
+        if tuple(mask.shape[-2:]) != (int(height), int(width)):
+            mask = (
+                F.interpolate(
+                    mask.float().view(1, 1, *mask.shape[-2:]),
+                    size=(int(height), int(width)),
+                    mode="nearest",
+                )[0, 0]
+                > 0.5
+            )
+        return mask.to(device=device).view(1, int(height), int(width))
+
+    def _skybox_mask_for_target(
+        self,
+        target: torch.Tensor,
+        sky_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if not self._skybox_optimization_mask_enabled():
+            return None
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        if sky_mask is None:
+            sky_mask = self._skybox_mask_from_image(target)
+        if sky_mask is None:
+            return None
+        return self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device)
+
+    def _apply_skybox_optimization_mask(
+        self,
+        render_pkg: dict,
+        sky_mask: torch.Tensor | None,
+    ) -> dict:
+        if sky_mask is None or not self._skybox_optimization_mask_enabled():
+            return render_pkg
+        gs_rgb = render_pkg.get("gs_only")
+        sky_rgb = render_pkg.get("sky_bg_only")
+        trans = render_pkg.get("sky_bg_alpha")
+        if not (torch.is_tensor(gs_rgb) and torch.is_tensor(sky_rgb) and torch.is_tensor(trans)):
+            return render_pkg
+        if sky_rgb.ndim != 3 or trans.ndim != 3:
+            return render_pkg
+        mask = self._normalize_skybox_mask(
+            sky_mask,
+            height=int(sky_rgb.shape[-2]),
+            width=int(sky_rgb.shape[-1]),
+            device=sky_rgb.device,
+        ).to(dtype=sky_rgb.dtype)
+        sky_rgb_masked_grad = sky_rgb * mask + sky_rgb.detach() * (1.0 - mask)
+        out = dict(render_pkg)
+        out["render"] = (gs_rgb + trans.to(sky_rgb) * sky_rgb_masked_grad).clamp(0.0, 1.0)
+        out["skybox_optimization_mask"] = mask
+        return out
 
     def render_keyframe_diagnostic(self, frame_id: int) -> KeyframeRenderDiagnostic | None:
         """Render an optimized keyframe for post-optimization diagnostics."""
@@ -704,15 +796,17 @@ class PanoGaussianMapper:
         c2w: torch.Tensor,
         steps: int = 1,
     ) -> dict[str, float]:
-        if self.map.anchor_count() == 0 or int(steps) <= 0:
+        if (self.map.anchor_count() == 0 and not self.map.has_skybox) or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
+        sky_mask = self._skybox_mask_for_target(target)
         last = {"loss": 0.0}
         for _ in range(int(steps)):
             self.optimizer.zero_grad(set_to_none=True)
             pkg = self.renderer.render(camera, self.map)
+            pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
             loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
             if loss.requires_grad:
                 loss.backward()
@@ -792,11 +886,12 @@ class PanoGaussianMapper:
         steps: int,
         phase: str = "non_keyframe",
     ) -> dict[str, float]:
-        if self.map.anchor_count() == 0 or int(steps) <= 0:
+        if (self.map.anchor_count() == 0 and not self.map.has_skybox) or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
+        sky_mask = self._skybox_mask_for_target(target)
         gaussian_scales = self._gaussian_scales_for_phase(phase, [])
         param_groups = self._map_param_groups(
             gaussian_enabled=gaussian_scales is not None and self.map.anchor_count() > 0,
@@ -812,6 +907,7 @@ class PanoGaussianMapper:
         for step_idx in range(int(steps)):
             optimizer.zero_grad(set_to_none=True)
             pkg = self.renderer.render(camera, self.map)
+            pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
             loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
             if loss.requires_grad:
                 loss.backward()
@@ -1045,7 +1141,12 @@ class PanoGaussianMapper:
                     c2w = pose_delta().detach()
                 camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w)
                 pkg = self.renderer.render(camera, self.map)
+                sky_mask = self._skybox_mask_for_target(target, kf.sky_mask)
+                pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
                 loss_i, metrics_i = backend_render_loss(pkg, target, weights=self.loss_weights)
+                if sky_mask is not None:
+                    metrics_i = dict(metrics_i)
+                    metrics_i["skybox_mask_ratio"] = sky_mask.to(device=device, dtype=dtype).mean().detach()
                 render_losses.append(loss_i)
                 for key, value in metrics_i.items():
                     metric_accum.setdefault(key, []).append(value.detach())

@@ -191,6 +191,8 @@ SkyBox:
   resolution: 512
   init_from_first_keyframe: true
   optimize: true
+  optimization_mask_enable: true
+  init_fallback_to_full_image: false
   lr: 0.01
   sky_mask_top_ratio: 0.58
   sky_mask_min_blue: 0.35

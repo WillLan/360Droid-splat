@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper, PanoRenderCamera
+from backend.pano_gs.losses import backend_render_loss
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem
@@ -155,6 +156,62 @@ def test_skybox_renders_without_anchors():
     assert pkg["render"].shape == image.shape
     assert float(pkg["render"][2].detach().mean()) > 0.5
     assert float(pkg["sky_bg_alpha"].detach().mean()) > 0.9
+
+
+def test_skybox_optimization_mask_blocks_non_sky_gradients():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 8,
+            "optimize": True,
+            "optimization_mask_enable": True,
+            "sky_mask_top_ratio": 0.5,
+            "sky_mask_min_blue": 0.4,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    image = torch.zeros(3, 8, 16)
+    image[0, 4:, :] = 1.0
+    image[1, :4, :] = 0.35
+    image[2, :4, :] = 1.0
+    camera = PanoRenderCamera(image_height=8, image_width=16, c2w=torch.eye(4))
+    pkg = renderer.render(camera, gaussian_map)
+    sky_rgb = pkg["sky_bg_only"]
+    assert torch.is_tensor(sky_rgb) and sky_rgb.requires_grad
+    sky_rgb.retain_grad()
+
+    sky_mask = mapper._skybox_mask_for_target(image)
+    masked_pkg = mapper._apply_skybox_optimization_mask(pkg, sky_mask)
+    loss, _ = backend_render_loss(masked_pkg, image)
+    loss.backward()
+
+    grad = sky_rgb.grad
+    assert torch.is_tensor(grad)
+    assert float(grad[:, :4, :].abs().sum()) > 0.0
+    assert float(grad[:, 4:, :].abs().max()) == 0.0
+
+
+def test_skybox_init_requires_sky_mask_by_default():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 8,
+            "optimize": True,
+            "sky_mask_top_ratio": 0.5,
+            "sky_mask_min_blue": 0.4,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    image = torch.zeros(3, 8, 16)
+    image[0] = 1.0
+
+    assert not gaussian_map.initialize_skybox_from_image(image, torch.eye(4))
+    assert gaussian_map._skybox_initialized is False
 
 
 def test_system_runs_synthetic_smoke(tmp_path: Path):
