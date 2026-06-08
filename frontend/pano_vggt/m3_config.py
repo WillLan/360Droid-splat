@@ -22,6 +22,13 @@ def _positive_int(value: Any, *, name: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: Any, *, name: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative, got {parsed}.")
+    return parsed
+
+
 @dataclass(frozen=True)
 class MatchingHeadConfig:
     """Configuration for the gated dense matching and sky heads."""
@@ -86,6 +93,7 @@ class DenseBAConfig:
     factor_chunk_size: int = 2048
     optimize_pose: bool = True
     optimize_depth: bool = True
+    history_keyframes: int = 8
 
 
 @dataclass(frozen=True)
@@ -217,6 +225,10 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         factor_chunk_size=_positive_int(ba_raw.get("factor_chunk_size", 2048), name="PanoVGGT.DenseBA.factor_chunk_size"),
         optimize_pose=bool(ba_raw.get("optimize_pose", True)),
         optimize_depth=bool(ba_raw.get("optimize_depth", True)),
+        history_keyframes=_nonnegative_int(
+            ba_raw.get("history_keyframes", 8),
+            name="PanoVGGT.DenseBA.history_keyframes",
+        ),
     )
     keyframe_anchor = KeyframeAnchorConfig(
         enabled=bool(keyframe_anchor_raw.get("enabled", False)),

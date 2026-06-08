@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -14,6 +14,7 @@ from .alignment import SimilarityTransform, SubmapAligner, sample_overlap_points
 from .dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from .dense_matcher import PoseGuidedDenseMatcher
 from .engine import PanoVGGTInferenceEngine, build_panovggt_engine
+from .keyframe_memory import KeyframeMemory, KeyframeRecord
 from .loop import FrontendPoseGraph, LoopManager, PoseGraphEdge
 from .m3_config import parse_m3_sphere_config
 from .types import PanoVGGTLocalPrediction
@@ -216,6 +217,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.conf_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
+        self.keyframe_memory = KeyframeMemory(max_keyframes=max(1, int(self.m3_config.dense_ba.history_keyframes)))
         self.last_keyframe_id: Optional[int] = None
         self.last_keyframe_anchor: _KeyframeAnchorRecord | None = None
         self.chunk_count = 0
@@ -228,6 +230,11 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     @property
     def keyframe_anchor_enabled(self) -> bool:
         return bool(self.m3_config.enabled and self.m3_config.keyframe_anchor.enabled)
+
+    @property
+    def dense_ba_history_enabled(self) -> bool:
+        mode = str(self.m3_config.dense_ba.mode).lower()
+        return bool(self.m3_config.enabled and self.m3_config.dense_ba.enabled and mode in {"history_window", "keyframe_graph"})
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -245,6 +252,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             fid = int(frame_id)
             self.backend_pose_overrides[fid] = pose_cpu
             self.pose_by_frame[fid] = pose_cpu.to(self.device)
+            for record in self.keyframe_memory.records:
+                if int(record.frame_id) == fid:
+                    record.pose_c2w = pose_cpu
             if (
                 update_last_keyframe_anchor
                 and self.last_keyframe_anchor is not None
@@ -332,7 +342,30 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         else:
             anchor_metrics = self._compute_anchor_metrics_sidepath(images, frame_ids)
         factor_graph = full_factor_graph
-        pred_refined, ba_stats = self.dense_ba_refiner.refine(pred0, frame_ids, factor_graph=factor_graph)
+        if self.dense_ba_history_enabled:
+            seed_transform = self._align_chunk(pred0, frame_ids)
+            pred_ba_input = self._prediction_to_world(pred0, seed_transform)
+            pred_refined, ba_stats = self.dense_ba_refiner.refine(
+                pred_ba_input,
+                frame_ids,
+                factor_graph=factor_graph,
+                keyframe_memory=self.keyframe_memory,
+            )
+            pred = pred_refined if ba_stats.used_refined else pred_ba_input
+            transform = SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
+            transform.accepted = bool(seed_transform.accepted)
+            alignment_residual = float(seed_transform.residual)
+        else:
+            pred_refined, ba_stats = self.dense_ba_refiner.refine(
+                pred0,
+                frame_ids,
+                factor_graph=factor_graph,
+                keyframe_memory=self.keyframe_memory,
+            )
+            pred = pred_refined if ba_stats.used_refined else pred0
+            transform = self._align_chunk(pred, frame_ids)
+            alignment_residual = float(transform.residual)
+        factor_graph = getattr(self.dense_ba_refiner, "last_factor_graph", factor_graph) or factor_graph
         self.last_dense_ba_stats = ba_stats
         if ba_stats.enabled:
             self.dense_ba_stats_history.append(ba_stats)
@@ -352,8 +385,6 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             }
         else:
             self.last_m3_debug = None
-        pred = pred_refined if ba_stats.used_refined else pred0
-        transform = self._align_chunk(pred, frame_ids)
         backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)
         chunk_descriptor = self._chunk_descriptor(pred, images)
         loop_target = self.loop_manager.add_chunk(chunk_descriptor)
@@ -416,7 +447,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 valid_world,
                 anchor_metrics.get(local_idx),
                 pred.sky_prob[local_idx].detach() if pred.sky_prob is not None else None,
-                transform.residual,
+                alignment_residual,
                 "tracked_panovggt_long" + ba_stats.status_suffix,
             )
 
@@ -428,20 +459,21 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             data = output_data.get(frame_id)
             if data is not None:
                 pose, inverse_depth, confidence, world_points, valid_world, anchor_metric, sky_prob, residual, status = data
-                self.pending_outputs.append(
-                    self._make_output(
-                        record.frame,
-                        pose=pose,
-                        inverse_depth=inverse_depth,
-                        confidence=confidence,
-                        world_points=world_points,
-                        valid_world_points_mask=valid_world,
-                        anchor_metrics=anchor_metric,
-                        sky_prob=sky_prob,
-                        residual=residual,
-                        status=status,
-                    )
+                output = self._make_output(
+                    record.frame,
+                    pose=pose,
+                    inverse_depth=inverse_depth,
+                    confidence=confidence,
+                    world_points=world_points,
+                    valid_world_points_mask=valid_world,
+                    anchor_metrics=anchor_metric,
+                    sky_prob=sky_prob,
+                    residual=residual,
+                    status=status,
                 )
+                self.pending_outputs.append(output)
+                if output.is_keyframe and self.dense_ba_history_enabled:
+                    self._remember_keyframe_record(frame_id, frame_ids.index(frame_id), pred, pose)
                 self.emitted_frame_ids.add(frame_id)
         self.chunk_count += 1
         self._trim_alignment_cache()
@@ -615,6 +647,25 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 anchor_pose_c2w=anchor_context.record.pose_c2w.detach(),
             )
         return out
+
+    def _prediction_to_world(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        transform: SimilarityTransform,
+    ) -> PanoVGGTLocalPrediction:
+        poses = torch.stack([transform.apply_pose(pose.to(self.device)) for pose in pred.poses_c2w], dim=0).detach()
+        depth = (pred.depth.to(self.device) * float(transform.scale)).clamp_min(1.0e-6).detach()
+        local_points = None
+        if pred.local_points is not None:
+            local_points = (pred.local_points.to(self.device) * float(transform.scale)).detach()
+        points = torch.stack([transform.apply_points(points.to(self.device)) for points in pred.chunk_world_points], dim=0).detach()
+        return replace(
+            pred,
+            poses_c2w=poses.to(pred.poses_c2w),
+            depth=depth.to(pred.depth),
+            local_points=local_points.to(pred.depth) if local_points is not None else None,
+            chunk_world_points=points.to(pred.chunk_world_points),
+        )
 
     def _backend_feedback_correction(
         self,
@@ -802,6 +853,42 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             world_points=world_points.detach().cpu(),
             world_points_confidence=output_world_confidence.detach().cpu(),
             valid_world_points_mask=output_valid.detach().cpu(),
+        )
+
+    def _remember_keyframe_record(
+        self,
+        frame_id: int,
+        local_idx: int,
+        pred: PanoVGGTLocalPrediction,
+        pose_c2w: torch.Tensor,
+    ) -> None:
+        if (
+            pred.dense_descriptors is None
+            or pred.match_confidence is None
+            or pred.sky_prob is None
+            or pred.feature_hw is None
+            or pred.image_hw is None
+        ):
+            return
+        idx = int(local_idx)
+        if idx < 0 or idx >= int(pred.poses_c2w.shape[0]):
+            return
+        static_confidence = None
+        if pred.static_confidence is not None:
+            static_confidence = pred.static_confidence[idx].detach().cpu().float()
+        self.keyframe_memory.add(
+            KeyframeRecord(
+                frame_id=int(frame_id),
+                pose_c2w=pose_c2w.detach().cpu().float(),
+                depth_low=pred.depth[idx].detach().cpu().float(),
+                dense_descriptors=pred.dense_descriptors[idx].detach().cpu().float(),
+                match_confidence=pred.match_confidence[idx].detach().cpu().float(),
+                sky_prob=pred.sky_prob[idx].detach().cpu().float(),
+                static_confidence=static_confidence,
+                feature_hw=tuple(int(v) for v in pred.feature_hw),
+                image_hw=tuple(int(v) for v in pred.image_hw),
+                frozen=True,
+            )
         )
 
     def _decide_keyframe(

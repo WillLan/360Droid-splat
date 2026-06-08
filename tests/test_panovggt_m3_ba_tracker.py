@@ -9,6 +9,7 @@ from frontend.pano_vggt.alignment import SimilarityTransform
 from frontend.pano_vggt.dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from frontend.pano_vggt.engine import PanoVGGTInferenceEngine
 from frontend.pano_vggt.factor_graph import DenseSphereFactor, DenseSphereFactorGraph
+from frontend.pano_vggt.keyframe_memory import KeyframeMemory, KeyframeRecord
 from frontend.pano_vggt.m3_config import parse_m3_sphere_config
 from frontend.pano_vggt.spherical_correspondence import generate_gt_spherical_correspondences
 from frontend.pano_vggt.spherical_dense_ba import SphericalTangentDenseBA
@@ -91,7 +92,32 @@ def _prediction(
     return pred
 
 
-def _m3_config(*, shadow: bool = False, min_num_factors: int = 1, residual_worse: bool = False) -> dict:
+def _m3_config(
+    *,
+    shadow: bool = False,
+    min_num_factors: int = 1,
+    residual_worse: bool = False,
+    mode: str = "local_chunk",
+    history_keyframes: int | None = None,
+) -> dict:
+    dense_ba = {
+        "enabled": True,
+        "shadow_mode": shadow,
+        "mode": mode,
+        "iters": 3,
+        "min_num_factors": min_num_factors,
+        "min_valid_factor_ratio": 0.1,
+        "huber_delta_deg": 10.0,
+        "pose_prior_weight": 0.0,
+        "depth_prior_weight": 0.0,
+        "max_pose_update_deg": 20.0,
+        "max_logdepth_update": 0.5,
+        "fallback_if_residual_worse": residual_worse,
+        "residual_worse_tolerance": 1.0,
+        "factor_chunk_size": 64,
+    }
+    if history_keyframes is not None:
+        dense_ba["history_keyframes"] = history_keyframes
     return {
         "PanoVGGT": {
             "M3Sphere": {"enabled": True},
@@ -101,21 +127,7 @@ def _m3_config(*, shadow: bool = False, min_num_factors: int = 1, residual_worse
                 "search_radius": 1,
                 "use_depth_consistency": False,
             },
-            "DenseBA": {
-                "enabled": True,
-                "shadow_mode": shadow,
-                "iters": 3,
-                "min_num_factors": min_num_factors,
-                "min_valid_factor_ratio": 0.1,
-                "huber_delta_deg": 10.0,
-                "pose_prior_weight": 0.0,
-                "depth_prior_weight": 0.0,
-                "max_pose_update_deg": 20.0,
-                "max_logdepth_update": 0.5,
-                "fallback_if_residual_worse": residual_worse,
-                "residual_worse_tolerance": 1.0,
-                "factor_chunk_size": 64,
-            },
+            "DenseBA": dense_ba,
         }
     }
 
@@ -267,6 +279,37 @@ def test_dense_ba_refiner_synthetic_prediction_returns_refined_prediction_and_fi
     assert torch.allclose(refined.poses_c2w[1, :3, 3], true_poses[1, :3, 3], atol=1e-3)
 
 
+def test_dense_ba_refiner_history_window_adds_keyframe_anchor_factors():
+    feature_hw = (4, 8)
+    pred = _prediction(feature_hw=feature_hw)
+    memory = KeyframeMemory(max_keyframes=4)
+    memory.add(
+        KeyframeRecord(
+            frame_id=-1,
+            pose_c2w=torch.eye(4),
+            depth_low=torch.full((1, feature_hw[0], feature_hw[1]), 2.0),
+            dense_descriptors=torch.ones(4, feature_hw[0], feature_hw[1]),
+            match_confidence=torch.ones(1, feature_hw[0], feature_hw[1]),
+            sky_prob=torch.zeros(1, feature_hw[0], feature_hw[1]),
+            feature_hw=feature_hw,
+            image_hw=feature_hw,
+            frozen=True,
+        )
+    )
+    cfg = _m3_config(mode="history_window", history_keyframes=1, min_num_factors=1)
+    cfg["PanoVGGT"]["DenseBA"]["optimize_depth"] = False
+    refiner = PanoVGGTDenseBARefiner(parse_m3_sphere_config(cfg))
+
+    refined, stats = refiner.refine(pred, (0, 1), keyframe_memory=memory)
+
+    assert stats.success
+    assert refined.poses_c2w.shape == pred.poses_c2w.shape
+    assert stats.history_keyframes == 1
+    assert stats.history_factors > 0
+    assert refiner.last_factor_graph is not None
+    assert any(int(factor.tgt) == 0 and int(factor.src) >= 1 for factor in refiner.last_factor_graph.factors)
+
+
 def test_dense_ba_refiner_residual_worse_threshold_triggers_fallback():
     true_poses = _poses(0.2)
     true_depth = _depth((5, 8), 2.0)
@@ -360,10 +403,12 @@ class _FakeRefiner:
         self.refined = refined
         self.stats = stats
         self.calls = 0
+        self.memory_lengths: list[int] = []
 
     def refine(self, pred, frame_ids, *, factor_graph=None, keyframe_memory=None):
         _ = pred, frame_ids, factor_graph, keyframe_memory
         self.calls += 1
+        self.memory_lengths.append(0 if keyframe_memory is None else len(keyframe_memory))
         return self.refined, self.stats
 
 
@@ -573,6 +618,32 @@ def test_tracker_non_shadow_success_sends_refined_prediction_into_align_chunk():
     assert captured[0] is refined
     assert outputs
     assert "dense_ba_active_success" in outputs[0].tracking_status
+
+
+def test_tracker_history_window_passes_emitted_keyframes_to_refiner_memory():
+    pred0 = _prediction()
+    cfg = _m3_config(shadow=False, mode="history_window", history_keyframes=4)
+    tracker, captured = _tracker_with_fake_alignment(pred0, cfg)
+    stats = DenseBARefinerStats(
+        enabled=True,
+        shadow_mode=False,
+        mode="history_window",
+        success=False,
+        used_refined=False,
+        fallback_reason="empty_factors",
+    )
+    fake_refiner = _FakeRefiner(pred0, stats)
+    tracker.dense_ba_refiner = fake_refiner
+
+    _feed_two_frames(tracker)
+    for idx in range(2, 4):
+        tracker.track(PanoFrame(image=torch.zeros(3, 5, 8), timestamp=float(idx), frame_id=idx))
+    tracker.pop_ready_outputs()
+
+    assert fake_refiner.memory_lengths[0] == 0
+    assert fake_refiner.memory_lengths[1] >= 1
+    assert len(tracker.keyframe_memory) >= 1
+    assert len(captured) == 2
 
 
 def test_tracker_enabled_descriptors_missing_fallback_still_emits_frontend_output():

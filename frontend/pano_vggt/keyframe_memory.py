@@ -16,11 +16,18 @@ class KeyframeRecord:
     match_confidence: torch.Tensor
     sky_prob: torch.Tensor
     static_confidence: torch.Tensor | None = None
+    feature_hw: tuple[int, int] | None = None
+    image_hw: tuple[int, int] | None = None
     frozen: bool = False
 
 
 class KeyframeMemory:
-    """Bounded in-memory cache for dense matching side data."""
+    """Bounded in-memory cache for dense matching side data.
+
+    Frozen records are intended to act as fixed historical anchors during
+    history-window BA; they may be used as targets, but should not be optimized
+    or pruned by local frontend refinement.
+    """
 
     def __init__(self, max_keyframes: int = 64) -> None:
         self.max_keyframes = max(1, int(max_keyframes))

@@ -60,6 +60,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert default_cfg.descriptor_dim == 24
     assert default_cfg.matching_head.descriptor_dim == 24
     assert default_cfg.dense_ba.residual_mode == "tangent"
+    assert default_cfg.dense_ba.mode == "local_chunk"
+    assert default_cfg.dense_ba.history_keyframes == 8
     assert default_cfg.keyframe_anchor.enabled is False
 
     cfg = parse_m3_sphere_config(
@@ -74,7 +76,13 @@ def test_m3_config_parser_defaults_and_explicit_values():
                 },
                 "KeyframeAnchor": {"enabled": True, "cell_pair_conf_threshold": 0.2},
                 "DenseMatching": {"enabled": True, "search_radius": 7, "topk": 2},
-                "DenseBA": {"enabled": True, "iters": 4, "residual_mode": "tangent"},
+                "DenseBA": {
+                    "enabled": True,
+                    "iters": 4,
+                    "mode": "history_window",
+                    "history_keyframes": 3,
+                    "residual_mode": "tangent",
+                },
                 "InferenceWindow": {"size": 5, "overlap": 1, "temporal_radius": 3},
             }
         }
@@ -88,6 +96,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert cfg.dense_matching.topk == 2
     assert cfg.dense_ba.enabled is True
     assert cfg.dense_ba.iters == 4
+    assert cfg.dense_ba.mode == "history_window"
+    assert cfg.dense_ba.history_keyframes == 3
     assert cfg.keyframe_anchor.enabled is True
     assert cfg.keyframe_anchor.cell_pair_conf_threshold == 0.2
     assert cfg.inference_window.size == 5
