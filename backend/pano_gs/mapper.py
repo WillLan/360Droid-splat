@@ -46,6 +46,9 @@ class MapperStats:
     last_suppressed_insert: int = 0
     last_outlier_resets: int = 0
     last_outlier_pruned: int = 0
+    last_render_missing_pixels: int = 0
+    last_render_depth_mismatch_pixels: int = 0
+    last_render_bad_pixels: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -112,6 +115,7 @@ class PanoGaussianMap(nn.Module):
         self.skybox_enabled = bool(cfg.get("enabled", False))
         self.skybox_optimize = bool(cfg.get("optimize", True))
         self.skybox_optimization_mask_enable = bool(cfg.get("optimization_mask_enable", True))
+        self.skybox_force_sky_render = bool(cfg.get("force_sky_render", False))
         self.skybox_init_fallback_to_full_image = bool(cfg.get("init_fallback_to_full_image", False))
         self.skybox_resolution = max(4, int(cfg.get("resolution", 512)))
         self.skybox_lr = float(cfg.get("lr", 1.0e-2))
@@ -501,7 +505,13 @@ class PanoGaussianMapper:
         self.map = gaussian_map
         self.renderer = renderer or PFGS360Renderer(config=gaussian_map.config)
         self.optimizer = gaussian_map.make_optimizer(lr=lr)
-        self.loss_weights = loss_weights or BackendLossWeights()
+        if loss_weights is None:
+            sky_cfg = gaussian_map.config.get("SkyBox", {}) if isinstance(gaussian_map.config, dict) else {}
+            self.loss_weights = BackendLossWeights(
+                sky_alpha=float(sky_cfg.get("sky_alpha_loss_weight", 0.0)),
+            )
+        else:
+            self.loss_weights = loss_weights
         self.stats = MapperStats()
         self.optim_cfg = gaussian_map.config.get("BackendOptimization", {}) if isinstance(gaussian_map.config, dict) else {}
         mapping_cfg = gaussian_map.config.get("Mapping", {}) if isinstance(gaussian_map.config, dict) else {}
@@ -515,7 +525,7 @@ class PanoGaussianMapper:
         )
         self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
         self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
-        self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.15))
+        self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.10))
         self.pfgs360_foreground_rel_threshold = float(novel_cfg.get("foreground_rel_threshold", 0.10))
         self.pfgs360_photometric_error_threshold = float(novel_cfg.get("photometric_error_threshold", 0.08))
         self.pfgs360_near_grid_radius = max(0, int(novel_cfg.get("near_grid_radius", 1)))
@@ -585,6 +595,9 @@ class PanoGaussianMapper:
         self.stats.last_suppressed_insert = int(filter_stats.get("suppressed_insert", 0))
         self.stats.last_outlier_resets = int(filter_stats.get("outlier_resets", 0))
         self.stats.last_outlier_pruned = int(filter_stats.get("outlier_pruned", 0))
+        self.stats.last_render_missing_pixels = int(filter_stats.get("missing_pixels", 0))
+        self.stats.last_render_depth_mismatch_pixels = int(filter_stats.get("depth_mismatch_pixels", 0))
+        self.stats.last_render_bad_pixels = int(filter_stats.get("render_bad_pixels", 0))
         if image is not None:
             self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
         if n == 0:
@@ -699,6 +712,9 @@ class PanoGaussianMapper:
             "suppressed_insert": 0,
             "outlier_resets": 0,
             "outlier_pruned": 0,
+            "missing_pixels": 0,
+            "depth_mismatch_pixels": 0,
+            "render_bad_pixels": 0,
         }
         insert_enabled = (
             torch.ones(len(seeds), dtype=torch.bool)
@@ -836,7 +852,13 @@ class PanoGaussianMapper:
         sky_mask: torch.Tensor | None,
         temporal_ok: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, dict[str, int]]:
-        stats = {"outlier_resets": 0, "outlier_pruned": 0}
+        stats = {
+            "outlier_resets": 0,
+            "outlier_pruned": 0,
+            "missing_pixels": 0,
+            "depth_mismatch_pixels": 0,
+            "render_bad_pixels": 0,
+        }
         if self.map.anchor_count() == 0:
             return None, stats
         target = image.detach().to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
@@ -870,17 +892,17 @@ class PanoGaussianMapper:
             aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
             valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
             missing = (alpha < self.pfgs360_render_alpha_min) | (~valid_aligned)
-            foreground = valid_aligned & (aligned_target < render_depth * (1.0 - self.pfgs360_foreground_rel_threshold))
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
-            photo_err = (render_rgb.to(target) - target).abs().mean(dim=0, keepdim=True)
-            inconsistent = (
-                valid_aligned
-                & (rel > self.pfgs360_render_depth_rel_threshold)
-                & (photo_err > self.pfgs360_photometric_error_threshold)
-            )
-            render_bad = missing | foreground | inconsistent
+            depth_mismatch = valid_aligned & (rel > self.pfgs360_render_depth_rel_threshold)
+            render_bad = missing | depth_mismatch
             if sky_mask is not None:
-                render_bad = render_bad & (~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device))
+                non_sky = ~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device)
+                missing = missing & non_sky
+                depth_mismatch = depth_mismatch & non_sky
+                render_bad = render_bad & non_sky
+            stats["missing_pixels"] = int(missing.sum().detach().cpu())
+            stats["depth_mismatch_pixels"] = int(depth_mismatch.sum().detach().cpu())
+            stats["render_bad_pixels"] = int(render_bad.sum().detach().cpu())
             evidence_stats = self._update_pfgs360_outlier_evidence(
                 render_bad.detach(),
                 pkg,
@@ -1327,7 +1349,12 @@ class PanoGaussianMapper:
         ).to(dtype=sky_rgb.dtype)
         sky_rgb_masked = sky_rgb * mask
         out = dict(render_pkg)
-        out["render"] = (gs_rgb + trans.to(sky_rgb) * sky_rgb_masked).clamp(0.0, 1.0)
+        if bool(getattr(self.map, "skybox_force_sky_render", False)):
+            out["render"] = (gs_rgb * (1.0 - mask) + sky_rgb_masked).clamp(0.0, 1.0)
+            out["skybox_force_sky_render"] = True
+        else:
+            out["render"] = (gs_rgb + trans.to(sky_rgb) * sky_rgb_masked).clamp(0.0, 1.0)
+            out["skybox_force_sky_render"] = False
         out["skybox_optimization_mask"] = mask
         return out
 

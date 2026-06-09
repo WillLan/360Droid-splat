@@ -205,6 +205,8 @@ SkyBox:
   init_from_first_keyframe: true
   optimize: true
   optimization_mask_enable: true
+  force_sky_render: true
+  sky_alpha_loss_weight: 0.05
   init_fallback_to_full_image: false
   lr: 0.01
   sky_mask_top_ratio: 0.58

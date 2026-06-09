@@ -1537,6 +1537,11 @@ class PanoDroidGSSlamSystem:
                             "kept": int(inserted_count),
                             "skipped_voxel": int(getattr(self.mapper.stats, "last_skipped_voxel", 0)),
                             "skipped_budget": int(getattr(self.mapper.stats, "last_skipped_budget", 0)),
+                            "render_missing_pixels": int(getattr(self.mapper.stats, "last_render_missing_pixels", 0)),
+                            "render_depth_mismatch_pixels": int(
+                                getattr(self.mapper.stats, "last_render_depth_mismatch_pixels", 0)
+                            ),
+                            "render_bad_pixels": int(getattr(self.mapper.stats, "last_render_bad_pixels", 0)),
                         },
                     )
                     output_profile["new_gaussian_visualization_sec"] = float(time.perf_counter() - section_start)

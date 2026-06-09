@@ -31,8 +31,6 @@ class _DepthGateRenderer:
     def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
         H, W = int(camera.image_height), int(camera.image_width)
         render = torch.zeros(3, H, W, device=camera.c2w.device, dtype=camera.c2w.dtype)
-        if W >= 3:
-            render[:, :, 2] = 1.0
         depth = torch.ones(1, H, W, device=render.device, dtype=render.dtype)
         if W >= 2:
             depth[:, :, 1] = 2.0
@@ -125,7 +123,7 @@ def test_mapper_renders_keyframe_diagnostic():
     assert diagnostic.anchor_count == 2
 
 
-def test_pfgs360_mapper_render_depth_gate_inserts_missing_foreground_and_inconsistent_regions():
+def test_pfgs360_mapper_render_depth_gate_inserts_missing_and_depth_mismatch_regions():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
         "Mapping": {
@@ -137,9 +135,7 @@ def test_pfgs360_mapper_render_depth_gate_inserts_missing_foreground_and_inconsi
                 "keyframe_max_seeds": 10,
                 "global_anchor_budget": 20,
                 "render_alpha_min": 0.2,
-                "foreground_rel_threshold": 0.1,
-                "render_depth_rel_threshold": 0.15,
-                "photometric_error_threshold": 0.08,
+                "render_depth_rel_threshold": 0.10,
                 "near_grid_radius": 0,
                 "reset_after_outlier_observations": 99,
                 "prune_after_outlier_observations": 99,
@@ -173,7 +169,38 @@ def test_pfgs360_mapper_render_depth_gate_inserts_missing_foreground_and_inconsi
 
     assert inserted == 3
     assert mapper.stats.last_suppressed_insert == 1
+    assert mapper.stats.last_render_missing_pixels == 1
+    assert mapper.stats.last_render_depth_mismatch_pixels == 2
+    assert mapper.stats.last_render_bad_pixels == 3
     assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
+
+
+def test_mapper_force_sky_render_uses_skybox_inside_sky_mask():
+    config = {
+        "SkyBox": {
+            "enabled": True,
+            "force_sky_render": True,
+            "optimization_mask_enable": True,
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    gs = torch.zeros(3, 1, 2)
+    gs[0] = 1.0
+    sky = torch.zeros(3, 1, 2)
+    sky[2] = 1.0
+    pkg = {
+        "render": gs,
+        "gs_only": gs,
+        "sky_bg_only": sky,
+        "sky_bg_alpha": torch.ones(1, 1, 2),
+        "alpha": torch.ones(1, 1, 2),
+    }
+
+    out = mapper._apply_skybox_optimization_mask(pkg, torch.tensor([[[True, False]]]))
+
+    assert bool(out["skybox_force_sky_render"])
+    assert torch.allclose(out["render"][:, 0, 0], torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.allclose(out["render"][:, 0, 1], torch.tensor([1.0, 0.0, 0.0]))
 
 
 def test_mapper_random_window_optimizes_one_sample_per_step():

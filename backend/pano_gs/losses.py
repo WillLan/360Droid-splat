@@ -19,6 +19,7 @@ class BackendLossWeights:
     depth: float = 0.1
     opacity: float = 0.01
     distortion: float = 0.0
+    sky_alpha: float = 0.0
 
 
 def pano_photometric_loss(
@@ -85,6 +86,20 @@ def backend_render_loss(
         opacity_reg = charbonnier(alpha).mean()
         total = total + weights.opacity * opacity_reg
 
+    sky_alpha = rgb.new_tensor(0.0)
+    sky_mask = render_pkg.get("skybox_optimization_mask")
+    if weights.sky_alpha > 0.0 and alpha is not None and torch.is_tensor(sky_mask):
+        mask = sky_mask.to(device=rgb.device, dtype=rgb.dtype)
+        if mask.shape != alpha.shape:
+            mask = torch.nn.functional.interpolate(
+                mask.reshape(1, 1, *mask.shape[-2:]),
+                size=alpha.shape[-2:],
+                mode="nearest",
+            )[0]
+        denom = mask.sum().clamp_min(1.0)
+        sky_alpha = ((alpha.to(rgb) ** 2) * mask).sum() / denom
+        total = total + weights.sky_alpha * sky_alpha
+
     distortion = rgb.new_tensor(0.0)
     render_distort = render_pkg.get("render_distort")
     if render_distort is not None:
@@ -96,6 +111,6 @@ def backend_render_loss(
         "photometric": photo.detach(),
         "depth": depth.detach(),
         "opacity": opacity_reg.detach(),
+        "sky_alpha": sky_alpha.detach(),
         "distortion": distortion.detach(),
     }
-

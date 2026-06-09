@@ -155,9 +155,7 @@ Mapping:
     global_anchor_budget: 1500000
     temporal_pair_conf_min: 0.70
     render_alpha_min: 0.20
-    render_depth_rel_threshold: 0.15
-    foreground_rel_threshold: 0.10
-    photometric_error_threshold: 0.08
+    render_depth_rel_threshold: 0.10
     near_grid_radius: 1
     near_distance_factor: 1.0
     reset_after_outlier_observations: 3
@@ -216,6 +214,8 @@ SkyBox:
   init_from_first_keyframe: true
   optimize: true
   optimization_mask_enable: true
+  force_sky_render: true
+  sky_alpha_loss_weight: 0.05
   init_fallback_to_full_image: false
   lr: 0.01
   sky_mask_top_ratio: 0.58
