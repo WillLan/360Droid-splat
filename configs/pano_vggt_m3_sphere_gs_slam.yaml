@@ -72,8 +72,8 @@ PanoVGGT:
   MatchingHead:
     enabled: true
     checkpoint: null
-    matching_checkpoint: null
-    sky_checkpoint: null
+    matching_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_matching_ddp_b2_20k_8f_parallaxfix_dtw_nyc_20260604_1036/checkpoints/matching_head.pt
+    sky_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_sky_ddp_b4_10k_dtw_nyc_20260604_0845/checkpoints/sky_head.pt
     descriptor_dim: 24
     feature_hook: null
     feature_key: null

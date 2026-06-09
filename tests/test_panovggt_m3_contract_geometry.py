@@ -118,6 +118,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.keyframe_anchor.min_keyframe_interval == 4
     assert parsed_file.keyframe_anchor.max_keyframe_interval == 8
     assert parsed_file.matching_head.descriptor_dim == 24
+    assert parsed_file.matching_head.matching_checkpoint.endswith("/matching_head.pt")
+    assert parsed_file.matching_head.sky_checkpoint.endswith("/sky_head.pt")
     assert file_cfg["PanoVGGT"]["image_size"] is None
 
     shadow_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_shadow.yaml").read_text())
