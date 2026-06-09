@@ -337,6 +337,12 @@ def _summarize_dense_ba_stats(frontend) -> dict:
             "mean_pose_rot_update_deg": 0.0,
             "mean_depth_update": 0.0,
             "max_depth_update": 0.0,
+            "pose_only_solver_ratio": 0.0,
+            "mean_used_factors": 0.0,
+            "mean_pose_variables": 0.0,
+            "mean_depth_variables": 0.0,
+            "mean_pose_solve_sec": 0.0,
+            "time_budget_stops": 0,
         }
 
     successes = [item for item in history if bool(getattr(item, "success", False))]
@@ -351,6 +357,12 @@ def _summarize_dense_ba_stats(frontend) -> dict:
     pose_rot_update = [float(getattr(item, "pose_update_norm", {}).get("rot_max_deg", 0.0)) for item in history]
     depth_update = [float(getattr(item, "depth_update_norm", {}).get("mean", 0.0)) for item in history]
     depth_update_max = [float(getattr(item, "depth_update_norm", {}).get("max", 0.0)) for item in history]
+    pose_only_count = sum(int(str(getattr(item, "solver_mode", "")) == "pose_only_factor_graph") for item in history)
+    used_factors = [float(getattr(item, "used_factors", 0)) for item in history]
+    pose_variables = [float(getattr(item, "num_pose_variables", 0)) for item in history]
+    depth_variables = [float(getattr(item, "num_depth_variables", 0)) for item in history]
+    pose_solve_sec = [float(getattr(item, "pose_solve_sec", 0.0)) for item in history]
+    time_budget_stops = sum(int(bool(getattr(item, "stopped_by_time_budget", False))) for item in history)
     chunk_count = len(history)
     used_refined = sum(int(bool(getattr(item, "used_refined", False))) for item in history)
     return {
@@ -371,6 +383,12 @@ def _summarize_dense_ba_stats(frontend) -> dict:
         "mean_pose_rot_update_deg": _finite_mean(pose_rot_update),
         "mean_depth_update": _finite_mean(depth_update),
         "max_depth_update": float(max(depth_update_max)) if depth_update_max else 0.0,
+        "pose_only_solver_ratio": float(pose_only_count / chunk_count) if chunk_count else 0.0,
+        "mean_used_factors": _finite_mean(used_factors),
+        "mean_pose_variables": _finite_mean(pose_variables),
+        "mean_depth_variables": _finite_mean(depth_variables),
+        "mean_pose_solve_sec": _finite_mean(pose_solve_sec),
+        "time_budget_stops": int(time_budget_stops),
     }
 
 

@@ -61,6 +61,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert default_cfg.matching_head.descriptor_dim == 24
     assert default_cfg.dense_ba.residual_mode == "tangent"
     assert default_cfg.dense_ba.mode == "local_chunk"
+    assert default_cfg.dense_ba.solver_mode == "pose_only_factor_graph"
+    assert default_cfg.dense_ba.optimize_depth is False
     assert default_cfg.dense_ba.history_keyframes == 8
     assert default_cfg.keyframe_anchor.enabled is False
 
@@ -107,8 +109,18 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.enabled is True
     assert parsed_file.matching_head.enabled is True
     assert parsed_file.dense_matching.enabled is True
+    assert parsed_file.dense_matching.search_radius == 4
+    assert parsed_file.dense_matching.max_factors == 8192
+    assert parsed_file.dense_matching.max_samples_per_edge == 1024
     assert parsed_file.dense_ba.enabled is True
     assert parsed_file.dense_ba.shadow_mode is False
+    assert parsed_file.dense_ba.solver_mode == "pose_only_factor_graph"
+    assert parsed_file.dense_ba.iters == 3
+    assert parsed_file.dense_ba.optimize_pose is True
+    assert parsed_file.dense_ba.optimize_depth is False
+    assert parsed_file.dense_ba.max_ba_factors == 8192
+    assert parsed_file.dense_ba.max_depth_variables == 0
+    assert parsed_file.dense_ba.max_solver_sec == 8.0
     assert parsed_file.dense_ba.line_search is True
     assert parsed_file.dense_ba.logdepth_update_quantile == 0.99
     assert parsed_file.joint_inference.enabled is True
@@ -139,14 +151,19 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_shadow.matching_head.feature_hook == "aggregator"
     assert parsed_shadow.dense_matching.max_factors == 4096
     assert parsed_shadow.dense_matching.max_samples_per_edge == 512
+    assert parsed_shadow.dense_matching.search_radius == 4
     assert parsed_shadow.dense_ba.shadow_mode is True
+    assert parsed_shadow.dense_ba.solver_mode == "pose_only_factor_graph"
     assert parsed_shadow.dense_ba.iters == 3
     assert parsed_shadow.dense_ba.min_num_factors == 128
     assert parsed_shadow.dense_ba.factor_chunk_size == 512
+    assert parsed_shadow.dense_ba.optimize_depth is False
     assert parsed_shadow.keyframe_anchor.enabled is True
     assert shadow_cfg["Visualization"]["m3_log_every"] == 5
     assert shadow_cfg["Visualization"]["m3_max_matches"] == 80
     assert parsed_active.dense_ba.shadow_mode is False
+    assert parsed_active.dense_ba.solver_mode == "pose_only_factor_graph"
+    assert parsed_active.dense_ba.optimize_depth is False
     assert active_cfg["Results"]["save_dir"].endswith("_active_seq1")
 
 

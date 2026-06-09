@@ -68,7 +68,7 @@ PanoVGGT:
 
   DenseMatching:
     enabled: true
-    search_radius: 8
+    search_radius: 4
     topk: 1
     min_match_confidence: 0.2
     min_static_confidence: 0.2
@@ -86,6 +86,7 @@ PanoVGGT:
     enabled: true
     shadow_mode: false
     mode: local_chunk
+    solver_mode: pose_only_factor_graph
     residual_mode: tangent
     debug_pixel_residual: false
     iters: 3
@@ -103,8 +104,11 @@ PanoVGGT:
     fallback_if_residual_worse: true
     residual_worse_tolerance: 1.05
     factor_chunk_size: 512
+    max_ba_factors: 4096
+    max_depth_variables: 0
+    max_solver_sec: 8.0
     optimize_pose: true
-    optimize_depth: true
+    optimize_depth: false
 
   InferenceWindow:
     size: 4

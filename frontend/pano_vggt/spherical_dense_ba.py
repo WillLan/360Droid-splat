@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 from typing import Any
 
 import torch
@@ -72,8 +73,17 @@ class SphericalTangentDenseBA:
         max_pose_update_deg: float = 5.0,
         max_logdepth_update: float = 0.35,
         line_search: bool = False,
+        solver_mode: str = "pose_depth_full",
+        max_ba_factors: int = 0,
+        max_depth_variables: int = 0,
+        max_solver_sec: float = 0.0,
     ) -> SphericalTangentDenseBAOutput:
         """Optimize local chunk poses and log inverse depth with tangent residuals."""
+
+        solve_start = time.perf_counter()
+        solver_mode = str(solver_mode or "pose_depth_full").lower()
+        if solver_mode == "pose_only_factor_graph":
+            optimize_depth = False
 
         poses0 = poses_c2w.detach().float()
         log0 = _normalize_log_inv_depth(log_inv_depth).detach().float()
@@ -83,6 +93,12 @@ class SphericalTangentDenseBA:
             raise ValueError("poses_c2w and log_inv_depth must contain the same number of frames.")
 
         flat = _flatten_factors(factors, feature_hw=tuple(int(v) for v in log0.shape[-2:]), device=poses0.device, dtype=poses0.dtype)
+        original_factor_count = int(flat.src.numel())
+        flat = _limit_flat_factors(
+            flat,
+            max_factors=int(max_ba_factors),
+            max_depth_variables=int(max_depth_variables) if bool(optimize_depth) else 0,
+        )
         if flat.src.numel() == 0:
             return self._failed_output(poses0, log0, flat, reason="empty_or_invalid_factors")
 
@@ -95,7 +111,25 @@ class SphericalTangentDenseBA:
         total_dim = pose_dim + depth_dim
         if total_dim == 0:
             residual = self._residual_for_state(poses0, log0, flat)
-            return self._success_output(poses0, log0, flat, residual, initial_residual=residual, debug={"iters": 0, "reason": "no_free_variables"})
+            return self._success_output(
+                poses0,
+                log0,
+                flat,
+                residual,
+                initial_residual=residual,
+                debug={
+                    "iters": 0,
+                    "reason": "no_free_variables",
+                    "solver_mode": solver_mode,
+                    "original_num_factors": original_factor_count,
+                    "used_factors": int(flat.src.numel()),
+                    "num_pose_variables": 0,
+                    "num_depth_variables": 0,
+                    "pose_solve_sec": 0.0,
+                    "line_search_sec": 0.0,
+                    "stopped_by_time_budget": False,
+                },
+            )
 
         cur_poses = poses0.clone()
         cur_log = log0.clone()
@@ -103,8 +137,14 @@ class SphericalTangentDenseBA:
         failed_reason = None
         pose_update = poses0.new_zeros(len(free_frames), 6)
         depth_update = poses0.new_zeros(depth_dim)
+        pose_solve_sec = 0.0
+        line_search_sec = 0.0
+        stopped_by_time_budget = False
 
         for iter_idx in range(max(0, int(iters))):
+            if float(max_solver_sec) > 0.0 and time.perf_counter() - solve_start >= float(max_solver_sec):
+                stopped_by_time_budget = True
+                break
             x0 = poses0.new_zeros(total_dim, requires_grad=True)
 
             def residual_fn(delta: torch.Tensor) -> torch.Tensor:
@@ -123,12 +163,14 @@ class SphericalTangentDenseBA:
                 )
 
             try:
+                section_start = time.perf_counter()
                 residual0 = residual_fn(x0)
                 if not torch.isfinite(residual0).all():
                     failed_reason = "non_finite_residual"
                     break
                 jac = torch.autograd.functional.jacobian(residual_fn, x0, vectorize=False)
                 jac = jac.reshape(residual0.numel(), total_dim)
+                pose_solve_sec += time.perf_counter() - section_start
             except RuntimeError as exc:
                 failed_reason = f"autograd_failure:{exc}"
                 break
@@ -138,7 +180,9 @@ class SphericalTangentDenseBA:
 
             hess = jac.T @ jac
             grad = jac.T @ residual0.detach().reshape(-1)
+            section_start = time.perf_counter()
             step = _solve_lm_step(hess, grad, damping=float(damping))
+            pose_solve_sec += time.perf_counter() - section_start
             if step is None:
                 failed_reason = "linear_solve_failure"
                 break
@@ -162,6 +206,7 @@ class SphericalTangentDenseBA:
                 step = step.clone()
                 step[pose_dim : pose_dim + depth_dim] = total_dz - depth_update
 
+            section_start = time.perf_counter()
             step_scale, next_poses, next_log = self._line_search_state(
                 cur_poses,
                 cur_log,
@@ -174,6 +219,7 @@ class SphericalTangentDenseBA:
                 optimize_depth=optimize_depth,
                 enabled=bool(line_search),
             )
+            line_search_sec += time.perf_counter() - section_start
             if step_scale <= 0.0:
                 break
             step = step * float(step_scale)
@@ -208,7 +254,19 @@ class SphericalTangentDenseBA:
             initial_residual=initial_residual,
             pose_update=pose_update.detach(),
             depth_update=depth_update.detach(),
-            debug={"iters": int(iters), "fixed_frames": fixed, "num_variables": total_dim},
+            debug={
+                "iters": int(iters),
+                "fixed_frames": fixed,
+                "num_variables": total_dim,
+                "solver_mode": solver_mode,
+                "original_num_factors": original_factor_count,
+                "used_factors": int(flat.src.numel()),
+                "num_pose_variables": pose_dim,
+                "num_depth_variables": depth_dim,
+                "pose_solve_sec": float(pose_solve_sec),
+                "line_search_sec": float(line_search_sec),
+                "stopped_by_time_budget": bool(stopped_by_time_budget),
+            },
         )
 
     def _line_search_state(
@@ -478,6 +536,41 @@ def _flatten_factors(
         tgt_bearing=torch.cat(tgt_bearing_parts, dim=0),
         weight=torch.cat(weight_parts, dim=0),
         valid_mask=torch.ones_like(src, dtype=torch.bool),
+    )
+
+
+def _limit_flat_factors(
+    flat: _FlatFactors,
+    *,
+    max_factors: int,
+    max_depth_variables: int,
+) -> _FlatFactors:
+    n = int(flat.src.numel())
+    if n == 0:
+        return flat
+    idx = torch.arange(n, device=flat.src.device, dtype=torch.long)
+    if int(max_factors) > 0 and n > int(max_factors):
+        weight = torch.nan_to_num(flat.weight.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        _, top_idx = torch.topk(weight, k=int(max_factors), largest=True, sorted=False)
+        idx = top_idx.sort().values
+    if int(max_depth_variables) > 0:
+        unique_count = int(torch.unique(flat.unique_depth[idx]).numel())
+        if unique_count > int(max_depth_variables):
+            weight = torch.nan_to_num(flat.weight[idx].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            _, top_local = torch.topk(weight, k=min(int(max_depth_variables), int(idx.numel())), largest=True, sorted=False)
+            idx = idx[top_local].sort().values
+
+    _, unique_depth = torch.unique(flat.unique_depth[idx], sorted=True, return_inverse=True)
+    return _FlatFactors(
+        src=flat.src[idx],
+        tgt=flat.tgt[idx],
+        src_y=flat.src_y[idx],
+        src_x=flat.src_x[idx],
+        unique_depth=unique_depth.long(),
+        src_bearing=flat.src_bearing[idx],
+        tgt_bearing=flat.tgt_bearing[idx],
+        weight=flat.weight[idx],
+        valid_mask=flat.valid_mask[idx],
     )
 
 

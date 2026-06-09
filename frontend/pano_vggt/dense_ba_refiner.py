@@ -37,6 +37,12 @@ class DenseBARefinerStats:
     history_factors: int = 0
     pose_update_norm: dict[str, float] = field(default_factory=dict)
     depth_update_norm: dict[str, float] = field(default_factory=dict)
+    solver_mode: str = ""
+    used_factors: int = 0
+    num_pose_variables: int = 0
+    num_depth_variables: int = 0
+    pose_solve_sec: float = 0.0
+    stopped_by_time_budget: bool = False
 
     @property
     def status_suffix(self) -> str:
@@ -68,6 +74,12 @@ class DenseBARefinerStats:
             "dense_ba_pose_update_trans_max": float(self.pose_update_norm.get("trans_max", 0.0)),
             "dense_ba_depth_update_mean": float(self.depth_update_norm.get("mean", 0.0)),
             "dense_ba_depth_update_max": float(self.depth_update_norm.get("max", 0.0)),
+            "dense_ba_solver_pose_only": float(str(self.solver_mode) == "pose_only_factor_graph"),
+            "dense_ba_used_factors": float(self.used_factors),
+            "dense_ba_num_pose_variables": float(self.num_pose_variables),
+            "dense_ba_num_depth_variables": float(self.num_depth_variables),
+            "dense_ba_pose_solve_sec": float(self.pose_solve_sec),
+            "dense_ba_stopped_by_time_budget": float(self.stopped_by_time_budget),
         }
 
 
@@ -167,6 +179,10 @@ class PanoVGGTDenseBARefiner:
             max_pose_update_deg=self.config.dense_ba.max_pose_update_deg,
             max_logdepth_update=self.config.dense_ba.max_logdepth_update,
             line_search=self.config.dense_ba.line_search,
+            solver_mode=self.config.dense_ba.solver_mode,
+            max_ba_factors=self.config.dense_ba.max_ba_factors,
+            max_depth_variables=self.config.dense_ba.max_depth_variables,
+            max_solver_sec=self.config.dense_ba.max_solver_sec,
         )
         if output.failed:
             return pred, self._stats(success=False, reason=str(output.debug.get("fallback_reason", "solver_failed")), graph_metrics=graph_metrics, output=output)
@@ -572,8 +588,10 @@ class PanoVGGTDenseBARefiner:
     ) -> DenseBARefinerStats:
         metrics = graph_metrics or {}
         initial = 0.0
+        debug = {}
         if output is not None:
-            initial = float(output.debug.get("initial_mean_angular_residual_deg", 0.0))
+            debug = dict(output.debug)
+            initial = float(debug.get("initial_mean_angular_residual_deg", 0.0))
         return DenseBARefinerStats(
             enabled=self.enabled if enabled is None else bool(enabled),
             shadow_mode=self.shadow_mode,
@@ -591,6 +609,12 @@ class PanoVGGTDenseBARefiner:
             history_factors=int(metrics.get("history_factors", 0.0)),
             pose_update_norm={} if output is None else dict(output.pose_update_norm),
             depth_update_norm={} if output is None else dict(output.depth_update_norm),
+            solver_mode=str(debug.get("solver_mode", self.config.dense_ba.solver_mode)),
+            used_factors=int(debug.get("used_factors", metrics.get("valid_factors", 0.0))),
+            num_pose_variables=int(debug.get("num_pose_variables", 0)),
+            num_depth_variables=int(debug.get("num_depth_variables", 0)),
+            pose_solve_sec=float(debug.get("pose_solve_sec", 0.0)),
+            stopped_by_time_budget=bool(debug.get("stopped_by_time_budget", False)),
         )
 
 

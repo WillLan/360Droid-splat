@@ -277,6 +277,39 @@ def test_dense_ba_refiner_synthetic_prediction_returns_refined_prediction_and_fi
     assert refined.ba_valid_ratio is not None
     assert torch.isfinite(refined.chunk_world_points).all()
     assert torch.allclose(refined.poses_c2w[1, :3, 3], true_poses[1, :3, 3], atol=1e-3)
+    assert torch.allclose(refined.depth, pred.depth)
+    assert stats.solver_mode == "pose_only_factor_graph"
+    assert stats.num_depth_variables == 0
+    assert stats.used_factors > 0
+    assert stats.pose_solve_sec >= 0.0
+    assert stats.depth_update_norm.get("max", 0.0) == 0.0
+
+
+def test_pose_only_dense_ba_does_not_build_depth_variables():
+    feature_hw = (5, 8)
+    true_poses = _poses(0.2)
+    graph = _graph_from_truth(true_poses, _depth(feature_hw, 2.0), feature_hw=feature_hw)
+    init_poses = _poses(0.05)
+    log_inv_depth = torch.log(_depth(feature_hw, 2.0).reciprocal())
+
+    out = SphericalTangentDenseBA(factor_chunk_size=64, huber_delta_deg=10.0)(
+        init_poses,
+        log_inv_depth,
+        graph,
+        fixed_frames=1,
+        iters=3,
+        optimize_pose=True,
+        optimize_depth=True,
+        solver_mode="pose_only_factor_graph",
+        max_ba_factors=8,
+    )
+
+    assert not out.failed
+    assert out.debug["solver_mode"] == "pose_only_factor_graph"
+    assert out.debug["num_depth_variables"] == 0
+    assert out.debug["used_factors"] == 8
+    assert torch.allclose(out.log_inv_depth, log_inv_depth)
+    assert out.depth_update_norm.get("max", 0.0) == 0.0
 
 
 def test_dense_ba_refiner_history_window_adds_keyframe_anchor_factors():

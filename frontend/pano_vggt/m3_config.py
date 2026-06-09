@@ -55,7 +55,7 @@ class DenseMatchingConfig:
     min_match_confidence: float = 0.2
     min_static_confidence: float = 0.2
     min_match_score: float = 0.0
-    max_factors: int = 65536
+    max_factors: int = 8192
     max_samples_per_edge: int | None = None
     use_wraparound: bool = True
     forward_backward: bool = True
@@ -74,8 +74,9 @@ class DenseBAConfig:
     debug_pixel_residual: bool = False
     shadow_mode: bool = True
     mode: str = "local_chunk"
+    solver_mode: str = "pose_only_factor_graph"
     fixed_policy: str = "first_frame"
-    iters: int = 6
+    iters: int = 3
     lm: float = 1.0e-4
     fixed_frames: int = 1
     sample_stride: int = 1
@@ -91,8 +92,11 @@ class DenseBAConfig:
     fallback_if_residual_worse: bool = True
     residual_worse_tolerance: float = 1.05
     factor_chunk_size: int = 2048
+    max_ba_factors: int = 8192
+    max_depth_variables: int = 0
+    max_solver_sec: float = 8.0
     optimize_pose: bool = True
-    optimize_depth: bool = True
+    optimize_depth: bool = False
     history_keyframes: int = 8
     depth_update_policy: str = "max"
     logdepth_update_quantile: float = 1.0
@@ -214,7 +218,7 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         min_match_confidence=float(dense_raw.get("min_match_confidence", 0.2)),
         min_static_confidence=float(dense_raw.get("min_static_confidence", 0.2)),
         min_match_score=float(dense_raw.get("min_match_score", 0.0)),
-        max_factors=_positive_int(dense_raw.get("max_factors", 65536), name="PanoVGGT.DenseMatching.max_factors"),
+        max_factors=_positive_int(dense_raw.get("max_factors", 8192), name="PanoVGGT.DenseMatching.max_factors"),
         max_samples_per_edge=(
             None
             if max_samples_per_edge_raw is None
@@ -233,8 +237,9 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         debug_pixel_residual=bool(ba_raw.get("debug_pixel_residual", False)),
         shadow_mode=bool(ba_raw.get("shadow_mode", True)),
         mode=str(ba_raw.get("mode", "local_chunk")),
+        solver_mode=str(ba_raw.get("solver_mode", "pose_only_factor_graph")),
         fixed_policy=str(ba_raw.get("fixed_policy", "first_frame")),
-        iters=_positive_int(ba_raw.get("iters", 6), name="PanoVGGT.DenseBA.iters"),
+        iters=_positive_int(ba_raw.get("iters", 3), name="PanoVGGT.DenseBA.iters"),
         lm=float(ba_raw.get("lm", 1.0e-4)),
         fixed_frames=_positive_int(ba_raw.get("fixed_frames", 1), name="PanoVGGT.DenseBA.fixed_frames"),
         sample_stride=_positive_int(ba_raw.get("sample_stride", 1), name="PanoVGGT.DenseBA.sample_stride"),
@@ -250,8 +255,14 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         fallback_if_residual_worse=bool(ba_raw.get("fallback_if_residual_worse", True)),
         residual_worse_tolerance=float(ba_raw.get("residual_worse_tolerance", 1.05)),
         factor_chunk_size=_positive_int(ba_raw.get("factor_chunk_size", 2048), name="PanoVGGT.DenseBA.factor_chunk_size"),
+        max_ba_factors=_positive_int(ba_raw.get("max_ba_factors", 8192), name="PanoVGGT.DenseBA.max_ba_factors"),
+        max_depth_variables=_nonnegative_int(
+            ba_raw.get("max_depth_variables", 0),
+            name="PanoVGGT.DenseBA.max_depth_variables",
+        ),
+        max_solver_sec=float(ba_raw.get("max_solver_sec", 8.0)),
         optimize_pose=bool(ba_raw.get("optimize_pose", True)),
-        optimize_depth=bool(ba_raw.get("optimize_depth", True)),
+        optimize_depth=bool(ba_raw.get("optimize_depth", False)),
         history_keyframes=_nonnegative_int(
             ba_raw.get("history_keyframes", 8),
             name="PanoVGGT.DenseBA.history_keyframes",
