@@ -138,6 +138,39 @@ def test_mapper_random_window_optimizes_one_sample_per_step():
     assert mapper.stats.last_trainable_pose_count == 2
 
 
+def test_mapper_frontend_graph_window_prioritizes_history_hints():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "keyframe_steps": 0,
+            "local_submap_steps": 0,
+            "sliding_window_steps": 1,
+            "window_keyframes": 2,
+            "use_frontend_graph_window": True,
+            "random_window_frame_per_iter": False,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    for frame_id in (0, 4, 8, 12):
+        image = torch.full((3, 4, 8), 0.2 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.insert_keyframe(_small_seed_batch(frame_id), _small_frontend_output(frame_id), image=image)
+    mapper.set_frontend_graph_window_ids([4, 12])
+
+    metrics = mapper.optimize_after_keyframe()
+
+    assert metrics["window_size"] == 3.0
+    assert mapper.stats.last_window_keyframes == [4, 8, 12]
+    assert renderer.frame_ids == [4, 8, 12]
+
+
 def test_pano_gaussian_map_saves_legacy_3dgs_ply_schema(tmp_path: Path):
     config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
     gaussian_map = PanoGaussianMap(config=config, device="cpu")

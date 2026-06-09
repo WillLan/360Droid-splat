@@ -18,6 +18,9 @@ class KeyframeRecord:
     static_confidence: torch.Tensor | None = None
     feature_hw: tuple[int, int] | None = None
     image_hw: tuple[int, int] | None = None
+    image: torch.Tensor | None = None
+    global_points: torch.Tensor | None = None
+    confidence: torch.Tensor | None = None
     frozen: bool = False
 
 

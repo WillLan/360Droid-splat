@@ -469,6 +469,10 @@ class PanoGaussianMapper:
         self.keyframes: list[MapperKeyframe] = []
         self.pose_deltas: dict[int, PoseDelta] = {}
         self.last_inserted_range: tuple[int, int] = (0, 0)
+        self.last_requested_source_flat_idx: torch.Tensor | None = None
+        self.last_inserted_source_flat_idx: torch.Tensor | None = None
+        self.last_source_hw: tuple[int, int] | None = None
+        self.frontend_graph_window_ids: tuple[int, ...] = ()
 
     @property
     def uses_joint_optimization(self) -> bool:
@@ -482,10 +486,19 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
     ) -> int:
         requested = len(seeds)
+        self.last_requested_source_flat_idx = (
+            None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
+        )
+        self.last_source_hw = seeds.source_hw
         sky_mask = self._skybox_mask_from_image(image) if image is not None else None
         if image is not None and self.map.has_skybox:
             self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
         seeds, filter_stats = self._filter_novel_seeds(seeds)
+        self.last_inserted_source_flat_idx = (
+            None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
+        )
+        if self.last_source_hw is None:
+            self.last_source_hw = seeds.source_hw
         start = self.map.anchor_count()
         n = self.map.add_seeds(seeds)
         end = start + int(n)
@@ -509,6 +522,20 @@ class PanoGaussianMapper:
                 )
             )
         return n
+
+    def set_frontend_graph_window_ids(self, frame_ids) -> None:
+        ids: list[int] = []
+        if frame_ids is None:
+            self.frontend_graph_window_ids = ()
+            return
+        for frame_id in frame_ids:
+            try:
+                value = int(frame_id)
+            except (TypeError, ValueError):
+                continue
+            if value not in ids:
+                ids.append(value)
+        self.frontend_graph_window_ids = tuple(ids)
 
     def _filter_novel_seeds(self, seeds: GaussianSeedBatch) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if not self.novel_insertion_enabled or len(seeds) == 0:
@@ -604,6 +631,12 @@ class PanoGaussianMapper:
             scale=seeds.scale.index_select(0, keep_idx.to(device=seeds.scale.device)),
             level=seeds.level.index_select(0, keep_idx.to(device=seeds.level.device)),
             frame_id=int(seeds.frame_id),
+            source_flat_idx=(
+                None
+                if seeds.source_flat_idx is None
+                else seeds.source_flat_idx.index_select(0, keep_idx.to(device=seeds.source_flat_idx.device))
+            ),
+            source_hw=seeds.source_hw,
         )
 
     @staticmethod
@@ -615,6 +648,8 @@ class PanoGaussianMapper:
             scale=seeds.scale[:0],
             level=seeds.level[:0],
             frame_id=int(seeds.frame_id),
+            source_flat_idx=None if seeds.source_flat_idx is None else seeds.source_flat_idx[:0],
+            source_hw=seeds.source_hw,
         )
 
     def _register_keyframe(
@@ -832,7 +867,7 @@ class PanoGaussianMapper:
         local_steps = int(self.optim_cfg.get("local_submap_steps", 0))
         if local_steps > 0:
             local_window = int(self.optim_cfg.get("local_window_keyframes", 2))
-            selected = self.keyframes[-max(1, local_window) :]
+            selected = self._select_backend_keyframe_window(max(1, local_window))
             local_metrics = self._optimize_keyframe_set(
                 selected,
                 steps=local_steps,
@@ -846,7 +881,7 @@ class PanoGaussianMapper:
         sliding_steps = int(self.optim_cfg.get("sliding_window_steps", 0))
         if sliding_steps > 0:
             window = int(self.optim_cfg.get("window_keyframes", 8))
-            selected = self.keyframes[-max(1, window) :]
+            selected = self._select_backend_keyframe_window(max(1, window))
             sliding_metrics = self._optimize_keyframe_set(
                 selected,
                 steps=sliding_steps,
@@ -857,6 +892,32 @@ class PanoGaussianMapper:
             if "loss" in sliding_metrics:
                 metrics["sliding_loss"] = sliding_metrics["loss"]
         return metrics
+
+    def _select_backend_keyframe_window(self, latest_count: int) -> list[MapperKeyframe]:
+        latest_count = max(1, int(latest_count))
+        if not bool(self.optim_cfg.get("use_frontend_graph_window", False)):
+            return self.keyframes[-latest_count:]
+        by_id = {int(kf.frame_id): kf for kf in self.keyframes}
+        latest_ids = [int(kf.frame_id) for kf in self.keyframes[-latest_count:]]
+        hint_ids = [int(fid) for fid in self.frontend_graph_window_ids if int(fid) in by_id]
+        selected_ids: set[int] = set(hint_ids) | set(latest_ids)
+        cap = max(0, int(self.optim_cfg.get("frontend_graph_window_max_keyframes", 0)))
+        if cap > 0 and len(selected_ids) > cap:
+            ordered: list[int] = []
+            for fid in reversed(hint_ids):
+                if fid not in ordered:
+                    ordered.append(fid)
+                if len(ordered) >= cap:
+                    break
+            if len(ordered) < cap:
+                for kf in reversed(self.keyframes):
+                    fid = int(kf.frame_id)
+                    if fid not in ordered:
+                        ordered.append(fid)
+                    if len(ordered) >= cap:
+                        break
+            selected_ids = set(ordered)
+        return [kf for kf in self.keyframes if int(kf.frame_id) in selected_ids]
 
     def bootstrap_latest_keyframe(self, *, steps: int, diagnostic_callback=None, diagnostic_every: int = 0) -> dict[str, float]:
         if not self.keyframes or int(steps) <= 0:
@@ -1185,6 +1246,7 @@ class PanoGaussianMapper:
         last["sampled_window_size"] = float(len(last_sampled_ids))
         last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
         last["trainable_pose_count"] = float(len(trainable_pose_ids))
+        last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
         self.stats.last_loss = float(last.get("loss", 0.0))
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = pose_norm

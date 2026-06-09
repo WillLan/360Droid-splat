@@ -59,6 +59,24 @@ class _AnchorFrameMetrics:
     anchor_pose_c2w: torch.Tensor
 
 
+@dataclass
+class _JointInferenceContext:
+    history_records: tuple[KeyframeRecord, ...]
+    history_frame_ids: tuple[int, ...]
+    history_count: int
+    current_frame_ids: tuple[int, ...]
+
+
+@dataclass
+class _AlignmentDebug:
+    overlap_points: int = 0
+    history_points: int = 0
+    history_ids: tuple[int, ...] = ()
+    scale: float = 1.0
+    residual: float = 0.0
+    inlier_ratio: float = 0.0
+
+
 def _relative_from_c2w(c2w_i: torch.Tensor, c2w_j: torch.Tensor) -> torch.Tensor:
     return torch.linalg.inv(c2w_j) @ c2w_i
 
@@ -84,6 +102,28 @@ def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
         mode="bilinear",
         align_corners=False,
     )[0].permute(1, 2, 0)
+
+
+def _slice_prediction(pred: PanoVGGTLocalPrediction, start: int, count: int) -> PanoVGGTLocalPrediction:
+    n = int(pred.poses_c2w.shape[0])
+    start_i = max(0, min(int(start), n))
+    count_i = max(0, min(int(count), n - start_i))
+    idx = slice(start_i, start_i + count_i)
+    return replace(
+        pred,
+        poses_c2w=pred.poses_c2w[idx],
+        depth=pred.depth[idx],
+        confidence=pred.confidence[idx],
+        chunk_world_points=pred.chunk_world_points[idx],
+        local_points=None if pred.local_points is None else pred.local_points[idx],
+        global_points=None if pred.global_points is None else pred.global_points[idx],
+        descriptors=None if pred.descriptors is None else pred.descriptors[idx],
+        dense_descriptors=None if pred.dense_descriptors is None else pred.dense_descriptors[idx],
+        match_confidence=None if pred.match_confidence is None else pred.match_confidence[idx],
+        static_confidence=None if pred.static_confidence is None else pred.static_confidence[idx],
+        sky_logits=None if pred.sky_logits is None else pred.sky_logits[idx],
+        sky_prob=None if pred.sky_prob is None else pred.sky_prob[idx],
+    )
 
 
 def _feature_uv_to_grid(uv: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -271,6 +311,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
         self.last_m3_debug: dict | None = None
+        self.last_alignment_debug = _AlignmentDebug()
+        self.current_recent_history_ids: tuple[int, ...] = ()
         self.keyframe_decision_history: list[dict] = []
         self._pending_keyframe_decisions: list[dict] = []
 
@@ -282,6 +324,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     def dense_ba_history_enabled(self) -> bool:
         mode = str(self.m3_config.dense_ba.mode).lower()
         return bool(self.m3_config.enabled and self.m3_config.dense_ba.enabled and mode in {"history_window", "keyframe_graph"})
+
+    @property
+    def joint_inference_enabled(self) -> bool:
+        return bool(self.m3_config.enabled and self.m3_config.joint_inference.enabled)
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -373,6 +419,67 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 if len(self.records) - self.next_chunk_start < self.chunk_size:
                     break
 
+    def _recent_joint_history_records(self, frame_ids: tuple[int, ...]) -> tuple[KeyframeRecord, ...]:
+        if not self.joint_inference_enabled:
+            return ()
+        cfg = self.m3_config.joint_inference
+        if str(cfg.history_policy).lower() != "recent":
+            return ()
+        max_history = max(0, int(cfg.max_history_frames))
+        if max_history <= 0:
+            return ()
+        current_ids = {int(fid) for fid in frame_ids}
+        records: list[KeyframeRecord] = []
+        for record in reversed(self.keyframe_memory.records):
+            if int(record.frame_id) in current_ids:
+                continue
+            if record.image is None:
+                continue
+            records.append(record)
+            if len(records) >= max_history:
+                break
+        return tuple(reversed(records))
+
+    def _build_joint_inference_batch(
+        self,
+        images: torch.Tensor,
+        frame_ids: tuple[int, ...],
+    ) -> tuple[torch.Tensor, _JointInferenceContext]:
+        records = self._recent_joint_history_records(frame_ids)
+        if not records:
+            return images, _JointInferenceContext((), (), 0, frame_ids)
+        history_images = []
+        size = tuple(int(v) for v in images.shape[-2:])
+        for record in records:
+            image = record.image.to(device=images.device, dtype=images.dtype)
+            if tuple(image.shape[-2:]) != size:
+                image = F.interpolate(
+                    image.unsqueeze(0),
+                    size=size,
+                    mode="bilinear",
+                    align_corners=False,
+                )[0]
+            history_images.append(image)
+        joint_images = torch.cat([torch.stack(history_images, dim=0), images], dim=0)
+        history_ids = tuple(int(record.frame_id) for record in records)
+        return joint_images, _JointInferenceContext(records, history_ids, len(records), frame_ids)
+
+    def _joint_anchor_context(self, context: _JointInferenceContext) -> _ChunkAnchorContext | None:
+        if not self.keyframe_anchor_enabled or context.history_count <= 0:
+            return None
+        anchor_idx = int(context.history_count) - 1
+        record = context.history_records[anchor_idx]
+        return _ChunkAnchorContext(
+            record=_KeyframeAnchorRecord(
+                frame_id=int(record.frame_id),
+                image=record.image.detach().cpu().float() if record.image is not None else torch.empty(0),
+                pose_c2w=record.pose_c2w.detach().cpu().float(),
+            ),
+            full_index=anchor_idx,
+            prepended=True,
+            current_full_indices=tuple(range(int(context.history_count), int(context.history_count) + len(context.current_frame_ids))),
+        )
+
     def _process_chunk(self, start: int, end: int, *, final: bool) -> None:
         frame_ids = tuple(int(r.frame.frame_id) for r in self.records[start:end])
         range_key = (frame_ids[0], frame_ids[-1], len(frame_ids))
@@ -381,23 +488,52 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.processed_ranges.add(range_key)
 
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
-        pred0 = self.engine.infer(images)
+        infer_images, joint_context = self._build_joint_inference_batch(images, frame_ids)
+        self.current_recent_history_ids = tuple(joint_context.history_frame_ids)
+        pred_full0 = self.engine.infer(infer_images)
         full_factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
-        anchor_context = self._anchor_context_from_current_chunk(frame_ids)
+        pred0 = (
+            _slice_prediction(pred_full0, joint_context.history_count, len(frame_ids))
+            if joint_context.history_count > 0
+            else pred_full0
+        )
+        anchor_context = self._joint_anchor_context(joint_context)
+        if anchor_context is None:
+            anchor_context = self._anchor_context_from_current_chunk(frame_ids)
         if anchor_context is not None:
-            anchor_metrics = self._compute_anchor_metrics(pred0, anchor_context)
+            anchor_metrics = self._compute_anchor_metrics(pred_full0 if joint_context.history_count > 0 else pred0, anchor_context)
+        elif self.joint_inference_enabled:
+            anchor_metrics = {}
         else:
             anchor_metrics = self._compute_anchor_metrics_sidepath(images, frame_ids)
         factor_graph = full_factor_graph
         if self.dense_ba_history_enabled:
-            seed_transform = self._align_chunk(pred0, frame_ids)
-            pred_ba_input = self._prediction_to_world(pred0, seed_transform)
-            pred_refined, ba_stats = self.dense_ba_refiner.refine(
-                pred_ba_input,
+            seed_transform = self._align_chunk(
+                pred0,
                 frame_ids,
-                factor_graph=factor_graph,
-                keyframe_memory=self.keyframe_memory,
+                history_pred=pred_full0 if joint_context.history_count > 0 else None,
+                history_records=joint_context.history_records,
             )
+            if joint_context.history_count > 0:
+                pred_ba_seed = self._prediction_to_world(pred_full0, seed_transform)
+                pred_refined, ba_stats = self.dense_ba_refiner.refine(
+                    pred_ba_seed,
+                    tuple((*joint_context.history_frame_ids, *frame_ids)),
+                    factor_graph=factor_graph,
+                    keyframe_memory=None,
+                    current_start=joint_context.history_count,
+                    current_count=len(frame_ids),
+                    fixed_frames_override=1,
+                )
+                pred_ba_input = _slice_prediction(pred_ba_seed, joint_context.history_count, len(frame_ids))
+            else:
+                pred_ba_input = self._prediction_to_world(pred0, seed_transform)
+                pred_refined, ba_stats = self.dense_ba_refiner.refine(
+                    pred_ba_input,
+                    frame_ids,
+                    factor_graph=factor_graph,
+                    keyframe_memory=self.keyframe_memory,
+                )
             pred = pred_refined if ba_stats.used_refined else pred_ba_input
             transform = SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
             transform.accepted = bool(seed_transform.accepted)
@@ -410,7 +546,12 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 keyframe_memory=self.keyframe_memory,
             )
             pred = pred_refined if ba_stats.used_refined else pred0
-            transform = self._align_chunk(pred, frame_ids)
+            transform = self._align_chunk(
+                pred,
+                frame_ids,
+                history_pred=pred_full0 if joint_context.history_count > 0 else None,
+                history_records=joint_context.history_records,
+            )
             alignment_residual = float(transform.residual)
         factor_graph = getattr(self.dense_ba_refiner, "last_factor_graph", factor_graph) or factor_graph
         self.last_dense_ba_stats = ba_stats
@@ -419,12 +560,25 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             self.last_m3_debug = {
                 "chunk_index": int(self.chunk_count),
                 "frame_ids": frame_ids,
+                "recent_history_ids": tuple(joint_context.history_frame_ids),
                 "stats": ba_stats,
                 "factor_graph": factor_graph,
                 "sky_prob": pred0.sky_prob.detach().cpu() if pred0.sky_prob is not None else None,
                 "feature_hw": pred0.feature_hw,
                 "image_hw": pred0.image_hw,
                 "images": images.detach().cpu(),
+                "alignment": {
+                    "overlap_points": float(self.last_alignment_debug.overlap_points),
+                    "history_points": float(self.last_alignment_debug.history_points),
+                    "overlap_alignment_points": float(self.last_alignment_debug.overlap_points),
+                    "history_alignment_points": float(self.last_alignment_debug.history_points),
+                    "history_ids": tuple(int(fid) for fid in self.last_alignment_debug.history_ids),
+                    "scale": float(self.last_alignment_debug.scale),
+                    "alignment_scale": float(self.last_alignment_debug.scale),
+                    "residual": float(self.last_alignment_debug.residual),
+                    "alignment_rmse": float(self.last_alignment_debug.residual),
+                    "inlier_ratio": float(self.last_alignment_debug.inlier_ratio),
+                },
                 "keyframe_anchor": {
                     int(frame_ids[local_idx]): metrics.frame_mean_pair_conf
                     for local_idx, metrics in anchor_metrics.items()
@@ -519,8 +673,16 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     status=status,
                 )
                 self.pending_outputs.append(output)
-                if output.is_keyframe and self.dense_ba_history_enabled:
-                    self._remember_keyframe_record(frame_id, frame_ids.index(frame_id), pred, pose)
+                if output.is_keyframe and (self.dense_ba_history_enabled or self.joint_inference_enabled):
+                    self._remember_keyframe_record(
+                        frame_id,
+                        frame_ids.index(frame_id),
+                        pred,
+                        pose,
+                        image=record.image,
+                        global_points=output.world_points,
+                        confidence=output.depth_confidence,
+                    )
                 self.emitted_frame_ids.add(frame_id)
         self.chunk_count += 1
         self._trim_alignment_cache()
@@ -737,9 +899,23 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         corrected = (correction.to(device=flat.device, dtype=flat.dtype) @ hom.T).T[:, :3]
         return corrected.reshape_as(points)
 
-    def _align_chunk(self, pred: PanoVGGTLocalPrediction, frame_ids: tuple[int, ...]) -> SimilarityTransform:
+    def _align_chunk(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        frame_ids: tuple[int, ...],
+        *,
+        history_pred: PanoVGGTLocalPrediction | None = None,
+        history_records: tuple[KeyframeRecord, ...] = (),
+    ) -> SimilarityTransform:
+        self.last_alignment_debug = _AlignmentDebug(history_ids=tuple(int(r.frame_id) for r in history_records))
         if not self.global_points_by_frame:
             transform = self._root_transform(pred.poses_c2w[0])
+            self.last_alignment_debug = _AlignmentDebug(
+                history_ids=tuple(int(r.frame_id) for r in history_records),
+                scale=float(transform.scale),
+                residual=float(transform.residual),
+                inlier_ratio=float(transform.inlier_ratio),
+            )
             self.pose_graph.add_edge(
                 PoseGraphEdge(
                     source_chunk=self.chunk_count,
@@ -754,27 +930,85 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         source_parts = []
         target_parts = []
         weight_parts = []
-        for local_idx, frame_id in enumerate(frame_ids):
-            target = self.global_points_by_frame.get(int(frame_id))
-            if target is None:
-                continue
-            source = pred.chunk_world_points[local_idx].to(target.device)
-            conf = pred.confidence[local_idx, 0].to(target.device)
-            src, tgt, weights = sample_overlap_points(
-                source,
-                target,
-                conf,
-                None,
-                max_points=max(1, self.max_alignment_points // max(1, self.overlap)),
-            )
-            if src.numel() == 0:
-                continue
-            source_parts.append(src)
-            target_parts.append(tgt)
-            weight_parts.append(weights)
+        overlap_points = 0
+        history_points = 0
+        use_history = bool(self.m3_config.alignment.use_common_history and history_pred is not None and history_records)
+        has_overlap_targets = any(int(frame_id) in self.global_points_by_frame for frame_id in frame_ids)
+        history_targets: list[tuple[int, KeyframeRecord, torch.Tensor]] = []
+        if use_history and history_pred is not None:
+            for hist_idx, record in enumerate(history_records):
+                target = record.global_points
+                if target is None:
+                    target = self.global_points_by_frame.get(int(record.frame_id))
+                if target is not None:
+                    history_targets.append((int(hist_idx), record, target))
+        use_history = bool(use_history and history_targets)
+        ratio = min(1.0, max(0.0, float(self.m3_config.alignment.history_point_budget_ratio)))
+        total_budget = max(1, int(self.max_alignment_points))
+        if use_history and has_overlap_targets:
+            history_budget = int(total_budget * ratio)
+            if ratio > 0.0:
+                history_budget = max(1, history_budget)
+            if ratio >= 1.0:
+                history_budget = total_budget
+            history_budget = min(total_budget, history_budget)
+            overlap_budget = max(0, total_budget - history_budget)
+        elif use_history:
+            history_budget = total_budget
+            overlap_budget = 0
+        else:
+            history_budget = 0
+            overlap_budget = total_budget
+
+        if overlap_budget > 0:
+            per_overlap = max(1, overlap_budget // max(1, self.overlap))
+            for local_idx, frame_id in enumerate(frame_ids):
+                target = self.global_points_by_frame.get(int(frame_id))
+                if target is None:
+                    continue
+                source = pred.chunk_world_points[local_idx].to(target.device)
+                conf = pred.confidence[local_idx, 0].to(target.device)
+                src, tgt, weights = sample_overlap_points(
+                    source,
+                    target,
+                    conf,
+                    None,
+                    max_points=per_overlap,
+                )
+                if src.numel() == 0:
+                    continue
+                source_parts.append(src)
+                target_parts.append(tgt)
+                weight_parts.append(weights)
+                overlap_points += int(src.shape[0])
+
+        if use_history and history_pred is not None and history_budget > 0:
+            per_history = max(1, history_budget // max(1, len(history_targets)))
+            for hist_idx, record, target in history_targets:
+                target_t = target.to(device=history_pred.chunk_world_points.device, dtype=history_pred.chunk_world_points.dtype)
+                source = history_pred.chunk_world_points[hist_idx].to(target_t)
+                if tuple(source.shape[:2]) != tuple(target_t.shape[:2]):
+                    source = _resize_points(source, tuple(int(v) for v in target_t.shape[:2]))
+                conf = history_pred.confidence[hist_idx, 0].to(target_t.device)
+                if tuple(conf.shape[-2:]) != tuple(source.shape[:2]):
+                    conf = _resize_field(conf.unsqueeze(0), tuple(int(v) for v in source.shape[:2]))[0]
+                src, tgt, weights = sample_overlap_points(
+                    source,
+                    target_t,
+                    conf,
+                    None,
+                    max_points=per_history,
+                )
+                if src.numel() == 0:
+                    continue
+                source_parts.append(src)
+                target_parts.append(tgt)
+                weight_parts.append(weights)
+                history_points += int(src.shape[0])
+
         if not source_parts:
             return self._handle_alignment_failure(
-                "no overlapping frames with cached global world points",
+                "no overlapping or common-history frames with cached global world points",
                 device=pred.depth.device,
                 dtype=pred.depth.dtype,
             )
@@ -788,6 +1022,14 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 dtype=pred.depth.dtype,
             )
         transform = self.aligner.align(source_all, target_all, weight_all)
+        self.last_alignment_debug = _AlignmentDebug(
+            overlap_points=int(overlap_points),
+            history_points=int(history_points),
+            history_ids=tuple(int(r.frame_id) for r in history_records),
+            scale=float(transform.scale),
+            residual=float(transform.residual),
+            inlier_ratio=float(transform.inlier_ratio),
+        )
         if not transform.accepted:
             return self._handle_alignment_failure(
                 (
@@ -908,6 +1150,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         local_idx: int,
         pred: PanoVGGTLocalPrediction,
         pose_c2w: torch.Tensor,
+        *,
+        image: torch.Tensor | None = None,
+        global_points: torch.Tensor | None = None,
+        confidence: torch.Tensor | None = None,
     ) -> None:
         if (
             pred.dense_descriptors is None
@@ -934,6 +1180,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 static_confidence=static_confidence,
                 feature_hw=tuple(int(v) for v in pred.feature_hw),
                 image_hw=tuple(int(v) for v in pred.image_hw),
+                image=None if image is None else image.detach().cpu().float(),
+                global_points=None if global_points is None else global_points.detach().cpu().float(),
+                confidence=None if confidence is None else confidence.detach().cpu().float(),
                 frozen=True,
             )
         )
@@ -976,6 +1225,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 "accepted": True,
                 "reasons": ["first_frame"],
                 "keyframe_score": float(key_score),
+                "recent_history_ids": list(self.current_recent_history_ids),
             }
         cfg = self.m3_config.keyframe_anchor
         reasons: list[str] = []
@@ -987,8 +1237,15 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             "reasons": reasons,
             "keyframe_score": float(key_score),
             "keyframe_gap": int(keyframe_gap),
+            "recent_history_ids": list(self.current_recent_history_ids),
         }
+        coverage_deficit = 0.0
+        matching_uncertainty = 0.0
+        connectivity_deficit = 1.0
         if anchor_metrics is not None:
+            coverage_deficit = max(0.0, min(1.0, 1.0 - float(anchor_metrics.match_coverage)))
+            matching_uncertainty = max(0.0, min(1.0, 1.0 - float(anchor_metrics.frame_mean_pair_conf)))
+            connectivity_deficit = max(0.0, min(1.0, float(anchor_metrics.low_pair_conf_ratio)))
             decision.update(
                 {
                     "anchor_frame_id": int(anchor_metrics.anchor_frame_id),
@@ -1028,17 +1285,40 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     reasons.append("translation_depth_ratio")
                 elif median_depth > 1.0e-6:
                     decision["translation_depth_ratio"] = float(translation_value / median_depth)
+        parallax = max(0.0, min(1.0, float(decision.get("translation_depth_ratio", 0.0)) / max(float(cfg.translation_depth_ratio_threshold), 1.0e-6)))
+        m3_score = (
+            0.35 * float(coverage_deficit)
+            + 0.30 * float(matching_uncertainty)
+            + 0.20 * float(connectivity_deficit)
+            + 0.15 * float(parallax)
+        )
+        decision.update(
+            {
+                "m3_keyframe_score": float(m3_score),
+                "map_coverage_deficit": float(coverage_deficit),
+                "matching_uncertainty": float(matching_uncertainty),
+                "graph_connectivity_deficit": float(connectivity_deficit),
+                "parallax_score": float(parallax),
+            }
+        )
+        if self.joint_inference_enabled:
+            decision["legacy_candidate_reasons"] = list(reasons)
+            reasons.clear()
+        if m3_score >= float(self.keyframe_threshold):
+            reasons.append("m3_score")
         min_interval = max(0, int(cfg.min_keyframe_interval))
         max_interval = max(0, int(cfg.max_keyframe_interval))
-        quality_reasons = {"low_mean_pair_conf", "high_low_pair_conf_ratio", "low_match_coverage"}
-        if min_interval > 0 and keyframe_gap < min_interval and not any(r in quality_reasons for r in reasons):
+        if min_interval > 0 and keyframe_gap < min_interval:
             decision["suppressed_by_min_keyframe_interval"] = True
+            decision["suppressed_by_min_interval"] = True
             decision["suppressed_reasons"] = list(reasons)
             decision["min_keyframe_interval"] = int(min_interval)
             reasons.clear()
-        if max_interval > 0 and keyframe_gap >= max_interval and not reasons:
-            reasons.append("max_keyframe_interval")
+        if max_interval > 0 and keyframe_gap >= max_interval:
+            if "max_keyframe_interval" not in reasons:
+                reasons.append("max_keyframe_interval")
             decision["max_keyframe_interval"] = int(max_interval)
+            decision["forced_by_max_interval"] = True
         accepted = bool(reasons)
         decision["accepted"] = accepted
         return accepted, decision

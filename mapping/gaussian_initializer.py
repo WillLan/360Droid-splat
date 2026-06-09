@@ -19,6 +19,8 @@ class GaussianSeedBatch:
     scale: torch.Tensor
     level: torch.Tensor
     frame_id: int
+    source_flat_idx: torch.Tensor | None = None
+    source_hw: tuple[int, int] | None = None
 
     def __len__(self) -> int:
         return int(self.xyz.shape[0])
@@ -31,6 +33,8 @@ class GaussianSeedBatch:
             scale=self.scale.to(device),
             level=self.level.to(device),
             frame_id=self.frame_id,
+            source_flat_idx=None if self.source_flat_idx is None else self.source_flat_idx.to(device),
+            source_hw=self.source_hw,
         )
 
 
@@ -143,6 +147,8 @@ class GaussianInitializer:
             scale=scale,
             level=levels.to(device=xyz.device),
             frame_id=int(output.frame_id),
+            source_flat_idx=flat_idx.detach().to(device=xyz.device, dtype=torch.long),
+            source_hw=(int(H), int(W)),
         )
 
     def from_world_points_only(
@@ -233,6 +239,8 @@ class GaussianInitializer:
             scale=scale,
             level=levels.to(device=xyz.device),
             frame_id=int(output.frame_id),
+            source_flat_idx=flat_idx.detach().to(device=xyz.device, dtype=torch.long),
+            source_hw=(int(H), int(W)),
         )
 
     def _sky_mask_from_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -293,4 +301,6 @@ class GaussianInitializer:
             scale=torch.zeros(0, device=device),
             level=torch.zeros(0, dtype=torch.int8, device=device),
             frame_id=int(frame_id),
+            source_flat_idx=torch.zeros(0, dtype=torch.long, device=device),
+            source_hw=None,
         )

@@ -94,6 +94,27 @@ class DenseBAConfig:
     optimize_pose: bool = True
     optimize_depth: bool = True
     history_keyframes: int = 8
+    depth_update_policy: str = "max"
+    logdepth_update_quantile: float = 1.0
+    line_search: bool = False
+
+
+@dataclass(frozen=True)
+class JointInferenceConfig:
+    """Configuration for recent-history joint PanoVGGT inference."""
+
+    enabled: bool = False
+    history_policy: str = "recent"
+    min_history_frames: int = 0
+    max_history_frames: int = 3
+
+
+@dataclass(frozen=True)
+class AlignmentConfig:
+    """Configuration for history-aware chunk alignment."""
+
+    use_common_history: bool = False
+    history_point_budget_ratio: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -135,6 +156,8 @@ class M3SphereConfig:
     dense_ba: DenseBAConfig = DenseBAConfig()
     keyframe_anchor: KeyframeAnchorConfig = KeyframeAnchorConfig()
     inference_window: InferenceWindowConfig = InferenceWindowConfig()
+    joint_inference: JointInferenceConfig = JointInferenceConfig()
+    alignment: AlignmentConfig = AlignmentConfig()
 
 
 def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
@@ -152,6 +175,8 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     ba_raw = _section(pano_cfg, "DenseBA")
     keyframe_anchor_raw = _section(pano_cfg, "KeyframeAnchor")
     window_raw = _section(pano_cfg, "InferenceWindow")
+    joint_raw = _section(pano_cfg, "JointInference")
+    alignment_raw = _section(pano_cfg, "Alignment")
 
     descriptor_dim = _positive_int(
         head_raw.get("descriptor_dim", m3_raw.get("descriptor_dim", 24)),
@@ -231,6 +256,9 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
             ba_raw.get("history_keyframes", 8),
             name="PanoVGGT.DenseBA.history_keyframes",
         ),
+        depth_update_policy=str(ba_raw.get("depth_update_policy", "max")),
+        logdepth_update_quantile=float(ba_raw.get("logdepth_update_quantile", 1.0)),
+        line_search=bool(ba_raw.get("line_search", False)),
     )
     keyframe_anchor = KeyframeAnchorConfig(
         enabled=bool(keyframe_anchor_raw.get("enabled", False)),
@@ -260,6 +288,22 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     )
     if inference_window.overlap < 0:
         raise ValueError("PanoVGGT.InferenceWindow.overlap must be non-negative.")
+    joint_inference = JointInferenceConfig(
+        enabled=bool(joint_raw.get("enabled", False)),
+        history_policy=str(joint_raw.get("history_policy", "recent")),
+        min_history_frames=_nonnegative_int(
+            joint_raw.get("min_history_frames", 0),
+            name="PanoVGGT.JointInference.min_history_frames",
+        ),
+        max_history_frames=_nonnegative_int(
+            joint_raw.get("max_history_frames", 3),
+            name="PanoVGGT.JointInference.max_history_frames",
+        ),
+    )
+    alignment = AlignmentConfig(
+        use_common_history=bool(alignment_raw.get("use_common_history", False)),
+        history_point_budget_ratio=float(alignment_raw.get("history_point_budget_ratio", 0.5)),
+    )
 
     return M3SphereConfig(
         enabled=bool(m3_raw.get("enabled", False)),
@@ -269,4 +313,6 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         dense_ba=dense_ba,
         keyframe_anchor=keyframe_anchor,
         inference_window=inference_window,
+        joint_inference=joint_inference,
+        alignment=alignment,
     )

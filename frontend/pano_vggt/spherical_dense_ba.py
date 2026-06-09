@@ -71,6 +71,7 @@ class SphericalTangentDenseBA:
         depth_prior_weight: float = 1.0e-2,
         max_pose_update_deg: float = 5.0,
         max_logdepth_update: float = 0.35,
+        line_search: bool = False,
     ) -> SphericalTangentDenseBAOutput:
         """Optimize local chunk poses and log inverse depth with tangent residuals."""
 
@@ -151,14 +152,42 @@ class SphericalTangentDenseBA:
             if not torch.isfinite(step).all():
                 failed_reason = "non_finite_update"
                 break
+
+            if optimize_depth and depth_dim:
+                dz = step[pose_dim : pose_dim + depth_dim]
+                total_dz = (depth_update + dz.detach()).clamp(
+                    -float(max_logdepth_update),
+                    float(max_logdepth_update),
+                )
+                step = step.clone()
+                step[pose_dim : pose_dim + depth_dim] = total_dz - depth_update
+
+            step_scale, next_poses, next_log = self._line_search_state(
+                cur_poses,
+                cur_log,
+                step,
+                flat,
+                free_frames=free_frames,
+                pose_dim=pose_dim,
+                depth_dim=depth_dim,
+                optimize_pose=optimize_pose,
+                optimize_depth=optimize_depth,
+                enabled=bool(line_search),
+            )
+            if step_scale <= 0.0:
+                break
+            step = step * float(step_scale)
             if optimize_pose and pose_dim:
                 pose_delta = step[:pose_dim].view(len(free_frames), 6)
-                cur_poses = _apply_free_pose_delta(cur_poses, pose_delta, free_frames)
                 pose_update = pose_update + pose_delta.detach()
             if optimize_depth and depth_dim:
                 dz = step[pose_dim : pose_dim + depth_dim]
-                cur_log = _apply_unique_depth_delta(cur_log, dz, flat)
-                depth_update = depth_update + dz.detach()
+                depth_update = (depth_update + dz.detach()).clamp(
+                    -float(max_logdepth_update),
+                    float(max_logdepth_update),
+                )
+            cur_poses = next_poses
+            cur_log = next_log
 
             if float(step.abs().max().detach().cpu()) < 1.0e-7:
                 break
@@ -181,6 +210,52 @@ class SphericalTangentDenseBA:
             depth_update=depth_update.detach(),
             debug={"iters": int(iters), "fixed_frames": fixed, "num_variables": total_dim},
         )
+
+    def _line_search_state(
+        self,
+        poses: torch.Tensor,
+        log_inv_depth: torch.Tensor,
+        step: torch.Tensor,
+        flat: _FlatFactors,
+        *,
+        free_frames: list[int],
+        pose_dim: int,
+        depth_dim: int,
+        optimize_pose: bool,
+        optimize_depth: bool,
+        enabled: bool,
+    ) -> tuple[float, torch.Tensor, torch.Tensor]:
+        scales = (1.0, 0.5, 0.25, 0.125, 0.0625) if enabled else (1.0,)
+        base = self._residual_for_state(poses, log_inv_depth, flat).detach()
+        base_mean = _mean_rad(base)
+        best_scale = 0.0
+        best_poses = poses
+        best_log = log_inv_depth
+        best_mean = base_mean
+        for scale in scales:
+            cur_step = step * float(scale)
+            cur_poses = poses
+            if optimize_pose and pose_dim:
+                cur_poses = _apply_free_pose_delta(
+                    poses,
+                    cur_step[:pose_dim].view(len(free_frames), 6),
+                    free_frames,
+                )
+            cur_log = log_inv_depth
+            if optimize_depth and depth_dim:
+                cur_log = _apply_unique_depth_delta(log_inv_depth, cur_step[pose_dim : pose_dim + depth_dim], flat)
+            residual = self._residual_for_state(cur_poses, cur_log, flat).detach()
+            if not torch.isfinite(residual).all():
+                continue
+            mean = _mean_rad(residual)
+            if not enabled or mean <= base_mean + 1.0e-12:
+                return float(scale), cur_poses.detach(), cur_log.detach()
+            if mean < best_mean:
+                best_scale = float(scale)
+                best_poses = cur_poses.detach()
+                best_log = cur_log.detach()
+                best_mean = mean
+        return best_scale, best_poses, best_log
 
     def _weighted_residual_vector(
         self,
@@ -450,6 +525,16 @@ def _mean_deg(residual: torch.Tensor) -> float:
     if finite.numel() == 0:
         return 0.0
     return float(torch.rad2deg(finite).mean().cpu())
+
+
+def _mean_rad(residual: torch.Tensor) -> float:
+    if residual.numel() == 0:
+        return 0.0
+    angular = residual.detach().norm(dim=-1)
+    finite = angular[torch.isfinite(angular)]
+    if finite.numel() == 0:
+        return float("inf")
+    return float(finite.mean().cpu())
 
 
 def _median_deg(residual: torch.Tensor) -> float:

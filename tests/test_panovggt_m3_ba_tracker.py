@@ -405,8 +405,8 @@ class _FakeRefiner:
         self.calls = 0
         self.memory_lengths: list[int] = []
 
-    def refine(self, pred, frame_ids, *, factor_graph=None, keyframe_memory=None):
-        _ = pred, frame_ids, factor_graph, keyframe_memory
+    def refine(self, pred, frame_ids, *, factor_graph=None, keyframe_memory=None, **kwargs):
+        _ = pred, frame_ids, factor_graph, keyframe_memory, kwargs
         self.calls += 1
         self.memory_lengths.append(0 if keyframe_memory is None else len(keyframe_memory))
         return self.refined, self.stats
@@ -426,7 +426,8 @@ def _tracker_with_fake_alignment(pred: PanoVGGTLocalPrediction, cfg: dict) -> tu
     )
     captured = []
 
-    def fake_align(aligned_pred, frame_ids):
+    def fake_align(aligned_pred, frame_ids, **kwargs):
+        _ = kwargs
         _ = frame_ids
         captured.append(aligned_pred)
         return SimilarityTransform.identity(device=aligned_pred.depth.device, dtype=aligned_pred.depth.dtype)
@@ -495,7 +496,8 @@ def _tracker_for_anchor_tests(
         **novel_insert_options,
     )
 
-    def fake_align(aligned_pred, frame_ids):
+    def fake_align(aligned_pred, frame_ids, **kwargs):
+        _ = kwargs
         _ = frame_ids
         return SimilarityTransform.identity(device=aligned_pred.depth.device, dtype=aligned_pred.depth.dtype)
 
@@ -529,6 +531,62 @@ def test_keyframe_anchor_uses_sidepath_without_prepending_main_forward():
     tracker.pop_ready_outputs()
 
     assert engine.batch_sizes == [2, 2, 3]
+
+
+def test_joint_inference_uses_recent_history_keyframes_once():
+    engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 1.0))
+    cfg = _anchor_cfg(
+        {
+            "prepend_previous_keyframe": False,
+            "min_keyframe_interval": 4,
+            "max_keyframe_interval": 8,
+        }
+    )
+    cfg["PanoVGGT"]["JointInference"] = {
+        "enabled": True,
+        "history_policy": "recent",
+        "max_history_frames": 3,
+    }
+    tracker = PanoVGGTLongTracker(
+        engine=engine,
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=2,
+        overlap=0,
+        emit_delay=0,
+        min_overlap_points=1,
+        require_aligned_world_points=False,
+        emit_unaligned=True,
+    )
+
+    def fake_align(aligned_pred, frame_ids, **kwargs):
+        assert kwargs["history_records"]
+        return SimilarityTransform.identity(device=aligned_pred.depth.device, dtype=aligned_pred.depth.dtype)
+
+    tracker._align_chunk = fake_align
+    for frame_id in (0, 4, 8, 12):
+        tracker.keyframe_memory.add(
+            KeyframeRecord(
+                frame_id=frame_id,
+                pose_c2w=torch.eye(4),
+                depth_low=torch.ones(1, 2, 4),
+                dense_descriptors=torch.ones(4, 2, 4),
+                match_confidence=torch.ones(1, 2, 4),
+                sky_prob=torch.zeros(1, 2, 4),
+                feature_hw=(2, 4),
+                image_hw=(2, 4),
+                image=torch.zeros(3, 2, 4),
+                global_points=torch.zeros(2, 4, 3),
+            )
+        )
+
+    for idx in range(20, 22):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+    outputs = tracker.pop_ready_outputs()
+
+    assert engine.batch_sizes == [5]
+    assert tracker.current_recent_history_ids == (4, 8, 12)
+    assert len(outputs) == 2
 
 
 def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
@@ -934,3 +992,26 @@ def test_slam_logger_can_disable_keyframe_opt_file_saves(tmp_path):
 
     assert not (tmp_path / "kf_renders_opt").exists()
     assert not (tmp_path / "kf_depths_opt").exists()
+
+
+def test_slam_logger_saves_new_gaussian_insertion_visualization(tmp_path):
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": True},
+        },
+        tmp_path,
+    )
+
+    path = logger.observe_new_gaussians(
+        frame_id=7,
+        image=torch.zeros(3, 4, 8),
+        source_hw=(4, 8),
+        requested_idx=torch.tensor([0, 3, 9, 10]),
+        inserted_idx=torch.tensor([3, 10]),
+        stats={"kept": 2, "skipped_voxel": 1},
+    )
+
+    assert path is not None
+    assert path.is_file()
+    assert path.name == "frame_000007.png"

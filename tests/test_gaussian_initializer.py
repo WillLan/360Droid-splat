@@ -59,6 +59,8 @@ def test_gaussian_initializer_dense_backprojects_every_valid_pixel():
 
     valid = (inv > 1e-6) & (conf >= 0.5)
     assert len(seeds) == int(valid.sum())
+    assert seeds.source_hw == (H, W)
+    assert torch.equal(seeds.source_flat_idx.cpu(), torch.nonzero(valid.view(-1), as_tuple=False).flatten())
 
     row, col = 2, 3
     flat = row * W + col
@@ -130,6 +132,8 @@ def test_gaussian_initializer_world_points_only_uses_input_xyz_exactly():
     seeds = initializer.from_frontend_output(output, image)
     expected = points.reshape(-1, 3)[valid.view(-1)]
     assert torch.allclose(seeds.xyz, expected)
+    assert seeds.source_hw == (H, W)
+    assert torch.equal(seeds.source_flat_idx.cpu(), torch.nonzero(valid.view(-1), as_tuple=False).flatten())
 
 
 def test_gaussian_initializer_world_points_only_requires_world_points():
@@ -212,6 +216,33 @@ def test_novel_gaussian_insertion_obeys_keyframe_and_global_budgets():
     assert mapper.insert_keyframe(second, _frontend_output_for_mapper(1)) == 1
     assert mapper.map.anchor_count() == 3
     assert mapper.stats.last_skipped_budget == 1
+
+
+def test_mapper_tracks_requested_and_inserted_seed_source_pixels():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "first_keyframe_max_seeds": 2,
+                "keyframe_max_seeds": 2,
+                "global_anchor_budget": 10,
+                "voxel_neighbor_radius": 0,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    seeds = _seed_batch(
+        torch.tensor([[0.1, 0.0, 0.0], [2.1, 0.0, 0.0], [4.1, 0.0, 0.0]]),
+        torch.tensor([0.2, 0.9, 0.8]),
+    )
+    seeds.source_flat_idx = torch.tensor([3, 5, 7], dtype=torch.long)
+    seeds.source_hw = (2, 4)
+
+    assert mapper.insert_keyframe(seeds, _frontend_output_for_mapper(0)) == 2
+
+    assert mapper.last_source_hw == (2, 4)
+    assert torch.equal(mapper.last_requested_source_flat_idx, torch.tensor([3, 5, 7]))
+    assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([5, 7]))
 
 
 def test_novel_gaussian_insertion_voxel_dedup_updates_existing_observation():

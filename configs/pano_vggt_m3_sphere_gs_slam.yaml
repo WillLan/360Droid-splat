@@ -47,7 +47,7 @@ PanoVGGT:
 
   KeyframeAnchor:
     enabled: true
-    prepend_previous_keyframe: true
+    prepend_previous_keyframe: false
     pair_confidence_mode: geometric_mean
     cell_pair_conf_threshold: 0.45
     frame_mean_pair_conf_threshold: 0.38
@@ -56,8 +56,18 @@ PanoVGGT:
     translation_threshold: 2.0
     translation_depth_ratio_threshold: 0.30
     min_keyframe_interval: 4
-    max_keyframe_interval: 12
+    max_keyframe_interval: 8
     sky_threshold: 0.5
+
+  JointInference:
+    enabled: true
+    history_policy: recent
+    min_history_frames: 0
+    max_history_frames: 3
+
+  Alignment:
+    use_common_history: true
+    history_point_budget_ratio: 0.5
 
   MatchingHead:
     enabled: true
@@ -89,8 +99,8 @@ PanoVGGT:
 
   DenseBA:
     enabled: true
-    shadow_mode: true
-    mode: local_chunk
+    shadow_mode: false
+    mode: history_window
     residual_mode: tangent
     debug_pixel_residual: false
     iters: 6
@@ -110,6 +120,9 @@ PanoVGGT:
     factor_chunk_size: 2048
     optimize_pose: true
     optimize_depth: true
+    depth_update_policy: clamp_local
+    logdepth_update_quantile: 0.99
+    line_search: true
 
   InferenceWindow:
     size: 4
@@ -158,6 +171,8 @@ Mapping:
     insert_confidence_floor: 0.20
     spatial_cell_size: 8
     max_seeds_per_cell: 2
+    save_visualization: true
+    visualize_candidates: true
 
   BootstrapOptimization:
     enabled: true
@@ -178,7 +193,8 @@ BackendOptimization:
   sample_keyframes_per_step: 1
   pose_window_keyframes: 8
   replay_random_keyframes: 0
-  final_global_steps: 0
+  final_global_steps: 100
+  use_frontend_graph_window: true
   fixed_window_frames: 1
   gaussian_lr: 0.002
   pose_lr: 0.001

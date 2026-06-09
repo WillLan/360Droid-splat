@@ -488,6 +488,23 @@ class SlamRuntimeLogger:
             payload["frontend/valid_world_points"] = int(valid_world.sum().item())
         if output.world_points is not None:
             payload["frontend/world_points_finite"] = int(torch.isfinite(output.world_points).all(dim=-1).sum().item())
+        if isinstance(m3_debug, dict):
+            alignment = m3_debug.get("alignment")
+            if isinstance(alignment, dict):
+                for source, target in (
+                    ("overlap_points", "m3/alignment_overlap_points"),
+                    ("history_points", "m3/alignment_history_points"),
+                    ("overlap_alignment_points", "m3/overlap_alignment_points"),
+                    ("history_alignment_points", "m3/history_alignment_points"),
+                    ("scale", "m3/alignment_scale"),
+                    ("alignment_scale", "m3/alignment_scale"),
+                    ("residual", "m3/alignment_residual"),
+                    ("alignment_rmse", "m3/alignment_rmse"),
+                    ("inlier_ratio", "m3/alignment_inlier_ratio"),
+                ):
+                    value = alignment.get(source)
+                    if value is not None:
+                        payload[target] = float(value)
 
         if self.run is not None:
             self.run.log(payload, step=self._step)
@@ -635,6 +652,12 @@ class SlamRuntimeLogger:
             ("translation_delta", "kf/translation_delta"),
             ("median_depth", "kf/median_depth"),
             ("translation_depth_ratio", "kf/translation_depth_ratio"),
+            ("m3_keyframe_score", "kf/m3_keyframe_score"),
+            ("map_coverage_deficit", "kf/map_coverage_deficit"),
+            ("matching_uncertainty", "kf/matching_uncertainty"),
+            ("graph_connectivity_deficit", "kf/graph_connectivity_deficit"),
+            ("parallax_score", "kf/parallax_score"),
+            ("keyframe_gap", "kf/keyframe_gap"),
         ):
             value = decision.get(source)
             if value is not None:
@@ -647,6 +670,87 @@ class SlamRuntimeLogger:
         if reasons:
             payload["kf/reason"] = ",".join(str(item) for item in reasons)
         self.run.log(payload, step=max(1, int(self._step)))
+
+    def observe_new_gaussians(
+        self,
+        *,
+        frame_id: int,
+        image: torch.Tensor,
+        source_hw: tuple[int, int] | None,
+        requested_idx: torch.Tensor | None,
+        inserted_idx: torch.Tensor | None,
+        stats: dict[str, float | int] | None = None,
+    ) -> Path | None:
+        if source_hw is None or requested_idx is None or inserted_idx is None:
+            return None
+        height, width = int(source_hw[0]), int(source_hw[1])
+        if height <= 0 or width <= 0:
+            return None
+        requested = torch.zeros(height * width, dtype=torch.bool)
+        inserted = torch.zeros(height * width, dtype=torch.bool)
+        req = requested_idx.detach().cpu().long()
+        ins = inserted_idx.detach().cpu().long()
+        req = req[(req >= 0) & (req < requested.numel())]
+        ins = ins[(ins >= 0) & (ins < inserted.numel())]
+        if req.numel():
+            requested[req] = True
+        if ins.numel():
+            inserted[ins] = True
+        requested_mask = requested.view(height, width)
+        inserted_mask = inserted.view(height, width)
+        candidate_only = requested_mask & ~inserted_mask
+
+        rgb = _image_tensor_to_pil(image)
+        if rgb.size != (width, height):
+            rgb = rgb.resize((width, height), Image.BILINEAR)
+        overlay = np.asarray(rgb).astype(np.float32)
+        cand_np = candidate_only.numpy()
+        ins_np = inserted_mask.numpy()
+        overlay[cand_np] = 0.45 * overlay[cand_np] + 0.55 * np.array([255.0, 210.0, 30.0])
+        overlay[ins_np] = 0.35 * overlay[ins_np] + 0.65 * np.array([255.0, 30.0, 30.0])
+        overlay_img = Image.fromarray(overlay.clip(0, 255).astype(np.uint8), mode="RGB")
+        req_img = Image.fromarray((requested_mask.numpy().astype(np.uint8) * 255), mode="L").convert("RGB")
+        ins_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        ins_rgb[..., 0] = inserted_mask.numpy().astype(np.uint8) * 255
+        ins_img = Image.fromarray(ins_rgb, mode="RGB")
+
+        title_h = 30
+        w, h = rgb.size
+        canvas = Image.new("RGB", (4 * w, h + title_h), "white")
+        for idx, panel in enumerate((rgb, req_img, ins_img, overlay_img)):
+            canvas.paste(panel, (idx * w, title_h))
+        draw = ImageDraw.Draw(canvas)
+        labels = ("rgb", "candidate seeds", "inserted seeds", "overlay")
+        for idx, label in enumerate(labels):
+            draw.text((idx * w + 8, 8), label, fill=(0, 0, 0))
+        stat_text = (
+            f"KF {int(frame_id):06d} requested={int(req.numel())} inserted={int(ins.numel())} "
+            f"ratio={float(inserted_mask.float().mean()):.4f}"
+        )
+        draw.text((8, h + title_h - 18), stat_text, fill=(0, 0, 0))
+        canvas = _resize_to_max_width(canvas, self.kf_opt_max_width)
+
+        path = None
+        if self.save_local:
+            out_dir = self.visualization_dir / "new_gaussians"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"frame_{int(frame_id):06d}.png"
+            canvas.save(path)
+        if self.run is not None:
+            payload: dict[str, float | int | str] = {
+                "mapping/new_gaussians_requested": int(req.numel()),
+                "mapping/new_gaussians_inserted": int(ins.numel()),
+                "mapping/new_gaussians_inserted_mask_ratio": float(inserted_mask.float().mean()),
+            }
+            if stats:
+                for key, value in stats.items():
+                    payload[f"mapping/new_gaussians_{key}"] = float(value)
+            if self._wandb is not None:
+                payload["mapping/new_gaussians"] = self._wandb.Image(str(path) if path is not None else canvas)
+                if path is not None:
+                    payload["mapping/new_gaussians_png"] = str(path)
+            self.run.log(payload, step=max(1, int(self._step)))
+        return path
 
     def save_keyframe_diagnostic(self, diagnostic, *, render_dir: Path, depth_dir: Path) -> tuple[Path | None, Path | None]:
         if diagnostic is None:
@@ -1280,6 +1384,32 @@ class PanoDroidGSSlamSystem:
         keyframes = 0
         last_status = None
 
+        def update_frontend_graph_window_hint(out) -> None:
+            if not bool(backend_cfg.get("use_frontend_graph_window", False)):
+                return
+            setter = getattr(self.mapper, "set_frontend_graph_window_ids", None)
+            if not callable(setter):
+                return
+            ids: list[int] = []
+            debug = getattr(self.frontend, "last_m3_debug", None)
+            if isinstance(debug, dict):
+                ids.extend(int(fid) for fid in debug.get("recent_history_ids", ()) if fid is not None)
+                alignment = debug.get("alignment")
+                if isinstance(alignment, dict):
+                    ids.extend(int(fid) for fid in alignment.get("history_ids", ()) if fid is not None)
+            decisions = getattr(self.frontend, "keyframe_decision_history", None)
+            if isinstance(decisions, list):
+                for decision in reversed(decisions):
+                    if int(decision.get("frame_id", -1)) != int(out.frame_id):
+                        continue
+                    ids.extend(int(fid) for fid in decision.get("recent_history_ids", ()) if fid is not None)
+                    anchor_id = decision.get("anchor_frame_id")
+                    if anchor_id is not None:
+                        ids.append(int(anchor_id))
+                    break
+            ids.append(int(out.frame_id))
+            setter(ids)
+
         def drain_keyframe_decisions() -> None:
             nonlocal keyframe_decision_count
             if decision_file is None:
@@ -1305,10 +1435,24 @@ class PanoDroidGSSlamSystem:
             if out.is_keyframe and out.inverse_depth is not None:
                 seeds = self.initializer.from_frontend_output(out, source_frame.image)
                 if self.mapper.uses_joint_optimization:
-                    self.mapper.insert_keyframe(seeds, out, image=source_frame.image)
+                    inserted_count = self.mapper.insert_keyframe(seeds, out, image=source_frame.image)
                 else:
-                    self.mapper.insert_keyframe(seeds, out)
+                    inserted_count = self.mapper.insert_keyframe(seeds, out)
                 keyframes += 1
+                novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
+                if bool(novel_cfg.get("save_visualization", False)):
+                    logger.observe_new_gaussians(
+                        frame_id=int(out.frame_id),
+                        image=source_frame.image,
+                        source_hw=getattr(self.mapper, "last_source_hw", None),
+                        requested_idx=getattr(self.mapper, "last_requested_source_flat_idx", None),
+                        inserted_idx=getattr(self.mapper, "last_inserted_source_flat_idx", None),
+                        stats={
+                            "kept": int(inserted_count),
+                            "skipped_voxel": int(getattr(self.mapper.stats, "last_skipped_voxel", 0)),
+                            "skipped_budget": int(getattr(self.mapper.stats, "last_skipped_budget", 0)),
+                        },
+                    )
                 if self.mapper.uses_joint_optimization:
                     if bootstrap_enabled and keyframes == 1 and bootstrap_steps > 0:
                         init_dir = output_dir / "init_vis" / f"frame_{int(out.frame_id):06d}"
@@ -1360,8 +1504,9 @@ class PanoDroidGSSlamSystem:
                             except Exception as exc:
                                 self.mapper.stats.notes.append(
                                     f"frame {out.frame_id}: init skybox preview save failed: {exc!r}"
-                                )
+                        )
                     else:
+                        update_frontend_graph_window_hint(out)
                         metrics = self.mapper.optimize_after_keyframe()
                     backend_loss = metrics.get("loss")
                     feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)

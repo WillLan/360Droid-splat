@@ -97,6 +97,9 @@ class PanoVGGTDenseBARefiner:
         *,
         factor_graph: DenseSphereFactorGraph | None = None,
         keyframe_memory: KeyframeMemory | None = None,
+        current_start: int = 0,
+        current_count: int | None = None,
+        fixed_frames_override: int | None = None,
     ) -> tuple[PanoVGGTLocalPrediction, DenseBARefinerStats]:
         """Return a refined prediction or the original prediction with fallback stats."""
 
@@ -118,9 +121,13 @@ class PanoVGGTDenseBARefiner:
         graph = factor_graph if factor_graph is not None else self._build_factor_graph(pred)
         solver_pred = pred
         fixed_frames = self._fixed_frames(frame_ids)
-        current_start = 0
+        explicit_current_start = max(0, int(current_start))
+        explicit_current_count = current_count
+        current_start = explicit_current_start
         history_keyframes = 0
-        if mode in {"history_window", "keyframe_graph"}:
+        if fixed_frames_override is not None:
+            fixed_frames = max(1, min(int(fixed_frames_override), int(pred.poses_c2w.shape[0])))
+        if mode in {"history_window", "keyframe_graph"} and explicit_current_start == 0:
             prepared = self._prepare_history_window(
                 pred,
                 frame_ids,
@@ -159,6 +166,7 @@ class PanoVGGTDenseBARefiner:
             depth_prior_weight=self.config.dense_ba.depth_prior_weight,
             max_pose_update_deg=self.config.dense_ba.max_pose_update_deg,
             max_logdepth_update=self.config.dense_ba.max_logdepth_update,
+            line_search=self.config.dense_ba.line_search,
         )
         if output.failed:
             return pred, self._stats(success=False, reason=str(output.debug.get("fallback_reason", "solver_failed")), graph_metrics=graph_metrics, output=output)
@@ -174,7 +182,10 @@ class PanoVGGTDenseBARefiner:
             return pred, self._stats(success=False, reason="residual_worse", graph_metrics=graph_metrics, output=output)
 
         refined_full = self._rebuild_prediction(solver_pred, log_inv_depth_low, output)
-        refined = self._slice_current_prediction(pred, refined_full, current_start)
+        if explicit_current_start > 0 or explicit_current_count is not None:
+            refined = self._slice_prediction(refined_full, explicit_current_start, explicit_current_count)
+        else:
+            refined = self._slice_current_prediction(pred, refined_full, current_start)
         stats = self._stats(success=True, reason=None, graph_metrics=graph_metrics, output=output)
         refined = replace(
             refined,
@@ -457,8 +468,14 @@ class PanoVGGTDenseBARefiner:
         if not torch.allclose(output.poses_c2w[:fixed_frames], pred.poses_c2w[:fixed_frames].to(output.poses_c2w), atol=1.0e-5):
             return "fixed_frame_changed"
         log_delta = output.log_inv_depth - log_inv_depth_low.to(output.log_inv_depth)
-        if torch.isfinite(log_delta).all() and float(log_delta.abs().max().detach().cpu()) > float(self.config.dense_ba.max_logdepth_update) + 1.0e-5:
-            return "depth_update_too_large"
+        if not torch.isfinite(log_delta).all():
+            return "non_finite_depth_update"
+        update_abs = log_delta.abs().detach().reshape(-1)
+        if update_abs.numel():
+            q = min(1.0, max(0.0, float(self.config.dense_ba.logdepth_update_quantile)))
+            update_q = float(torch.quantile(update_abs.float().cpu(), q).item())
+            if q < 1.0 and update_q > float(self.config.dense_ba.max_logdepth_update) + 1.0e-5:
+                return "depth_update_quantile_too_large"
         if output.pose_update_norm.get("rot_max_deg", 0.0) > float(self.config.dense_ba.max_pose_update_deg) + 0.2:
             return "pose_update_too_large"
         return None
@@ -516,6 +533,32 @@ class PanoVGGTDenseBARefiner:
             ba_residual_angular=refined.ba_residual_angular,
             ba_valid_ratio=refined.ba_valid_ratio,
             ba_update_norm=refined.ba_update_norm,
+        )
+
+    def _slice_prediction(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        start: int,
+        count: int | None,
+    ) -> PanoVGGTLocalPrediction:
+        n = int(pred.poses_c2w.shape[0])
+        start_i = max(0, min(int(start), n))
+        count_i = n - start_i if count is None else max(0, min(int(count), n - start_i))
+        idx = slice(start_i, start_i + count_i)
+        return replace(
+            pred,
+            poses_c2w=pred.poses_c2w[idx],
+            depth=pred.depth[idx],
+            confidence=pred.confidence[idx],
+            chunk_world_points=pred.chunk_world_points[idx],
+            local_points=None if pred.local_points is None else pred.local_points[idx],
+            global_points=None if pred.global_points is None else pred.global_points[idx],
+            descriptors=None if pred.descriptors is None else pred.descriptors[idx],
+            dense_descriptors=None if pred.dense_descriptors is None else pred.dense_descriptors[idx],
+            match_confidence=None if pred.match_confidence is None else pred.match_confidence[idx],
+            static_confidence=None if pred.static_confidence is None else pred.static_confidence[idx],
+            sky_logits=None if pred.sky_logits is None else pred.sky_logits[idx],
+            sky_prob=None if pred.sky_prob is None else pred.sky_prob[idx],
         )
 
     def _stats(

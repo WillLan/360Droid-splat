@@ -108,8 +108,15 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.matching_head.enabled is True
     assert parsed_file.dense_matching.enabled is True
     assert parsed_file.dense_ba.enabled is True
-    assert parsed_file.dense_ba.shadow_mode is True
+    assert parsed_file.dense_ba.shadow_mode is False
+    assert parsed_file.dense_ba.line_search is True
+    assert parsed_file.dense_ba.logdepth_update_quantile == 0.99
+    assert parsed_file.joint_inference.enabled is True
+    assert parsed_file.joint_inference.max_history_frames == 3
+    assert parsed_file.alignment.use_common_history is True
     assert parsed_file.keyframe_anchor.enabled is True
+    assert parsed_file.keyframe_anchor.min_keyframe_interval == 4
+    assert parsed_file.keyframe_anchor.max_keyframe_interval == 8
     assert parsed_file.matching_head.descriptor_dim == 24
     assert file_cfg["PanoVGGT"]["image_size"] is None
 
