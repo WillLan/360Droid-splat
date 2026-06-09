@@ -269,3 +269,7 @@ Results:
   save_skybox_previews: true
   skybox_preview_height: 256
   skybox_preview_width: 512
+
+RuntimeProfiling:
+  enabled: true
+  path: runtime_profile.jsonl

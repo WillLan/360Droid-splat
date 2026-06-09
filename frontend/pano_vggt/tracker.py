@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import time
 from typing import Optional
 
 import torch
@@ -311,6 +312,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
         self.last_m3_debug: dict | None = None
+        self.last_profile: dict | None = None
         self.last_alignment_debug = _AlignmentDebug()
         self.current_recent_history_ids: tuple[int, ...] = ()
         self.keyframe_decision_history: list[dict] = []
@@ -487,10 +489,34 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             return
         self.processed_ranges.add(range_key)
 
+        profile: dict = {
+            "chunk_index": int(self.chunk_count),
+            "frame_start": int(frame_ids[0]),
+            "frame_end": int(frame_ids[-1]),
+            "frame_count": int(len(frame_ids)),
+            "history_count": 0,
+        }
+        profile_total_start = time.perf_counter()
+        profile_mark = profile_total_start
+
+        def mark_profile(name: str) -> None:
+            nonlocal profile_mark
+            now = time.perf_counter()
+            profile[f"{name}_sec"] = float(now - profile_mark)
+            profile_mark = now
+
+        def add_profile(name: str, elapsed: float) -> None:
+            profile[name] = float(profile.get(name, 0.0)) + float(elapsed)
+
         images = torch.stack([r.image for r in self.records[start:end]], dim=0).to(self.device)
+        mark_profile("stack_images")
         infer_images, joint_context = self._build_joint_inference_batch(images, frame_ids)
         self.current_recent_history_ids = tuple(joint_context.history_frame_ids)
+        profile["history_count"] = int(joint_context.history_count)
+        profile["recent_history_count"] = int(len(joint_context.history_frame_ids))
+        mark_profile("joint_batch")
         pred_full0 = self.engine.infer(infer_images)
+        mark_profile("engine_infer")
         full_factor_graph = getattr(self.engine, "last_dense_factor_graph", None)
         pred0 = (
             _slice_prediction(pred_full0, joint_context.history_count, len(frame_ids))
@@ -506,16 +532,20 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             anchor_metrics = {}
         else:
             anchor_metrics = self._compute_anchor_metrics_sidepath(images, frame_ids)
+        mark_profile("anchor_metrics")
         factor_graph = full_factor_graph
         if self.dense_ba_history_enabled:
+            section_start = time.perf_counter()
             seed_transform = self._align_chunk(
                 pred0,
                 frame_ids,
                 history_pred=pred_full0 if joint_context.history_count > 0 else None,
                 history_records=joint_context.history_records,
             )
+            add_profile("alignment_sec", time.perf_counter() - section_start)
             if joint_context.history_count > 0:
                 pred_ba_seed = self._prediction_to_world(pred_full0, seed_transform)
+                section_start = time.perf_counter()
                 pred_refined, ba_stats = self.dense_ba_refiner.refine(
                     pred_ba_seed,
                     tuple((*joint_context.history_frame_ids, *frame_ids)),
@@ -525,34 +555,42 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     current_count=len(frame_ids),
                     fixed_frames_override=1,
                 )
+                add_profile("dense_ba_sec", time.perf_counter() - section_start)
                 pred_ba_input = _slice_prediction(pred_ba_seed, joint_context.history_count, len(frame_ids))
             else:
                 pred_ba_input = self._prediction_to_world(pred0, seed_transform)
+                section_start = time.perf_counter()
                 pred_refined, ba_stats = self.dense_ba_refiner.refine(
                     pred_ba_input,
                     frame_ids,
                     factor_graph=factor_graph,
                     keyframe_memory=self.keyframe_memory,
                 )
+                add_profile("dense_ba_sec", time.perf_counter() - section_start)
             pred = pred_refined if ba_stats.used_refined else pred_ba_input
             transform = SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
             transform.accepted = bool(seed_transform.accepted)
             alignment_residual = float(seed_transform.residual)
         else:
+            section_start = time.perf_counter()
             pred_refined, ba_stats = self.dense_ba_refiner.refine(
                 pred0,
                 frame_ids,
                 factor_graph=factor_graph,
                 keyframe_memory=self.keyframe_memory,
             )
+            add_profile("dense_ba_sec", time.perf_counter() - section_start)
             pred = pred_refined if ba_stats.used_refined else pred0
+            section_start = time.perf_counter()
             transform = self._align_chunk(
                 pred,
                 frame_ids,
                 history_pred=pred_full0 if joint_context.history_count > 0 else None,
                 history_records=joint_context.history_records,
             )
+            add_profile("alignment_sec", time.perf_counter() - section_start)
             alignment_residual = float(transform.residual)
+        mark_profile("dense_ba_and_alignment")
         factor_graph = getattr(self.dense_ba_refiner, "last_factor_graph", factor_graph) or factor_graph
         self.last_dense_ba_stats = ba_stats
         if ba_stats.enabled:
@@ -586,7 +624,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             }
         else:
             self.last_m3_debug = None
+        mark_profile("m3_debug")
         backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)
+        mark_profile("backend_feedback_correction")
         chunk_descriptor = self._chunk_descriptor(pred, images)
         loop_target = self.loop_manager.add_chunk(chunk_descriptor)
         if loop_target is not None:
@@ -599,6 +639,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     edge_type="loop",
                 )
             )
+        mark_profile("loop_descriptor")
 
         output_data: dict[
             int,
@@ -651,6 +692,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 alignment_residual,
                 "tracked_panovggt_long" + ba_stats.status_suffix,
             )
+        mark_profile("output_fields")
 
         emit_end = end if final else max(start, end - self.emit_delay)
         for record in self.records[start:emit_end]:
@@ -684,8 +726,13 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                         confidence=output.depth_confidence,
                     )
                 self.emitted_frame_ids.add(frame_id)
+        mark_profile("emit_outputs")
         self.chunk_count += 1
         self._trim_alignment_cache()
+        profile["total_sec"] = float(time.perf_counter() - profile_total_start)
+        self.last_profile = profile
+        if isinstance(self.last_m3_debug, dict):
+            self.last_m3_debug["profile"] = dict(profile)
 
     def _anchor_context_from_current_chunk(
         self,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -670,6 +671,19 @@ class SlamRuntimeLogger:
         if reasons:
             payload["kf/reason"] = ",".join(str(item) for item in reasons)
         self.run.log(payload, step=max(1, int(self._step)))
+
+    def observe_profile(self, profile: dict) -> None:
+        if self.run is None:
+            return
+        event = str(profile.get("event", "runtime")).replace(" ", "_")
+        payload: dict[str, float] = {}
+        for key, value in profile.items():
+            if key == "event" or isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                payload[f"profile/{event}/{key}"] = float(value)
+        if payload:
+            self.run.log(payload, step=max(1, int(self._step)))
 
     def observe_new_gaussians(
         self,
@@ -1376,13 +1390,27 @@ class PanoDroidGSSlamSystem:
         feedback_logging_enabled = self._backend_feedback_enabled() and bool(feedback_cfg.get("log_decisions", True))
         feedback_path = output_dir / "backend_feedback_decisions.jsonl"
         feedback_file = open(feedback_path, "w", encoding="utf-8") if feedback_logging_enabled else None
+        profile_cfg = self.config.get("RuntimeProfiling", {})
+        profiling_enabled = bool(profile_cfg.get("enabled", False)) if isinstance(profile_cfg, dict) else False
+        profile_path = output_dir / str(profile_cfg.get("path", "runtime_profile.jsonl")) if profiling_enabled else None
+        profile_file = open(profile_path, "w", encoding="utf-8") if profile_path is not None else None
         keyframe_decision_count = 0
         backend_feedback_decision_count = 0
         backend_feedback_applied_count = 0
+        last_profiled_frontend_chunk: int | None = None
         frame_cache: dict[int, PanoFrame] = {}
         frame_count = 0
         keyframes = 0
         last_status = None
+
+        def write_profile(event: str, **values) -> None:
+            if not profiling_enabled:
+                return
+            profile = {"event": str(event), **values}
+            if profile_file is not None:
+                profile_file.write(json.dumps(profile, sort_keys=True) + "\n")
+                profile_file.flush()
+            logger.observe_profile(profile)
 
         def update_frontend_graph_window_hint(out) -> None:
             if not bool(backend_cfg.get("use_frontend_graph_window", False)):
@@ -1425,22 +1453,50 @@ class PanoDroidGSSlamSystem:
 
         def process_output(out) -> None:
             nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
+            nonlocal last_profiled_frontend_chunk
+            process_start = time.perf_counter()
+            output_profile: dict[str, float | int] = {
+                "frame_id": int(out.frame_id),
+                "is_keyframe": int(bool(out.is_keyframe)),
+            }
+            metrics: dict = {}
             last_status = out.tracking_status
             source_frame = frame_cache.pop(int(out.frame_id), None)
             if source_frame is None:
                 self.mapper.stats.notes.append(f"frame {out.frame_id}: missing source frame for frontend output")
+                output_profile["missing_source_frame"] = 1
+                output_profile["total_sec"] = float(time.perf_counter() - process_start)
+                write_profile("process_output", **output_profile)
                 return
+            frontend_profile = getattr(self.frontend, "last_profile", None)
+            if isinstance(frontend_profile, dict):
+                chunk_index = int(frontend_profile.get("chunk_index", -1))
+                if chunk_index >= 0 and chunk_index != last_profiled_frontend_chunk:
+                    last_profiled_frontend_chunk = chunk_index
+                    chunk_profile: dict[str, float | int] = {}
+                    for key, value in frontend_profile.items():
+                        if isinstance(value, bool):
+                            continue
+                        if isinstance(value, (int, float)):
+                            chunk_profile[str(key)] = float(value)
+                    write_profile("frontend_chunk", **chunk_profile)
             backend_loss = None
             keyframe_opt_diagnostic = None
             if out.is_keyframe and out.inverse_depth is not None:
+                section_start = time.perf_counter()
                 seeds = self.initializer.from_frontend_output(out, source_frame.image)
+                output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
+                section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization:
                     inserted_count = self.mapper.insert_keyframe(seeds, out, image=source_frame.image)
                 else:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)
+                output_profile["mapper_insert_keyframe_sec"] = float(time.perf_counter() - section_start)
+                output_profile["inserted_gaussians"] = float(inserted_count)
                 keyframes += 1
                 novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
                 if bool(novel_cfg.get("save_visualization", False)):
+                    section_start = time.perf_counter()
                     logger.observe_new_gaussians(
                         frame_id=int(out.frame_id),
                         image=source_frame.image,
@@ -1453,6 +1509,7 @@ class PanoDroidGSSlamSystem:
                             "skipped_budget": int(getattr(self.mapper.stats, "last_skipped_budget", 0)),
                         },
                     )
+                    output_profile["new_gaussian_visualization_sec"] = float(time.perf_counter() - section_start)
                 if self.mapper.uses_joint_optimization:
                     if bootstrap_enabled and keyframes == 1 and bootstrap_steps > 0:
                         init_dir = output_dir / "init_vis" / f"frame_{int(out.frame_id):06d}"
@@ -1475,22 +1532,27 @@ class PanoDroidGSSlamSystem:
                                     step=max(1, int(logger._step)),
                                 )
 
+                        section_start = time.perf_counter()
                         metrics = self.mapper.bootstrap_latest_keyframe(
                             steps=bootstrap_steps,
                             diagnostic_callback=save_bootstrap,
                             diagnostic_every=bootstrap_save_every,
                         )
+                        output_profile["backend_bootstrap_call_sec"] = float(time.perf_counter() - section_start)
                         try:
+                            section_start = time.perf_counter()
                             init_ply = output_dir / "point_cloud" / "init" / f"frame_{int(out.frame_id):06d}.ply"
                             self.map.save_ply(init_ply)
                             logger.log_artifact_file(init_ply)
                             init_alias = output_dir / "point_cloud" / "init" / "point_cloud.ply"
                             self.map.save_ply(init_alias)
                             logger.log_artifact_file(init_alias)
+                            output_profile["save_init_ply_sec"] = float(time.perf_counter() - section_start)
                         except Exception as exc:
                             self.mapper.stats.notes.append(f"frame {out.frame_id}: init ply save failed: {exc!r}")
                         if bool(results_cfg.get("save_skybox_previews", False)) and self.map.has_skybox:
                             try:
+                                section_start = time.perf_counter()
                                 sky_dir = output_dir / "skybox"
                                 sky_dir.mkdir(parents=True, exist_ok=True)
                                 preview = self.map.skybox_erp_preview(
@@ -1501,50 +1563,71 @@ class PanoDroidGSSlamSystem:
                                     preview_path = sky_dir / f"init_frame_{int(out.frame_id):06d}_erp.png"
                                     _image_tensor_to_pil(preview).save(preview_path)
                                     logger.log_image_file("skybox/init_erp_preview", preview_path)
+                                output_profile["save_init_skybox_preview_sec"] = float(time.perf_counter() - section_start)
                             except Exception as exc:
                                 self.mapper.stats.notes.append(
                                     f"frame {out.frame_id}: init skybox preview save failed: {exc!r}"
                         )
                     else:
                         update_frontend_graph_window_hint(out)
+                        section_start = time.perf_counter()
                         metrics = self.mapper.optimize_after_keyframe()
+                        output_profile["backend_optimize_after_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                     backend_loss = metrics.get("loss")
+                    section_start = time.perf_counter()
                     feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
+                    output_profile["backend_feedback_collect_sec"] = float(time.perf_counter() - section_start)
                     for feedback_decision in feedback_decisions:
                         if feedback_file is not None:
                             feedback_file.write(json.dumps(feedback_decision, sort_keys=True) + "\n")
                             feedback_file.flush()
                         backend_feedback_decision_count += 1
+                    section_start = time.perf_counter()
                     backend_feedback_applied_count += self._apply_backend_feedback_updates(feedback_updates)
+                    output_profile["backend_feedback_apply_sec"] = float(time.perf_counter() - section_start)
                     try:
+                        section_start = time.perf_counter()
                         keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
+                        output_profile["backend_keyframe_diagnostic_sec"] = float(time.perf_counter() - section_start)
                     except Exception as exc:
                         self.mapper.stats.notes.append(
                             f"frame {out.frame_id}: keyframe optimized render failed: {exc!r}"
                         )
                 elif refine_steps > 0:
+                    section_start = time.perf_counter()
                     metrics = self.mapper.refine_on_keyframe(
                         image=source_frame.image,
                         c2w=out.pose_c2w,
                         steps=refine_steps,
                     )
+                    output_profile["backend_refine_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                     backend_loss = metrics.get("loss")
             elif self.mapper.uses_joint_optimization and non_keyframe_steps > 0:
+                section_start = time.perf_counter()
                 metrics = self.mapper.optimize_frame_observation(
                     image=source_frame.image,
                     c2w=out.pose_c2w,
                     steps=non_keyframe_steps,
                     phase="non_keyframe",
                 )
+                output_profile["backend_non_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                 backend_loss = metrics.get("loss")
+            for key, value in metrics.items():
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)) and str(key).startswith("profile_"):
+                    output_profile[str(key)] = float(value)
             backend_pose = self.mapper.refined_pose_c2w(int(out.frame_id))
             render_pose = backend_pose if backend_pose is not None else out.pose_c2w.detach().cpu()
             backend_render_pkg = None
             if self.map.anchor_count() > 0:
                 try:
+                    section_start = time.perf_counter()
                     backend_render_pkg = self.mapper.render_view(image=source_frame.image, c2w=render_pose)
+                    output_profile["backend_render_view_sec"] = float(time.perf_counter() - section_start)
                 except Exception as exc:
                     self.mapper.stats.notes.append(f"frame {out.frame_id}: backend visualization render failed: {exc!r}")
+            section_start = time.perf_counter()
             logger.observe(
                 out,
                 source_frame,
@@ -1555,8 +1638,15 @@ class PanoDroidGSSlamSystem:
                 backend_render_pkg=backend_render_pkg,
                 m3_debug=getattr(self.frontend, "last_m3_debug", None),
             )
+            output_profile["logger_observe_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
             logger.observe_keyframe_opt(keyframe_opt_diagnostic)
+            output_profile["logger_keyframe_opt_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
             drain_keyframe_decisions()
+            output_profile["drain_keyframe_decisions_sec"] = float(time.perf_counter() - section_start)
+            output_profile["total_sec"] = float(time.perf_counter() - process_start)
+            write_profile("process_output", **output_profile)
 
         def save_final_artifacts() -> dict:
             artifacts: dict[str, str | int | list[str] | None] = {
@@ -1636,21 +1726,45 @@ class PanoDroidGSSlamSystem:
             for frame in iter_sequence_frames(self.config):
                 if max_frames is not None and frame_count >= int(max_frames):
                     break
+                frame_start = time.perf_counter()
                 frame_cache[int(frame.frame_id)] = frame
+                section_start = time.perf_counter()
                 out = self.frontend.track(frame)
+                frontend_track_sec = float(time.perf_counter() - section_start)
                 last_status = out.tracking_status
                 pop_ready = getattr(self.frontend, "pop_ready_outputs", None)
+                section_start = time.perf_counter()
                 outputs = pop_ready() if callable(pop_ready) else [out]
+                pop_ready_sec = float(time.perf_counter() - section_start)
                 for ready in outputs:
                     process_output(ready)
+                write_profile(
+                    "input_frame",
+                    frame_id=int(frame.frame_id),
+                    frontend_track_sec=frontend_track_sec,
+                    pop_ready_sec=pop_ready_sec,
+                    ready_outputs=float(len(outputs)),
+                    total_sec=float(time.perf_counter() - frame_start),
+                )
                 frame_count += 1
 
             flush = getattr(self.frontend, "flush", None)
             if callable(flush):
+                section_start = time.perf_counter()
+                flushed = 0
                 for ready in flush():
+                    flushed += 1
                     process_output(ready)
+                write_profile("frontend_flush", flushed_outputs=float(flushed), total_sec=float(time.perf_counter() - section_start))
 
+            section_start = time.perf_counter()
             final_metrics = self.mapper.finalize_optimization()
+            final_metrics["profile_backend_finalize_call_sec"] = float(time.perf_counter() - section_start)
+            write_profile("finalize_optimization", **{
+                key: float(value)
+                for key, value in final_metrics.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and str(key).startswith("profile_")
+            })
             if decision_file is not None:
                 decision_file.close()
             if feedback_file is not None:
@@ -1690,10 +1804,13 @@ class PanoDroidGSSlamSystem:
                 "backend_feedback_path": str(feedback_path) if feedback_logging_enabled else None,
                 "backend_feedback_decision_count": int(backend_feedback_decision_count),
                 "backend_feedback_applied_count": int(backend_feedback_applied_count),
+                "runtime_profile_path": str(profile_path) if profile_path is not None else None,
                 "notes": self.mapper.stats.notes,
             }
             with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2)
+            if profile_file is not None and not profile_file.closed:
+                profile_file.close()
             logger.finish(summary)
             return summary
         except BaseException as exc:
@@ -1701,6 +1818,8 @@ class PanoDroidGSSlamSystem:
                 decision_file.close()
             if feedback_file is not None and not feedback_file.closed:
                 feedback_file.close()
+            if profile_file is not None and not profile_file.closed:
+                profile_file.close()
             logger.finish({"failed": True, "error": repr(exc)})
             raise
 

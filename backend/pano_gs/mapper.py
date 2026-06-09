@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
+import time
 
 import numpy as np
 import torch
@@ -850,10 +851,12 @@ class PanoGaussianMapper:
         """Run local and sliding-window joint Gaussian/pose optimization."""
         if not self.uses_joint_optimization or not self.keyframes:
             return {}
+        total_start = time.perf_counter()
         metrics: dict[str, float] = {}
         keyframe_steps = int(self.optim_cfg.get("keyframe_steps", 0))
         if keyframe_steps > 0:
             optimize_pose = bool(self.optim_cfg.get("keyframe_optimize_pose", self.optim_cfg.get("pose_refine_enable", False)))
+            section_start = time.perf_counter()
             keyframe_metrics = self._optimize_keyframe_set(
                 [self.keyframes[-1]],
                 steps=keyframe_steps,
@@ -861,6 +864,7 @@ class PanoGaussianMapper:
                 gaussian_scales=self._gaussian_scales_for_phase("keyframe", [self.keyframes[-1]]),
                 pose_enabled=optimize_pose,
             )
+            metrics["profile_backend_keyframe_sec"] = float(time.perf_counter() - section_start)
             metrics.update(keyframe_metrics)
             if "loss" in keyframe_metrics:
                 metrics["keyframe_loss"] = keyframe_metrics["loss"]
@@ -868,12 +872,14 @@ class PanoGaussianMapper:
         if local_steps > 0:
             local_window = int(self.optim_cfg.get("local_window_keyframes", 2))
             selected = self._select_backend_keyframe_window(max(1, local_window))
+            section_start = time.perf_counter()
             local_metrics = self._optimize_keyframe_set(
                 selected,
                 steps=local_steps,
                 phase="local_submap",
                 gaussian_scales=self._gaussian_scales_for_phase("local_submap", selected),
             )
+            metrics["profile_backend_local_submap_sec"] = float(time.perf_counter() - section_start)
             metrics.update(local_metrics)
             if "loss" in local_metrics:
                 metrics["local_loss"] = local_metrics["loss"]
@@ -882,15 +888,18 @@ class PanoGaussianMapper:
         if sliding_steps > 0:
             window = int(self.optim_cfg.get("window_keyframes", 8))
             selected = self._select_backend_keyframe_window(max(1, window))
+            section_start = time.perf_counter()
             sliding_metrics = self._optimize_keyframe_set(
                 selected,
                 steps=sliding_steps,
                 phase="sliding_window",
                 gaussian_scales=self._gaussian_scales_for_phase("sliding_window", selected),
             )
+            metrics["profile_backend_sliding_window_sec"] = float(time.perf_counter() - section_start)
             metrics.update(sliding_metrics)
             if "loss" in sliding_metrics:
                 metrics["sliding_loss"] = sliding_metrics["loss"]
+        metrics["profile_backend_optimize_after_keyframe_sec"] = float(time.perf_counter() - total_start)
         return metrics
 
     def _select_backend_keyframe_window(self, latest_count: int) -> list[MapperKeyframe]:
@@ -923,7 +932,8 @@ class PanoGaussianMapper:
         if not self.keyframes or int(steps) <= 0:
             return {}
         selected = [self.keyframes[-1]]
-        return self._optimize_keyframe_set(
+        total_start = time.perf_counter()
+        metrics = self._optimize_keyframe_set(
             selected,
             steps=int(steps),
             phase="bootstrap",
@@ -932,6 +942,8 @@ class PanoGaussianMapper:
             diagnostic_callback=diagnostic_callback,
             diagnostic_every=diagnostic_every,
         )
+        metrics["profile_backend_bootstrap_sec"] = float(time.perf_counter() - total_start)
+        return metrics
 
     def optimize_frame_observation(
         self,
@@ -943,6 +955,7 @@ class PanoGaussianMapper:
     ) -> dict[str, float]:
         if (self.map.anchor_count() == 0 and not self.map.has_skybox) or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
+        total_start = time.perf_counter()
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
@@ -953,22 +966,28 @@ class PanoGaussianMapper:
             phase=phase,
         )
         if not param_groups:
-            return {"loss": 0.0, "steps": 0.0}
+            return {"loss": 0.0, "steps": 0.0, "profile_backend_non_keyframe_sec": float(time.perf_counter() - total_start)}
         optimizer = torch.optim.AdamW(param_groups, weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)))
         last: dict[str, float] = {"loss": 0.0}
         best = float("inf")
         stale = 0
         min_delta, patience = self._early_stop_options()
+        render_loss_sec = 0.0
+        backward_step_sec = 0.0
         for step_idx in range(int(steps)):
             optimizer.zero_grad(set_to_none=True)
+            section_start = time.perf_counter()
             pkg = self.renderer.render(camera, self.map)
             pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
             loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
+            render_loss_sec += time.perf_counter() - section_start
             if loss.requires_grad:
+                section_start = time.perf_counter()
                 loss.backward()
                 if gaussian_scales is not None:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+                backward_step_sec += time.perf_counter() - section_start
             last = {k: float(v.detach().cpu()) for k, v in metrics.items()}
             last["loss"] = float(loss.detach().cpu())
             current = float(last["loss"])
@@ -987,6 +1006,11 @@ class PanoGaussianMapper:
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = 0.0
         self.stats.optimization_steps += int(last["steps"])
+        total_sec = float(time.perf_counter() - total_start)
+        last["profile_backend_non_keyframe_sec"] = total_sec
+        last["profile_backend_non_keyframe_render_loss_sec"] = float(render_loss_sec)
+        last["profile_backend_non_keyframe_backward_step_sec"] = float(backward_step_sec)
+        last["profile_backend_non_keyframe_step_avg_sec"] = total_sec / max(1.0, float(last["steps"]))
         return last
 
     def finalize_optimization(self) -> dict[str, float]:
@@ -1131,6 +1155,7 @@ class PanoGaussianMapper:
     ) -> dict[str, float]:
         if not keyframes or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
+        total_start = time.perf_counter()
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
         gaussian_enabled = gaussian_scales is not None and self.map.anchor_count() > 0
@@ -1160,7 +1185,7 @@ class PanoGaussianMapper:
                 }
             )
         if not param_groups:
-            return {"loss": 0.0, "steps": 0.0}
+            return {"loss": 0.0, "steps": 0.0, f"profile_backend_{str(phase)}_optimize_set_sec": float(time.perf_counter() - total_start)}
 
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -1174,15 +1199,22 @@ class PanoGaussianMapper:
         actual_steps = 0
         selected_ids = {int(kf.frame_id) for kf in keyframes}
         last_sampled_ids: list[int] = []
+        sample_sec = 0.0
+        render_loss_sec = 0.0
+        backward_step_sec = 0.0
+        diagnostic_sec = 0.0
         for step_idx in range(int(steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
+            section_start = time.perf_counter()
             sampled_keyframes, replay_ids = self._sample_keyframes_for_step(
                 keyframes,
                 selected_ids=selected_ids,
             )
+            sample_sec += time.perf_counter() - section_start
             last_sampled_ids = [int(kf.frame_id) for kf in sampled_keyframes]
+            section_start = time.perf_counter()
             for kf in sampled_keyframes:
                 target = kf.image.to(device=device, dtype=dtype)
                 H, W = int(target.shape[-2]), int(target.shape[-1])
@@ -1206,16 +1238,20 @@ class PanoGaussianMapper:
                 for key, value in metrics_i.items():
                     metric_accum.setdefault(key, []).append(value.detach())
             if not render_losses:
-                return {"loss": 0.0, "steps": 0.0}
+                elapsed = float(time.perf_counter() - total_start)
+                return {"loss": 0.0, "steps": 0.0, f"profile_backend_{str(phase)}_optimize_set_sec": elapsed}
+            render_loss_sec += time.perf_counter() - section_start
             loss = torch.stack(render_losses).mean()
             if pose_params and pose_prior_weight > 0.0:
                 prior = torch.stack([param.square().mean() for param in pose_params]).mean()
                 loss = loss + pose_prior_weight * prior
             if loss.requires_grad:
+                section_start = time.perf_counter()
                 loss.backward()
                 if gaussian_enabled:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+                backward_step_sec += time.perf_counter() - section_start
             actual_steps = step_idx + 1
             last = {
                 key: float(torch.stack(values).mean().detach().cpu())
@@ -1224,11 +1260,13 @@ class PanoGaussianMapper:
             }
             last["loss"] = float(loss.detach().cpu())
             if diagnostic_callback is not None and len(keyframes) == 1:
+                section_start = time.perf_counter()
                 every = max(1, int(diagnostic_every))
                 if actual_steps == 1 or actual_steps % every == 0 or actual_steps == int(steps):
                     diagnostic = self.render_keyframe_diagnostic(int(keyframes[0].frame_id))
                     if diagnostic is not None:
                         diagnostic_callback(actual_steps, diagnostic)
+                diagnostic_sec += time.perf_counter() - section_start
             current = float(last["loss"])
             if min_delta > 0.0 and patience > 0:
                 if current < best - min_delta:
@@ -1247,6 +1285,20 @@ class PanoGaussianMapper:
         last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
         last["trainable_pose_count"] = float(len(trainable_pose_ids))
         last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
+        phase_key = str(phase).replace("/", "_")
+        total_sec = float(time.perf_counter() - total_start)
+        last["profile_backend_optimize_set_sec"] = total_sec
+        last["profile_backend_step_avg_sec"] = total_sec / max(1, actual_steps)
+        last["profile_backend_sample_sec"] = float(sample_sec)
+        last["profile_backend_render_loss_sec"] = float(render_loss_sec)
+        last["profile_backend_backward_step_sec"] = float(backward_step_sec)
+        last["profile_backend_diagnostic_sec"] = float(diagnostic_sec)
+        last[f"profile_backend_{phase_key}_optimize_set_sec"] = total_sec
+        last[f"profile_backend_{phase_key}_step_avg_sec"] = total_sec / max(1, actual_steps)
+        last[f"profile_backend_{phase_key}_sample_sec"] = float(sample_sec)
+        last[f"profile_backend_{phase_key}_render_loss_sec"] = float(render_loss_sec)
+        last[f"profile_backend_{phase_key}_backward_step_sec"] = float(backward_step_sec)
+        last[f"profile_backend_{phase_key}_diagnostic_sec"] = float(diagnostic_sec)
         self.stats.last_loss = float(last.get("loss", 0.0))
         self.stats.last_phase = phase
         self.stats.last_pose_delta_norm = pose_norm
