@@ -121,6 +121,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.matching_head.matching_checkpoint.endswith("/matching_head.pt")
     assert parsed_file.matching_head.sky_checkpoint.endswith("/sky_head.pt")
     assert file_cfg["PanoVGGT"]["image_size"] is None
+    assert file_cfg["Dataset"]["erp_resize_height"] == 518
+    assert file_cfg["Dataset"]["erp_resize_width"] == 1036
 
     shadow_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_shadow.yaml").read_text())
     active_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_active.yaml").read_text())

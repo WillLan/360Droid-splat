@@ -2,10 +2,10 @@ Dataset:
   synthetic: false
   dataset_path: /mnt/disk1/lanboyang/Datasets/360uav/seqs
   sequence: null
-  # Keep null in this M3-Sphere contract config: image resolution is inferred
-  # from the input stream instead of being fixed in the config.
-  erp_resize_height: null
-  erp_resize_width: null
+  # Resize PanoCity-scale ERP input before inference; PanoVGGT.image_size stays
+  # null so model feature/image sizes are still inferred from tensors.
+  erp_resize_height: 518
+  erp_resize_width: 1036
   begin: 0
   end: null
 
