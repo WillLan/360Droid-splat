@@ -257,6 +257,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         novel_insert_confidence_floor: float = 0.0,
         novel_spatial_cell_size: int = 0,
         novel_max_seeds_per_cell: int = 0,
+        novel_insertion_strategy: str = "legacy",
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.chunk_size = max(1, int(chunk_size))
@@ -274,6 +275,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.novel_insert_confidence_floor = float(novel_insert_confidence_floor)
         self.novel_spatial_cell_size = max(0, int(novel_spatial_cell_size))
         self.novel_max_seeds_per_cell = max(0, int(novel_max_seeds_per_cell))
+        self.novel_insertion_strategy = str(novel_insertion_strategy or "legacy").lower()
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
         self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
         self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
@@ -317,6 +319,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.current_recent_history_ids: tuple[int, ...] = ()
         self.keyframe_decision_history: list[dict] = []
         self._pending_keyframe_decisions: list[dict] = []
+        self._pending_insertion_hints: dict[int, dict[str, torch.Tensor]] = {}
 
     @property
     def keyframe_anchor_enabled(self) -> bool:
@@ -372,6 +375,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         out = self._pending_keyframe_decisions
         self._pending_keyframe_decisions = []
         return out
+
+    def consume_insertion_hints(self, frame_id: int) -> dict[str, torch.Tensor] | None:
+        return self._pending_insertion_hints.pop(int(frame_id), None)
 
     def flush(self) -> list[FrontendOutput]:
         self._run_ready_chunks(final=True)
@@ -1158,14 +1164,26 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         output_valid = valid_world_points_mask
         output_world_confidence = confidence
         if self.novel_insertion_enabled and self.keyframe_anchor_enabled and is_keyframe:
-            output_valid, output_world_confidence = self._novel_world_mask_and_confidence(
-                valid_world_points_mask=valid_world_points_mask,
-                confidence=confidence,
-                image_size=tuple(int(v) for v in world_points.shape[:2]),
-                anchor_metrics=anchor_metrics,
-                sky_prob=sky_prob,
-                first_keyframe=self.last_keyframe_id is None,
-            )
+            image_size = tuple(int(v) for v in world_points.shape[:2])
+            first_keyframe = self.last_keyframe_id is None
+            if self.novel_insertion_strategy == "pfgs360":
+                hints = self._pfgs360_insertion_hints(
+                    image_size=image_size,
+                    anchor_metrics=anchor_metrics,
+                    sky_prob=sky_prob,
+                    first_keyframe=first_keyframe,
+                )
+                if hints:
+                    self._pending_insertion_hints[frame_id] = hints
+            else:
+                output_valid, output_world_confidence = self._novel_world_mask_and_confidence(
+                    valid_world_points_mask=valid_world_points_mask,
+                    confidence=confidence,
+                    image_size=image_size,
+                    anchor_metrics=anchor_metrics,
+                    sky_prob=sky_prob,
+                    first_keyframe=first_keyframe,
+                )
         if is_keyframe:
             self.last_keyframe_id = frame_id
             self.last_keyframe_anchor = _KeyframeAnchorRecord(
@@ -1426,6 +1444,38 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             ).to(device=valid.device)
         return candidate, world_conf.clamp(0.0, 1.0)
 
+    def _pfgs360_insertion_hints(
+        self,
+        *,
+        image_size: tuple[int, int],
+        anchor_metrics: _AnchorFrameMetrics | None,
+        sky_prob: torch.Tensor | None,
+        first_keyframe: bool,
+    ) -> dict[str, torch.Tensor]:
+        hints: dict[str, torch.Tensor] = {}
+        if first_keyframe and sky_prob is not None:
+            non_sky_feature = sky_prob.detach().float() <= float(self.m3_config.keyframe_anchor.sky_threshold)
+        elif anchor_metrics is not None:
+            non_sky_feature = anchor_metrics.non_sky.bool()
+        elif sky_prob is not None:
+            non_sky_feature = sky_prob.detach().float() <= float(self.m3_config.keyframe_anchor.sky_threshold)
+        else:
+            non_sky_feature = None
+        if non_sky_feature is not None:
+            hints["non_sky"] = (_resize_nearest(non_sky_feature.float(), image_size) > 0.5).detach().cpu()
+        if anchor_metrics is not None:
+            hints["pair_confidence"] = _resize_field(
+                anchor_metrics.pair_confidence.detach().float(),
+                image_size,
+            ).clamp(0.0, 1.0).detach().cpu()
+            hints["low_pair_conf"] = (
+                _resize_nearest(anchor_metrics.low_pair_conf.float(), image_size) > 0.5
+            ).detach().cpu()
+            hints["matched_cells"] = (
+                _resize_nearest(anchor_metrics.matched_cells.float(), image_size) > 0.5
+            ).detach().cpu()
+        return hints
+
     def _chunk_descriptor(self, pred: PanoVGGTLocalPrediction, images: torch.Tensor) -> torch.Tensor:
         if pred.descriptors is not None and pred.descriptors.numel() > 0:
             return pred.descriptors.float().mean(dim=0)
@@ -1485,4 +1535,5 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         novel_insert_confidence_floor=float(novel_cfg.get("insert_confidence_floor", 0.0)),
         novel_spatial_cell_size=int(novel_cfg.get("spatial_cell_size", 0)),
         novel_max_seeds_per_cell=int(novel_cfg.get("max_seeds_per_cell", 0)),
+        novel_insertion_strategy=str(novel_cfg.get("strategy", "legacy")),
     )

@@ -27,6 +27,32 @@ class _CountingRenderer:
         return {"render": render, "depth": render.new_ones(1, H, W)}
 
 
+class _DepthGateRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        H, W = int(camera.image_height), int(camera.image_width)
+        render = torch.zeros(3, H, W, device=camera.c2w.device, dtype=camera.c2w.dtype)
+        if W >= 3:
+            render[:, :, 2] = 1.0
+        depth = torch.ones(1, H, W, device=render.device, dtype=render.dtype)
+        if W >= 2:
+            depth[:, :, 1] = 2.0
+        if W >= 3:
+            depth[:, :, 2] = 0.6
+        alpha = torch.ones(1, H, W, device=render.device, dtype=render.dtype)
+        alpha[:, :, 0] = 0.0
+        total = int(gaussian_map.anchor_count())
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "visibility_filter": torch.zeros(total, dtype=torch.bool, device=render.device),
+            "radii": torch.zeros(total, dtype=torch.int32, device=render.device),
+            "n_touched": torch.zeros(total, dtype=torch.int32, device=render.device),
+            "render_distort": None,
+        }
+
+
 def _small_frontend_output(frame_id: int) -> FrontendOutput:
     pose = torch.eye(4)
     pose[0, 3] = float(frame_id) * 0.1
@@ -97,6 +123,57 @@ def test_mapper_renders_keyframe_diagnostic():
     assert diagnostic.render.shape == image.shape
     assert diagnostic.depth is not None
     assert diagnostic.anchor_count == 2
+
+
+def test_pfgs360_mapper_render_depth_gate_inserts_missing_foreground_and_inconsistent_regions():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360",
+                "voxel_size": 0.1,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 20,
+                "render_alpha_min": 0.2,
+                "foreground_rel_threshold": 0.1,
+                "render_depth_rel_threshold": 0.15,
+                "photometric_error_threshold": 0.08,
+                "near_grid_radius": 0,
+                "reset_after_outlier_observations": 99,
+                "prune_after_outlier_observations": 99,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_DepthGateRenderer())
+    first = GaussianSeedBatch(
+        xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+        rgb=torch.zeros(1, 3),
+        confidence=torch.ones(1),
+        scale=torch.full((1,), 0.1),
+        level=torch.zeros(1, dtype=torch.int8),
+        frame_id=0,
+    )
+    assert mapper.insert_keyframe(first, _small_frontend_output(0), image=torch.zeros(3, 1, 4)) == 1
+    seeds = GaussianSeedBatch(
+        xyz=torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [3.0, 0.0, 1.0]]),
+        rgb=torch.zeros(4, 3),
+        confidence=torch.ones(4),
+        scale=torch.full((4,), 0.1),
+        level=torch.zeros(4, dtype=torch.int8),
+        frame_id=1,
+        source_flat_idx=torch.arange(4),
+        source_hw=(1, 4),
+        insert_enabled=torch.ones(4, dtype=torch.bool),
+        insert_score=torch.tensor([1.0, 0.9, 0.8, 0.1]),
+    )
+
+    inserted = mapper.insert_keyframe(seeds, _small_frontend_output(1), image=torch.zeros(3, 1, 4))
+
+    assert inserted == 3
+    assert mapper.stats.last_suppressed_insert == 1
+    assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
 
 
 def test_mapper_random_window_optimizes_one_sample_per_step():
@@ -495,6 +572,9 @@ def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
     assert any((tmp_path / "point_cloud" / "init").glob("frame_*.ply"))
     assert Path(summary["artifacts"]["final_ply"]).is_file()
     assert Path(summary["artifacts"]["final_checkpoint"]).is_file()
+    checkpoint = torch.load(summary["artifacts"]["final_checkpoint"], map_location="cpu", weights_only=False)
+    assert "anchor_birth_frame" in checkpoint
+    assert "anchor_outlier_obs" in checkpoint
     assert summary["artifacts"]["final_keyframe_render_count"] >= 1
     assert Path(summary["artifacts"]["final_skybox_erp_preview"]).is_file()
     assert Path(summary["artifacts"]["final_skybox_faces"]).is_file()

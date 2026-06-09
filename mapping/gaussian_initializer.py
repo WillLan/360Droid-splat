@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+import torch.nn.functional as F
 
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
@@ -21,6 +22,9 @@ class GaussianSeedBatch:
     frame_id: int
     source_flat_idx: torch.Tensor | None = None
     source_hw: tuple[int, int] | None = None
+    insert_enabled: torch.Tensor | None = None
+    insert_score: torch.Tensor | None = None
+    grid_coord: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return int(self.xyz.shape[0])
@@ -35,6 +39,9 @@ class GaussianSeedBatch:
             frame_id=self.frame_id,
             source_flat_idx=None if self.source_flat_idx is None else self.source_flat_idx.to(device),
             source_hw=self.source_hw,
+            insert_enabled=None if self.insert_enabled is None else self.insert_enabled.to(device),
+            insert_score=None if self.insert_score is None else self.insert_score.to(device),
+            grid_coord=None if self.grid_coord is None else self.grid_coord.to(device),
         )
 
 
@@ -61,6 +68,9 @@ class GaussianInitializer:
         sky_mask_cloud_saturation: float = 0.22,
         sky_mask_texture_threshold: float = 0.08,
         seed_source: str = "depth_pose",
+        insertion_strategy: str = "legacy",
+        pfgs360_voxel_size: float = 0.12,
+        temporal_pair_conf_min: float = 0.70,
     ) -> None:
         seed_source = str(seed_source).lower()
         if seed_source not in {"depth_pose", "world_points_only"}:
@@ -78,14 +88,25 @@ class GaussianInitializer:
         self.sky_mask_cloud_saturation = float(sky_mask_cloud_saturation)
         self.sky_mask_texture_threshold = float(sky_mask_texture_threshold)
         self.seed_source = seed_source
+        self.insertion_strategy = str(insertion_strategy or "legacy").lower()
+        self.pfgs360_voxel_size = max(float(pfgs360_voxel_size), 1.0e-6)
+        self.temporal_pair_conf_min = float(temporal_pair_conf_min)
 
     def from_frontend_output(
         self,
         output: FrontendOutput,
         image: torch.Tensor,
+        *,
+        insertion_hints: dict | None = None,
+        first_keyframe: bool = False,
     ) -> GaussianSeedBatch:
         if self.seed_source == "world_points_only":
-            return self.from_world_points_only(output, image)
+            return self.from_world_points_only(
+                output,
+                image,
+                insertion_hints=insertion_hints,
+                first_keyframe=first_keyframe,
+            )
         if output.inverse_depth is None:
             return self._empty(output.frame_id, image)
         inv = output.inverse_depth.detach().float()
@@ -155,6 +176,9 @@ class GaussianInitializer:
         self,
         output: FrontendOutput,
         image: torch.Tensor,
+        *,
+        insertion_hints: dict | None = None,
+        first_keyframe: bool = False,
     ) -> GaussianSeedBatch:
         """Create seeds from already-global point maps without depth backprojection."""
 
@@ -178,6 +202,15 @@ class GaussianInitializer:
         _, H, W = img.shape
         if tuple(points.shape[:2]) != (H, W):
             raise ValueError(f"World-points shape {tuple(points.shape[:2])} does not match image {(H, W)}")
+
+        if self.insertion_strategy == "pfgs360":
+            return self._from_world_points_pfgs360(
+                output,
+                img,
+                points,
+                insertion_hints=insertion_hints,
+                first_keyframe=first_keyframe,
+            )
 
         conf = output.world_points_confidence
         if conf is None:
@@ -243,6 +276,186 @@ class GaussianInitializer:
             source_hw=(int(H), int(W)),
         )
 
+    def _from_world_points_pfgs360(
+        self,
+        output: FrontendOutput,
+        img: torch.Tensor,
+        points: torch.Tensor,
+        *,
+        insertion_hints: dict | None,
+        first_keyframe: bool,
+    ) -> GaussianSeedBatch:
+        _, H, W = img.shape
+        conf_t = self._world_confidence(output, points, H, W)
+        valid_t = self._world_valid_mask(output, points, H, W)
+        finite = torch.isfinite(points).all(dim=-1, keepdim=False).unsqueeze(0)
+        mask = finite & valid_t & torch.isfinite(conf_t) & (conf_t >= self.min_confidence)
+
+        if self.sky_mask_enable:
+            sky = self._sky_mask_from_image(img).to(device=mask.device)
+            mask = mask & ~sky
+
+        hints = insertion_hints or {}
+        non_sky = self._hint_mask(hints.get("non_sky"), (H, W), device=points.device)
+        if non_sky is not None:
+            mask = mask & non_sky
+
+        pair_conf = self._hint_field(hints.get("pair_confidence"), (H, W), device=points.device, dtype=points.dtype)
+        if bool(first_keyframe):
+            temporal_ok = torch.ones_like(mask, dtype=torch.bool)
+        elif pair_conf is None:
+            temporal_ok = torch.ones_like(mask, dtype=torch.bool)
+        else:
+            temporal_ok = pair_conf >= float(self.temporal_pair_conf_min)
+
+        flat_idx = torch.nonzero(mask.view(-1), as_tuple=False).flatten()
+        if flat_idx.numel() == 0:
+            return self._empty(output.frame_id, img)
+
+        xyz_flat = points.reshape(-1, 3)
+        rgb_flat = img.to(device=points.device, dtype=points.dtype).permute(1, 2, 0).reshape(-1, 3)
+        conf_flat = conf_t.reshape(-1).to(device=points.device, dtype=points.dtype)
+        temporal_flat = temporal_ok.reshape(-1).to(device=points.device)
+        pair_flat = None if pair_conf is None else pair_conf.reshape(-1).to(device=points.device, dtype=points.dtype)
+
+        xyz_sel = xyz_flat[flat_idx]
+        rgb_sel = rgb_flat[flat_idx].clamp(0.0, 1.0)
+        conf_sel = conf_flat[flat_idx].clamp(0.0, 1.0)
+        insert_pixel = temporal_flat[flat_idx].bool()
+        score_sel = conf_sel if pair_flat is None else (conf_sel * pair_flat[flat_idx].clamp(0.0, 1.0))
+
+        grid = torch.floor(xyz_sel / float(self.pfgs360_voxel_size)).to(torch.int32)
+        unique_grid, inverse = torch.unique(grid, dim=0, return_inverse=True)
+        n_voxels = int(unique_grid.shape[0])
+        weights = conf_sel.clamp_min(1.0e-4)
+        sum_w = torch.zeros(n_voxels, device=points.device, dtype=points.dtype)
+        sum_w.index_add_(0, inverse, weights)
+        xyz_sum = torch.zeros(n_voxels, 3, device=points.device, dtype=points.dtype)
+        rgb_sum = torch.zeros(n_voxels, 3, device=points.device, dtype=points.dtype)
+        xyz_sum.index_add_(0, inverse, xyz_sel * weights.unsqueeze(-1))
+        rgb_sum.index_add_(0, inverse, rgb_sel * weights.unsqueeze(-1))
+        xyz = xyz_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
+        rgb = rgb_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
+
+        count = torch.zeros(n_voxels, device=points.device, dtype=points.dtype)
+        count.index_add_(0, inverse, torch.ones_like(weights))
+        conf_sum = torch.zeros(n_voxels, device=points.device, dtype=points.dtype)
+        conf_sum.index_add_(0, inverse, conf_sel)
+        conf = (conf_sum / count.clamp_min(1.0)).clamp(0.0, 1.0)
+
+        insert_count = torch.zeros(n_voxels, device=points.device, dtype=points.dtype)
+        insert_count.index_add_(0, inverse, insert_pixel.to(dtype=points.dtype))
+        insert_enabled = insert_count > 0
+        best_pos = self._best_positions_by_score(score_sel, inverse, n_voxels)
+        source_flat_idx = flat_idx[best_pos]
+        insert_score = score_sel[best_pos].clamp(0.0, 1.0)
+
+        if self.max_seeds_per_keyframe > 0 and n_voxels > self.max_seeds_per_keyframe:
+            _, order = torch.topk(insert_score, k=self.max_seeds_per_keyframe, largest=True)
+            xyz = xyz.index_select(0, order)
+            rgb = rgb.index_select(0, order)
+            conf = conf.index_select(0, order)
+            unique_grid = unique_grid.index_select(0, order)
+            insert_enabled = insert_enabled.index_select(0, order)
+            insert_score = insert_score.index_select(0, order)
+            source_flat_idx = source_flat_idx.index_select(0, order)
+
+        n = int(xyz.shape[0])
+        return GaussianSeedBatch(
+            xyz=xyz,
+            rgb=rgb,
+            confidence=conf,
+            scale=torch.full((n,), float(self.pfgs360_voxel_size), device=points.device, dtype=points.dtype),
+            level=torch.zeros(n, dtype=torch.int8, device=points.device),
+            frame_id=int(output.frame_id),
+            source_flat_idx=source_flat_idx.detach().to(device=points.device, dtype=torch.long),
+            source_hw=(int(H), int(W)),
+            insert_enabled=insert_enabled.detach().to(device=points.device, dtype=torch.bool),
+            insert_score=insert_score.detach().to(device=points.device, dtype=points.dtype),
+            grid_coord=unique_grid.detach().to(device=points.device, dtype=torch.int32),
+        )
+
+    def _world_confidence(self, output: FrontendOutput, points: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        conf = output.world_points_confidence
+        if conf is None:
+            conf = output.depth_confidence
+        if conf is None:
+            return torch.ones((1, H, W), dtype=points.dtype, device=points.device)
+        conf_t = conf.detach().float()
+        if conf_t.ndim == 2:
+            conf_t = conf_t.unsqueeze(0)
+        if conf_t.ndim == 3 and conf_t.shape[0] != 1:
+            raise ValueError(f"Expected confidence as 1xHxW, got {tuple(conf_t.shape)}")
+        if tuple(conf_t.shape[-2:]) != (H, W):
+            raise ValueError(f"World-points confidence shape {tuple(conf_t.shape[-2:])} does not match image {(H, W)}")
+        return conf_t.to(device=points.device, dtype=points.dtype)
+
+    def _world_valid_mask(self, output: FrontendOutput, points: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        valid_mask = output.valid_world_points_mask
+        if valid_mask is None:
+            return torch.ones((1, H, W), dtype=torch.bool, device=points.device)
+        valid_t = valid_mask.detach().bool()
+        if valid_t.ndim == 2:
+            valid_t = valid_t.unsqueeze(0)
+        if valid_t.ndim == 3 and valid_t.shape[0] != 1:
+            raise ValueError(f"Expected valid_world_points_mask as 1xHxW, got {tuple(valid_t.shape)}")
+        if tuple(valid_t.shape[-2:]) != (H, W):
+            raise ValueError(f"World-points mask shape {tuple(valid_t.shape[-2:])} does not match image {(H, W)}")
+        return valid_t.to(device=points.device)
+
+    @staticmethod
+    def _hint_field(
+        value: torch.Tensor | None,
+        size: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        field = value.detach().float()
+        if field.ndim == 2:
+            field = field.unsqueeze(0)
+        if field.ndim != 3 or int(field.shape[0]) != 1:
+            raise ValueError(f"Insertion hint must have shape HxW or 1xHxW, got {tuple(value.shape)}")
+        if tuple(field.shape[-2:]) != tuple(size):
+            field = F.interpolate(field.unsqueeze(0), size=size, mode="bilinear", align_corners=False)[0]
+        return field.to(device=device, dtype=dtype)
+
+    @classmethod
+    def _hint_mask(
+        cls,
+        value: torch.Tensor | None,
+        size: tuple[int, int],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        field = cls._hint_field(value, size, device=device, dtype=torch.float32)
+        if field is None:
+            return None
+        return (field > 0.5).to(device=device)
+
+    @staticmethod
+    def _best_positions_by_score(score: torch.Tensor, inverse: torch.Tensor, n_voxels: int) -> torch.Tensor:
+        positions = torch.arange(score.shape[0], device=score.device, dtype=torch.long)
+        if hasattr(torch.Tensor, "scatter_reduce_"):
+            best_score = torch.full((n_voxels,), -float("inf"), device=score.device, dtype=score.dtype)
+            best_score.scatter_reduce_(0, inverse, score, reduce="amax", include_self=True)
+            is_best = score >= best_score[inverse]
+            sentinel = torch.full_like(positions, int(score.shape[0]))
+            pos_candidates = torch.where(is_best, positions, sentinel)
+            best_pos = torch.full((n_voxels,), int(score.shape[0]), device=score.device, dtype=torch.long)
+            best_pos.scatter_reduce_(0, inverse, pos_candidates, reduce="amin", include_self=True)
+            return best_pos.clamp_max(max(0, int(score.shape[0]) - 1))
+        best = []
+        for idx in range(n_voxels):
+            rows = torch.nonzero(inverse == idx, as_tuple=False).flatten()
+            if rows.numel() == 0:
+                best.append(0)
+            else:
+                best.append(int(rows[torch.argmax(score.index_select(0, rows))]))
+        return torch.tensor(best, dtype=torch.long, device=score.device)
+
     def _sky_mask_from_image(self, image: torch.Tensor) -> torch.Tensor:
         """Return a conservative sky-like mask with shape ``1xHxW``."""
 
@@ -303,4 +516,7 @@ class GaussianInitializer:
             frame_id=int(frame_id),
             source_flat_idx=torch.zeros(0, dtype=torch.long, device=device),
             source_hw=None,
+            insert_enabled=torch.zeros(0, dtype=torch.bool, device=device),
+            insert_score=torch.zeros(0, device=device),
+            grid_coord=torch.zeros(0, 3, dtype=torch.int32, device=device),
         )

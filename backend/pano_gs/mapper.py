@@ -20,7 +20,7 @@ from backend.pano_gs.adapter import PFGS360Renderer, PanoRenderCamera
 from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from backend.pano_gs.pose_param import PoseDelta
 from frontend.pano_droid.interfaces import FrontendOutput
-from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
+from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
 from mapping.gaussian_initializer import GaussianSeedBatch
 
 
@@ -41,6 +41,11 @@ class MapperStats:
     last_window_keyframes: list[int] = field(default_factory=list)
     last_sampled_keyframes: list[int] = field(default_factory=list)
     last_trainable_pose_count: int = 0
+    last_hash_hits: int = 0
+    last_hash_near_hits: int = 0
+    last_suppressed_insert: int = 0
+    last_outlier_resets: int = 0
+    last_outlier_pruned: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -51,6 +56,8 @@ class MapperKeyframe:
     gaussian_start: int
     gaussian_end: int
     sky_mask: torch.Tensor | None = None
+    target_depth: torch.Tensor | None = None
+    depth_confidence: torch.Tensor | None = None
 
 
 @dataclass
@@ -87,6 +94,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_grid_coord = torch.zeros(0, 3, dtype=torch.int32)
         self._anchor_obs_count = torch.zeros(0, dtype=torch.int32)
         self._anchor_conf_accum = torch.zeros(0, dtype=torch.float32)
+        self._anchor_birth_frame = torch.zeros(0, dtype=torch.int32)
+        self._anchor_last_seen_kf = torch.zeros(0, dtype=torch.int32)
+        self._anchor_inlier_obs = torch.zeros(0, dtype=torch.int32)
+        self._anchor_outlier_obs = torch.zeros(0, dtype=torch.int32)
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
@@ -191,7 +202,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_voxel_size = torch.cat(
             [self._anchor_voxel_size, seeds.scale.detach().cpu().to(torch.float32)], dim=0
         )
-        grid = torch.floor(seeds.xyz.detach().cpu() / seeds.scale.detach().cpu().view(-1, 1).clamp_min(1e-6))
+        if seeds.grid_coord is not None and int(seeds.grid_coord.shape[0]) == int(len(seeds)):
+            grid = seeds.grid_coord.detach().cpu().to(torch.int32)
+        else:
+            grid = torch.floor(seeds.xyz.detach().cpu() / seeds.scale.detach().cpu().view(-1, 1).clamp_min(1e-6)).to(torch.int32)
         self._anchor_grid_coord = torch.cat([self._anchor_grid_coord, grid.to(torch.int32)], dim=0)
         self._anchor_obs_count = torch.cat(
             [self._anchor_obs_count, torch.ones(len(seeds), dtype=torch.int32)], dim=0
@@ -199,7 +213,39 @@ class PanoGaussianMap(nn.Module):
         self._anchor_conf_accum = torch.cat(
             [self._anchor_conf_accum, seeds.confidence.detach().cpu().to(torch.float32)], dim=0
         )
+        frame_ids = torch.full((len(seeds),), int(seeds.frame_id), dtype=torch.int32)
+        self._anchor_birth_frame = torch.cat([self._anchor_birth_frame, frame_ids], dim=0)
+        self._anchor_last_seen_kf = torch.cat([self._anchor_last_seen_kf, frame_ids], dim=0)
+        self._anchor_inlier_obs = torch.cat([self._anchor_inlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
+        self._anchor_outlier_obs = torch.cat([self._anchor_outlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         return int(xyz.shape[0])
+
+    def prune_anchors(self, prune_mask: torch.Tensor) -> int:
+        if self.anchor_count() == 0:
+            return 0
+        mask = prune_mask.detach().to(device=self.xyz.device, dtype=torch.bool).view(-1)
+        if int(mask.shape[0]) != self.anchor_count():
+            raise ValueError(f"Prune mask length {int(mask.shape[0])} does not match anchor count {self.anchor_count()}")
+        keep = ~mask
+        n_pruned = int(mask.sum().item())
+        if n_pruned <= 0:
+            return 0
+        self.xyz = nn.Parameter(self.xyz.detach()[keep])
+        self.rotation = nn.Parameter(self.rotation.detach()[keep])
+        self.scaling = nn.Parameter(self.scaling.detach()[keep])
+        self.opacity_logit = nn.Parameter(self.opacity_logit.detach()[keep])
+        self.features = nn.Parameter(self.features.detach()[keep])
+        keep_cpu = keep.detach().cpu()
+        self._anchor_level = self._anchor_level[keep_cpu]
+        self._anchor_voxel_size = self._anchor_voxel_size[keep_cpu]
+        self._anchor_grid_coord = self._anchor_grid_coord[keep_cpu]
+        self._anchor_obs_count = self._anchor_obs_count[keep_cpu]
+        self._anchor_conf_accum = self._anchor_conf_accum[keep_cpu]
+        self._anchor_birth_frame = self._anchor_birth_frame[keep_cpu]
+        self._anchor_last_seen_kf = self._anchor_last_seen_kf[keep_cpu]
+        self._anchor_inlier_obs = self._anchor_inlier_obs[keep_cpu]
+        self._anchor_outlier_obs = self._anchor_outlier_obs[keep_cpu]
+        return n_pruned
 
     def make_optimizer(self, *, lr: float = 2e-3, weight_decay: float = 0.0) -> torch.optim.Optimizer:
         param_groups = [{"params": self.gaussian_parameters(), "lr": float(lr), "name": "gaussians"}]
@@ -430,6 +476,10 @@ class PanoGaussianMap(nn.Module):
                 "anchor_grid_coord": self._anchor_grid_coord,
                 "anchor_obs_count": self._anchor_obs_count,
                 "anchor_conf_accum": self._anchor_conf_accum,
+                "anchor_birth_frame": self._anchor_birth_frame,
+                "anchor_last_seen_kf": self._anchor_last_seen_kf,
+                "anchor_inlier_obs": self._anchor_inlier_obs,
+                "anchor_outlier_obs": self._anchor_outlier_obs,
                 "config": self.config,
             },
             path,
@@ -459,6 +509,21 @@ class PanoGaussianMapper:
         pano_cfg = gaussian_map.config.get("PanoVGGT", {}) if isinstance(gaussian_map.config, dict) else {}
         m3_enabled = bool((pano_cfg.get("M3Sphere", {}) or {}).get("enabled", False)) if isinstance(pano_cfg, dict) else False
         self.novel_insertion_enabled = bool(novel_cfg.get("enabled", m3_enabled))
+        self.novel_insertion_strategy = str(novel_cfg.get("strategy", "legacy") or "legacy").lower()
+        self.pfgs360_insertion_enabled = bool(
+            self.novel_insertion_enabled and self.novel_insertion_strategy == "pfgs360"
+        )
+        self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
+        self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
+        self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.15))
+        self.pfgs360_foreground_rel_threshold = float(novel_cfg.get("foreground_rel_threshold", 0.10))
+        self.pfgs360_photometric_error_threshold = float(novel_cfg.get("photometric_error_threshold", 0.08))
+        self.pfgs360_near_grid_radius = max(0, int(novel_cfg.get("near_grid_radius", 1)))
+        self.pfgs360_near_distance_factor = max(0.0, float(novel_cfg.get("near_distance_factor", 1.0)))
+        self.pfgs360_reset_after_outliers = max(0, int(novel_cfg.get("reset_after_outlier_observations", 3)))
+        self.pfgs360_prune_after_outliers = max(0, int(novel_cfg.get("prune_after_outlier_observations", 6)))
+        self.pfgs360_protect_recent_keyframes = max(0, int(novel_cfg.get("protect_recent_keyframes", 8)))
+        self.pfgs360_max_prune_per_keyframe = max(0, int(novel_cfg.get("max_prune_per_keyframe", 500)))
         self.first_keyframe_max_seeds = int(novel_cfg.get("first_keyframe_max_seeds", 80000))
         self.keyframe_max_seeds = int(novel_cfg.get("keyframe_max_seeds", 30000))
         self.global_anchor_budget = int(novel_cfg.get("global_anchor_budget", 1500000))
@@ -494,7 +559,12 @@ class PanoGaussianMapper:
         sky_mask = self._skybox_mask_from_image(image) if image is not None else None
         if image is not None and self.map.has_skybox:
             self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
-        seeds, filter_stats = self._filter_novel_seeds(seeds)
+        seeds, filter_stats = self._filter_novel_seeds(
+            seeds,
+            frontend_output=frontend_output,
+            image=image,
+            sky_mask=sky_mask,
+        )
         self.last_inserted_source_flat_idx = (
             None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
         )
@@ -510,6 +580,11 @@ class PanoGaussianMapper:
         self.stats.last_inserted_anchors = int(n)
         self.stats.last_skipped_voxel = int(filter_stats.get("skipped_voxel", 0))
         self.stats.last_skipped_budget = int(filter_stats.get("skipped_budget", 0))
+        self.stats.last_hash_hits = int(filter_stats.get("hash_hits", 0))
+        self.stats.last_hash_near_hits = int(filter_stats.get("hash_near_hits", 0))
+        self.stats.last_suppressed_insert = int(filter_stats.get("suppressed_insert", 0))
+        self.stats.last_outlier_resets = int(filter_stats.get("outlier_resets", 0))
+        self.stats.last_outlier_pruned = int(filter_stats.get("outlier_pruned", 0))
         if image is not None:
             self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
         if n == 0:
@@ -520,6 +595,17 @@ class PanoGaussianMapper:
                     f"frame {frontend_output.frame_id}: novel insertion kept {n}/{requested} "
                     f"seeds, skipped_voxel={self.stats.last_skipped_voxel}, "
                     f"skipped_budget={self.stats.last_skipped_budget}"
+                )
+            )
+        if self.pfgs360_insertion_enabled and (
+            self.stats.last_suppressed_insert or self.stats.last_outlier_resets or self.stats.last_outlier_pruned
+        ):
+            self.stats.notes.append(
+                (
+                    f"frame {frontend_output.frame_id}: pfgs360 insertion "
+                    f"hits={self.stats.last_hash_hits}, near_hits={self.stats.last_hash_near_hits}, "
+                    f"suppressed={self.stats.last_suppressed_insert}, "
+                    f"resets={self.stats.last_outlier_resets}, pruned={self.stats.last_outlier_pruned}"
                 )
             )
         return n
@@ -538,9 +624,23 @@ class PanoGaussianMapper:
                 ids.append(value)
         self.frontend_graph_window_ids = tuple(ids)
 
-    def _filter_novel_seeds(self, seeds: GaussianSeedBatch) -> tuple[GaussianSeedBatch, dict[str, int]]:
+    def _filter_novel_seeds(
+        self,
+        seeds: GaussianSeedBatch,
+        *,
+        frontend_output: FrontendOutput | None = None,
+        image: torch.Tensor | None = None,
+        sky_mask: torch.Tensor | None = None,
+    ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if not self.novel_insertion_enabled or len(seeds) == 0:
             return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
+        if self.pfgs360_insertion_enabled:
+            return self._filter_pfgs360_seeds(
+                seeds,
+                frontend_output=frontend_output,
+                image=image,
+                sky_mask=sky_mask,
+            )
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
         budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
         if self.global_anchor_budget > 0:
@@ -575,6 +675,386 @@ class PanoGaussianMapper:
             return self._empty_seed_like(seeds), {"skipped_voxel": skipped_voxel, "skipped_budget": skipped_budget}
         keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
         return self._subset_seeds(seeds, keep_idx), {"skipped_voxel": skipped_voxel, "skipped_budget": skipped_budget}
+
+    def _filter_pfgs360_seeds(
+        self,
+        seeds: GaussianSeedBatch,
+        *,
+        frontend_output: FrontendOutput | None,
+        image: torch.Tensor | None,
+        sky_mask: torch.Tensor | None,
+    ) -> tuple[GaussianSeedBatch, dict[str, int]]:
+        seeds = self._with_pfgs360_seed_metadata(seeds)
+        per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
+        budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
+        if self.global_anchor_budget > 0:
+            budget = min(budget, max(0, int(self.global_anchor_budget) - self.map.anchor_count()))
+        budget = max(0, int(budget))
+
+        stats = {
+            "skipped_voxel": 0,
+            "skipped_budget": 0,
+            "hash_hits": 0,
+            "hash_near_hits": 0,
+            "suppressed_insert": 0,
+            "outlier_resets": 0,
+            "outlier_pruned": 0,
+        }
+        insert_enabled = (
+            torch.ones(len(seeds), dtype=torch.bool)
+            if seeds.insert_enabled is None
+            else seeds.insert_enabled.detach().cpu().bool()
+        )
+        first_keyframe = self.stats.n_keyframes == 0 or self.map.anchor_count() == 0
+        if not first_keyframe and frontend_output is not None and image is not None:
+            image_hw = tuple(int(v) for v in image.shape[-2:])
+            temporal_ok = self._seed_pixel_mask(seeds, insert_enabled, image_hw)
+            render_bad, evidence_stats = self._pfgs360_render_bad_mask(
+                frontend_output,
+                image,
+                sky_mask=sky_mask,
+                temporal_ok=temporal_ok,
+            )
+            stats.update(evidence_stats)
+            if render_bad is not None:
+                insert_enabled &= self._sample_seed_mask(render_bad, seeds).detach().cpu().bool()
+
+        score = seeds.insert_score if seeds.insert_score is not None else seeds.confidence
+        score_cpu = score.detach().cpu().float()
+        conf_cpu = seeds.confidence.detach().cpu().float()
+        xyz_cpu = seeds.xyz.detach().cpu().float()
+        grid_cpu = (
+            seeds.grid_coord.detach().cpu().to(torch.int32)
+            if seeds.grid_coord is not None and int(seeds.grid_coord.shape[0]) == len(seeds)
+            else torch.floor(xyz_cpu / float(self.pfgs360_voxel_size)).to(torch.int32)
+        )
+        order = torch.argsort(score_cpu, descending=True)
+        occupied = self._build_voxel_index()
+        anchor_xyz_cpu = self.map.get_xyz.detach().cpu().float() if self.map.anchor_count() > 0 else torch.zeros(0, 3)
+        kept: list[int] = []
+        for seed_idx in order.tolist():
+            key = (0, int(grid_cpu[seed_idx, 0]), int(grid_cpu[seed_idx, 1]), int(grid_cpu[seed_idx, 2]))
+            hit, near_hit = self._find_pfgs360_hash_hit(
+                occupied,
+                key,
+                xyz_cpu[seed_idx],
+                anchor_xyz_cpu,
+            )
+            if hit is not None:
+                if int(hit) >= 0:
+                    self._accumulate_existing_observation(
+                        int(hit),
+                        float(conf_cpu[seed_idx]),
+                        frame_id=int(seeds.frame_id),
+                    )
+                    if near_hit:
+                        stats["hash_near_hits"] += 1
+                    else:
+                        stats["hash_hits"] += 1
+                stats["skipped_voxel"] += 1
+                continue
+            if not bool(insert_enabled[seed_idx]):
+                stats["suppressed_insert"] += 1
+                continue
+            if len(kept) >= budget:
+                stats["skipped_budget"] += 1
+                continue
+            kept.append(int(seed_idx))
+            occupied[key] = -1
+        if not kept:
+            return self._empty_seed_like(seeds), stats
+        keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
+        return self._subset_seeds(seeds, keep_idx), stats
+
+    def _with_pfgs360_seed_metadata(self, seeds: GaussianSeedBatch) -> GaussianSeedBatch:
+        n = len(seeds)
+        device = seeds.xyz.device
+        dtype = seeds.xyz.dtype
+        grid = (
+            seeds.grid_coord.to(device=device, dtype=torch.int32)
+            if seeds.grid_coord is not None and int(seeds.grid_coord.shape[0]) == n
+            else torch.floor(seeds.xyz.detach() / float(self.pfgs360_voxel_size)).to(device=device, dtype=torch.int32)
+        )
+        return GaussianSeedBatch(
+            xyz=seeds.xyz,
+            rgb=seeds.rgb,
+            confidence=seeds.confidence,
+            scale=torch.full((n,), float(self.pfgs360_voxel_size), device=device, dtype=dtype),
+            level=torch.zeros(n, dtype=torch.int8, device=device),
+            frame_id=int(seeds.frame_id),
+            source_flat_idx=seeds.source_flat_idx,
+            source_hw=seeds.source_hw,
+            insert_enabled=(
+                torch.ones(n, dtype=torch.bool, device=device)
+                if seeds.insert_enabled is None
+                else seeds.insert_enabled.to(device=device, dtype=torch.bool)
+            ),
+            insert_score=(
+                seeds.confidence.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+                if seeds.insert_score is None
+                else seeds.insert_score.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+            ),
+            grid_coord=grid,
+        )
+
+    def _find_pfgs360_hash_hit(
+        self,
+        occupied: dict[tuple[int, int, int, int], int],
+        key: tuple[int, int, int, int],
+        candidate_xyz: torch.Tensor,
+        anchor_xyz_cpu: torch.Tensor,
+    ) -> tuple[int | None, bool]:
+        hit = occupied.get(key)
+        if hit is not None:
+            return int(hit), False
+        radius = int(self.pfgs360_near_grid_radius)
+        if radius <= 0 or anchor_xyz_cpu.numel() == 0 or self.pfgs360_near_distance_factor <= 0.0:
+            return None, False
+        level, x, y, z = key
+        best_row: int | None = None
+        best_dist = float("inf")
+        thresh = float(self.pfgs360_near_distance_factor) * float(self.pfgs360_voxel_size)
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+                    row = occupied.get((level, x + dx, y + dy, z + dz))
+                    if row is None or int(row) < 0 or int(row) >= int(anchor_xyz_cpu.shape[0]):
+                        continue
+                    dist = float(torch.linalg.norm(anchor_xyz_cpu[int(row)] - candidate_xyz).item())
+                    if dist <= thresh and dist < best_dist:
+                        best_dist = dist
+                        best_row = int(row)
+        return best_row, best_row is not None
+
+    def _pfgs360_render_bad_mask(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None,
+        temporal_ok: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, dict[str, int]]:
+        stats = {"outlier_resets": 0, "outlier_pruned": 0}
+        if self.map.anchor_count() == 0:
+            return None, stats
+        target = image.detach().to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
+        if target.ndim == 4:
+            target = target[0]
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        target_depth, depth_conf = self._target_depth_from_output(frontend_output, (H, W), target.device, target.dtype)
+        if target_depth is None:
+            return None, stats
+        with torch.no_grad():
+            camera = PanoRenderCamera(
+                image_height=H,
+                image_width=W,
+                c2w=frontend_output.pose_c2w.detach().to(device=target.device, dtype=target.dtype),
+            )
+            pkg = self.renderer.render(camera, self.map)
+            pkg = self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, sky_mask))
+            render_depth = pkg.get("depth")
+            render_rgb = pkg.get("render")
+            alpha = pkg.get("alpha", pkg.get("opacity"))
+            if not (torch.is_tensor(render_depth) and torch.is_tensor(render_rgb)):
+                return None, stats
+            if not torch.is_tensor(alpha):
+                alpha = torch.ones_like(render_depth)
+            render_depth = render_depth.to(device=target.device, dtype=target.dtype)
+            alpha = alpha.to(device=target.device, dtype=target.dtype)
+            valid = torch.isfinite(target_depth) & torch.isfinite(render_depth) & (target_depth > 1.0e-6) & (render_depth > 1.0e-6)
+            if depth_conf is not None:
+                valid = valid & (depth_conf.to(device=target.device, dtype=target.dtype) > 1.0e-6)
+            scale, shift = self._robust_depth_scale_shift(target_depth, render_depth, valid & (alpha >= self.pfgs360_render_alpha_min))
+            aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
+            valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
+            missing = (alpha < self.pfgs360_render_alpha_min) | (~valid_aligned)
+            foreground = valid_aligned & (aligned_target < render_depth * (1.0 - self.pfgs360_foreground_rel_threshold))
+            rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
+            photo_err = (render_rgb.to(target) - target).abs().mean(dim=0, keepdim=True)
+            inconsistent = (
+                valid_aligned
+                & (rel > self.pfgs360_render_depth_rel_threshold)
+                & (photo_err > self.pfgs360_photometric_error_threshold)
+            )
+            render_bad = missing | foreground | inconsistent
+            if sky_mask is not None:
+                render_bad = render_bad & (~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device))
+            evidence_stats = self._update_pfgs360_outlier_evidence(
+                render_bad.detach(),
+                pkg,
+                frontend_output,
+                H,
+                W,
+                temporal_ok=temporal_ok,
+            )
+            stats.update(evidence_stats)
+            return render_bad.detach().cpu().bool(), stats
+
+    def _target_depth_from_output(
+        self,
+        frontend_output: FrontendOutput,
+        size: tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        H, W = int(size[0]), int(size[1])
+        target_depth: torch.Tensor | None = None
+        if frontend_output.inverse_depth is not None:
+            inv = frontend_output.inverse_depth.detach().float()
+            if inv.ndim == 2:
+                inv = inv.unsqueeze(0)
+            target_depth = inv.clamp_min(1.0e-6).reciprocal()
+        elif frontend_output.world_points is not None:
+            pts = frontend_output.world_points.detach().float()
+            if pts.ndim == 4 and int(pts.shape[0]) == 1:
+                pts = pts[0]
+            if pts.ndim == 3 and int(pts.shape[-1]) == 3:
+                c2w = frontend_output.pose_c2w.detach().float()
+                center = c2w[:3, 3].view(1, 1, 3)
+                target_depth = torch.linalg.norm(pts - center, dim=-1, keepdim=False).unsqueeze(0)
+        if target_depth is None:
+            return None, None
+        if tuple(target_depth.shape[-2:]) != (H, W):
+            target_depth = F.interpolate(target_depth.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+        target_depth = target_depth.to(device=device, dtype=dtype)
+        conf = frontend_output.depth_confidence
+        if conf is None:
+            conf = frontend_output.world_points_confidence
+        conf_t = None
+        if conf is not None:
+            conf_t = conf.detach().float()
+            if conf_t.ndim == 2:
+                conf_t = conf_t.unsqueeze(0)
+            if tuple(conf_t.shape[-2:]) != (H, W):
+                conf_t = F.interpolate(conf_t.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+            conf_t = conf_t.to(device=device, dtype=dtype)
+        return target_depth, conf_t
+
+    @staticmethod
+    def _robust_depth_scale_shift(
+        target_depth: torch.Tensor,
+        render_depth: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+        if values.numel() < 16:
+            one = render_depth.new_tensor(1.0)
+            zero = render_depth.new_tensor(0.0)
+            return one, zero
+        td = target_depth.reshape(-1).index_select(0, values).clamp_min(1.0e-6)
+        rd = render_depth.reshape(-1).index_select(0, values).clamp_min(1.0e-6)
+        scale = torch.median(rd / td).clamp(0.05, 20.0)
+        shift = torch.median(rd - scale * td)
+        return scale, shift
+
+    @staticmethod
+    def _sample_seed_mask(mask: torch.Tensor, seeds: GaussianSeedBatch) -> torch.Tensor:
+        if seeds.source_flat_idx is None or seeds.source_hw is None:
+            return torch.ones(len(seeds), dtype=torch.bool)
+        flat = mask.detach().bool().reshape(-1)
+        idx = seeds.source_flat_idx.detach().cpu().long()
+        valid = (idx >= 0) & (idx < int(flat.shape[0]))
+        out = torch.ones(len(seeds), dtype=torch.bool)
+        if bool(valid.any()):
+            out[valid] = flat.index_select(0, idx[valid])
+        return out
+
+    @staticmethod
+    def _seed_pixel_mask(
+        seeds: GaussianSeedBatch,
+        flags: torch.Tensor,
+        image_hw: tuple[int, int],
+    ) -> torch.Tensor | None:
+        if seeds.source_flat_idx is None or seeds.source_hw is None:
+            return None
+        H, W = int(image_hw[0]), int(image_hw[1])
+        if tuple(seeds.source_hw) != (H, W):
+            return None
+        idx = seeds.source_flat_idx.detach().cpu().long()
+        valid = (idx >= 0) & (idx < H * W)
+        if not bool(valid.any()):
+            return None
+        out = torch.zeros(1, H, W, dtype=torch.bool)
+        out.view(-1)[idx[valid]] = flags.detach().cpu().bool()[valid]
+        return out
+
+    def _update_pfgs360_outlier_evidence(
+        self,
+        render_bad: torch.Tensor,
+        render_pkg: dict,
+        frontend_output: FrontendOutput,
+        H: int,
+        W: int,
+        *,
+        temporal_ok: torch.Tensor | None = None,
+    ) -> dict[str, int]:
+        stats = {"outlier_resets": 0, "outlier_pruned": 0}
+        n = self.map.anchor_count()
+        if n <= 0 or self.map._anchor_outlier_obs.shape[0] != n:
+            return stats
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        xyz = self.map.get_xyz.detach()
+        c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
+        w2c = torch.linalg.inv(c2w)
+        xyz_h = torch.cat([xyz, torch.ones(n, 1, device=device, dtype=dtype)], dim=1)
+        cam = (w2c @ xyz_h.T).T[:, :3]
+        dist = torch.linalg.norm(cam, dim=-1)
+        valid = dist > 1.0e-6
+        visibility = render_pkg.get("visibility_filter")
+        if torch.is_tensor(visibility) and int(visibility.numel()) == n:
+            valid = valid & visibility.to(device=device, dtype=torch.bool).view(-1)
+        rows = torch.nonzero(valid, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return stats
+        pixels = bearing_to_erp_pixel(cam.index_select(0, rows), H, W)
+        ui = pixels[:, 0].round().long().remainder(W)
+        vi = pixels[:, 1].round().long().clamp(0, H - 1)
+        bad = render_bad.to(device=device, dtype=torch.bool)[0, vi, ui]
+        if temporal_ok is not None:
+            temporal = temporal_ok.to(device=device, dtype=torch.bool)[0, vi, ui]
+            rows = rows.index_select(0, torch.nonzero(temporal, as_tuple=False).flatten())
+            bad = bad[temporal]
+            if rows.numel() == 0:
+                return stats
+        rows_cpu = rows.detach().cpu()
+        bad_cpu = bad.detach().cpu()
+        if bool((~bad_cpu).any()):
+            self.map._anchor_inlier_obs[rows_cpu[~bad_cpu]] += 1
+        if bool(bad_cpu.any()):
+            outlier_rows = rows_cpu[bad_cpu]
+            self.map._anchor_outlier_obs[outlier_rows] += 1
+            self.map._anchor_last_seen_kf[outlier_rows] = int(frontend_output.frame_id)
+        reset_rows = torch.zeros(0, dtype=torch.long)
+        if self.pfgs360_reset_after_outliers > 0:
+            reset_rows = torch.nonzero(
+                self.map._anchor_outlier_obs >= int(self.pfgs360_reset_after_outliers),
+                as_tuple=False,
+            ).flatten()
+            if reset_rows.numel() > 0:
+                rows_dev = reset_rows.to(device=device)
+                low_opacity = torch.full((int(rows_dev.numel()), 1), 0.01, device=device, dtype=dtype)
+                with torch.no_grad():
+                    self.map.opacity_logit.data[rows_dev] = torch.minimum(
+                        self.map.opacity_logit.data[rows_dev],
+                        self.map._inv_sigmoid(low_opacity),
+                    )
+                stats["outlier_resets"] = int(reset_rows.numel())
+        if self.pfgs360_prune_after_outliers > 0 and self.pfgs360_max_prune_per_keyframe > 0:
+            old_enough = self.map._anchor_birth_frame <= int(frontend_output.frame_id) - int(self.pfgs360_protect_recent_keyframes)
+            prune_rows = torch.nonzero(
+                (self.map._anchor_outlier_obs >= int(self.pfgs360_prune_after_outliers)) & old_enough,
+                as_tuple=False,
+            ).flatten()
+            if prune_rows.numel() > self.pfgs360_max_prune_per_keyframe:
+                prune_rows = prune_rows[: self.pfgs360_max_prune_per_keyframe]
+            if prune_rows.numel() > 0:
+                prune_mask = torch.zeros(n, dtype=torch.bool)
+                prune_mask[prune_rows] = True
+                stats["outlier_pruned"] = self.map.prune_anchors(prune_mask.to(device=device))
+        return stats
 
     def _build_voxel_index(self) -> dict[tuple[int, int, int, int], int]:
         occupied: dict[tuple[int, int, int, int], int] = {}
@@ -615,13 +1095,15 @@ class PanoGaussianMapper:
                         return int(hit)
         return None
 
-    def _accumulate_existing_observation(self, anchor_idx: int, confidence: float) -> None:
+    def _accumulate_existing_observation(self, anchor_idx: int, confidence: float, *, frame_id: int | None = None) -> None:
         if int(anchor_idx) < 0:
             return
         if int(anchor_idx) >= int(self.map._anchor_obs_count.shape[0]):
             return
         self.map._anchor_obs_count[int(anchor_idx)] += 1
         self.map._anchor_conf_accum[int(anchor_idx)] += float(confidence)
+        if frame_id is not None and int(anchor_idx) < int(self.map._anchor_last_seen_kf.shape[0]):
+            self.map._anchor_last_seen_kf[int(anchor_idx)] = int(frame_id)
 
     @staticmethod
     def _subset_seeds(seeds: GaussianSeedBatch, keep_idx: torch.Tensor) -> GaussianSeedBatch:
@@ -638,6 +1120,21 @@ class PanoGaussianMapper:
                 else seeds.source_flat_idx.index_select(0, keep_idx.to(device=seeds.source_flat_idx.device))
             ),
             source_hw=seeds.source_hw,
+            insert_enabled=(
+                None
+                if seeds.insert_enabled is None
+                else seeds.insert_enabled.index_select(0, keep_idx.to(device=seeds.insert_enabled.device))
+            ),
+            insert_score=(
+                None
+                if seeds.insert_score is None
+                else seeds.insert_score.index_select(0, keep_idx.to(device=seeds.insert_score.device))
+            ),
+            grid_coord=(
+                None
+                if seeds.grid_coord is None
+                else seeds.grid_coord.index_select(0, keep_idx.to(device=seeds.grid_coord.device))
+            ),
         )
 
     @staticmethod
@@ -651,6 +1148,9 @@ class PanoGaussianMapper:
             frame_id=int(seeds.frame_id),
             source_flat_idx=None if seeds.source_flat_idx is None else seeds.source_flat_idx[:0],
             source_hw=seeds.source_hw,
+            insert_enabled=None if seeds.insert_enabled is None else seeds.insert_enabled[:0],
+            insert_score=None if seeds.insert_score is None else seeds.insert_score[:0],
+            grid_coord=None if seeds.grid_coord is None else seeds.grid_coord[:0],
         )
 
     def _register_keyframe(
@@ -673,9 +1173,53 @@ class PanoGaussianMapper:
             gaussian_start=int(start),
             gaussian_end=int(end),
             sky_mask=sky_mask.detach().cpu().bool() if torch.is_tensor(sky_mask) else None,
+            target_depth=self._keyframe_target_depth(frontend_output, image, sky_mask=sky_mask),
+            depth_confidence=self._keyframe_depth_confidence(frontend_output, image, sky_mask=sky_mask),
         )
         self.keyframes = [kf for kf in self.keyframes if kf.frame_id != frame_id]
         self.keyframes.append(record)
+
+    def _keyframe_target_depth(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not self.pfgs360_insertion_enabled:
+            return None
+        img = image.detach()
+        if img.ndim == 4:
+            img = img[0]
+        H, W = int(img.shape[-2]), int(img.shape[-1])
+        depth, _ = self._target_depth_from_output(frontend_output, (H, W), torch.device("cpu"), torch.float32)
+        if depth is None:
+            return None
+        if sky_mask is not None:
+            mask = self._normalize_skybox_mask(sky_mask, height=H, width=W, device=torch.device("cpu"))
+            depth = depth.masked_fill(mask.bool(), 0.0)
+        return depth.detach().cpu().float()
+
+    def _keyframe_depth_confidence(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not self.pfgs360_insertion_enabled:
+            return None
+        img = image.detach()
+        if img.ndim == 4:
+            img = img[0]
+        H, W = int(img.shape[-2]), int(img.shape[-1])
+        _, conf = self._target_depth_from_output(frontend_output, (H, W), torch.device("cpu"), torch.float32)
+        if conf is None:
+            conf = torch.ones(1, H, W, dtype=torch.float32)
+        if sky_mask is not None:
+            mask = self._normalize_skybox_mask(sky_mask, height=H, width=W, device=torch.device("cpu"))
+            conf = conf.masked_fill(mask.bool(), 0.0)
+        return conf.detach().cpu().float()
 
     def refined_pose_c2w(self, frame_id: int) -> torch.Tensor | None:
         pose_delta = self.pose_deltas.get(int(frame_id))
@@ -1230,7 +1774,15 @@ class PanoGaussianMapper:
                 pkg = self.renderer.render(camera, self.map)
                 sky_mask = self._skybox_mask_for_target(target, kf.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
-                loss_i, metrics_i = backend_render_loss(pkg, target, weights=self.loss_weights)
+                target_depth = None if kf.target_depth is None else kf.target_depth.to(device=device, dtype=dtype)
+                depth_confidence = None if kf.depth_confidence is None else kf.depth_confidence.to(device=device, dtype=dtype)
+                loss_i, metrics_i = backend_render_loss(
+                    pkg,
+                    target,
+                    target_depth=target_depth,
+                    depth_confidence=depth_confidence,
+                    weights=self.loss_weights,
+                )
                 if sky_mask is not None:
                     metrics_i = dict(metrics_i)
                     metrics_i["skybox_mask_ratio"] = sky_mask.to(device=device, dtype=dtype).mean().detach()

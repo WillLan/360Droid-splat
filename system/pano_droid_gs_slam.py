@@ -1225,6 +1225,11 @@ class PanoDroidGSSlamSystem:
             sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
             voxel_sizes=tuple(config.get("Hierarchical", {}).get("voxel_size_lis", [0.12, 0.45, 1.8])),
             seed_source=str(mapping_cfg.get("seed_source", default_seed_source)),
+            insertion_strategy=str((mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("strategy", "legacy")),
+            pfgs360_voxel_size=float((mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("voxel_size", 0.12)),
+            temporal_pair_conf_min=float(
+                (mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("temporal_pair_conf_min", 0.70)
+            ),
         )
         self.map = PanoGaussianMap(config=config)
         render_cfg = config.get("Renderer", {})
@@ -1484,7 +1489,14 @@ class PanoDroidGSSlamSystem:
             keyframe_opt_diagnostic = None
             if out.is_keyframe and out.inverse_depth is not None:
                 section_start = time.perf_counter()
-                seeds = self.initializer.from_frontend_output(out, source_frame.image)
+                consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
+                insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
+                seeds = self.initializer.from_frontend_output(
+                    out,
+                    source_frame.image,
+                    insertion_hints=insertion_hints,
+                    first_keyframe=int(getattr(self.mapper.stats, "n_keyframes", 0)) == 0,
+                )
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
                 section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization:

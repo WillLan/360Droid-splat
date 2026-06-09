@@ -162,15 +162,22 @@ Mapping:
   refine_steps_per_keyframe: 0
   NovelGaussianInsertion:
     enabled: true
+    strategy: pfgs360
+    voxel_size: 0.12
     first_keyframe_max_seeds: 160000
     keyframe_max_seeds: 60000
     global_anchor_budget: 3000000
-    first_keyframe_voxel_neighbor_radius: 0
-    voxel_neighbor_radius: 0
-    pair_conf_insert_threshold: 0.985
-    insert_confidence_floor: 0.20
-    spatial_cell_size: 8
-    max_seeds_per_cell: 2
+    temporal_pair_conf_min: 0.70
+    render_alpha_min: 0.20
+    render_depth_rel_threshold: 0.15
+    foreground_rel_threshold: 0.10
+    photometric_error_threshold: 0.08
+    near_grid_radius: 1
+    near_distance_factor: 1.0
+    reset_after_outlier_observations: 3
+    prune_after_outlier_observations: 6
+    protect_recent_keyframes: 8
+    max_prune_per_keyframe: 500
     save_visualization: true
     visualize_candidates: true
 

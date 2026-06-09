@@ -160,6 +160,58 @@ def test_gaussian_initializer_world_points_only_requires_world_points():
         raise AssertionError("world_points_only should reject missing world_points")
 
 
+def test_pfgs360_initializer_uses_single_voxel_and_aggregates_candidates():
+    H, W = 1, 4
+    points = torch.tensor(
+        [
+            [[0.01, 0.0, 1.0], [0.05, 0.0, 1.0], [0.25, 0.0, 1.0], [0.37, 0.0, 1.0]],
+        ],
+        dtype=torch.float32,
+    )
+    conf = torch.tensor([[[0.2, 0.8, 1.0, 0.5]]], dtype=torch.float32)
+    valid = torch.ones(1, H, W, dtype=torch.bool)
+    output = FrontendOutput(
+        frame_id=8,
+        timestamp=8.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+        world_points=points,
+        world_points_confidence=conf,
+        valid_world_points_mask=valid,
+    )
+    hints = {
+        "non_sky": torch.ones(1, H, W, dtype=torch.bool),
+        "pair_confidence": torch.tensor([[[0.9, 0.6, 0.8, 0.1]]], dtype=torch.float32),
+    }
+    initializer = GaussianInitializer(
+        max_seeds_per_keyframe=0,
+        seed_source="world_points_only",
+        insertion_strategy="pfgs360",
+        pfgs360_voxel_size=0.12,
+        temporal_pair_conf_min=0.7,
+    )
+
+    seeds = initializer.from_frontend_output(output, torch.rand(3, H, W), insertion_hints=hints, first_keyframe=False)
+
+    assert len(seeds) == 3
+    assert torch.allclose(seeds.scale, torch.full_like(seeds.scale, 0.12))
+    assert torch.equal(seeds.level.cpu(), torch.zeros(3, dtype=torch.int8))
+    assert seeds.grid_coord is not None
+    assert torch.equal(seeds.grid_coord.cpu(), torch.tensor([[0, 0, 8], [2, 0, 8], [3, 0, 8]], dtype=torch.int32))
+    assert seeds.insert_enabled is not None
+    assert torch.equal(seeds.insert_enabled.cpu(), torch.tensor([True, True, False]))
+    assert seeds.source_flat_idx is not None
+    assert torch.equal(seeds.source_flat_idx.cpu(), torch.tensor([1, 2, 3]))
+
+
 def _seed_batch(xyz: torch.Tensor, confidence: torch.Tensor | None = None, *, frame_id: int = 0) -> GaussianSeedBatch:
     n = int(xyz.shape[0])
     if confidence is None:
@@ -171,6 +223,30 @@ def _seed_batch(xyz: torch.Tensor, confidence: torch.Tensor | None = None, *, fr
         scale=torch.ones(n),
         level=torch.zeros(n, dtype=torch.int8),
         frame_id=frame_id,
+    )
+
+
+def _pfgs_seed_batch(
+    xyz: torch.Tensor,
+    *,
+    frame_id: int,
+    insert_enabled: torch.Tensor | None = None,
+    insert_score: torch.Tensor | None = None,
+    source_flat_idx: torch.Tensor | None = None,
+    source_hw: tuple[int, int] | None = None,
+) -> GaussianSeedBatch:
+    n = int(xyz.shape[0])
+    return GaussianSeedBatch(
+        xyz=xyz.float(),
+        rgb=torch.full((n, 3), 0.5),
+        confidence=torch.ones(n),
+        scale=torch.full((n,), 0.1),
+        level=torch.zeros(n, dtype=torch.int8),
+        frame_id=frame_id,
+        source_flat_idx=source_flat_idx,
+        source_hw=source_hw,
+        insert_enabled=insert_enabled,
+        insert_score=insert_score,
     )
 
 
@@ -318,3 +394,40 @@ def test_novel_gaussian_insertion_uses_separate_first_keyframe_neighbor_radius()
     assert mapper.insert_keyframe(near_existing, _frontend_output_for_mapper(1)) == 0
     assert mapper.map.anchor_count() == 2
     assert mapper.stats.last_skipped_voxel == 1
+
+
+def test_pfgs360_mapper_hash_hits_near_hits_and_suppressed_misses():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360",
+                "voxel_size": 0.1,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "near_grid_radius": 1,
+                "near_distance_factor": 1.0,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    first = _pfgs_seed_batch(torch.tensor([[0.05, 0.0, 0.0]]), frame_id=0)
+    assert mapper.insert_keyframe(first, _frontend_output_for_mapper(0)) == 1
+    before_obs = int(mapper.map._anchor_obs_count[0])
+
+    second = _pfgs_seed_batch(
+        torch.tensor([[0.06, 0.0, 0.0], [0.14, 0.0, 0.0], [0.35, 0.0, 0.0], [0.55, 0.0, 0.0]]),
+        frame_id=1,
+        insert_enabled=torch.tensor([True, True, False, True]),
+        insert_score=torch.tensor([0.9, 0.8, 1.0, 0.7]),
+    )
+
+    assert mapper.insert_keyframe(second, _frontend_output_for_mapper(1)) == 1
+
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_hash_hits == 1
+    assert mapper.stats.last_hash_near_hits == 1
+    assert mapper.stats.last_skipped_voxel == 2
+    assert mapper.stats.last_suppressed_insert == 1
+    assert int(mapper.map._anchor_obs_count[0]) == before_obs + 2

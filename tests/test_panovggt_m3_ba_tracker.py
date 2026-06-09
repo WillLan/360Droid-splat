@@ -741,6 +741,49 @@ def test_novel_insert_pair_threshold_adds_spatially_limited_candidates():
     assert float(conf[mask].min()) >= 0.2
 
 
+def test_pfgs360_insertion_hints_do_not_replace_valid_world_mask():
+    tracker = _tracker_for_anchor_tests(
+        _RecordingAnchorEngine(),
+        novel_insert_options={"novel_insertion_strategy": "pfgs360"},
+    )
+    tracker.last_keyframe_id = 0
+    pose = torch.eye(4)
+    pose[0, 3] = 1.0
+    valid = torch.ones(1, 4, 8, dtype=torch.bool)
+    valid[0, 0, 0] = False
+    anchor_metrics = SimpleNamespace(
+        anchor_frame_id=0,
+        frame_mean_pair_conf=0.9,
+        low_pair_conf_ratio=0.0,
+        match_coverage=1.0,
+        pair_conf_quantiles={},
+        pair_confidence=torch.full((1, 2, 4), 0.9),
+        low_pair_conf=torch.zeros(1, 2, 4, dtype=torch.bool),
+        matched_cells=torch.ones(1, 2, 4, dtype=torch.bool),
+        non_sky=torch.ones(1, 2, 4, dtype=torch.bool),
+        anchor_pose_c2w=torch.eye(4),
+    )
+
+    output = tracker._make_output(
+        PanoFrame(image=torch.zeros(3, 4, 8), timestamp=1.0, frame_id=1),
+        pose=pose,
+        inverse_depth=torch.ones(1, 4, 8),
+        confidence=torch.ones(1, 4, 8),
+        world_points=torch.zeros(4, 8, 3),
+        valid_world_points_mask=valid,
+        anchor_metrics=anchor_metrics,
+        sky_prob=None,
+        residual=0.0,
+        status="tracked_panovggt_long",
+    )
+    hints = tracker.consume_insertion_hints(1)
+
+    assert output.is_keyframe
+    assert torch.equal(output.valid_world_points_mask, valid)
+    assert hints is not None
+    assert hints["pair_confidence"].shape == (1, 4, 8)
+
+
 def test_tracker_shadow_mode_runs_ba_but_alignment_receives_original_prediction():
     pred0 = _prediction()
     refined = replace(pred0, poses_c2w=pred0.poses_c2w.clone())
