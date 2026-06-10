@@ -1,5 +1,31 @@
 # Project Operating Rules
 
+## Interactive research coding workflow
+
+- For research design, algorithm changes, and non-trivial code improvements,
+  use a clarification-first workflow.
+- Before editing code for a non-trivial change, read the relevant files and
+  report the current task interpretation, uncertain design points, 2-3 concrete
+  options for each important uncertainty, and the recommended option with its
+  tradeoff.
+- Do not edit code until the user confirms the design when the task affects
+  model architecture, loss functions or residual definitions, training data,
+  sampling, metrics, validation protocol, config schema or defaults, public
+  APIs, saved output formats, or experiment launch behavior.
+- If there are multiple reasonable implementations, stop and ask. Do not
+  silently choose one for algorithmic, data, config, output, or experiment
+  behavior.
+- If the user request is underspecified, ask clarification questions instead of
+  filling important gaps by assumption.
+- For simple local fixes, typo fixes, formatting, clearly reversible
+  implementation details, or edits that only apply a user-confirmed design,
+  proceed without asking, but state the assumption briefly.
+- When asking, provide 2-3 options, mark one as recommended, and explain the
+  tradeoff in one short sentence.
+- If the user says "先讨论", "先给方案", "不要直接改", "让我确认",
+  "多问我", or equivalent wording, stop after the design/options and wait for
+  confirmation before editing code.
+
 ## PanoVGGT-M3-Sphere implementation guardrails
 
 - Current task goal: plan and implement a config-gated PanoVGGT-M3-Sphere
