@@ -466,6 +466,9 @@ class SlamRuntimeLogger:
         url = getattr(self.run, "url", None)
         return str(url) if url else None
 
+    def _wandb_step(self, step: int | None = None) -> int:
+        return max(1, int(self._step if step is None else step))
+
     def observe(
         self,
         output: FrontendOutput,
@@ -606,14 +609,14 @@ class SlamRuntimeLogger:
             if image_payload:
                 self.run.log(image_payload, step=self._step)
 
-    def observe_keyframe_opt(self, diagnostic) -> None:
+    def observe_keyframe_opt(self, diagnostic, *, step: int | None = None) -> None:
         """Save and log post-optimization keyframe render diagnostics."""
 
         if diagnostic is None:
             return
         self._kf_opt_count += 1
         frame_id = int(getattr(diagnostic, "frame_id"))
-        step = max(1, int(self._step))
+        log_step = self._wandb_step(step)
         payload: dict[str, float | int] = {
             "backend/kf_opt_frame_id": frame_id,
             "backend/kf_opt_loss": float(getattr(diagnostic, "loss", 0.0)),
@@ -621,7 +624,7 @@ class SlamRuntimeLogger:
             "backend/kf_opt_anchor_count": int(getattr(diagnostic, "anchor_count", 0)),
         }
         if self.run is not None:
-            self.run.log(payload, step=step)
+            self.run.log(payload, step=log_step)
 
         should_log_image = self.save_kf_opt and (
             self._kf_opt_count == 1 or self._kf_opt_count % self.kf_opt_log_every == 0
@@ -654,9 +657,9 @@ class SlamRuntimeLogger:
                 image_payload["backend/kf_render_opt_png"] = str(render_path)
             if depth_path is not None:
                 image_payload["backend/kf_depth_opt_png"] = str(depth_path)
-            self.run.log(image_payload, step=step)
+            self.run.log(image_payload, step=log_step)
 
-    def observe_keyframe_decision(self, decision: dict) -> None:
+    def observe_keyframe_decision(self, decision: dict, *, step: int | None = None) -> None:
         if self.run is None:
             return
         payload: dict[str, float | int | str] = {
@@ -688,9 +691,9 @@ class SlamRuntimeLogger:
         reasons = decision.get("reasons") or []
         if reasons:
             payload["kf/reason"] = ",".join(str(item) for item in reasons)
-        self.run.log(payload, step=max(1, int(self._step)))
+        self.run.log(payload, step=self._wandb_step(step))
 
-    def observe_profile(self, profile: dict) -> None:
+    def observe_profile(self, profile: dict, *, step: int | None = None) -> None:
         if self.run is None:
             return
         event = str(profile.get("event", "runtime")).replace(" ", "_")
@@ -701,7 +704,7 @@ class SlamRuntimeLogger:
             if isinstance(value, (int, float)):
                 payload[f"profile/{event}/{key}"] = float(value)
         if payload:
-            self.run.log(payload, step=max(1, int(self._step)))
+            self.run.log(payload, step=self._wandb_step(step))
 
     def observe_new_gaussians(
         self,
@@ -712,6 +715,7 @@ class SlamRuntimeLogger:
         requested_idx: torch.Tensor | None,
         inserted_idx: torch.Tensor | None,
         stats: dict[str, float | int] | None = None,
+        step: int | None = None,
     ) -> Path | None:
         if source_hw is None or requested_idx is None or inserted_idx is None:
             return None
@@ -781,7 +785,7 @@ class SlamRuntimeLogger:
                 payload["mapping/new_gaussians"] = self._wandb.Image(str(path) if path is not None else canvas)
                 if path is not None:
                     payload["mapping/new_gaussians_png"] = str(path)
-            self.run.log(payload, step=max(1, int(self._step)))
+            self.run.log(payload, step=self._wandb_step(step))
         return path
 
     def observe_depth_insertion_diagnostic(
@@ -793,6 +797,7 @@ class SlamRuntimeLogger:
         inserted_idx: torch.Tensor | None,
         diagnostic,
         stats: dict[str, float | int] | None = None,
+        step: int | None = None,
     ) -> Path | None:
         if diagnostic is None:
             return None
@@ -940,7 +945,7 @@ class SlamRuntimeLogger:
                 payload["mapping/depth_insertion"] = self._wandb.Image(str(path) if path is not None else canvas)
                 if path is not None:
                     payload["mapping/depth_insertion_png"] = str(path)
-            self.run.log(payload, step=max(1, int(self._step)))
+            self.run.log(payload, step=self._wandb_step(step))
         return path
 
     def save_keyframe_diagnostic(self, diagnostic, *, render_dir: Path, depth_dir: Path) -> tuple[Path | None, Path | None]:
@@ -957,7 +962,7 @@ class SlamRuntimeLogger:
         if self.run is None or self._wandb is None:
             return
         try:
-            self.run.log({key: self._wandb.Image(str(path)), f"{key}_png": str(path)}, step=step or max(1, self._step))
+            self.run.log({key: self._wandb.Image(str(path)), f"{key}_png": str(path)}, step=self._wandb_step(step))
         except Exception:
             return
 
@@ -1620,7 +1625,7 @@ class PanoDroidGSSlamSystem:
             ids.append(int(out.frame_id))
             setter(ids)
 
-        def drain_keyframe_decisions() -> None:
+        def drain_keyframe_decisions(*, step: int | None = None) -> None:
             nonlocal keyframe_decision_count
             if decision_file is None:
                 return
@@ -1631,7 +1636,7 @@ class PanoDroidGSSlamSystem:
                 decision_file.write(json.dumps(decision, sort_keys=True) + "\n")
                 decision_file.flush()
                 keyframe_decision_count += 1
-                logger.observe_keyframe_decision(decision)
+                logger.observe_keyframe_decision(decision, step=step)
 
         def drain_frontend_keyframe_graph_pose_updates() -> int:
             pop_updates = getattr(self.frontend, "pop_keyframe_graph_pose_updates", None)
@@ -1660,6 +1665,7 @@ class PanoDroidGSSlamSystem:
                 output_profile["total_sec"] = float(time.perf_counter() - process_start)
                 write_profile("process_output", **output_profile)
                 return
+            output_wandb_step = max(1, int(logger._step) + 1)
             frontend_profile = getattr(self.frontend, "last_profile", None)
             if isinstance(frontend_profile, dict):
                 chunk_index = int(frontend_profile.get("chunk_index", -1))
@@ -1742,6 +1748,7 @@ class PanoDroidGSSlamSystem:
                         requested_idx=getattr(self.mapper, "last_requested_source_flat_idx", None),
                         inserted_idx=getattr(self.mapper, "last_inserted_source_flat_idx", None),
                         stats=insertion_stats,
+                        step=output_wandb_step,
                     )
                     output_profile["new_gaussian_visualization_sec"] = float(time.perf_counter() - section_start)
                 if bool(novel_cfg.get("save_depth_insertion_visualization", False)):
@@ -1753,6 +1760,7 @@ class PanoDroidGSSlamSystem:
                         inserted_idx=getattr(self.mapper, "last_inserted_source_flat_idx", None),
                         diagnostic=getattr(self.mapper, "last_depth_insertion_diagnostic", None),
                         stats=insertion_stats,
+                        step=output_wandb_step,
                     )
                     output_profile["depth_insertion_visualization_sec"] = float(time.perf_counter() - section_start)
                 if self.mapper.uses_joint_optimization:
@@ -1774,7 +1782,7 @@ class PanoDroidGSSlamSystem:
                                         "backend/bootstrap_depth": logger._wandb.Image(str(depth_path)),
                                         "backend/bootstrap_step": int(step),
                                     },
-                                    step=max(1, int(logger._step)),
+                                    step=output_wandb_step,
                                 )
 
                         section_start = time.perf_counter()
@@ -1807,7 +1815,7 @@ class PanoDroidGSSlamSystem:
                                 if preview is not None:
                                     preview_path = sky_dir / f"init_frame_{int(out.frame_id):06d}_erp.png"
                                     _image_tensor_to_pil(preview).save(preview_path)
-                                    logger.log_image_file("skybox/init_erp_preview", preview_path)
+                                    logger.log_image_file("skybox/init_erp_preview", preview_path, step=output_wandb_step)
                                 output_profile["save_init_skybox_preview_sec"] = float(time.perf_counter() - section_start)
                             except Exception as exc:
                                 self.mapper.stats.notes.append(
@@ -1885,10 +1893,10 @@ class PanoDroidGSSlamSystem:
             )
             output_profile["logger_observe_sec"] = float(time.perf_counter() - section_start)
             section_start = time.perf_counter()
-            logger.observe_keyframe_opt(keyframe_opt_diagnostic)
+            logger.observe_keyframe_opt(keyframe_opt_diagnostic, step=output_wandb_step)
             output_profile["logger_keyframe_opt_sec"] = float(time.perf_counter() - section_start)
             section_start = time.perf_counter()
-            drain_keyframe_decisions()
+            drain_keyframe_decisions(step=output_wandb_step)
             output_profile["drain_keyframe_decisions_sec"] = float(time.perf_counter() - section_start)
             output_profile["total_sec"] = float(time.perf_counter() - process_start)
             write_profile("process_output", **output_profile)

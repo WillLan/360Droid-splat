@@ -1463,6 +1463,66 @@ def test_slam_logger_saves_new_gaussian_insertion_visualization(tmp_path):
     assert path.name == "frame_000007.png"
 
 
+def test_slam_logger_logs_keyframe_mapping_diagnostics_at_explicit_step(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": False},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._step = 12
+    explicit_step = 13
+
+    logger.observe_new_gaussians(
+        frame_id=7,
+        image=torch.zeros(3, 4, 8),
+        source_hw=(4, 8),
+        requested_idx=torch.tensor([0, 3, 9, 10]),
+        inserted_idx=torch.tensor([3, 10]),
+        stats={"kept": 2, "skipped_voxel": 1},
+        step=explicit_step,
+    )
+
+    diagnostic = SimpleNamespace(
+        frame_id=7,
+        render_depth=torch.ones(1, 4, 8),
+        predicted_depth=torch.full((1, 4, 8), 1.2),
+        rel_depth_error=torch.full((1, 4, 8), 0.2),
+        missing_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_mismatch_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        render_bad_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_scale=1.0,
+        depth_shift=0.0,
+    )
+    diagnostic.depth_mismatch_mask[..., 1, 1] = True
+    diagnostic.render_bad_mask = diagnostic.depth_mismatch_mask
+    logger.observe_depth_insertion_diagnostic(
+        frame_id=7,
+        image=torch.zeros(3, 4, 8),
+        source_hw=(4, 8),
+        inserted_idx=torch.tensor([9]),
+        diagnostic=diagnostic,
+        stats={"kept": 1},
+        step=explicit_step,
+    )
+
+    assert logger._step == 12
+    assert len(logger.run.logged) == 2
+    assert all(step == explicit_step for _, step in logger.run.logged)
+    logged_keys = set().union(*(payload.keys() for payload, _ in logger.run.logged))
+    assert "mapping/new_gaussians_requested" in logged_keys
+    assert "mapping/depth_insertion_need_pixels" in logged_keys
+
+
 def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):
     logger = SlamRuntimeLogger(
         {
