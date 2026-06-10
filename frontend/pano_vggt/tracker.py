@@ -15,7 +15,8 @@ from .alignment import SimilarityTransform, SubmapAligner, sample_overlap_points
 from .dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from .dense_matcher import PoseGuidedDenseMatcher
 from .engine import PanoVGGTInferenceEngine, build_panovggt_engine
-from .keyframe_memory import KeyframeMemory, KeyframeRecord
+from .keyframe_graph_refiner import KeyframeGraphBAStats, PanoVGGTKeyframeGraphRefiner
+from .keyframe_memory import KeyframeCorrespondenceGraph, KeyframeMemory, KeyframeRecord
 from .loop import FrontendPoseGraph, LoopManager, PoseGraphEdge
 from .m3_config import parse_m3_sphere_config
 from .types import PanoVGGTLocalPrediction
@@ -279,6 +280,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
         self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
         self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
+        self.keyframe_graph_refiner = PanoVGGTKeyframeGraphRefiner(self.m3_config)
         self.aligner = SubmapAligner(
             align_mode=align_mode,
             max_residual=float(max_align_rmse),
@@ -307,12 +309,24 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.conf_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
-        self.keyframe_memory = KeyframeMemory(max_keyframes=max(1, int(self.m3_config.dense_ba.history_keyframes)))
+        memory_keyframes = max(1, int(self.m3_config.dense_ba.history_keyframes))
+        if self.keyframe_graph_enabled:
+            memory_keyframes = max(
+                memory_keyframes,
+                int(self.m3_config.keyframe_graph.window_keyframes) + int(self.m3_config.keyframe_graph.adjacent_history) + 1,
+            )
+        self.keyframe_memory = KeyframeMemory(max_keyframes=memory_keyframes)
+        graph_cfg = self.m3_config.keyframe_graph
+        graph_max_edges = max(16, int(graph_cfg.window_keyframes) * max(1, int(graph_cfg.adjacent_history) + 1) * 4)
+        self.keyframe_correspondence_graph = KeyframeCorrespondenceGraph(max_edges=graph_max_edges)
+        self.pending_keyframe_graph_pose_updates: dict[int, torch.Tensor] = {}
         self.last_keyframe_id: Optional[int] = None
         self.last_keyframe_anchor: _KeyframeAnchorRecord | None = None
         self.chunk_count = 0
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
+        self.last_keyframe_graph_stats: KeyframeGraphBAStats | None = None
+        self.keyframe_graph_stats_history: list[KeyframeGraphBAStats] = []
         self.last_m3_debug: dict | None = None
         self.last_profile: dict | None = None
         self.last_alignment_debug = _AlignmentDebug()
@@ -333,6 +347,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     @property
     def joint_inference_enabled(self) -> bool:
         return bool(self.m3_config.enabled and self.m3_config.joint_inference.enabled)
+
+    @property
+    def keyframe_graph_enabled(self) -> bool:
+        return bool(self.m3_config.enabled and self.m3_config.keyframe_graph.enabled)
 
     def load_checkpoint(self, path: str) -> None:
         self.engine.load_checkpoint(path)
@@ -374,6 +392,14 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
     def pop_keyframe_decisions(self) -> list[dict]:
         out = self._pending_keyframe_decisions
         self._pending_keyframe_decisions = []
+        return out
+
+    def pop_keyframe_graph_pose_updates(self) -> dict[int, torch.Tensor]:
+        out = {
+            int(frame_id): pose.detach().cpu().float()
+            for frame_id, pose in self.pending_keyframe_graph_pose_updates.items()
+        }
+        self.pending_keyframe_graph_pose_updates = {}
         return out
 
     def consume_insertion_hints(self, frame_id: int) -> dict[str, torch.Tensor] | None:
@@ -599,6 +625,11 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         mark_profile("dense_ba_and_alignment")
         factor_graph = getattr(self.dense_ba_refiner, "last_factor_graph", factor_graph) or factor_graph
         self.last_dense_ba_stats = ba_stats
+        section_start = time.perf_counter()
+        pred, transform, keyframe_graph_current_stats = self._post_align_current_to_last_ba(pred, frame_ids, transform)
+        if keyframe_graph_current_stats is not None:
+            self._record_keyframe_graph_stats(keyframe_graph_current_stats)
+        add_profile("keyframe_graph_current_to_last_sec", time.perf_counter() - section_start)
         if ba_stats.enabled:
             self.dense_ba_stats_history.append(ba_stats)
             self.last_m3_debug = {
@@ -628,8 +659,27 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     for local_idx, metrics in anchor_metrics.items()
                 },
             }
+            if keyframe_graph_current_stats is not None:
+                self.last_m3_debug.setdefault("keyframe_graph", {}).update(keyframe_graph_current_stats.as_debug())
         else:
             self.last_m3_debug = None
+            if keyframe_graph_current_stats is not None and keyframe_graph_current_stats.enabled:
+                self.last_m3_debug = {
+                    "chunk_index": int(self.chunk_count),
+                    "frame_ids": frame_ids,
+                    "recent_history_ids": tuple(joint_context.history_frame_ids),
+                    "keyframe_graph": keyframe_graph_current_stats.as_debug(),
+                    "alignment": {
+                        "overlap_points": float(self.last_alignment_debug.overlap_points),
+                        "history_points": float(self.last_alignment_debug.history_points),
+                        "history_ids": tuple(int(fid) for fid in self.last_alignment_debug.history_ids),
+                        "scale": float(self.last_alignment_debug.scale),
+                        "alignment_scale": float(self.last_alignment_debug.scale),
+                        "residual": float(self.last_alignment_debug.residual),
+                        "alignment_rmse": float(self.last_alignment_debug.residual),
+                        "inlier_ratio": float(self.last_alignment_debug.inlier_ratio),
+                    },
+                }
         mark_profile("m3_debug")
         backend_correction = self._backend_feedback_correction(pred, frame_ids, transform)
         mark_profile("backend_feedback_correction")
@@ -720,9 +770,11 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     residual=residual,
                     status=status,
                 )
-                self.pending_outputs.append(output)
-                if output.is_keyframe and (self.dense_ba_history_enabled or self.joint_inference_enabled):
-                    self._remember_keyframe_record(
+                if output.is_keyframe and (
+                    self.dense_ba_history_enabled or self.joint_inference_enabled or self.keyframe_graph_enabled
+                ):
+                    previous_keyframes = tuple(self.keyframe_memory.records)
+                    keyframe_record = self._remember_keyframe_record(
                         frame_id,
                         frame_ids.index(frame_id),
                         pred,
@@ -731,6 +783,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                         global_points=output.world_points,
                         confidence=output.depth_confidence,
                     )
+                    graph_updates = self._handle_new_keyframe_graph_record(keyframe_record, previous_keyframes)
+                    if graph_updates:
+                        self._apply_keyframe_graph_update_to_output(output, graph_updates)
+                self.pending_outputs.append(output)
                 self.emitted_frame_ids.add(frame_id)
         mark_profile("emit_outputs")
         self.chunk_count += 1
@@ -928,6 +984,63 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             local_points=local_points.to(pred.depth) if local_points is not None else None,
             chunk_world_points=points.to(pred.chunk_world_points),
         )
+
+    @staticmethod
+    def _identity_like_transform(transform: SimilarityTransform, *, device: torch.device, dtype: torch.dtype) -> SimilarityTransform:
+        identity = SimilarityTransform.identity(device=device, dtype=dtype)
+        identity.accepted = bool(transform.accepted)
+        identity.residual = float(transform.residual)
+        identity.inlier_ratio = float(transform.inlier_ratio)
+        return identity
+
+    def _post_align_current_to_last_ba(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        frame_ids: tuple[int, ...],
+        transform: SimilarityTransform,
+    ) -> tuple[PanoVGGTLocalPrediction, SimilarityTransform, KeyframeGraphBAStats | None]:
+        if not self.keyframe_graph_enabled:
+            return pred, transform, None
+        world_pred = self._prediction_to_world(pred, transform)
+        identity = self._identity_like_transform(transform, device=world_pred.depth.device, dtype=world_pred.depth.dtype)
+        if not transform.accepted:
+            stats = KeyframeGraphBAStats(
+                enabled=True,
+                stage="current_to_last",
+                success=False,
+                fallback_reason="alignment_not_accepted",
+            )
+            return world_pred, identity, stats
+        if not self.m3_config.keyframe_graph.current_to_last_ba:
+            stats = KeyframeGraphBAStats(
+                enabled=True,
+                stage="current_to_last",
+                success=False,
+                fallback_reason="disabled",
+            )
+            return world_pred, identity, stats
+        last_keyframe = None
+        if self.last_keyframe_id is not None:
+            last_keyframe = self.keyframe_memory.get(int(self.last_keyframe_id))
+        if last_keyframe is None and self.keyframe_memory.records:
+            last_keyframe = self.keyframe_memory.records[-1]
+        new_local_indices = tuple(
+            local_idx
+            for local_idx, frame_id in enumerate(frame_ids)
+            if int(frame_id) not in self.global_points_by_frame
+        )
+        refined, stats = self.keyframe_graph_refiner.refine_current_to_last(
+            world_pred,
+            frame_ids,
+            new_local_indices=new_local_indices,
+            last_keyframe=last_keyframe,
+        )
+        return refined, identity, stats
+
+    def _record_keyframe_graph_stats(self, stats: KeyframeGraphBAStats) -> None:
+        self.last_keyframe_graph_stats = stats
+        if stats.enabled:
+            self.keyframe_graph_stats_history.append(stats)
 
     def _backend_feedback_correction(
         self,
@@ -1219,7 +1332,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         image: torch.Tensor | None = None,
         global_points: torch.Tensor | None = None,
         confidence: torch.Tensor | None = None,
-    ) -> None:
+    ) -> KeyframeRecord | None:
         if (
             pred.dense_descriptors is None
             or pred.match_confidence is None
@@ -1227,30 +1340,143 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             or pred.feature_hw is None
             or pred.image_hw is None
         ):
-            return
+            return None
         idx = int(local_idx)
         if idx < 0 or idx >= int(pred.poses_c2w.shape[0]):
-            return
+            return None
         static_confidence = None
         if pred.static_confidence is not None:
             static_confidence = pred.static_confidence[idx].detach().cpu().float()
-        self.keyframe_memory.add(
-            KeyframeRecord(
-                frame_id=int(frame_id),
-                pose_c2w=pose_c2w.detach().cpu().float(),
-                depth_low=pred.depth[idx].detach().cpu().float(),
-                dense_descriptors=pred.dense_descriptors[idx].detach().cpu().float(),
-                match_confidence=pred.match_confidence[idx].detach().cpu().float(),
-                sky_prob=pred.sky_prob[idx].detach().cpu().float(),
-                static_confidence=static_confidence,
-                feature_hw=tuple(int(v) for v in pred.feature_hw),
-                image_hw=tuple(int(v) for v in pred.image_hw),
-                image=None if image is None else image.detach().cpu().float(),
-                global_points=None if global_points is None else global_points.detach().cpu().float(),
-                confidence=None if confidence is None else confidence.detach().cpu().float(),
-                frozen=True,
-            )
+        record = KeyframeRecord(
+            frame_id=int(frame_id),
+            pose_c2w=pose_c2w.detach().cpu().float(),
+            depth_low=pred.depth[idx].detach().cpu().float(),
+            dense_descriptors=pred.dense_descriptors[idx].detach().cpu().float(),
+            match_confidence=pred.match_confidence[idx].detach().cpu().float(),
+            sky_prob=pred.sky_prob[idx].detach().cpu().float(),
+            static_confidence=static_confidence,
+            feature_hw=tuple(int(v) for v in pred.feature_hw),
+            image_hw=tuple(int(v) for v in pred.image_hw),
+            image=None if image is None else image.detach().cpu().float(),
+            global_points=None if global_points is None else global_points.detach().cpu().float(),
+            confidence=None if confidence is None else confidence.detach().cpu().float(),
+            frozen=True,
         )
+        self.keyframe_memory.add(record)
+        return record
+
+    def _handle_new_keyframe_graph_record(
+        self,
+        record: KeyframeRecord | None,
+        previous_records: tuple[KeyframeRecord, ...],
+    ) -> dict[int, torch.Tensor]:
+        if not self.keyframe_graph_enabled or record is None:
+            return {}
+        cfg = self.m3_config.keyframe_graph
+        added_edges = 0
+        edge_stats: list[KeyframeGraphBAStats] = []
+        if cfg.adjacent_edges:
+            history = max(1, int(cfg.adjacent_history))
+            candidates = [
+                item
+                for item in previous_records
+                if int(item.frame_id) != int(record.frame_id)
+            ][-history:]
+            for target in reversed(candidates):
+                edge, stats = self.keyframe_graph_refiner.build_adjacent_edge(
+                    source=record,
+                    target=target,
+                    edge_type="adjacent",
+                )
+                self._record_keyframe_graph_stats(stats)
+                edge_stats.append(stats)
+                if edge is None:
+                    continue
+                self.keyframe_correspondence_graph.add_edge(edge)
+                added_edges += 1
+
+        updates: dict[int, torch.Tensor] = {}
+        if added_edges > 0 and len(self.keyframe_memory) % max(1, int(cfg.optimize_every_keyframes)) == 0:
+            updates = self._optimize_keyframe_correspondence_graph()
+
+        if isinstance(self.last_m3_debug, dict):
+            graph_debug = self.last_m3_debug.setdefault("keyframe_graph", {})
+            graph_debug.update(self.keyframe_correspondence_graph.metrics())
+            graph_debug["keyframe_graph_added_edges"] = float(added_edges)
+            if edge_stats:
+                graph_debug.update(edge_stats[-1].as_debug())
+        return updates
+
+    def _optimize_keyframe_correspondence_graph(self) -> dict[int, torch.Tensor]:
+        updates, stats = self.keyframe_graph_refiner.optimize_keyframe_graph(
+            memory=self.keyframe_memory,
+            graph=self.keyframe_correspondence_graph,
+        )
+        self._record_keyframe_graph_stats(stats)
+        applied = self._apply_keyframe_graph_pose_updates(updates)
+        if isinstance(self.last_m3_debug, dict):
+            graph_debug = self.last_m3_debug.setdefault("keyframe_graph", {})
+            graph_debug.update(stats.as_debug())
+            graph_debug["keyframe_graph_pose_updates"] = float(len(applied))
+        return applied
+
+    def _apply_keyframe_graph_pose_updates(self, updates: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        if not updates:
+            return {}
+        old_poses: dict[int, torch.Tensor] = {}
+        for frame_id, pose in updates.items():
+            fid = int(frame_id)
+            current = self.pose_by_frame.get(fid)
+            if current is None:
+                record = self.keyframe_memory.get(fid)
+                current = None if record is None else record.pose_c2w
+            if torch.is_tensor(current) and tuple(current.shape) == (4, 4):
+                old_poses[fid] = current.detach().to(device=self.device, dtype=pose.dtype)
+
+        self.keyframe_memory.update_poses(updates)
+        applied: dict[int, torch.Tensor] = {}
+        for frame_id, pose in updates.items():
+            fid = int(frame_id)
+            new_pose = pose.detach().cpu().float()
+            if tuple(new_pose.shape) != (4, 4) or not torch.isfinite(new_pose).all():
+                continue
+            self.pose_by_frame[fid] = new_pose.to(self.device)
+            old_pose = old_poses.get(fid)
+            if old_pose is not None:
+                correction = new_pose.to(device=old_pose.device, dtype=old_pose.dtype) @ torch.linalg.inv(old_pose)
+                points = self.global_points_by_frame.get(fid)
+                if points is not None:
+                    self.global_points_by_frame[fid] = self._apply_pose_correction_to_points(
+                        points.to(device=correction.device, dtype=correction.dtype),
+                        correction,
+                    ).detach()
+            if self.last_keyframe_anchor is not None and int(self.last_keyframe_anchor.frame_id) == fid:
+                self.last_keyframe_anchor.pose_c2w = new_pose
+            if self.m3_config.keyframe_graph.publish_pose_updates:
+                self.pending_keyframe_graph_pose_updates[fid] = new_pose
+            applied[fid] = new_pose
+        return applied
+
+    def _apply_keyframe_graph_update_to_output(
+        self,
+        output: FrontendOutput,
+        updates: dict[int, torch.Tensor],
+    ) -> None:
+        new_pose = updates.get(int(output.frame_id))
+        if new_pose is None:
+            return
+        old_pose = output.pose_c2w.detach().float()
+        new_pose = new_pose.detach().cpu().float()
+        correction = new_pose @ torch.linalg.inv(old_pose)
+        output.pose_c2w = new_pose
+        prev_pose = self.pose_by_frame.get(int(output.frame_id) - 1)
+        if prev_pose is not None:
+            relative = _relative_from_c2w(prev_pose.detach().cpu().unsqueeze(0), new_pose.unsqueeze(0))[0]
+            output.relative_pose = relative.detach().cpu()
+        if output.world_points is not None:
+            output.world_points = self._apply_pose_correction_to_points(output.world_points.detach().float(), correction).detach().cpu()
+        if "kf_graph" not in output.tracking_status:
+            output.tracking_status = f"{output.tracking_status}_kf_graph"
 
     def _decide_keyframe(
         self,

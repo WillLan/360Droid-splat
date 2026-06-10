@@ -1633,6 +1633,16 @@ class PanoDroidGSSlamSystem:
                 keyframe_decision_count += 1
                 logger.observe_keyframe_decision(decision)
 
+        def drain_frontend_keyframe_graph_pose_updates() -> int:
+            pop_updates = getattr(self.frontend, "pop_keyframe_graph_pose_updates", None)
+            apply_updates = getattr(self.mapper, "apply_frontend_pose_updates", None)
+            if not callable(pop_updates) or not callable(apply_updates):
+                return 0
+            updates = pop_updates()
+            if not updates:
+                return 0
+            return int(apply_updates(updates))
+
         def process_output(out) -> None:
             nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
             nonlocal last_profiled_frontend_chunk
@@ -1682,6 +1692,11 @@ class PanoDroidGSSlamSystem:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)
                 output_profile["mapper_insert_keyframe_sec"] = float(time.perf_counter() - section_start)
                 output_profile["inserted_gaussians"] = float(inserted_count)
+                section_start = time.perf_counter()
+                output_profile["frontend_keyframe_graph_pose_updates"] = float(
+                    drain_frontend_keyframe_graph_pose_updates()
+                )
+                output_profile["frontend_keyframe_graph_pose_update_sec"] = float(time.perf_counter() - section_start)
                 output_profile["missing_seed_candidates"] = int(
                     getattr(self.mapper.stats, "last_missing_seed_candidates", 0)
                 )

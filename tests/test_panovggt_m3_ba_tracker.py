@@ -9,7 +9,13 @@ from frontend.pano_vggt.alignment import SimilarityTransform
 from frontend.pano_vggt.dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from frontend.pano_vggt.engine import PanoVGGTInferenceEngine
 from frontend.pano_vggt.factor_graph import DenseSphereFactor, DenseSphereFactorGraph
-from frontend.pano_vggt.keyframe_memory import KeyframeMemory, KeyframeRecord
+from frontend.pano_vggt.keyframe_graph_refiner import PanoVGGTKeyframeGraphRefiner
+from frontend.pano_vggt.keyframe_memory import (
+    KeyframeCorrespondenceEdge,
+    KeyframeCorrespondenceGraph,
+    KeyframeMemory,
+    KeyframeRecord,
+)
 from frontend.pano_vggt.m3_config import parse_m3_sphere_config
 from frontend.pano_vggt.spherical_correspondence import generate_gt_spherical_correspondences
 from frontend.pano_vggt.spherical_dense_ba import SphericalTangentDenseBA
@@ -92,6 +98,66 @@ def _prediction(
     return pred
 
 
+def _descriptor_grid(
+    feature_hw: tuple[int, int],
+    *,
+    frames: int,
+    channels: int = 4,
+) -> torch.Tensor:
+    h, w = feature_hw
+    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    xx = xx.float() / max(1, w - 1)
+    yy = yy.float() / max(1, h - 1)
+    base = torch.stack([xx, yy, 1.0 - xx, 1.0 - yy], dim=0)
+    if channels > 4:
+        base = torch.cat([base, torch.ones(channels - 4, h, w)], dim=0)
+    base = torch.nn.functional.normalize(base[:channels], dim=0)
+    return base.unsqueeze(0).repeat(int(frames), 1, 1, 1)
+
+
+def _prediction_n(
+    n: int,
+    *,
+    feature_hw: tuple[int, int] = (5, 8),
+    tx_step: float = 0.05,
+) -> PanoVGGTLocalPrediction:
+    poses = torch.eye(4).repeat(int(n), 1, 1)
+    for idx in range(int(n)):
+        poses[idx, 0, 3] = float(idx) * float(tx_step)
+    depth = torch.full((int(n), 1, feature_hw[0], feature_hw[1]), 2.0)
+    local_points = torch.zeros(int(n), feature_hw[0], feature_hw[1], 3)
+    return PanoVGGTLocalPrediction(
+        poses_c2w=poses,
+        depth=depth,
+        confidence=torch.ones_like(depth),
+        chunk_world_points=local_points.clone(),
+        local_points=local_points.clone(),
+        dense_descriptors=_descriptor_grid(feature_hw, frames=int(n)),
+        match_confidence=torch.ones(int(n), 1, feature_hw[0], feature_hw[1]),
+        sky_prob=torch.zeros(int(n), 1, feature_hw[0], feature_hw[1]),
+        feature_hw=feature_hw,
+        image_hw=feature_hw,
+    )
+
+
+def _record_from_prediction(pred: PanoVGGTLocalPrediction, idx: int, frame_id: int) -> KeyframeRecord:
+    assert pred.dense_descriptors is not None
+    assert pred.match_confidence is not None
+    assert pred.sky_prob is not None
+    return KeyframeRecord(
+        frame_id=int(frame_id),
+        pose_c2w=pred.poses_c2w[int(idx)].detach().cpu().float(),
+        depth_low=pred.depth[int(idx)].detach().cpu().float(),
+        dense_descriptors=pred.dense_descriptors[int(idx)].detach().cpu().float(),
+        match_confidence=pred.match_confidence[int(idx)].detach().cpu().float(),
+        sky_prob=pred.sky_prob[int(idx)].detach().cpu().float(),
+        feature_hw=tuple(int(v) for v in pred.feature_hw),
+        image_hw=tuple(int(v) for v in pred.image_hw),
+        global_points=pred.chunk_world_points[int(idx)].detach().cpu().float(),
+        frozen=True,
+    )
+
+
 def _m3_config(
     *,
     shadow: bool = False,
@@ -130,6 +196,70 @@ def _m3_config(
             "DenseBA": dense_ba,
         }
     }
+
+
+def _keyframe_graph_config() -> dict:
+    cfg = _m3_config(shadow=False, min_num_factors=1)
+    cfg["PanoVGGT"]["DenseMatching"].update(
+        {
+            "enabled": True,
+            "min_match_confidence": 0.0,
+            "min_static_confidence": 0.0,
+            "min_match_score": 0.0,
+            "forward_backward": False,
+            "use_depth_consistency": False,
+            "max_samples_per_edge": 32,
+        }
+    )
+    cfg["PanoVGGT"]["DenseBA"].update(
+        {
+            "iters": 3,
+            "pose_prior_weight": 0.0,
+            "depth_prior_weight": 0.0,
+            "factor_chunk_size": 64,
+            "max_solver_sec": 2.0,
+        }
+    )
+    cfg["PanoVGGT"]["KeyframeGraph"] = {
+        "enabled": True,
+        "current_to_last_ba": True,
+        "adjacent_edges": True,
+        "retrieval_edges": False,
+        "loop_edges": False,
+        "adjacent_history": 1,
+        "window_keyframes": 4,
+        "optimize_every_keyframes": 1,
+        "fixed_keyframes": 1,
+        "min_valid_factors": 1,
+        "min_valid_factor_ratio": 0.0,
+        "max_factors_per_edge": 64,
+        "publish_pose_updates": True,
+    }
+    return cfg
+
+
+def _minimal_factor_graph(src: int = 1, tgt: int = 0, factors: int = 4) -> DenseSphereFactorGraph:
+    valid = torch.ones(int(factors), dtype=torch.bool)
+    uv = torch.stack(
+        [
+            torch.linspace(0.5, 1.5, steps=int(factors)),
+            torch.linspace(0.5, 1.5, steps=int(factors)),
+        ],
+        dim=-1,
+    )
+    bearing = torch.nn.functional.normalize(torch.ones(int(factors), 3), dim=-1)
+    factor = DenseSphereFactor(
+        src=int(src),
+        tgt=int(tgt),
+        src_uv=uv,
+        tgt_uv=uv.clone(),
+        src_bearing=bearing,
+        tgt_bearing=bearing.clone(),
+        weight=torch.ones(int(factors)),
+        match_score=torch.ones(int(factors)),
+        valid_mask=valid,
+    )
+    return DenseSphereFactorGraph(factors=[factor], edges=torch.tensor([[int(src), int(tgt)]], dtype=torch.long))
 
 
 def test_spherical_dense_ba_two_frame_pose_perturbation_residual_decreases():
@@ -310,6 +440,150 @@ def test_pose_only_dense_ba_does_not_build_depth_variables():
     assert out.debug["used_factors"] == 8
     assert torch.allclose(out.log_inv_depth, log_inv_depth)
     assert out.depth_update_norm.get("max", 0.0) == 0.0
+
+
+def test_keyframe_correspondence_graph_keeps_sparse_adjacent_edges():
+    factor = _minimal_factor_graph().factors[0]
+    graph = KeyframeCorrespondenceGraph(max_edges=4)
+    graph.add_edge(
+        KeyframeCorrespondenceEdge(
+            src_kf_id=2,
+            tgt_kf_id=1,
+            edge_type="adjacent",
+            factor=factor,
+            metrics={"valid_factors": 4.0, "valid_factor_ratio": 1.0, "mean_weight": 1.0},
+        )
+    )
+    graph.add_edge(
+        KeyframeCorrespondenceEdge(
+            src_kf_id=2,
+            tgt_kf_id=1,
+            edge_type="adjacent",
+            factor=factor,
+            metrics={"valid_factors": 8.0, "valid_factor_ratio": 1.0, "mean_weight": 1.0},
+        )
+    )
+
+    assert len(graph) == 1
+    assert len(graph.edges_for_nodes({1, 2})) == 1
+    assert len(graph.edges_for_nodes({0, 2})) == 0
+    metrics = graph.metrics()
+    assert metrics["keyframe_graph_adjacent_edges"] == 1.0
+    assert metrics["keyframe_graph_retrieval_edges"] == 0.0
+    assert metrics["keyframe_graph_loop_edges"] == 0.0
+
+
+def test_current_to_last_refiner_updates_only_selected_new_frames():
+    refiner = PanoVGGTKeyframeGraphRefiner(parse_m3_sphere_config(_keyframe_graph_config()))
+    pred = _prediction_n(3)
+    last = _record_from_prediction(pred, 0, frame_id=99)
+    graph = _minimal_factor_graph(src=1, tgt=0, factors=4)
+
+    refiner._match_graph = lambda solver_pred, edge_pairs: graph
+
+    def fake_solve(solver_pred, graph_arg, *, fixed_frames):
+        _ = graph_arg
+        assert fixed_frames == 1
+        poses = solver_pred.poses_c2w.clone()
+        poses[1, 0, 3] += 0.4
+        return SimpleNamespace(
+            failed=False,
+            poses_c2w=poses,
+            mean_angular_residual_deg=0.1,
+            pose_update_norm={"mean": 0.4, "max": 0.4, "rot_max_deg": 0.0},
+        )
+
+    refiner._solve = fake_solve
+
+    refined, stats = refiner.refine_current_to_last(
+        pred,
+        (10, 11, 12),
+        new_local_indices=(2,),
+        last_keyframe=last,
+    )
+
+    assert stats.success
+    assert stats.valid_factors == 4
+    assert torch.allclose(refined.poses_c2w[0], pred.poses_c2w[0])
+    assert torch.allclose(refined.poses_c2w[1], pred.poses_c2w[1])
+    assert torch.allclose(refined.poses_c2w[2, :3, 3], pred.poses_c2w[2, :3, 3] + torch.tensor([0.4, 0.0, 0.0]))
+
+
+def test_keyframe_graph_refiner_builds_adjacent_edge_from_records():
+    refiner = PanoVGGTKeyframeGraphRefiner(parse_m3_sphere_config(_keyframe_graph_config()))
+    pred = _prediction_n(2, tx_step=0.0)
+    previous = _record_from_prediction(pred, 0, frame_id=0)
+    current = _record_from_prediction(pred, 1, frame_id=1)
+
+    edge, stats = refiner.build_adjacent_edge(source=current, target=previous)
+
+    assert stats.success
+    assert edge is not None
+    assert edge.src_kf_id == 1
+    assert edge.tgt_kf_id == 0
+    assert edge.edge_type == "adjacent"
+    assert edge.metrics["valid_factors"] >= 1.0
+
+
+def test_keyframe_graph_ba_updates_only_non_fixed_keyframe_pose():
+    cfg = _keyframe_graph_config()
+    refiner = PanoVGGTKeyframeGraphRefiner(parse_m3_sphere_config(cfg))
+    true_poses = _poses(0.2)
+    init_poses = _poses(0.05)
+    depth = _depth((5, 8), 2.0)
+    truth_graph = _graph_from_truth(true_poses, depth, samples=24)
+    pred = _prediction(poses=init_poses, depth=depth)
+    memory = KeyframeMemory(max_keyframes=4)
+    record0 = _record_from_prediction(pred, 0, frame_id=0)
+    record1 = _record_from_prediction(pred, 1, frame_id=1)
+    record0.pose_c2w = true_poses[0].clone()
+    memory.add(record0)
+    memory.add(record1)
+    graph = KeyframeCorrespondenceGraph(max_edges=4)
+    graph.add_edge(
+        KeyframeCorrespondenceEdge(
+            src_kf_id=0,
+            tgt_kf_id=1,
+            edge_type="adjacent",
+            factor=truth_graph.factors[0],
+            metrics=truth_graph.metrics(),
+        )
+    )
+
+    updates, stats = refiner.optimize_keyframe_graph(memory=memory, graph=graph)
+
+    assert stats.success
+    assert 0 not in updates
+    assert 1 in updates
+    assert abs(float(updates[1][0, 3]) - 0.2) < abs(float(init_poses[1, 0, 3]) - 0.2)
+
+
+def test_keyframe_graph_disabled_keeps_frontend_output_api_and_empty_graph():
+    pred0 = _prediction()
+    tracker, _ = _tracker_with_fake_alignment(pred0, _m3_config(shadow=False))
+
+    outputs = _feed_two_frames(tracker)
+
+    assert outputs
+    assert len(tracker.keyframe_correspondence_graph) == 0
+    assert tracker.pop_keyframe_graph_pose_updates() == {}
+    assert set(FrontendOutput.__dataclass_fields__) == {
+        "frame_id",
+        "timestamp",
+        "pose_c2w",
+        "relative_pose",
+        "pose_confidence",
+        "inverse_depth",
+        "depth_confidence",
+        "spherical_flow",
+        "keyframe_score",
+        "is_keyframe",
+        "ba_residual",
+        "tracking_status",
+        "world_points",
+        "world_points_confidence",
+        "valid_world_points_mask",
+    }
 
 
 def test_dense_ba_refiner_history_window_adds_keyframe_anchor_factors():

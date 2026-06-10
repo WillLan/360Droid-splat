@@ -141,6 +141,25 @@ class KeyframeAnchorConfig:
 
 
 @dataclass(frozen=True)
+class KeyframeGraphConfig:
+    """Configuration for the gated persistent keyframe correspondence graph."""
+
+    enabled: bool = False
+    current_to_last_ba: bool = True
+    adjacent_edges: bool = True
+    retrieval_edges: bool = False
+    loop_edges: bool = False
+    adjacent_history: int = 1
+    window_keyframes: int = 16
+    optimize_every_keyframes: int = 1
+    fixed_keyframes: int = 1
+    min_valid_factors: int = 256
+    min_valid_factor_ratio: float = 0.03
+    max_factors_per_edge: int = 8192
+    publish_pose_updates: bool = False
+
+
+@dataclass(frozen=True)
 class InferenceWindowConfig:
     """Configuration for the future local inference/refinement window."""
 
@@ -160,6 +179,7 @@ class M3SphereConfig:
     dense_matching: DenseMatchingConfig = DenseMatchingConfig()
     dense_ba: DenseBAConfig = DenseBAConfig()
     keyframe_anchor: KeyframeAnchorConfig = KeyframeAnchorConfig()
+    keyframe_graph: KeyframeGraphConfig = KeyframeGraphConfig()
     inference_window: InferenceWindowConfig = InferenceWindowConfig()
     joint_inference: JointInferenceConfig = JointInferenceConfig()
     alignment: AlignmentConfig = AlignmentConfig()
@@ -179,6 +199,7 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     dense_raw = _section(pano_cfg, "DenseMatching")
     ba_raw = _section(pano_cfg, "DenseBA")
     keyframe_anchor_raw = _section(pano_cfg, "KeyframeAnchor")
+    keyframe_graph_raw = _section(pano_cfg, "KeyframeGraph")
     window_raw = _section(pano_cfg, "InferenceWindow")
     joint_raw = _section(pano_cfg, "JointInference")
     alignment_raw = _section(pano_cfg, "Alignment")
@@ -293,6 +314,39 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         ),
         sky_threshold=float(keyframe_anchor_raw.get("sky_threshold", 0.5)),
     )
+    keyframe_graph = KeyframeGraphConfig(
+        enabled=bool(keyframe_graph_raw.get("enabled", False)),
+        current_to_last_ba=bool(keyframe_graph_raw.get("current_to_last_ba", True)),
+        adjacent_edges=bool(keyframe_graph_raw.get("adjacent_edges", True)),
+        retrieval_edges=bool(keyframe_graph_raw.get("retrieval_edges", False)),
+        loop_edges=bool(keyframe_graph_raw.get("loop_edges", False)),
+        adjacent_history=_positive_int(
+            keyframe_graph_raw.get("adjacent_history", 1),
+            name="PanoVGGT.KeyframeGraph.adjacent_history",
+        ),
+        window_keyframes=_positive_int(
+            keyframe_graph_raw.get("window_keyframes", 16),
+            name="PanoVGGT.KeyframeGraph.window_keyframes",
+        ),
+        optimize_every_keyframes=_positive_int(
+            keyframe_graph_raw.get("optimize_every_keyframes", 1),
+            name="PanoVGGT.KeyframeGraph.optimize_every_keyframes",
+        ),
+        fixed_keyframes=_positive_int(
+            keyframe_graph_raw.get("fixed_keyframes", 1),
+            name="PanoVGGT.KeyframeGraph.fixed_keyframes",
+        ),
+        min_valid_factors=_positive_int(
+            keyframe_graph_raw.get("min_valid_factors", 256),
+            name="PanoVGGT.KeyframeGraph.min_valid_factors",
+        ),
+        min_valid_factor_ratio=float(keyframe_graph_raw.get("min_valid_factor_ratio", 0.03)),
+        max_factors_per_edge=_positive_int(
+            keyframe_graph_raw.get("max_factors_per_edge", 8192),
+            name="PanoVGGT.KeyframeGraph.max_factors_per_edge",
+        ),
+        publish_pose_updates=bool(keyframe_graph_raw.get("publish_pose_updates", False)),
+    )
     inference_window = InferenceWindowConfig(
         size=_positive_int(window_raw.get("size", 4), name="PanoVGGT.InferenceWindow.size"),
         overlap=int(window_raw.get("overlap", 2)),
@@ -325,6 +379,7 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
         dense_matching=dense_matching,
         dense_ba=dense_ba,
         keyframe_anchor=keyframe_anchor,
+        keyframe_graph=keyframe_graph,
         inference_window=inference_window,
         joint_inference=joint_inference,
         alignment=alignment,

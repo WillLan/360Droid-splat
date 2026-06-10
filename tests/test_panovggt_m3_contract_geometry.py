@@ -65,6 +65,12 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert default_cfg.dense_ba.optimize_depth is False
     assert default_cfg.dense_ba.history_keyframes == 8
     assert default_cfg.keyframe_anchor.enabled is False
+    assert default_cfg.keyframe_graph.enabled is False
+    assert default_cfg.keyframe_graph.current_to_last_ba is True
+    assert default_cfg.keyframe_graph.adjacent_edges is True
+    assert default_cfg.keyframe_graph.retrieval_edges is False
+    assert default_cfg.keyframe_graph.loop_edges is False
+    assert default_cfg.keyframe_graph.window_keyframes == 16
 
     cfg = parse_m3_sphere_config(
         {
@@ -77,6 +83,12 @@ def test_m3_config_parser_defaults_and_explicit_values():
                     "feature_hook": "aggregator",
                 },
                 "KeyframeAnchor": {"enabled": True, "cell_pair_conf_threshold": 0.2},
+                "KeyframeGraph": {
+                    "enabled": True,
+                    "window_keyframes": 6,
+                    "fixed_keyframes": 2,
+                    "publish_pose_updates": True,
+                },
                 "DenseMatching": {"enabled": True, "search_radius": 7, "topk": 2},
                 "DenseBA": {
                     "enabled": True,
@@ -102,6 +114,10 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert cfg.dense_ba.history_keyframes == 3
     assert cfg.keyframe_anchor.enabled is True
     assert cfg.keyframe_anchor.cell_pair_conf_threshold == 0.2
+    assert cfg.keyframe_graph.enabled is True
+    assert cfg.keyframe_graph.window_keyframes == 6
+    assert cfg.keyframe_graph.fixed_keyframes == 2
+    assert cfg.keyframe_graph.publish_pose_updates is True
     assert cfg.inference_window.size == 5
 
     file_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_gs_slam.yaml").read_text())

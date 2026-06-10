@@ -1372,6 +1372,27 @@ class PanoGaussianMapper:
                 out.append((int(keyframe.frame_id), pose))
         return out
 
+    def apply_frontend_pose_updates(self, updates: dict[int, torch.Tensor]) -> int:
+        """Replace registered keyframe pose bases with frontend graph updates."""
+
+        if not updates:
+            return 0
+        device = self.map.get_xyz.device
+        registered = {int(keyframe.frame_id) for keyframe in self.keyframes}
+        applied = 0
+        for frame_id, pose in updates.items():
+            fid = int(frame_id)
+            if fid not in registered:
+                continue
+            pose_t = pose.detach().to(device=device, dtype=self.map.get_xyz.dtype)
+            if tuple(pose_t.shape) != (4, 4) or not torch.isfinite(pose_t).all():
+                continue
+            self.pose_deltas[fid] = PoseDelta(pose_t).to(device=device)
+            applied += 1
+        if applied > 0:
+            self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+        return applied
+
     def render_view(self, *, image: torch.Tensor, c2w: torch.Tensor) -> dict | None:
         if self.map.anchor_count() == 0 and not self.map.has_skybox:
             return None
