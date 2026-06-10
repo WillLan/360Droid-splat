@@ -193,6 +193,13 @@ def test_pfgs360_mapper_render_depth_gate_budgets_missing_and_depth_mismatch_reg
     assert mapper.stats.last_depth_mismatch_seed_candidates == 2
     assert mapper.stats.last_skipped_missing_budget == 1
     assert mapper.stats.last_skipped_depth_mismatch_budget == 0
+    diagnostic = mapper.last_depth_insertion_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.render_depth is not None
+    assert diagnostic.predicted_depth is not None
+    assert diagnostic.rel_depth_error is not None
+    assert diagnostic.render_bad_mask is not None
+    assert int(diagnostic.render_bad_mask.sum()) == 4
     assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
 
 

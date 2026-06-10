@@ -139,6 +139,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert file_cfg["PanoVGGT"]["image_size"] is None
     assert file_cfg["Dataset"]["erp_resize_height"] == 518
     assert file_cfg["Dataset"]["erp_resize_width"] == 1036
+    assert file_cfg["Mapping"]["NovelGaussianInsertion"]["save_depth_insertion_visualization"] is True
     assert file_cfg["RuntimeProfiling"]["enabled"] is True
     assert file_cfg["RuntimeProfiling"]["path"] == "runtime_profile.jsonl"
 

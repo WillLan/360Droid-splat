@@ -79,6 +79,19 @@ class KeyframeRenderDiagnostic:
     phase: str | None
 
 
+@dataclass
+class DepthInsertionDiagnostic:
+    frame_id: int
+    render_depth: torch.Tensor | None
+    predicted_depth: torch.Tensor | None
+    rel_depth_error: torch.Tensor | None
+    missing_mask: torch.Tensor | None
+    depth_mismatch_mask: torch.Tensor | None
+    render_bad_mask: torch.Tensor | None
+    depth_scale: float = 1.0
+    depth_shift: float = 0.0
+
+
 class PanoGaussianMap(nn.Module):
     """Anchor-scaffold panorama map with gsplat360-compatible accessors."""
 
@@ -558,6 +571,7 @@ class PanoGaussianMapper:
         self.last_requested_source_flat_idx: torch.Tensor | None = None
         self.last_inserted_source_flat_idx: torch.Tensor | None = None
         self.last_source_hw: tuple[int, int] | None = None
+        self.last_depth_insertion_diagnostic: DepthInsertionDiagnostic | None = None
         self.frontend_graph_window_ids: tuple[int, ...] = ()
 
     @property
@@ -576,6 +590,7 @@ class PanoGaussianMapper:
             None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
         )
         self.last_source_hw = seeds.source_hw
+        self.last_depth_insertion_diagnostic = None
         sky_mask = self._skybox_mask_from_image(image) if image is not None else None
         if image is not None and self.map.has_skybox:
             self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
@@ -746,6 +761,12 @@ class PanoGaussianMapper:
         depth_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
         missing_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
         first_keyframe = self.stats.n_keyframes == 0 or self.map.anchor_count() == 0
+        if first_keyframe and frontend_output is not None and image is not None:
+            image_hw = tuple(int(v) for v in image.shape[-2:])
+            self.last_depth_insertion_diagnostic = self._prediction_depth_insertion_diagnostic(
+                frontend_output,
+                image_hw,
+            )
         if not first_keyframe and frontend_output is not None and image is not None:
             image_hw = tuple(int(v) for v in image.shape[-2:])
             temporal_ok = self._seed_pixel_mask(seeds, insert_enabled, image_hw)
@@ -973,7 +994,40 @@ class PanoGaussianMapper:
                 "missing": missing.detach().cpu().bool(),
                 "depth_mismatch": depth_mismatch.detach().cpu().bool(),
             }
+            self.last_depth_insertion_diagnostic = DepthInsertionDiagnostic(
+                frame_id=int(frontend_output.frame_id),
+                render_depth=render_depth.detach().cpu().float(),
+                predicted_depth=aligned_target.detach().cpu().float(),
+                rel_depth_error=rel.detach().cpu().float(),
+                missing_mask=masks["missing"],
+                depth_mismatch_mask=masks["depth_mismatch"],
+                render_bad_mask=masks["render_bad"],
+                depth_scale=float(scale.detach().cpu()),
+                depth_shift=float(shift.detach().cpu()),
+            )
             return masks, stats
+
+    def _prediction_depth_insertion_diagnostic(
+        self,
+        frontend_output: FrontendOutput,
+        image_hw: tuple[int, int],
+    ) -> DepthInsertionDiagnostic | None:
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        target_depth, _ = self._target_depth_from_output(frontend_output, image_hw, device, dtype)
+        if target_depth is None:
+            return None
+        return DepthInsertionDiagnostic(
+            frame_id=int(frontend_output.frame_id),
+            render_depth=None,
+            predicted_depth=target_depth.detach().cpu().float(),
+            rel_depth_error=None,
+            missing_mask=None,
+            depth_mismatch_mask=None,
+            render_bad_mask=None,
+            depth_scale=1.0,
+            depth_shift=0.0,
+        )
 
     def _target_depth_from_output(
         self,

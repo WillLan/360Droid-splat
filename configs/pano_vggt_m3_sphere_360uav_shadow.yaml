@@ -164,6 +164,7 @@ Mapping:
     prioritize_depth_mismatch: true
     first_keyframe_voxel_neighbor_radius: 0
     voxel_neighbor_radius: 0
+    save_depth_insertion_visualization: true
 
   BootstrapOptimization:
     enabled: true

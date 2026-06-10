@@ -173,6 +173,7 @@ Mapping:
     prune_after_outlier_observations: 6
     protect_recent_keyframes: 8
     max_prune_per_keyframe: 500
+    save_depth_insertion_visualization: true
 
   BootstrapOptimization:
     enabled: true

@@ -784,6 +784,165 @@ class SlamRuntimeLogger:
             self.run.log(payload, step=max(1, int(self._step)))
         return path
 
+    def observe_depth_insertion_diagnostic(
+        self,
+        *,
+        frame_id: int,
+        image: torch.Tensor,
+        source_hw: tuple[int, int] | None,
+        inserted_idx: torch.Tensor | None,
+        diagnostic,
+        stats: dict[str, float | int] | None = None,
+    ) -> Path | None:
+        if diagnostic is None:
+            return None
+        if source_hw is not None:
+            height, width = int(source_hw[0]), int(source_hw[1])
+        else:
+            height, width = int(image.shape[-2]), int(image.shape[-1])
+        if height <= 0 or width <= 0:
+            return None
+
+        def scalar_hw(value) -> torch.Tensor | None:
+            if not torch.is_tensor(value):
+                return None
+            tensor = value.detach().cpu().float()
+            while tensor.ndim > 2:
+                tensor = tensor[0]
+            if tensor.ndim != 2:
+                return None
+            if tuple(tensor.shape) != (height, width):
+                tensor = F.interpolate(
+                    tensor.view(1, 1, *tensor.shape),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+            return tensor
+
+        def mask_hw(value) -> torch.Tensor:
+            if not torch.is_tensor(value):
+                return torch.zeros(height, width, dtype=torch.bool)
+            tensor = value.detach().cpu().bool()
+            while tensor.ndim > 2:
+                tensor = tensor[0]
+            if tensor.ndim != 2:
+                return torch.zeros(height, width, dtype=torch.bool)
+            if tuple(tensor.shape) != (height, width):
+                tensor = F.interpolate(
+                    tensor.float().view(1, 1, *tensor.shape),
+                    size=(height, width),
+                    mode="nearest",
+                )[0, 0].bool()
+            return tensor
+
+        def scalar_panel(value: torch.Tensor | None, label: str, *, require_positive: bool = True) -> Image.Image:
+            if value is None:
+                panel = Image.new("RGB", (width, height), "black")
+                ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
+                return panel
+            valid = torch.isfinite(value)
+            if require_positive:
+                valid = valid & (value > 0.0)
+            panel = Image.fromarray(_scalar_to_rgb(value.numpy(), valid.numpy()), mode="RGB")
+            ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
+            return panel
+
+        rgb = _image_tensor_to_pil(image)
+        if rgb.size != (width, height):
+            rgb = rgb.resize((width, height), Image.BILINEAR)
+        render_depth = scalar_hw(getattr(diagnostic, "render_depth", None))
+        predicted_depth = scalar_hw(getattr(diagnostic, "predicted_depth", None))
+        rel_error = scalar_hw(getattr(diagnostic, "rel_depth_error", None))
+        missing = mask_hw(getattr(diagnostic, "missing_mask", None))
+        depth_mismatch = mask_hw(getattr(diagnostic, "depth_mismatch_mask", None))
+        need_insert = mask_hw(getattr(diagnostic, "render_bad_mask", None))
+
+        inserted_mask = torch.zeros(height * width, dtype=torch.bool)
+        if inserted_idx is not None:
+            ins = inserted_idx.detach().cpu().long()
+            ins = ins[(ins >= 0) & (ins < inserted_mask.numel())]
+            if ins.numel():
+                inserted_mask[ins] = True
+        inserted_mask = inserted_mask.view(height, width)
+
+        need_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        miss_np = missing.numpy()
+        mismatch_np = depth_mismatch.numpy()
+        need_np = need_insert.numpy()
+        need_rgb[need_np] = np.array([90, 90, 90], dtype=np.uint8)
+        need_rgb[miss_np] = np.array([255, 210, 30], dtype=np.uint8)
+        need_rgb[mismatch_np] = np.array([255, 40, 40], dtype=np.uint8)
+        need_panel = Image.fromarray(need_rgb, mode="RGB")
+        ImageDraw.Draw(need_panel).text((8, 8), "need insert: yellow=missing red=depth", fill=(255, 255, 255))
+
+        inserted_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        inserted_rgb[..., 0] = inserted_mask.numpy().astype(np.uint8) * 255
+        inserted_panel = Image.fromarray(inserted_rgb, mode="RGB")
+        ImageDraw.Draw(inserted_panel).text((8, 8), "inserted seed pixels", fill=(255, 255, 255))
+
+        overlay = np.asarray(rgb).astype(np.float32)
+        overlay[need_np] = 0.55 * overlay[need_np] + 0.45 * np.array([255.0, 210.0, 30.0])
+        ins_np = inserted_mask.numpy()
+        overlay[ins_np] = 0.35 * overlay[ins_np] + 0.65 * np.array([255.0, 30.0, 30.0])
+        overlay_panel = Image.fromarray(overlay.clip(0, 255).astype(np.uint8), mode="RGB")
+        ImageDraw.Draw(overlay_panel).text((8, 8), "rgb overlay: red=inserted", fill=(255, 255, 255))
+
+        render_label = "render depth before insertion" if render_depth is not None else "no prior render depth"
+        pred_label = "frontend predicted depth aligned"
+        scale = float(getattr(diagnostic, "depth_scale", 1.0))
+        shift = float(getattr(diagnostic, "depth_shift", 0.0))
+        rel_label = f"relative depth error scale={scale:.3g} shift={shift:.3g}"
+        panels = (
+            scalar_panel(render_depth, render_label),
+            scalar_panel(predicted_depth, pred_label),
+            scalar_panel(rel_error, rel_label, require_positive=False),
+            need_panel,
+            inserted_panel,
+            overlay_panel,
+        )
+
+        title_h = 30
+        canvas = Image.new("RGB", (len(panels) * width, height + title_h), "white")
+        for idx, panel in enumerate(panels):
+            canvas.paste(panel, (idx * width, title_h))
+        draw = ImageDraw.Draw(canvas)
+        draw.text(
+            (8, 8),
+            (
+                f"KF {int(frame_id):06d} need={int(need_insert.sum().item())} "
+                f"missing={int(missing.sum().item())} depth={int(depth_mismatch.sum().item())} "
+                f"inserted={int(inserted_mask.sum().item())}"
+            ),
+            fill=(0, 0, 0),
+        )
+        canvas = _resize_to_max_width(canvas, self.kf_opt_max_width)
+
+        path = None
+        if self.save_local:
+            out_dir = self.visualization_dir / "depth_insertion"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"frame_{int(frame_id):06d}.png"
+            canvas.save(path)
+        if self.run is not None:
+            payload: dict[str, float | int | str] = {
+                "mapping/depth_insertion_need_pixels": int(need_insert.sum().item()),
+                "mapping/depth_insertion_missing_pixels": int(missing.sum().item()),
+                "mapping/depth_insertion_depth_mismatch_pixels": int(depth_mismatch.sum().item()),
+                "mapping/depth_insertion_inserted_pixels": int(inserted_mask.sum().item()),
+                "mapping/depth_insertion_depth_scale": float(scale),
+                "mapping/depth_insertion_depth_shift": float(shift),
+            }
+            if stats:
+                for key, value in stats.items():
+                    payload[f"mapping/depth_insertion_{key}"] = float(value)
+            if self._wandb is not None:
+                payload["mapping/depth_insertion"] = self._wandb.Image(str(path) if path is not None else canvas)
+                if path is not None:
+                    payload["mapping/depth_insertion_png"] = str(path)
+            self.run.log(payload, step=max(1, int(self._step)))
+        return path
+
     def save_keyframe_diagnostic(self, diagnostic, *, render_dir: Path, depth_dir: Path) -> tuple[Path | None, Path | None]:
         if diagnostic is None:
             return None, None
@@ -1537,6 +1696,28 @@ class PanoDroidGSSlamSystem:
                 )
                 keyframes += 1
                 novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
+                insertion_stats = {
+                    "kept": int(inserted_count),
+                    "skipped_voxel": int(getattr(self.mapper.stats, "last_skipped_voxel", 0)),
+                    "skipped_budget": int(getattr(self.mapper.stats, "last_skipped_budget", 0)),
+                    "render_missing_pixels": int(getattr(self.mapper.stats, "last_render_missing_pixels", 0)),
+                    "render_depth_mismatch_pixels": int(
+                        getattr(self.mapper.stats, "last_render_depth_mismatch_pixels", 0)
+                    ),
+                    "render_bad_pixels": int(getattr(self.mapper.stats, "last_render_bad_pixels", 0)),
+                    "missing_seed_candidates": int(
+                        getattr(self.mapper.stats, "last_missing_seed_candidates", 0)
+                    ),
+                    "depth_mismatch_seed_candidates": int(
+                        getattr(self.mapper.stats, "last_depth_mismatch_seed_candidates", 0)
+                    ),
+                    "skipped_missing_budget": int(
+                        getattr(self.mapper.stats, "last_skipped_missing_budget", 0)
+                    ),
+                    "skipped_depth_mismatch_budget": int(
+                        getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
+                    ),
+                }
                 if bool(novel_cfg.get("save_visualization", False)):
                     section_start = time.perf_counter()
                     logger.observe_new_gaussians(
@@ -1545,30 +1726,20 @@ class PanoDroidGSSlamSystem:
                         source_hw=getattr(self.mapper, "last_source_hw", None),
                         requested_idx=getattr(self.mapper, "last_requested_source_flat_idx", None),
                         inserted_idx=getattr(self.mapper, "last_inserted_source_flat_idx", None),
-                        stats={
-                            "kept": int(inserted_count),
-                            "skipped_voxel": int(getattr(self.mapper.stats, "last_skipped_voxel", 0)),
-                            "skipped_budget": int(getattr(self.mapper.stats, "last_skipped_budget", 0)),
-                            "render_missing_pixels": int(getattr(self.mapper.stats, "last_render_missing_pixels", 0)),
-                            "render_depth_mismatch_pixels": int(
-                                getattr(self.mapper.stats, "last_render_depth_mismatch_pixels", 0)
-                            ),
-                            "render_bad_pixels": int(getattr(self.mapper.stats, "last_render_bad_pixels", 0)),
-                            "missing_seed_candidates": int(
-                                getattr(self.mapper.stats, "last_missing_seed_candidates", 0)
-                            ),
-                            "depth_mismatch_seed_candidates": int(
-                                getattr(self.mapper.stats, "last_depth_mismatch_seed_candidates", 0)
-                            ),
-                            "skipped_missing_budget": int(
-                                getattr(self.mapper.stats, "last_skipped_missing_budget", 0)
-                            ),
-                            "skipped_depth_mismatch_budget": int(
-                                getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
-                            ),
-                        },
+                        stats=insertion_stats,
                     )
                     output_profile["new_gaussian_visualization_sec"] = float(time.perf_counter() - section_start)
+                if bool(novel_cfg.get("save_depth_insertion_visualization", False)):
+                    section_start = time.perf_counter()
+                    logger.observe_depth_insertion_diagnostic(
+                        frame_id=int(out.frame_id),
+                        image=source_frame.image,
+                        source_hw=getattr(self.mapper, "last_source_hw", None),
+                        inserted_idx=getattr(self.mapper, "last_inserted_source_flat_idx", None),
+                        diagnostic=getattr(self.mapper, "last_depth_insertion_diagnostic", None),
+                        stats=insertion_stats,
+                    )
+                    output_profile["depth_insertion_visualization_sec"] = float(time.perf_counter() - section_start)
                 if self.mapper.uses_joint_optimization:
                     if bootstrap_enabled and keyframes == 1 and bootstrap_steps > 0:
                         init_dir = output_dir / "init_vis" / f"frame_{int(out.frame_id):06d}"

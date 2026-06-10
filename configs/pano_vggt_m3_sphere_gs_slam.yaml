@@ -188,6 +188,7 @@ Mapping:
     max_prune_per_keyframe: 500
     save_visualization: true
     visualize_candidates: true
+    save_depth_insertion_visualization: true
 
   BootstrapOptimization:
     enabled: true

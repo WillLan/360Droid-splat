@@ -1187,3 +1187,41 @@ def test_slam_logger_saves_new_gaussian_insertion_visualization(tmp_path):
     assert path is not None
     assert path.is_file()
     assert path.name == "frame_000007.png"
+
+
+def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled"},
+            "Visualization": {"save_local": True},
+        },
+        tmp_path,
+    )
+    diagnostic = SimpleNamespace(
+        frame_id=7,
+        render_depth=torch.ones(1, 4, 8),
+        predicted_depth=torch.full((1, 4, 8), 1.2),
+        rel_depth_error=torch.full((1, 4, 8), 0.2),
+        missing_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_mismatch_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        render_bad_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_scale=1.0,
+        depth_shift=0.0,
+    )
+    diagnostic.missing_mask[..., 0, 0] = True
+    diagnostic.depth_mismatch_mask[..., 1, 1] = True
+    diagnostic.render_bad_mask = diagnostic.missing_mask | diagnostic.depth_mismatch_mask
+
+    path = logger.observe_depth_insertion_diagnostic(
+        frame_id=7,
+        image=torch.zeros(3, 4, 8),
+        source_hw=(4, 8),
+        inserted_idx=torch.tensor([0, 9]),
+        diagnostic=diagnostic,
+        stats={"kept": 2},
+    )
+
+    assert path is not None
+    assert path.is_file()
+    assert path.parent.name == "depth_insertion"
+    assert path.name == "frame_000007.png"
