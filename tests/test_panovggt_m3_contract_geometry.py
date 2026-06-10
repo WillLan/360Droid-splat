@@ -145,7 +145,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.dense_ba.line_search is True
     assert parsed_file.dense_ba.logdepth_update_quantile == 0.99
     assert parsed_file.joint_inference.enabled is True
-    assert parsed_file.joint_inference.max_history_frames == 3
+    assert parsed_file.joint_inference.max_history_frames == 2
     assert parsed_file.alignment.use_common_history is False
     assert parsed_file.alignment.history_point_budget_ratio == 0.0
     assert parsed_file.alignment.exclude_sky is True
@@ -163,6 +163,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert file_cfg["Dataset"]["erp_resize_height"] == 518
     assert file_cfg["Dataset"]["erp_resize_width"] == 1036
     assert file_cfg["Mapping"]["NovelGaussianInsertion"]["save_depth_insertion_visualization"] is True
+    assert file_cfg["BackendOptimization"]["FeedForwardWindow"]["enabled"] is True
+    assert file_cfg["BackendOptimization"]["FeedForwardWindow"]["history_keyframes"] == 2
     assert file_cfg["RuntimeProfiling"]["enabled"] is False
     assert file_cfg["RuntimeProfiling"]["path"] == "runtime_profile.jsonl"
     assert file_cfg["WeightsAndBiases"]["runtime_log_preset"] == "compact_slam"

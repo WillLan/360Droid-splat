@@ -55,6 +55,27 @@ class _DepthGateRenderer:
         }
 
 
+class _BadEvidenceRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        H, W = int(camera.image_height), int(camera.image_width)
+        device = camera.c2w.device
+        dtype = camera.c2w.dtype
+        total = int(gaussian_map.anchor_count())
+        render = torch.zeros(3, H, W, device=device, dtype=dtype)
+        depth = torch.ones(1, H, W, device=device, dtype=dtype)
+        alpha = torch.ones(1, H, W, device=device, dtype=dtype)
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "visibility_filter": torch.ones(total, dtype=torch.bool, device=device),
+            "radii": torch.ones(total, dtype=torch.int32, device=device),
+            "n_touched": torch.ones(total, dtype=torch.int32, device=device),
+            "render_distort": None,
+        }
+
+
 def _small_frontend_output(frame_id: int) -> FrontendOutput:
     pose = torch.eye(4)
     pose[0, 3] = float(frame_id) * 0.1
@@ -72,6 +93,13 @@ def _small_frontend_output(frame_id: int) -> FrontendOutput:
         ba_residual=None,
         tracking_status="tracked",
     )
+
+
+def _small_non_keyframe_output(frame_id: int) -> FrontendOutput:
+    out = _small_frontend_output(frame_id)
+    out.is_keyframe = False
+    out.keyframe_score = 0.0
+    return out
 
 
 def _small_seed_batch(frame_id: int) -> GaussianSeedBatch:
@@ -301,6 +329,126 @@ def test_mapper_frontend_graph_window_prioritizes_history_hints():
     assert metrics["window_size"] == 3.0
     assert mapper.stats.last_window_keyframes == [4, 8, 12]
     assert renderer.frame_ids == [4, 8, 12]
+
+
+def test_mapper_feedforward_window_uses_history_and_non_keyframes():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "sliding_window_steps": 1,
+            "random_window_frame_per_iter": False,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {
+                "enabled": True,
+                "history_keyframes": 2,
+                "optimize_non_keyframe_observations": True,
+                "gaussian_scope": "selected_birth_keyframes",
+                "prune": {"enabled": False},
+            },
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    for frame_id in (1, 2, 3):
+        image = torch.full((3, 4, 8), 0.2 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.insert_keyframe(_small_seed_batch(frame_id), _small_frontend_output(frame_id), image=image)
+    for frame_id in (10, 11):
+        image = torch.full((3, 4, 8), 0.1 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.register_observation(_small_non_keyframe_output(frame_id), image)
+
+    metrics = mapper.optimize_feedforward_window(current_frame_ids=[10, 11], history_frame_ids=[1, 2, 3])
+
+    assert metrics["window_size"] == 4.0
+    assert mapper.stats.last_window_observations == [2, 3, 10, 11]
+    assert mapper.stats.last_window_keyframes == [2, 3]
+    assert renderer.frame_ids == [2, 3, 10, 11]
+
+
+def test_mapper_feedforward_window_freezes_non_window_gaussians():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "sliding_window_steps": 1,
+            "random_window_frame_per_iter": False,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+            "gaussian_lr": 0.1,
+            "FeedForwardWindow": {
+                "enabled": True,
+                "history_keyframes": 0,
+                "gaussian_scope": "selected_birth_keyframes",
+                "prune": {"enabled": False},
+            },
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    mapper.insert_keyframe(_small_seed_batch(1), _small_frontend_output(1), image=torch.zeros(3, 4, 8))
+    mapper.insert_keyframe(_small_seed_batch(99), _small_frontend_output(99), image=torch.zeros(3, 4, 8))
+    before = gaussian_map.features.detach().clone()
+
+    mapper.optimize_feedforward_window(current_frame_ids=[1], history_frame_ids=[])
+
+    after = gaussian_map.features.detach()
+    assert not torch.allclose(after[0], before[0])
+    assert torch.allclose(after[1], before[1])
+
+
+def test_mapper_feedforward_prune_only_removes_active_bad_gaussians():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "sliding_window_steps": 1,
+            "random_window_frame_per_iter": False,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {
+                "enabled": True,
+                "history_keyframes": 0,
+                "gaussian_scope": "selected_birth_keyframes",
+                "prune": {
+                    "enabled": True,
+                    "reset_after_bad": 1,
+                    "prune_after_bad": 2,
+                    "min_seen": 1,
+                    "min_bad_ratio": 0.5,
+                    "max_inlier_count": 0,
+                    "opacity_after_reset": 0.01,
+                    "max_prune_per_window": 10,
+                    "photo_error_threshold": 0.0,
+                },
+            },
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_BadEvidenceRenderer())
+
+    mapper.insert_keyframe(_small_seed_batch(1), _small_frontend_output(1), image=torch.ones(3, 4, 8))
+    mapper.insert_keyframe(_small_seed_batch(99), _small_frontend_output(99), image=torch.ones(3, 4, 8))
+
+    first = mapper.optimize_feedforward_window(current_frame_ids=[1], history_frame_ids=[])
+    assert first["feedforward_opacity_resets"] == 1.0
+    assert first["feedforward_pruned"] == 0.0
+    assert gaussian_map.anchor_count() == 2
+
+    second = mapper.optimize_feedforward_window(current_frame_ids=[1], history_frame_ids=[])
+    assert second["feedforward_pruned"] == 1.0
+    assert gaussian_map.anchor_count() == 1
+    assert gaussian_map._anchor_birth_frame.tolist() == [99]
 
 
 def test_pano_gaussian_map_saves_legacy_3dgs_ply_schema(tmp_path: Path):

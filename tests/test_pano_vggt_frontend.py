@@ -347,3 +347,61 @@ def test_system_runs_joint_gaussian_pose_backend_smoke(tmp_path: Path):
     assert summary["backend_optimization_steps"] > 0
     assert summary["backend_last_phase"] == "final_global"
     assert summary["backend_final_metrics"]["steps"] == 1.0
+
+
+def test_system_runs_feedforward_window_backend_smoke(tmp_path: Path):
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 12, "width": 24},
+        "Frontend": {
+            "mode": "panovggt_long",
+            "keyframe_threshold": 2.0,
+            "force_keyframe_interval": 2,
+        },
+        "PanoVGGT": {
+            "engine": "fake",
+            "image_size": [12, 24],
+            "chunk_size": 3,
+            "overlap": 1,
+            "emit_delay": 1,
+            "align_mode": "sim3",
+            "min_overlap_points": 16,
+        },
+        "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Hierarchical": {"voxel_size_lis": [0.2, 0.6, 1.8]},
+        "Mapping": {
+            "max_seeds_per_keyframe": 8,
+            "min_depth_confidence": 0.0,
+            "refine_steps_per_keyframe": 0,
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "keyframe_steps": 0,
+            "non_keyframe_steps": 0,
+            "local_submap_steps": 0,
+            "sliding_window_steps": 1,
+            "final_global_steps": 0,
+            "random_window_frame_per_iter": False,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {
+                "enabled": True,
+                "history_keyframes": 2,
+                "optimize_non_keyframe_observations": True,
+                "gaussian_scope": "selected_birth_keyframes",
+                "prune": {"enabled": False},
+            },
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+        "WeightsAndBiases": {"mode": "disabled"},
+        "Visualization": {"save_local": False},
+        "Results": {"save_dir": str(tmp_path)},
+    }
+
+    summary = PanoDroidGSSlamSystem(cfg).run(max_frames=4)
+
+    assert summary["anchors"] > 0
+    assert summary["backend_last_phase"] == "feedforward_window"
+    assert summary["backend_last_window_observations"]
+    assert summary["backend_last_feedforward_metrics"]["feedforward_window_size"] >= 1.0

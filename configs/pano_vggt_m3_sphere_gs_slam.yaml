@@ -64,7 +64,7 @@ PanoVGGT:
     enabled: true
     history_policy: recent
     min_history_frames: 0
-    max_history_frames: 3
+    max_history_frames: 2
 
   Alignment:
     use_common_history: false
@@ -220,6 +220,20 @@ BackendOptimization:
   optimize_skybox: true
   existing_gaussian_lr_scale: 0.15
   new_gaussian_lr_scale: 1.0
+  FeedForwardWindow:
+    enabled: true
+    history_keyframes: 2
+    optimize_non_keyframe_observations: true
+    gaussian_scope: selected_birth_keyframes
+    prune:
+      enabled: true
+      reset_after_bad: 3
+      prune_after_bad: 6
+      min_seen: 2
+      min_bad_ratio: 0.7
+      max_inlier_count: 1
+      opacity_after_reset: 0.01
+      max_prune_per_window: 500
   early_stop:
     enabled: false
     min_delta: 0.0002

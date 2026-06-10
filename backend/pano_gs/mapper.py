@@ -39,8 +39,13 @@ class MapperStats:
     last_skipped_budget: int = 0
     last_window_size: int = 0
     last_window_keyframes: list[int] = field(default_factory=list)
+    last_window_observations: list[int] = field(default_factory=list)
+    last_feedforward_current_frames: list[int] = field(default_factory=list)
+    last_feedforward_history_frames: list[int] = field(default_factory=list)
     last_sampled_keyframes: list[int] = field(default_factory=list)
     last_trainable_pose_count: int = 0
+    last_feedforward_opacity_resets: int = 0
+    last_feedforward_pruned: int = 0
     last_hash_hits: int = 0
     last_hash_near_hits: int = 0
     last_suppressed_insert: int = 0
@@ -62,6 +67,17 @@ class MapperKeyframe:
     image: torch.Tensor
     gaussian_start: int
     gaussian_end: int
+    sky_mask: torch.Tensor | None = None
+    target_depth: torch.Tensor | None = None
+    depth_confidence: torch.Tensor | None = None
+
+
+@dataclass
+class MapperObservation:
+    frame_id: int
+    image: torch.Tensor
+    pose_c2w: torch.Tensor
+    is_keyframe: bool = False
     sky_mask: torch.Tensor | None = None
     target_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
@@ -566,6 +582,7 @@ class PanoGaussianMapper:
         )
         self.voxel_neighbor_radius = max(0, int(novel_cfg.get("voxel_neighbor_radius", 0)))
         self.keyframes: list[MapperKeyframe] = []
+        self.observations: dict[int, MapperObservation] = {}
         self.pose_deltas: dict[int, PoseDelta] = {}
         self.last_inserted_range: tuple[int, int] = (0, 0)
         self.last_requested_source_flat_idx: torch.Tensor | None = None
@@ -573,6 +590,15 @@ class PanoGaussianMapper:
         self.last_source_hw: tuple[int, int] | None = None
         self.last_depth_insertion_diagnostic: DepthInsertionDiagnostic | None = None
         self.frontend_graph_window_ids: tuple[int, ...] = ()
+
+    @property
+    def feedforward_window_enabled(self) -> bool:
+        cfg = self._feedforward_window_cfg()
+        return bool(cfg.get("enabled", False))
+
+    def _feedforward_window_cfg(self) -> dict:
+        cfg = self.optim_cfg.get("FeedForwardWindow", {}) if isinstance(self.optim_cfg, dict) else {}
+        return cfg if isinstance(cfg, dict) else {}
 
     @property
     def uses_joint_optimization(self) -> bool:
@@ -633,6 +659,7 @@ class PanoGaussianMapper:
         )
         if image is not None:
             self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
+            self.register_observation(frontend_output, image, is_keyframe=True, sky_mask=sky_mask)
         if n == 0:
             self.stats.notes.append(f"frame {frontend_output.frame_id}: no seeds inserted")
         if self.novel_insertion_enabled and requested != n:
@@ -669,6 +696,65 @@ class PanoGaussianMapper:
             if value not in ids:
                 ids.append(value)
         self.frontend_graph_window_ids = tuple(ids)
+
+    def register_observation(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        *,
+        is_keyframe: bool | None = None,
+        sky_mask: torch.Tensor | None = None,
+    ) -> None:
+        self.register_observation_values(
+            frame_id=int(frontend_output.frame_id),
+            image=image,
+            c2w=frontend_output.pose_c2w,
+            inverse_depth=frontend_output.inverse_depth,
+            depth_confidence=frontend_output.depth_confidence,
+            world_points=frontend_output.world_points,
+            world_points_confidence=frontend_output.world_points_confidence,
+            is_keyframe=bool(frontend_output.is_keyframe) if is_keyframe is None else bool(is_keyframe),
+            sky_mask=sky_mask,
+        )
+
+    def register_observation_values(
+        self,
+        *,
+        frame_id: int,
+        image: torch.Tensor,
+        c2w: torch.Tensor,
+        inverse_depth: torch.Tensor | None = None,
+        depth_confidence: torch.Tensor | None = None,
+        world_points: torch.Tensor | None = None,
+        world_points_confidence: torch.Tensor | None = None,
+        is_keyframe: bool = False,
+        sky_mask: torch.Tensor | None = None,
+    ) -> None:
+        img = image.detach().cpu().float()
+        if img.ndim == 4 and int(img.shape[0]) == 1:
+            img = img[0]
+        if img.ndim != 3:
+            return
+        frame_id = int(frame_id)
+        sky = sky_mask if sky_mask is not None else self._skybox_mask_from_image(img)
+        depth, conf = self._target_depth_from_tensors(
+            inverse_depth=inverse_depth,
+            world_points=world_points,
+            pose_c2w=c2w,
+            confidence=depth_confidence if depth_confidence is not None else world_points_confidence,
+            size=(int(img.shape[-2]), int(img.shape[-1])),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.observations[frame_id] = MapperObservation(
+            frame_id=frame_id,
+            image=img,
+            pose_c2w=c2w.detach().cpu().float(),
+            is_keyframe=bool(is_keyframe),
+            sky_mask=sky.detach().cpu().bool() if torch.is_tensor(sky) else None,
+            target_depth=None if depth is None else depth.detach().cpu().float(),
+            depth_confidence=None if conf is None else conf.detach().cpu().float(),
+        )
 
     def _filter_novel_seeds(
         self,
@@ -1036,19 +1122,44 @@ class PanoGaussianMapper:
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self._target_depth_from_tensors(
+            inverse_depth=frontend_output.inverse_depth,
+            world_points=frontend_output.world_points,
+            pose_c2w=frontend_output.pose_c2w,
+            confidence=(
+                frontend_output.depth_confidence
+                if frontend_output.depth_confidence is not None
+                else frontend_output.world_points_confidence
+            ),
+            size=size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _target_depth_from_tensors(
+        self,
+        *,
+        inverse_depth: torch.Tensor | None,
+        world_points: torch.Tensor | None,
+        pose_c2w: torch.Tensor,
+        confidence: torch.Tensor | None,
+        size: tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         H, W = int(size[0]), int(size[1])
         target_depth: torch.Tensor | None = None
-        if frontend_output.inverse_depth is not None:
-            inv = frontend_output.inverse_depth.detach().float()
+        if inverse_depth is not None:
+            inv = inverse_depth.detach().float()
             if inv.ndim == 2:
                 inv = inv.unsqueeze(0)
             target_depth = inv.clamp_min(1.0e-6).reciprocal()
-        elif frontend_output.world_points is not None:
-            pts = frontend_output.world_points.detach().float()
+        elif world_points is not None:
+            pts = world_points.detach().float()
             if pts.ndim == 4 and int(pts.shape[0]) == 1:
                 pts = pts[0]
             if pts.ndim == 3 and int(pts.shape[-1]) == 3:
-                c2w = frontend_output.pose_c2w.detach().float()
+                c2w = pose_c2w.detach().float()
                 center = c2w[:3, 3].view(1, 1, 3)
                 target_depth = torch.linalg.norm(pts - center, dim=-1, keepdim=False).unsqueeze(0)
         if target_depth is None:
@@ -1056,12 +1167,9 @@ class PanoGaussianMapper:
         if tuple(target_depth.shape[-2:]) != (H, W):
             target_depth = F.interpolate(target_depth.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
         target_depth = target_depth.to(device=device, dtype=dtype)
-        conf = frontend_output.depth_confidence
-        if conf is None:
-            conf = frontend_output.world_points_confidence
         conf_t = None
-        if conf is not None:
-            conf_t = conf.detach().float()
+        if confidence is not None:
+            conf_t = confidence.detach().float()
             if conf_t.ndim == 2:
                 conf_t = conf_t.unsqueeze(0)
             if tuple(conf_t.shape[-2:]) != (H, W):
@@ -1554,8 +1662,450 @@ class PanoGaussianMapper:
         self.stats.optimization_steps += int(steps)
         return last
 
+    def optimize_feedforward_window(
+        self,
+        *,
+        current_frame_ids,
+        history_frame_ids=None,
+    ) -> dict[str, float]:
+        if not self.uses_joint_optimization or not self.feedforward_window_enabled:
+            return {}
+        cfg = self._feedforward_window_cfg()
+        steps = int(cfg.get("steps", self.optim_cfg.get("sliding_window_steps", 0)))
+        window_ids = self._feedforward_window_ids(current_frame_ids, history_frame_ids)
+        observations = self._selected_observations_for_ids(window_ids)
+        if not observations:
+            return {"loss": 0.0, "steps": 0.0, "window_size": 0.0}
+        if not bool(cfg.get("optimize_non_keyframe_observations", True)):
+            observations = [obs for obs in observations if bool(obs.is_keyframe)]
+        if not observations:
+            return {"loss": 0.0, "steps": 0.0, "window_size": 0.0}
+        total_start = time.perf_counter()
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        selected_keyframe_ids = self._feedforward_keyframe_ids(window_ids)
+        current_keyframe_ids = self._feedforward_keyframe_ids(current_frame_ids)
+        gaussian_scales = self._feedforward_gaussian_scales(selected_keyframe_ids)
+        gaussian_enabled = (
+            gaussian_scales is not None
+            and self.map.anchor_count() > 0
+            and bool((gaussian_scales > 0).any().detach().cpu())
+        )
+        pose_enabled = bool(self.optim_cfg.get("pose_refine_enable", False))
+        trainable_pose_ids = self._feedforward_trainable_pose_ids(current_keyframe_ids, pose_enabled=pose_enabled)
+        pose_params = [
+            self.pose_deltas[fid].delta
+            for fid in trainable_pose_ids
+            if fid in self.pose_deltas
+        ]
+        param_groups = self._map_param_groups(gaussian_enabled=gaussian_enabled, phase="feedforward_window")
+        if pose_params:
+            param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
+        if not param_groups:
+            return {
+                "loss": 0.0,
+                "steps": 0.0,
+                "window_size": float(len(observations)),
+                "feedforward_window_size": float(len(observations)),
+                "profile_backend_feedforward_window_sec": float(time.perf_counter() - total_start),
+            }
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)),
+        )
+        pose_prior_weight = float(self.optim_cfg.get("pose_prior_weight", 1e-3))
+        min_delta, patience = self._early_stop_options()
+        best = float("inf")
+        stale = 0
+        actual_steps = 0
+        last: dict[str, float] = {"loss": 0.0}
+        last_sampled_ids: list[int] = []
+        sample_sec = 0.0
+        render_loss_sec = 0.0
+        backward_step_sec = 0.0
+        for step_idx in range(max(0, steps)):
+            optimizer.zero_grad(set_to_none=True)
+            render_losses = []
+            metric_accum: dict[str, list[torch.Tensor]] = {}
+            section_start = time.perf_counter()
+            sampled = self._sample_observations_for_step(observations)
+            sample_sec += time.perf_counter() - section_start
+            last_sampled_ids = [int(obs.frame_id) for obs in sampled]
+            section_start = time.perf_counter()
+            for obs in sampled:
+                target = obs.image.to(device=device, dtype=dtype)
+                H, W = int(target.shape[-2]), int(target.shape[-1])
+                c2w = self._observation_pose(obs, trainable_pose_ids=trainable_pose_ids).to(device=device, dtype=dtype)
+                camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w)
+                pkg = self.renderer.render(camera, self.map)
+                sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
+                pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+                target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
+                depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
+                loss_i, metrics_i = backend_render_loss(
+                    pkg,
+                    target,
+                    target_depth=target_depth,
+                    depth_confidence=depth_confidence,
+                    weights=self.loss_weights,
+                )
+                if sky_mask is not None:
+                    metrics_i = dict(metrics_i)
+                    metrics_i["skybox_mask_ratio"] = sky_mask.to(device=device, dtype=dtype).mean().detach()
+                render_losses.append(loss_i)
+                for key, value in metrics_i.items():
+                    metric_accum.setdefault(key, []).append(value.detach())
+            if not render_losses:
+                break
+            render_loss_sec += time.perf_counter() - section_start
+            loss = torch.stack(render_losses).mean()
+            if pose_params and pose_prior_weight > 0.0:
+                prior = torch.stack([param.square().mean() for param in pose_params]).mean()
+                loss = loss + pose_prior_weight * prior
+            if loss.requires_grad:
+                section_start = time.perf_counter()
+                loss.backward()
+                if gaussian_enabled and gaussian_scales is not None:
+                    self._apply_gaussian_grad_scales(gaussian_scales)
+                optimizer.step()
+                backward_step_sec += time.perf_counter() - section_start
+            actual_steps = step_idx + 1
+            last = {
+                key: float(torch.stack(values).mean().detach().cpu())
+                for key, values in metric_accum.items()
+                if values
+            }
+            last["loss"] = float(loss.detach().cpu())
+            current = float(last["loss"])
+            if min_delta > 0.0 and patience > 0:
+                if current < best - min_delta:
+                    best = current
+                    stale = 0
+                else:
+                    stale += 1
+                    if stale >= patience:
+                        last["early_stop_step"] = float(actual_steps)
+                        break
+        active_mask = None
+        if self.map.anchor_count() > 0:
+            active_mask = self._active_anchor_mask_for_keyframes(selected_keyframe_ids)
+        prune_stats = self._maybe_prune_feedforward_window(
+            observations,
+            active_mask=active_mask,
+            selected_keyframe_ids=selected_keyframe_ids,
+        )
+        pose_norm = self._pose_delta_norm(trainable_pose_ids)
+        total_sec = float(time.perf_counter() - total_start)
+        last["steps"] = float(actual_steps)
+        last["pose_delta_norm"] = pose_norm
+        last["window_size"] = float(len(observations))
+        last["feedforward_window_size"] = float(len(observations))
+        last["feedforward_keyframe_count"] = float(len(selected_keyframe_ids))
+        last["sampled_window_size"] = float(len(last_sampled_ids))
+        last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
+        last["trainable_pose_count"] = float(len(trainable_pose_ids))
+        last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
+        last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
+        last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
+        last["profile_backend_feedforward_window_sec"] = total_sec
+        last["profile_backend_feedforward_window_step_avg_sec"] = total_sec / max(1, actual_steps)
+        last["profile_backend_feedforward_window_sample_sec"] = float(sample_sec)
+        last["profile_backend_feedforward_window_render_loss_sec"] = float(render_loss_sec)
+        last["profile_backend_feedforward_window_backward_step_sec"] = float(backward_step_sec)
+        self.stats.last_loss = float(last.get("loss", 0.0))
+        self.stats.last_phase = "feedforward_window"
+        self.stats.last_pose_delta_norm = pose_norm
+        self.stats.last_window_size = int(len(observations))
+        self.stats.last_window_observations = [int(obs.frame_id) for obs in observations]
+        self.stats.last_window_keyframes = list(selected_keyframe_ids)
+        self.stats.last_feedforward_current_frames = [int(fid) for fid in current_frame_ids or []]
+        hist_limit = max(0, int(cfg.get("history_keyframes", 2)))
+        self.stats.last_feedforward_history_frames = [int(fid) for fid in (history_frame_ids or [])][-hist_limit:]
+        self.stats.last_sampled_keyframes = list(last_sampled_ids)
+        self.stats.last_trainable_pose_count = int(len(trainable_pose_ids))
+        self.stats.last_feedforward_opacity_resets = int(prune_stats.get("opacity_resets", 0))
+        self.stats.last_feedforward_pruned = int(prune_stats.get("pruned", 0))
+        self.stats.optimization_steps += int(actual_steps)
+        return last
+
+    def _feedforward_window_ids(self, current_frame_ids, history_frame_ids=None) -> list[int]:
+        cfg = self._feedforward_window_cfg()
+        hist_limit = max(0, int(cfg.get("history_keyframes", 2)))
+        ids: list[int] = []
+        history = [] if history_frame_ids is None else [int(fid) for fid in history_frame_ids]
+        current = [] if current_frame_ids is None else [int(fid) for fid in current_frame_ids]
+        for fid in history[-hist_limit:] if hist_limit > 0 else []:
+            if fid not in ids:
+                ids.append(fid)
+        for fid in current:
+            if fid not in ids:
+                ids.append(fid)
+        return ids
+
+    def _selected_observations_for_ids(self, frame_ids: list[int]) -> list[MapperObservation]:
+        selected: list[MapperObservation] = []
+        for fid in frame_ids:
+            obs = self.observations.get(int(fid))
+            if obs is not None:
+                selected.append(obs)
+        return selected
+
+    def _feedforward_keyframe_ids(self, frame_ids) -> list[int]:
+        registered = {int(kf.frame_id) for kf in self.keyframes}
+        ids: list[int] = []
+        for fid in frame_ids or []:
+            value = int(fid)
+            if value in registered and value not in ids:
+                ids.append(value)
+        return ids
+
+    def _feedforward_trainable_pose_ids(self, current_keyframe_ids: list[int], *, pose_enabled: bool) -> set[int]:
+        if not pose_enabled:
+            return set()
+        return {int(fid) for fid in current_keyframe_ids if int(fid) in self.pose_deltas}
+
+    def _active_anchor_mask_for_keyframes(self, keyframe_ids: list[int]) -> torch.Tensor:
+        n = self.map.anchor_count()
+        device = self.map.get_xyz.device
+        if n <= 0 or not keyframe_ids:
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        birth = self.map._anchor_birth_frame.to(device=device)
+        mask = torch.zeros(n, dtype=torch.bool, device=device)
+        for fid in keyframe_ids:
+            mask |= birth == int(fid)
+        return mask
+
+    def _feedforward_gaussian_scales(self, selected_keyframe_ids: list[int]) -> torch.Tensor | None:
+        if not bool(self.optim_cfg.get("gaussian_refine_enable", True)):
+            return None
+        n = self.map.anchor_count()
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        scales = torch.zeros(n, device=device, dtype=dtype)
+        if n <= 0:
+            return scales
+        cfg = self._feedforward_window_cfg()
+        scope = str(cfg.get("gaussian_scope", "selected_birth_keyframes")).lower()
+        if scope == "all":
+            scales.fill_(float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("existing_gaussian_lr_scale", 0.1))))
+            return scales
+        active = self._active_anchor_mask_for_keyframes(selected_keyframe_ids)
+        scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
+        return scales
+
+    def _sample_observations_for_step(self, observations: list[MapperObservation]) -> list[MapperObservation]:
+        cfg = self._feedforward_window_cfg()
+        random_window = bool(cfg.get("random_observation_per_iter", False))
+        if random_window and len(observations) > 1:
+            sample_n = max(1, int(cfg.get("sample_observations_per_step", self.optim_cfg.get("sample_keyframes_per_step", 1))))
+            return random.sample(observations, min(sample_n, len(observations)))
+        return list(observations)
+
+    def _observation_pose(self, obs: MapperObservation, *, trainable_pose_ids: set[int]) -> torch.Tensor:
+        pose_delta = self.pose_deltas.get(int(obs.frame_id))
+        if pose_delta is None:
+            return obs.pose_c2w.detach()
+        if int(obs.frame_id) in trainable_pose_ids:
+            return pose_delta()
+        return pose_delta().detach()
+
+    def _maybe_prune_feedforward_window(
+        self,
+        observations: list[MapperObservation],
+        *,
+        active_mask: torch.Tensor | None,
+        selected_keyframe_ids: list[int],
+    ) -> dict[str, int]:
+        cfg = self._feedforward_window_cfg()
+        prune_cfg = cfg.get("prune", {}) if isinstance(cfg, dict) else {}
+        prune_cfg = prune_cfg if isinstance(prune_cfg, dict) else {}
+        stats = {"opacity_resets": 0, "pruned": 0}
+        if not bool(prune_cfg.get("enabled", False)):
+            return stats
+        n = self.map.anchor_count()
+        if n <= 0 or active_mask is None or int(active_mask.numel()) != n or not bool(active_mask.any()):
+            return stats
+        with torch.no_grad():
+            for obs in observations:
+                self._accumulate_feedforward_prune_evidence(obs, active_mask=active_mask)
+            device = self.map.get_xyz.device
+            active_cpu = active_mask.detach().cpu().bool()
+            outlier = self.map._anchor_outlier_obs[:n].detach().cpu().float()
+            inlier = self.map._anchor_inlier_obs[:n].detach().cpu().float()
+            seen = outlier + inlier
+            bad_ratio = outlier / seen.clamp_min(1.0)
+            reset_after = max(0, int(prune_cfg.get("reset_after_bad", 3)))
+            prune_after = max(0, int(prune_cfg.get("prune_after_bad", 6)))
+            min_seen = max(1, int(prune_cfg.get("min_seen", 2)))
+            min_bad_ratio = float(prune_cfg.get("min_bad_ratio", 0.7))
+            max_inlier_count = max(0, int(prune_cfg.get("max_inlier_count", 1)))
+            opacity_after_reset = max(1.0e-5, min(1.0 - 1.0e-5, float(prune_cfg.get("opacity_after_reset", 0.01))))
+            current_opacity = self.map.get_opacity.detach().cpu().view(-1)
+            reset_rows = torch.zeros(0, dtype=torch.long)
+            if reset_after > 0:
+                reset_rows = torch.nonzero(
+                    active_cpu
+                    & (outlier >= float(reset_after))
+                    & (bad_ratio >= min_bad_ratio)
+                    & (current_opacity > opacity_after_reset * 1.5),
+                    as_tuple=False,
+                ).flatten()
+                if reset_rows.numel() > 0:
+                    rows_dev = reset_rows.to(device=device)
+                    low_opacity = torch.full(
+                        (int(rows_dev.numel()), 1),
+                        opacity_after_reset,
+                        device=device,
+                        dtype=self.map.get_xyz.dtype,
+                    )
+                    self.map.opacity_logit.data[rows_dev] = torch.minimum(
+                        self.map.opacity_logit.data[rows_dev],
+                        self.map._inv_sigmoid(low_opacity),
+                    )
+                    stats["opacity_resets"] = int(reset_rows.numel())
+            if prune_after > 0:
+                reset_set = set(int(row) for row in reset_rows.tolist())
+                prune_rows = torch.nonzero(
+                    active_cpu
+                    & (outlier >= float(prune_after))
+                    & (seen >= float(min_seen))
+                    & (bad_ratio >= min_bad_ratio)
+                    & (inlier <= float(max_inlier_count)),
+                    as_tuple=False,
+                ).flatten()
+                if reset_set:
+                    keep_rows = [int(row) for row in prune_rows.tolist() if int(row) not in reset_set]
+                    prune_rows = torch.tensor(keep_rows, dtype=torch.long)
+                max_prune = max(0, int(prune_cfg.get("max_prune_per_window", cfg.get("max_prune_per_window", 500))))
+                if max_prune > 0 and prune_rows.numel() > max_prune:
+                    order = torch.argsort(outlier[prune_rows], descending=True)
+                    prune_rows = prune_rows.index_select(0, order[:max_prune])
+                if prune_rows.numel() > 0:
+                    prune_mask = torch.zeros(n, dtype=torch.bool)
+                    prune_mask[prune_rows] = True
+                    stats["pruned"] = self.map.prune_anchors(prune_mask.to(device=device))
+                    if stats["pruned"] > 0:
+                        self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+                        self.stats.n_anchors = self.map.anchor_count()
+                        self._rebuild_keyframe_ranges_from_birth_frames()
+                        self.last_inserted_range = self._range_for_latest_keyframe()
+        if stats["opacity_resets"] or stats["pruned"]:
+            self.stats.notes.append(
+                (
+                    "feedforward prune: "
+                    f"window_keyframes={list(int(fid) for fid in selected_keyframe_ids)}, "
+                    f"opacity_resets={stats['opacity_resets']}, pruned={stats['pruned']}"
+                )
+            )
+        return stats
+
+    def _accumulate_feedforward_prune_evidence(
+        self,
+        obs: MapperObservation,
+        *,
+        active_mask: torch.Tensor,
+    ) -> None:
+        n = self.map.anchor_count()
+        if n <= 0 or int(active_mask.numel()) != n:
+            return
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        target = obs.image.to(device=device, dtype=dtype)
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        c2w = self._observation_pose(obs, trainable_pose_ids=set()).to(device=device, dtype=dtype)
+        camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w)
+        pkg = self.renderer.render(camera, self.map)
+        sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
+        pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+        visibility = pkg.get("visibility_filter")
+        visible = active_mask.detach().to(device=device, dtype=torch.bool)
+        if torch.is_tensor(visibility) and int(visibility.numel()) == n:
+            visible = visible & visibility.to(device=device, dtype=torch.bool).view(-1)
+        rows = torch.nonzero(visible, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return
+        xyz = self.map.get_xyz.detach()
+        w2c = torch.linalg.inv(c2w)
+        xyz_h = torch.cat([xyz.index_select(0, rows), torch.ones(rows.numel(), 1, device=device, dtype=dtype)], dim=1)
+        cam = (w2c @ xyz_h.T).T[:, :3]
+        dist = torch.linalg.norm(cam, dim=-1)
+        valid = dist > 1.0e-6
+        if not bool(valid.any()):
+            return
+        rows = rows.index_select(0, torch.nonzero(valid, as_tuple=False).flatten())
+        cam = cam[valid]
+        pixels = bearing_to_erp_pixel(cam, H, W)
+        ui = pixels[:, 0].round().long().remainder(W)
+        vi = pixels[:, 1].round().long().clamp(0, H - 1)
+        sky_bad = torch.zeros(rows.shape[0], device=device, dtype=torch.bool)
+        non_sky = torch.ones(rows.shape[0], device=device, dtype=torch.bool)
+        if sky_mask is not None:
+            sky = sky_mask.to(device=device, dtype=torch.bool)[0, vi, ui]
+            sky_bad = sky
+            non_sky = ~sky
+        depth_bad = torch.zeros_like(sky_bad)
+        render_depth = pkg.get("depth")
+        if torch.is_tensor(render_depth) and obs.target_depth is not None:
+            prune_cfg = self._feedforward_window_cfg().get("prune", {})
+            prune_cfg = prune_cfg if isinstance(prune_cfg, dict) else {}
+            target_depth = obs.target_depth.to(device=device, dtype=dtype)
+            if tuple(target_depth.shape[-2:]) != (H, W):
+                target_depth = F.interpolate(target_depth.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+            rd = render_depth.to(device=device, dtype=dtype)
+            td = target_depth.to(device=device, dtype=dtype)
+            alpha = pkg.get("alpha", pkg.get("opacity"))
+            if not torch.is_tensor(alpha):
+                alpha = torch.ones_like(rd)
+            valid_depth = torch.isfinite(td) & torch.isfinite(rd) & (td > 1.0e-6) & (rd > 1.0e-6)
+            scale, shift = self._robust_depth_scale_shift(
+                td,
+                rd,
+                valid_depth & (alpha.to(device=device, dtype=dtype) >= self.pfgs360_render_alpha_min),
+            )
+            aligned = (td * scale + shift).clamp_min(1.0e-6)
+            rel = (aligned - rd).abs() / torch.maximum(aligned, rd).clamp_min(1.0e-6)
+            depth_threshold = float(prune_cfg.get("depth_rel_threshold", self.pfgs360_render_depth_rel_threshold))
+            depth_bad = (rel[0, vi, ui] > depth_threshold) & non_sky
+        render = pkg.get("render")
+        photo_bad = torch.zeros_like(sky_bad)
+        if torch.is_tensor(render):
+            prune_cfg = self._feedforward_window_cfg().get("prune", {})
+            prune_cfg = prune_cfg if isinstance(prune_cfg, dict) else {}
+            photo_error = (render.to(device=device, dtype=dtype) - target).abs().mean(dim=0)
+            photo_threshold = float(prune_cfg.get("photo_error_threshold", self.pfgs360_photometric_error_threshold))
+            photo_bad = (photo_error[vi, ui] > photo_threshold) & non_sky
+        bad = sky_bad | depth_bad | photo_bad
+        inlier = (~bad) & non_sky
+        rows_cpu = rows.detach().cpu()
+        bad_cpu = bad.detach().cpu()
+        inlier_cpu = inlier.detach().cpu()
+        if bool(bad_cpu.any()):
+            self.map._anchor_outlier_obs[rows_cpu[bad_cpu]] += 1
+            self.map._anchor_last_seen_kf[rows_cpu[bad_cpu]] = int(obs.frame_id)
+        if bool(inlier_cpu.any()):
+            self.map._anchor_inlier_obs[rows_cpu[inlier_cpu]] += 1
+
+    def _rebuild_keyframe_ranges_from_birth_frames(self) -> None:
+        birth = self.map._anchor_birth_frame.detach().cpu().long()
+        for keyframe in self.keyframes:
+            rows = torch.nonzero(birth == int(keyframe.frame_id), as_tuple=False).flatten()
+            if rows.numel() == 0:
+                keyframe.gaussian_start = 0
+                keyframe.gaussian_end = 0
+            else:
+                keyframe.gaussian_start = int(rows.min().item())
+                keyframe.gaussian_end = int(rows.max().item()) + 1
+
+    def _range_for_latest_keyframe(self) -> tuple[int, int]:
+        if not self.keyframes:
+            return (0, 0)
+        latest = self.keyframes[-1]
+        return (int(latest.gaussian_start), int(latest.gaussian_end))
+
     def optimize_after_keyframe(self) -> dict[str, float]:
         """Run local and sliding-window joint Gaussian/pose optimization."""
+        if self.feedforward_window_enabled:
+            return {}
         if not self.uses_joint_optimization or not self.keyframes:
             return {}
         total_start = time.perf_counter()
@@ -1660,6 +2210,8 @@ class PanoGaussianMapper:
         steps: int,
         phase: str = "non_keyframe",
     ) -> dict[str, float]:
+        if self.feedforward_window_enabled:
+            return {"loss": 0.0, "steps": 0.0}
         if (self.map.anchor_count() == 0 and not self.map.has_skybox) or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
         total_start = time.perf_counter()
@@ -1722,6 +2274,8 @@ class PanoGaussianMapper:
 
     def finalize_optimization(self) -> dict[str, float]:
         """Run low-frequency global polish after the sequence/block is complete."""
+        if self.feedforward_window_enabled and not bool(self._feedforward_window_cfg().get("allow_final_global", False)):
+            return {}
         if not self.uses_joint_optimization or not self.keyframes:
             return {}
         steps = int(self.optim_cfg.get("final_global_steps", 0))

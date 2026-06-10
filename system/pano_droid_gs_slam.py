@@ -1468,6 +1468,7 @@ class PanoDroidGSSlamSystem:
 
             self._delegate = PanoVGGTLegacyOnlineSlamSystem(config)
             return
+        self._apply_feedforward_window_frontend_defaults(config)
         self.frontend = build_frontend_from_config(config)
         mapping_cfg = config.get("Mapping", {})
         frontend_mode = str(config.get("Frontend", {}).get("mode", "graph")).lower()
@@ -1502,6 +1503,25 @@ class PanoDroidGSSlamSystem:
             renderer=self.renderer,
             lr=float(config.get("Mapping", {}).get("lr", 2e-3)),
         )
+
+    @staticmethod
+    def _apply_feedforward_window_frontend_defaults(config: dict) -> None:
+        frontend_mode = str(config.get("Frontend", {}).get("mode", "graph")).lower()
+        if frontend_mode != "panovggt_long":
+            return
+        backend_cfg = config.get("BackendOptimization", {})
+        if not isinstance(backend_cfg, dict):
+            return
+        ff_cfg = backend_cfg.get("FeedForwardWindow", {})
+        if not isinstance(ff_cfg, dict) or not bool(ff_cfg.get("enabled", False)):
+            return
+        history_keyframes = max(0, int(ff_cfg.get("history_keyframes", 2)))
+        pano_cfg = config.setdefault("PanoVGGT", {})
+        if not isinstance(pano_cfg, dict):
+            return
+        joint_cfg = pano_cfg.setdefault("JointInference", {})
+        if isinstance(joint_cfg, dict):
+            joint_cfg["max_history_frames"] = history_keyframes
 
     def _backend_feedback_cfg(self) -> dict:
         cfg = self.config.get("BackendFeedback", {})
@@ -1644,6 +1664,9 @@ class PanoDroidGSSlamSystem:
         bootstrap_steps = int(bootstrap_cfg.get("first_keyframe_steps", 0))
         bootstrap_save_every = max(1, int(bootstrap_cfg.get("save_every", 25)))
         backend_cfg = self.config.get("BackendOptimization", {})
+        feedforward_cfg = backend_cfg.get("FeedForwardWindow", {}) if isinstance(backend_cfg, dict) else {}
+        feedforward_cfg = feedforward_cfg if isinstance(feedforward_cfg, dict) else {}
+        feedforward_window_enabled = bool(feedforward_cfg.get("enabled", False))
         non_keyframe_steps = int(backend_cfg.get("non_keyframe_steps", 0))
         pano_cfg = self.config.get("PanoVGGT", {})
         keyframe_anchor_cfg = pano_cfg.get("KeyframeAnchor", {}) if isinstance(pano_cfg, dict) else {}
@@ -1662,6 +1685,7 @@ class PanoDroidGSSlamSystem:
         backend_feedback_decision_count = 0
         backend_feedback_applied_count = 0
         last_profiled_frontend_chunk: int | None = None
+        last_feedforward_metrics: dict = {}
         frame_cache: dict[int, PanoFrame] = {}
         frame_count = 0
         keyframes = 0
@@ -1725,6 +1749,92 @@ class PanoDroidGSSlamSystem:
                 return 0
             return int(apply_updates(updates))
 
+        def feedforward_debug_window(output_ids: list[int]) -> tuple[list[int], list[int]]:
+            debug = getattr(self.frontend, "last_m3_debug", None)
+            current_ids: list[int] = []
+            history_ids: list[int] = []
+            if isinstance(debug, dict):
+                current_ids.extend(int(fid) for fid in debug.get("frame_ids", ()) if fid is not None)
+                history_ids.extend(int(fid) for fid in debug.get("recent_history_ids", ()) if fid is not None)
+            if not current_ids:
+                current_ids.extend(int(fid) for fid in output_ids)
+            history_limit = max(0, int(feedforward_cfg.get("history_keyframes", 2)))
+            return current_ids, history_ids[-history_limit:] if history_limit > 0 else []
+
+        def register_cached_feedforward_observations(current_ids: list[int], history_ids: list[int]) -> int:
+            pose_by_frame = getattr(self.frontend, "pose_by_frame", {})
+            depth_by_frame = getattr(self.frontend, "depth_by_frame", {})
+            conf_by_frame = getattr(self.frontend, "conf_by_frame", {})
+            registered_keyframes = {int(kf.frame_id) for kf in self.mapper.keyframes}
+            count = 0
+            for frame_id in [*history_ids, *current_ids]:
+                fid = int(frame_id)
+                if fid in self.mapper.observations:
+                    continue
+                source_frame = frame_cache.get(fid)
+                if source_frame is None:
+                    continue
+                pose = pose_by_frame.get(fid) if isinstance(pose_by_frame, dict) else None
+                inv = depth_by_frame.get(fid) if isinstance(depth_by_frame, dict) else None
+                conf = conf_by_frame.get(fid) if isinstance(conf_by_frame, dict) else None
+                if pose is None or inv is None:
+                    continue
+                self.mapper.register_observation_values(
+                    frame_id=fid,
+                    image=source_frame.image,
+                    c2w=pose,
+                    inverse_depth=inv,
+                    depth_confidence=conf,
+                    is_keyframe=fid in registered_keyframes,
+                )
+                count += 1
+            return count
+
+        def optimize_feedforward_after_batch(outputs: list[FrontendOutput]) -> None:
+            nonlocal backend_feedback_decision_count, backend_feedback_applied_count, last_feedforward_metrics
+            if not feedforward_window_enabled or not outputs:
+                return
+            output_ids = [int(out.frame_id) for out in outputs]
+            current_ids, history_ids = feedforward_debug_window(output_ids)
+            section_start = time.perf_counter()
+            registered_count = register_cached_feedforward_observations(current_ids, history_ids)
+            register_sec = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
+            metrics = self.mapper.optimize_feedforward_window(
+                current_frame_ids=current_ids,
+                history_frame_ids=history_ids,
+            )
+            optimize_sec = float(time.perf_counter() - section_start)
+            if not metrics:
+                return
+            last_feedforward_metrics = dict(metrics)
+            section_start = time.perf_counter()
+            feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
+            feedback_collect_sec = float(time.perf_counter() - section_start)
+            for feedback_decision in feedback_decisions:
+                if feedback_file is not None:
+                    feedback_file.write(json.dumps(feedback_decision, sort_keys=True) + "\n")
+                    feedback_file.flush()
+                backend_feedback_decision_count += 1
+            section_start = time.perf_counter()
+            backend_feedback_applied_count += self._apply_backend_feedback_updates(feedback_updates)
+            feedback_apply_sec = float(time.perf_counter() - section_start)
+            write_profile(
+                "backend_feedforward_window",
+                current_frame_count=float(len(current_ids)),
+                history_frame_count=float(len(history_ids)),
+                registered_cached_observations=float(registered_count),
+                register_sec=register_sec,
+                optimize_sec=optimize_sec,
+                feedback_collect_sec=feedback_collect_sec,
+                feedback_apply_sec=feedback_apply_sec,
+                **{
+                    key: float(value)
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and str(key).startswith("profile_")
+                },
+            )
+
         def process_output(out) -> None:
             nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
             nonlocal last_profiled_frontend_chunk
@@ -1742,6 +1852,10 @@ class PanoDroidGSSlamSystem:
                 output_profile["total_sec"] = float(time.perf_counter() - process_start)
                 write_profile("process_output", **output_profile)
                 return
+            if feedforward_window_enabled and out.inverse_depth is not None:
+                section_start = time.perf_counter()
+                self.mapper.register_observation(out, source_frame.image, is_keyframe=bool(out.is_keyframe))
+                output_profile["mapper_register_observation_sec"] = float(time.perf_counter() - section_start)
             output_wandb_step = max(1, int(logger._step) + 1)
             frontend_profile = getattr(self.frontend, "last_profile", None)
             if isinstance(frontend_profile, dict):
@@ -1903,31 +2017,32 @@ class PanoDroidGSSlamSystem:
                                 self.mapper.stats.notes.append(
                                     f"frame {out.frame_id}: init skybox preview save failed: {exc!r}"
                         )
-                    else:
+                    elif not feedforward_window_enabled:
                         update_frontend_graph_window_hint(out)
                         section_start = time.perf_counter()
                         metrics = self.mapper.optimize_after_keyframe()
                         output_profile["backend_optimize_after_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                     backend_loss = metrics.get("loss")
-                    section_start = time.perf_counter()
-                    feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
-                    output_profile["backend_feedback_collect_sec"] = float(time.perf_counter() - section_start)
-                    for feedback_decision in feedback_decisions:
-                        if feedback_file is not None:
-                            feedback_file.write(json.dumps(feedback_decision, sort_keys=True) + "\n")
-                            feedback_file.flush()
-                        backend_feedback_decision_count += 1
-                    section_start = time.perf_counter()
-                    backend_feedback_applied_count += self._apply_backend_feedback_updates(feedback_updates)
-                    output_profile["backend_feedback_apply_sec"] = float(time.perf_counter() - section_start)
-                    try:
+                    if not feedforward_window_enabled:
                         section_start = time.perf_counter()
-                        keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
-                        output_profile["backend_keyframe_diagnostic_sec"] = float(time.perf_counter() - section_start)
-                    except Exception as exc:
-                        self.mapper.stats.notes.append(
-                            f"frame {out.frame_id}: keyframe optimized render failed: {exc!r}"
-                        )
+                        feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
+                        output_profile["backend_feedback_collect_sec"] = float(time.perf_counter() - section_start)
+                        for feedback_decision in feedback_decisions:
+                            if feedback_file is not None:
+                                feedback_file.write(json.dumps(feedback_decision, sort_keys=True) + "\n")
+                                feedback_file.flush()
+                            backend_feedback_decision_count += 1
+                        section_start = time.perf_counter()
+                        backend_feedback_applied_count += self._apply_backend_feedback_updates(feedback_updates)
+                        output_profile["backend_feedback_apply_sec"] = float(time.perf_counter() - section_start)
+                        try:
+                            section_start = time.perf_counter()
+                            keyframe_opt_diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
+                            output_profile["backend_keyframe_diagnostic_sec"] = float(time.perf_counter() - section_start)
+                        except Exception as exc:
+                            self.mapper.stats.notes.append(
+                                f"frame {out.frame_id}: keyframe optimized render failed: {exc!r}"
+                            )
                 elif refine_steps > 0:
                     section_start = time.perf_counter()
                     metrics = self.mapper.refine_on_keyframe(
@@ -1937,7 +2052,11 @@ class PanoDroidGSSlamSystem:
                     )
                     output_profile["backend_refine_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                     backend_loss = metrics.get("loss")
-            elif self.mapper.uses_joint_optimization and non_keyframe_steps > 0:
+            elif (
+                self.mapper.uses_joint_optimization
+                and non_keyframe_steps > 0
+                and not feedforward_window_enabled
+            ):
                 section_start = time.perf_counter()
                 metrics = self.mapper.optimize_frame_observation(
                     image=source_frame.image,
@@ -2073,6 +2192,7 @@ class PanoDroidGSSlamSystem:
                 pop_ready_sec = float(time.perf_counter() - section_start)
                 for ready in outputs:
                     process_output(ready)
+                optimize_feedforward_after_batch(outputs)
                 write_profile(
                     "input_frame",
                     frame_id=int(frame.frame_id),
@@ -2087,9 +2207,12 @@ class PanoDroidGSSlamSystem:
             if callable(flush):
                 section_start = time.perf_counter()
                 flushed = 0
+                flushed_outputs = []
                 for ready in flush():
                     flushed += 1
+                    flushed_outputs.append(ready)
                     process_output(ready)
+                optimize_feedforward_after_batch(flushed_outputs)
                 write_profile("frontend_flush", flushed_outputs=float(flushed), total_sec=float(time.perf_counter() - section_start))
 
             section_start = time.perf_counter()
@@ -2123,8 +2246,14 @@ class PanoDroidGSSlamSystem:
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_last_window_size": self.mapper.stats.last_window_size,
                 "backend_last_window_keyframes": self.mapper.stats.last_window_keyframes,
+                "backend_last_window_observations": self.mapper.stats.last_window_observations,
+                "backend_last_feedforward_current_frames": self.mapper.stats.last_feedforward_current_frames,
+                "backend_last_feedforward_history_frames": self.mapper.stats.last_feedforward_history_frames,
                 "backend_last_sampled_keyframes": self.mapper.stats.last_sampled_keyframes,
                 "backend_last_trainable_pose_count": self.mapper.stats.last_trainable_pose_count,
+                "backend_last_feedforward_opacity_resets": self.mapper.stats.last_feedforward_opacity_resets,
+                "backend_last_feedforward_pruned": self.mapper.stats.last_feedforward_pruned,
+                "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,
                 "backend_final_trajectory_png": final_backend_traj,
                 "artifacts": final_artifacts,
