@@ -95,6 +95,22 @@ def _resize_nearest(field: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     return F.interpolate(field.unsqueeze(0).float(), size=size, mode="nearest")[0]
 
 
+def _resize_scalar_map(field: torch.Tensor | None, size: tuple[int, int]) -> torch.Tensor | None:
+    if field is None:
+        return None
+    tensor = field.detach().float()
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim == 3:
+        if int(tensor.shape[0]) != 1:
+            tensor = tensor[:1]
+    else:
+        return None
+    if tuple(tensor.shape[-2:]) == tuple(size):
+        return tensor[0]
+    return _resize_field(tensor, size)[0]
+
+
 def _resize_points(points: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     if tuple(points.shape[:2]) == tuple(size):
         return points
@@ -1065,6 +1081,29 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         corrected = (correction.to(device=flat.device, dtype=flat.dtype) @ hom.T).T[:, :3]
         return corrected.reshape_as(points)
 
+    def _alignment_confidence(
+        self,
+        pred: PanoVGGTLocalPrediction,
+        local_idx: int,
+        point_hw: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        conf = _resize_scalar_map(pred.confidence[int(local_idx)], point_hw)
+        if conf is None:
+            conf = torch.ones(point_hw, device=device, dtype=dtype)
+        else:
+            conf = conf.to(device=device, dtype=dtype)
+
+        alignment_cfg = self.m3_config.alignment
+        if bool(self.m3_config.enabled and alignment_cfg.exclude_sky) and pred.sky_prob is not None:
+            sky = _resize_scalar_map(pred.sky_prob[int(local_idx)], point_hw)
+            if sky is not None:
+                non_sky = sky.to(device=device) <= float(alignment_cfg.sky_threshold)
+                conf = conf * non_sky.to(dtype=dtype)
+        return conf
+
     def _align_chunk(
         self,
         pred: PanoVGGTLocalPrediction,
@@ -1133,7 +1172,13 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 if target is None:
                     continue
                 source = pred.chunk_world_points[local_idx].to(target.device)
-                conf = pred.confidence[local_idx, 0].to(target.device)
+                conf = self._alignment_confidence(
+                    pred,
+                    local_idx,
+                    tuple(int(v) for v in source.shape[:2]),
+                    device=target.device,
+                    dtype=source.dtype,
+                )
                 src, tgt, weights = sample_overlap_points(
                     source,
                     target,
@@ -1155,9 +1200,13 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 source = history_pred.chunk_world_points[hist_idx].to(target_t)
                 if tuple(source.shape[:2]) != tuple(target_t.shape[:2]):
                     source = _resize_points(source, tuple(int(v) for v in target_t.shape[:2]))
-                conf = history_pred.confidence[hist_idx, 0].to(target_t.device)
-                if tuple(conf.shape[-2:]) != tuple(source.shape[:2]):
-                    conf = _resize_field(conf.unsqueeze(0), tuple(int(v) for v in source.shape[:2]))[0]
+                conf = self._alignment_confidence(
+                    history_pred,
+                    hist_idx,
+                    tuple(int(v) for v in source.shape[:2]),
+                    device=target_t.device,
+                    dtype=source.dtype,
+                )
                 src, tgt, weights = sample_overlap_points(
                     source,
                     target_t,

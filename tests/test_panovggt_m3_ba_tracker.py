@@ -949,6 +949,41 @@ def test_alignment_can_disable_common_history_and_use_only_overlap_points():
     assert tracker.last_alignment_debug.history_points == 0
 
 
+def test_alignment_excludes_sky_pixels_from_overlap_sim3():
+    cfg = _anchor_cfg()
+    cfg["PanoVGGT"]["Alignment"] = {
+        "exclude_sky": True,
+        "sky_threshold": 0.5,
+    }
+    tracker = PanoVGGTLongTracker(
+        engine=_RecordingAnchorEngine(),
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=1,
+        overlap=0,
+        emit_delay=0,
+        max_alignment_points=8,
+        min_overlap_points=4,
+        max_align_rmse=0.05,
+        require_aligned_world_points=True,
+        emit_unaligned=False,
+    )
+    yy, xx = torch.meshgrid(torch.arange(2, dtype=torch.float32), torch.arange(4, dtype=torch.float32), indexing="ij")
+    target = torch.stack([xx, yy, torch.ones_like(xx)], dim=-1)
+    source = target.clone()
+    source[:, 2:] += torch.tensor([100.0, 100.0, 100.0])
+    pred = _prediction(feature_hw=(2, 4))
+    pred.chunk_world_points[0] = source
+    pred.sky_prob[0, 0, :, 2:] = 0.95
+    tracker.global_points_by_frame[7] = target.clone()
+
+    transform = tracker._align_chunk(pred, (7,))
+
+    assert transform.accepted
+    assert tracker.last_alignment_debug.overlap_points == 4
+    assert transform.residual < 1.0e-4
+
+
 def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
     engine = _RecordingAnchorEngine()
     tracker = _tracker_for_anchor_tests(engine)

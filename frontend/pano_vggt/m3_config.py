@@ -119,6 +119,8 @@ class AlignmentConfig:
 
     use_common_history: bool = False
     history_point_budget_ratio: float = 0.5
+    exclude_sky: bool = True
+    sky_threshold: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -370,6 +372,8 @@ def parse_m3_sphere_config(config: dict[str, Any]) -> M3SphereConfig:
     alignment = AlignmentConfig(
         use_common_history=bool(alignment_raw.get("use_common_history", False)),
         history_point_budget_ratio=float(alignment_raw.get("history_point_budget_ratio", 0.5)),
+        exclude_sky=bool(alignment_raw.get("exclude_sky", True)),
+        sky_threshold=float(alignment_raw.get("sky_threshold", keyframe_anchor.sky_threshold)),
     )
 
     return M3SphereConfig(

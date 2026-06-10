@@ -65,6 +65,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert default_cfg.dense_ba.optimize_depth is False
     assert default_cfg.dense_ba.history_keyframes == 8
     assert default_cfg.keyframe_anchor.enabled is False
+    assert default_cfg.alignment.exclude_sky is True
+    assert default_cfg.alignment.sky_threshold == 0.5
     assert default_cfg.keyframe_graph.enabled is False
     assert default_cfg.keyframe_graph.current_to_last_ba is True
     assert default_cfg.keyframe_graph.adjacent_edges is True
@@ -97,6 +99,7 @@ def test_m3_config_parser_defaults_and_explicit_values():
                     "history_keyframes": 3,
                     "residual_mode": "tangent",
                 },
+                "Alignment": {"exclude_sky": False, "sky_threshold": 0.6},
                 "InferenceWindow": {"size": 5, "overlap": 1, "temporal_radius": 3},
             }
         }
@@ -118,6 +121,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert cfg.keyframe_graph.window_keyframes == 6
     assert cfg.keyframe_graph.fixed_keyframes == 2
     assert cfg.keyframe_graph.publish_pose_updates is True
+    assert cfg.alignment.exclude_sky is False
+    assert cfg.alignment.sky_threshold == 0.6
     assert cfg.inference_window.size == 5
 
     file_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_gs_slam.yaml").read_text())
@@ -143,6 +148,8 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.joint_inference.max_history_frames == 3
     assert parsed_file.alignment.use_common_history is False
     assert parsed_file.alignment.history_point_budget_ratio == 0.0
+    assert parsed_file.alignment.exclude_sky is True
+    assert parsed_file.alignment.sky_threshold == 0.5
     assert parsed_file.keyframe_anchor.enabled is True
     assert parsed_file.keyframe_anchor.min_keyframe_interval == 4
     assert parsed_file.keyframe_anchor.max_keyframe_interval == 8

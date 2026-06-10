@@ -165,7 +165,7 @@ def sample_overlap_points(
         weights = weights * source_confidence.reshape(-1).to(weights)
     if target_confidence is not None:
         weights = weights * target_confidence.reshape(-1).to(weights)
-    finite = torch.isfinite(source).all(dim=1) & torch.isfinite(target).all(dim=1) & torch.isfinite(weights)
+    finite = torch.isfinite(source).all(dim=1) & torch.isfinite(target).all(dim=1) & torch.isfinite(weights) & (weights > 0)
     source = source[finite]
     target = target[finite]
     weights = weights[finite].clamp_min(0.0)
@@ -175,4 +175,3 @@ def sample_overlap_points(
         target = target[idx]
         weights = weights[idx]
     return source, target, weights
-
