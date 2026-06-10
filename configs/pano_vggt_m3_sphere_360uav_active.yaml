@@ -178,7 +178,7 @@ Mapping:
   BootstrapOptimization:
     enabled: true
     first_keyframe_steps: 300
-    save_every: 25
+    save_every: 300
 
 BackendOptimization:
   enabled: true
@@ -247,15 +247,17 @@ WeightsAndBiases:
   project: 360Droid-splat
   group: panovggt_m3_sphere_360uav
   run_name: panovggt_m3_sphere_active_seq1
-  log_every: 5
-  log_keyframes: true
+  log_every: 20
+  log_keyframes: false
+  runtime_log_preset: compact_slam
+  log_keyframe_inserted_gaussians: true
 
 Visualization:
   save_local: true
-  log_every: 5
-  m3_log_every: 5
+  log_every: 20
+  m3_log_every: 20
   m3_max_matches: 80
-  save_kf_opt: true
+  save_kf_opt: false
   kf_opt_log_every: 1
   kf_opt_max_width: 1920
 
@@ -265,9 +267,9 @@ Results:
   kf_jpeg_quality: 95
   save_final_ply: true
   save_final_checkpoint: true
-  save_final_keyframe_renders: true
+  save_final_keyframe_renders: false
   final_keyframe_render_stride: 1
   final_keyframe_render_max: 50
-  save_skybox_previews: true
+  save_skybox_previews: false
   skybox_preview_height: 256
   skybox_preview_width: 512

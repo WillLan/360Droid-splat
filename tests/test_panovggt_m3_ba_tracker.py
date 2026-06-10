@@ -1558,6 +1558,81 @@ def test_slam_logger_logs_keyframe_mapping_diagnostics_at_explicit_step(tmp_path
     assert "mapping/depth_insertion_need_pixels" in logged_keys
 
 
+def test_slam_logger_compact_wandb_keeps_depth_insertion_and_insert_count(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value)
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled", "runtime_log_preset": "compact_slam"},
+            "Visualization": {"save_local": True, "save_kf_opt": True},
+            "Results": {"kf_render_format": "png"},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+    logger._step = 4
+
+    logger.observe_keyframe_opt(
+        SimpleNamespace(
+            frame_id=3,
+            target=torch.rand(3, 4, 8),
+            render=torch.rand(3, 4, 8),
+            depth=torch.rand(1, 4, 8).clamp_min(0.1),
+            loss=0.125,
+            psnr=22.5,
+            anchor_count=42,
+            phase="local_submap",
+        ),
+        step=5,
+    )
+    logger.observe_keyframe_inserted_gaussians(frame_id=3, inserted_count=1234, step=5)
+
+    diagnostic = SimpleNamespace(
+        frame_id=3,
+        render_depth=torch.ones(1, 4, 8),
+        predicted_depth=torch.full((1, 4, 8), 1.2),
+        rel_depth_error=torch.full((1, 4, 8), 0.2),
+        missing_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_mismatch_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        render_bad_mask=torch.zeros(1, 4, 8, dtype=torch.bool),
+        depth_scale=1.0,
+        depth_shift=0.0,
+    )
+    diagnostic.depth_mismatch_mask[..., 1, 1] = True
+    diagnostic.render_bad_mask = diagnostic.depth_mismatch_mask
+    logger.observe_depth_insertion_diagnostic(
+        frame_id=3,
+        image=torch.zeros(3, 4, 8),
+        source_hw=(4, 8),
+        inserted_idx=torch.tensor([9]),
+        diagnostic=diagnostic,
+        stats={"kept": 1},
+        step=5,
+    )
+
+    logged_keys = set().union(*(payload.keys() for payload, _ in logger.run.logged))
+    assert "backend/kf_opt_loss" in logged_keys
+    assert "backend/kf_opt_psnr" in logged_keys
+    assert "backend/kf_render_opt" not in logged_keys
+    assert "backend/kf_depth_opt" not in logged_keys
+    assert "mapping/keyframe_inserted_gaussians" in logged_keys
+    assert "mapping/new_gaussians_inserted" in logged_keys
+    assert "mapping/depth_insertion" in logged_keys
+    assert "mapping/depth_insertion_need_pixels" in logged_keys
+    assert "mapping/depth_insertion_png" not in logged_keys
+
+
 def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):
     logger = SlamRuntimeLogger(
         {

@@ -163,8 +163,10 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert file_cfg["Dataset"]["erp_resize_height"] == 518
     assert file_cfg["Dataset"]["erp_resize_width"] == 1036
     assert file_cfg["Mapping"]["NovelGaussianInsertion"]["save_depth_insertion_visualization"] is True
-    assert file_cfg["RuntimeProfiling"]["enabled"] is True
+    assert file_cfg["RuntimeProfiling"]["enabled"] is False
     assert file_cfg["RuntimeProfiling"]["path"] == "runtime_profile.jsonl"
+    assert file_cfg["WeightsAndBiases"]["runtime_log_preset"] == "compact_slam"
+    assert file_cfg["WeightsAndBiases"]["log_keyframe_inserted_gaussians"] is True
 
     shadow_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_shadow.yaml").read_text())
     active_cfg = yaml.safe_load(Path("configs/pano_vggt_m3_sphere_360uav_active.yaml").read_text())
@@ -187,8 +189,9 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_shadow.dense_ba.factor_chunk_size == 512
     assert parsed_shadow.dense_ba.optimize_depth is False
     assert parsed_shadow.keyframe_anchor.enabled is True
-    assert shadow_cfg["Visualization"]["m3_log_every"] == 5
+    assert shadow_cfg["Visualization"]["m3_log_every"] == 20
     assert shadow_cfg["Visualization"]["m3_max_matches"] == 80
+    assert shadow_cfg["WeightsAndBiases"]["runtime_log_preset"] == "compact_slam"
     assert parsed_active.dense_ba.shadow_mode is False
     assert parsed_active.dense_ba.solver_mode == "pose_only_factor_graph"
     assert parsed_active.dense_ba.optimize_depth is False
