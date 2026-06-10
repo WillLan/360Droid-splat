@@ -49,6 +49,10 @@ class MapperStats:
     last_render_missing_pixels: int = 0
     last_render_depth_mismatch_pixels: int = 0
     last_render_bad_pixels: int = 0
+    last_missing_seed_candidates: int = 0
+    last_depth_mismatch_seed_candidates: int = 0
+    last_skipped_missing_budget: int = 0
+    last_skipped_depth_mismatch_budget: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -525,6 +529,7 @@ class PanoGaussianMapper:
         )
         self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
         self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
+        self.pfgs360_missing_alpha_min = float(novel_cfg.get("missing_alpha_min", self.pfgs360_render_alpha_min))
         self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.10))
         self.pfgs360_foreground_rel_threshold = float(novel_cfg.get("foreground_rel_threshold", 0.10))
         self.pfgs360_photometric_error_threshold = float(novel_cfg.get("photometric_error_threshold", 0.08))
@@ -536,6 +541,11 @@ class PanoGaussianMapper:
         self.pfgs360_max_prune_per_keyframe = max(0, int(novel_cfg.get("max_prune_per_keyframe", 500)))
         self.first_keyframe_max_seeds = int(novel_cfg.get("first_keyframe_max_seeds", 80000))
         self.keyframe_max_seeds = int(novel_cfg.get("keyframe_max_seeds", 30000))
+        self.max_missing_seeds_per_keyframe = int(novel_cfg.get("max_missing_seeds_per_keyframe", 0))
+        self.max_depth_mismatch_seeds_per_keyframe = int(
+            novel_cfg.get("max_depth_mismatch_seeds_per_keyframe", 0)
+        )
+        self.prioritize_depth_mismatch = bool(novel_cfg.get("prioritize_depth_mismatch", True))
         self.global_anchor_budget = int(novel_cfg.get("global_anchor_budget", 1500000))
         self.first_keyframe_voxel_neighbor_radius = max(
             0,
@@ -598,6 +608,14 @@ class PanoGaussianMapper:
         self.stats.last_render_missing_pixels = int(filter_stats.get("missing_pixels", 0))
         self.stats.last_render_depth_mismatch_pixels = int(filter_stats.get("depth_mismatch_pixels", 0))
         self.stats.last_render_bad_pixels = int(filter_stats.get("render_bad_pixels", 0))
+        self.stats.last_missing_seed_candidates = int(filter_stats.get("missing_seed_candidates", 0))
+        self.stats.last_depth_mismatch_seed_candidates = int(
+            filter_stats.get("depth_mismatch_seed_candidates", 0)
+        )
+        self.stats.last_skipped_missing_budget = int(filter_stats.get("skipped_missing_budget", 0))
+        self.stats.last_skipped_depth_mismatch_budget = int(
+            filter_stats.get("skipped_depth_mismatch_budget", 0)
+        )
         if image is not None:
             self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
         if n == 0:
@@ -715,25 +733,44 @@ class PanoGaussianMapper:
             "missing_pixels": 0,
             "depth_mismatch_pixels": 0,
             "render_bad_pixels": 0,
+            "missing_seed_candidates": 0,
+            "depth_mismatch_seed_candidates": 0,
+            "skipped_missing_budget": 0,
+            "skipped_depth_mismatch_budget": 0,
         }
         insert_enabled = (
             torch.ones(len(seeds), dtype=torch.bool)
             if seeds.insert_enabled is None
             else seeds.insert_enabled.detach().cpu().bool()
         )
+        depth_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
+        missing_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
         first_keyframe = self.stats.n_keyframes == 0 or self.map.anchor_count() == 0
         if not first_keyframe and frontend_output is not None and image is not None:
             image_hw = tuple(int(v) for v in image.shape[-2:])
             temporal_ok = self._seed_pixel_mask(seeds, insert_enabled, image_hw)
-            render_bad, evidence_stats = self._pfgs360_render_bad_mask(
+            render_masks, evidence_stats = self._pfgs360_render_bad_mask(
                 frontend_output,
                 image,
                 sky_mask=sky_mask,
                 temporal_ok=temporal_ok,
             )
             stats.update(evidence_stats)
-            if render_bad is not None:
-                insert_enabled &= self._sample_seed_mask(render_bad, seeds).detach().cpu().bool()
+            if render_masks is not None:
+                depth_seed_mask = (
+                    self._sample_seed_mask(render_masks["depth_mismatch"], seeds).detach().cpu().bool()
+                    & insert_enabled
+                )
+                missing_seed_mask = (
+                    self._sample_seed_mask(render_masks["missing"], seeds).detach().cpu().bool()
+                    & insert_enabled
+                )
+                if self.prioritize_depth_mismatch:
+                    missing_seed_mask &= ~depth_seed_mask
+                render_bad_seed_mask = depth_seed_mask | missing_seed_mask
+                stats["depth_mismatch_seed_candidates"] = int(depth_seed_mask.sum().item())
+                stats["missing_seed_candidates"] = int(missing_seed_mask.sum().item())
+                insert_enabled &= render_bad_seed_mask
 
         score = seeds.insert_score if seeds.insert_score is not None else seeds.confidence
         score_cpu = score.detach().cpu().float()
@@ -748,6 +785,10 @@ class PanoGaussianMapper:
         occupied = self._build_voxel_index()
         anchor_xyz_cpu = self.map.get_xyz.detach().cpu().float() if self.map.anchor_count() > 0 else torch.zeros(0, 3)
         kept: list[int] = []
+        kept_missing = 0
+        kept_depth_mismatch = 0
+        missing_budget = int(self.max_missing_seeds_per_keyframe)
+        depth_budget = int(self.max_depth_mismatch_seeds_per_keyframe)
         for seed_idx in order.tolist():
             key = (0, int(grid_cpu[seed_idx, 0]), int(grid_cpu[seed_idx, 1]), int(grid_cpu[seed_idx, 2]))
             hit, near_hit = self._find_pfgs360_hash_hit(
@@ -772,10 +813,24 @@ class PanoGaussianMapper:
             if not bool(insert_enabled[seed_idx]):
                 stats["suppressed_insert"] += 1
                 continue
+            is_depth_mismatch_seed = bool(depth_seed_mask[seed_idx])
+            is_missing_seed = bool(missing_seed_mask[seed_idx]) and not is_depth_mismatch_seed
+            if is_depth_mismatch_seed and depth_budget > 0 and kept_depth_mismatch >= depth_budget:
+                stats["skipped_depth_mismatch_budget"] += 1
+                stats["skipped_budget"] += 1
+                continue
+            if is_missing_seed and missing_budget > 0 and kept_missing >= missing_budget:
+                stats["skipped_missing_budget"] += 1
+                stats["skipped_budget"] += 1
+                continue
             if len(kept) >= budget:
                 stats["skipped_budget"] += 1
                 continue
             kept.append(int(seed_idx))
+            if is_depth_mismatch_seed:
+                kept_depth_mismatch += 1
+            elif is_missing_seed:
+                kept_missing += 1
             occupied[key] = -1
         if not kept:
             return self._empty_seed_like(seeds), stats
@@ -851,7 +906,7 @@ class PanoGaussianMapper:
         *,
         sky_mask: torch.Tensor | None,
         temporal_ok: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, dict[str, int]]:
+    ) -> tuple[dict[str, torch.Tensor] | None, dict[str, int]]:
         stats = {
             "outlier_resets": 0,
             "outlier_pruned": 0,
@@ -891,7 +946,8 @@ class PanoGaussianMapper:
             scale, shift = self._robust_depth_scale_shift(target_depth, render_depth, valid & (alpha >= self.pfgs360_render_alpha_min))
             aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
             valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
-            missing = (alpha < self.pfgs360_render_alpha_min) | (~valid_aligned)
+            missing_alpha_min = max(0.0, min(1.0, float(self.pfgs360_missing_alpha_min)))
+            missing = (alpha < missing_alpha_min) | (~valid_aligned)
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
             depth_mismatch = valid_aligned & (rel > self.pfgs360_render_depth_rel_threshold)
             render_bad = missing | depth_mismatch
@@ -912,7 +968,12 @@ class PanoGaussianMapper:
                 temporal_ok=temporal_ok,
             )
             stats.update(evidence_stats)
-            return render_bad.detach().cpu().bool(), stats
+            masks = {
+                "render_bad": render_bad.detach().cpu().bool(),
+                "missing": missing.detach().cpu().bool(),
+                "depth_mismatch": depth_mismatch.detach().cpu().bool(),
+            }
+            return masks, stats
 
     def _target_depth_from_output(
         self,

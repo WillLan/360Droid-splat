@@ -133,6 +133,24 @@ def test_submap_aligner_recovers_similarity_transform():
     assert torch.mean(torch.linalg.norm(aligned - target[8:], dim=-1)) < 1e-3
 
 
+def test_submap_aligner_accepts_borderline_residual_when_threshold_relaxed():
+    xs, ys = torch.meshgrid(torch.arange(4, dtype=torch.float32), torch.arange(4, dtype=torch.float32), indexing="ij")
+    source = torch.stack([xs.reshape(-1), ys.reshape(-1), torch.zeros(16)], dim=-1)
+    z_offset = torch.where((xs.reshape(-1).long() + ys.reshape(-1).long()) % 2 == 0, 0.3, -0.3)
+    target = source.clone()
+    target[:, 2] = z_offset
+
+    transform = SubmapAligner(
+        align_mode="sim3",
+        max_residual=0.35,
+        min_inlier_ratio=0.35,
+        min_points=4,
+    ).align(source, target, torch.ones(16))
+
+    assert transform.accepted
+    assert 0.25 < transform.residual <= 0.35
+
+
 def test_sample_overlap_points_keeps_high_confidence_matches():
     source = torch.zeros(1, 4, 4, 3)
     target = torch.ones(1, 4, 4, 3)

@@ -622,6 +622,59 @@ def test_joint_inference_uses_recent_history_keyframes_once():
     assert len(outputs) == 2
 
 
+def test_alignment_can_disable_common_history_and_use_only_overlap_points():
+    cfg = _anchor_cfg()
+    cfg["PanoVGGT"]["Alignment"] = {
+        "use_common_history": False,
+        "history_point_budget_ratio": 0.0,
+    }
+    tracker = PanoVGGTLongTracker(
+        engine=_RecordingAnchorEngine(),
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=1,
+        overlap=0,
+        emit_delay=0,
+        max_alignment_points=4,
+        min_overlap_points=4,
+        max_align_rmse=0.05,
+        require_aligned_world_points=True,
+        emit_unaligned=False,
+    )
+    target = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    pred = _prediction(feature_hw=(2, 2))
+    pred.chunk_world_points[0] = target
+    tracker.global_points_by_frame[7] = target.clone()
+    history_pred = _prediction(feature_hw=(2, 2))
+    history_pred.chunk_world_points[0] = target + 100.0
+    history_record = KeyframeRecord(
+        frame_id=3,
+        pose_c2w=torch.eye(4),
+        depth_low=torch.ones(1, 2, 2),
+        dense_descriptors=torch.ones(4, 2, 2),
+        match_confidence=torch.ones(1, 2, 2),
+        sky_prob=torch.zeros(1, 2, 2),
+        global_points=target - 100.0,
+    )
+
+    transform = tracker._align_chunk(
+        pred,
+        (7,),
+        history_pred=history_pred,
+        history_records=(history_record,),
+    )
+
+    assert transform.accepted
+    assert tracker.last_alignment_debug.overlap_points == 4
+    assert tracker.last_alignment_debug.history_points == 0
+
+
 def test_keyframe_anchor_reuses_overlap_keyframe_without_prepending():
     engine = _RecordingAnchorEngine()
     tracker = _tracker_for_anchor_tests(engine)
@@ -718,6 +771,49 @@ def test_keyframe_anchor_min_interval_suppresses_motion_only_keyframe():
     assert decision["keyframe_gap"] == 2
     assert decision["suppressed_by_min_keyframe_interval"] is True
     assert "translation_depth_ratio" in decision["suppressed_reasons"]
+
+
+def test_keyframe_anchor_gap_window_uses_m3_score_threshold():
+    tracker = _tracker_for_anchor_tests(
+        _RecordingAnchorEngine(),
+        anchor_overrides={
+            "min_keyframe_interval": 4,
+            "max_keyframe_interval": 8,
+            "m3_score_threshold": 0.43,
+            "frame_mean_pair_conf_threshold": 0.0,
+            "frame_low_pair_conf_ratio": 1.1,
+            "translation_threshold": 99.0,
+            "translation_depth_ratio_threshold": 99.0,
+        },
+    )
+    tracker.last_keyframe_id = 0
+    tracker.last_keyframe_anchor = SimpleNamespace(
+        frame_id=0,
+        image=torch.zeros(3, 2, 4),
+        pose_c2w=torch.eye(4),
+    )
+    anchor_metrics = SimpleNamespace(
+        anchor_frame_id=0,
+        anchor_pose_c2w=torch.eye(4),
+        match_coverage=0.0,
+        frame_mean_pair_conf=0.5,
+        low_pair_conf_ratio=0.0,
+        pair_conf_quantiles={},
+    )
+
+    accepted, decision = tracker._decide_keyframe(
+        frame_id=4,
+        pose=torch.eye(4),
+        inverse_depth=torch.ones(1, 2, 4),
+        confidence=torch.ones(1, 2, 4),
+        key_score=0.0,
+        anchor_metrics=anchor_metrics,
+    )
+
+    assert accepted
+    assert decision["reasons"] == ["m3_score"]
+    assert decision["m3_score_threshold"] == 0.43
+    assert decision["m3_keyframe_score"] >= 0.43
 
 
 def test_keyframe_anchor_max_interval_forces_keyframe():

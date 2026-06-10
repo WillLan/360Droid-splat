@@ -1523,6 +1523,18 @@ class PanoDroidGSSlamSystem:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)
                 output_profile["mapper_insert_keyframe_sec"] = float(time.perf_counter() - section_start)
                 output_profile["inserted_gaussians"] = float(inserted_count)
+                output_profile["missing_seed_candidates"] = int(
+                    getattr(self.mapper.stats, "last_missing_seed_candidates", 0)
+                )
+                output_profile["depth_mismatch_seed_candidates"] = int(
+                    getattr(self.mapper.stats, "last_depth_mismatch_seed_candidates", 0)
+                )
+                output_profile["skipped_missing_budget"] = int(
+                    getattr(self.mapper.stats, "last_skipped_missing_budget", 0)
+                )
+                output_profile["skipped_depth_mismatch_budget"] = int(
+                    getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
+                )
                 keyframes += 1
                 novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
                 if bool(novel_cfg.get("save_visualization", False)):
@@ -1542,6 +1554,18 @@ class PanoDroidGSSlamSystem:
                                 getattr(self.mapper.stats, "last_render_depth_mismatch_pixels", 0)
                             ),
                             "render_bad_pixels": int(getattr(self.mapper.stats, "last_render_bad_pixels", 0)),
+                            "missing_seed_candidates": int(
+                                getattr(self.mapper.stats, "last_missing_seed_candidates", 0)
+                            ),
+                            "depth_mismatch_seed_candidates": int(
+                                getattr(self.mapper.stats, "last_depth_mismatch_seed_candidates", 0)
+                            ),
+                            "skipped_missing_budget": int(
+                                getattr(self.mapper.stats, "last_skipped_missing_budget", 0)
+                            ),
+                            "skipped_depth_mismatch_budget": int(
+                                getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
+                            ),
                         },
                     )
                     output_profile["new_gaussian_visualization_sec"] = float(time.perf_counter() - section_start)

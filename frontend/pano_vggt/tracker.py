@@ -1369,7 +1369,13 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         if self.joint_inference_enabled:
             decision["legacy_candidate_reasons"] = list(reasons)
             reasons.clear()
-        if m3_score >= float(self.keyframe_threshold):
+        m3_score_threshold = (
+            float(cfg.m3_score_threshold)
+            if float(cfg.m3_score_threshold) >= 0.0
+            else float(self.keyframe_threshold)
+        )
+        decision["m3_score_threshold"] = float(m3_score_threshold)
+        if m3_score >= float(m3_score_threshold):
             reasons.append("m3_score")
         min_interval = max(0, int(cfg.min_keyframe_interval))
         max_interval = max(0, int(cfg.max_keyframe_interval))

@@ -38,6 +38,10 @@ class _DepthGateRenderer:
             depth[:, :, 2] = 0.6
         alpha = torch.ones(1, H, W, device=render.device, dtype=render.dtype)
         alpha[:, :, 0] = 0.0
+        if W >= 5:
+            alpha[:, :, 4] = 0.10
+        if W >= 6:
+            alpha[:, :, 5] = 0.0
         total = int(gaussian_map.anchor_count())
         return {
             "render": render,
@@ -123,7 +127,7 @@ def test_mapper_renders_keyframe_diagnostic():
     assert diagnostic.anchor_count == 2
 
 
-def test_pfgs360_mapper_render_depth_gate_inserts_missing_and_depth_mismatch_regions():
+def test_pfgs360_mapper_render_depth_gate_budgets_missing_and_depth_mismatch_regions():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
         "Mapping": {
@@ -135,7 +139,11 @@ def test_pfgs360_mapper_render_depth_gate_inserts_missing_and_depth_mismatch_reg
                 "keyframe_max_seeds": 10,
                 "global_anchor_budget": 20,
                 "render_alpha_min": 0.2,
+                "missing_alpha_min": 0.05,
                 "render_depth_rel_threshold": 0.10,
+                "max_missing_seeds_per_keyframe": 1,
+                "max_depth_mismatch_seeds_per_keyframe": 2,
+                "prioritize_depth_mismatch": True,
                 "near_grid_radius": 0,
                 "reset_after_outlier_observations": 99,
                 "prune_after_outlier_observations": 99,
@@ -151,27 +159,40 @@ def test_pfgs360_mapper_render_depth_gate_inserts_missing_and_depth_mismatch_reg
         level=torch.zeros(1, dtype=torch.int8),
         frame_id=0,
     )
-    assert mapper.insert_keyframe(first, _small_frontend_output(0), image=torch.zeros(3, 1, 4)) == 1
+    assert mapper.insert_keyframe(first, _small_frontend_output(0), image=torch.zeros(3, 1, 6)) == 1
     seeds = GaussianSeedBatch(
-        xyz=torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [3.0, 0.0, 1.0]]),
-        rgb=torch.zeros(4, 3),
-        confidence=torch.ones(4),
-        scale=torch.full((4,), 0.1),
-        level=torch.zeros(4, dtype=torch.int8),
+        xyz=torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [2.0, 0.0, 1.0],
+                [3.0, 0.0, 1.0],
+                [4.0, 0.0, 1.0],
+                [5.0, 0.0, 1.0],
+            ]
+        ),
+        rgb=torch.zeros(6, 3),
+        confidence=torch.ones(6),
+        scale=torch.full((6,), 0.1),
+        level=torch.zeros(6, dtype=torch.int8),
         frame_id=1,
-        source_flat_idx=torch.arange(4),
-        source_hw=(1, 4),
-        insert_enabled=torch.ones(4, dtype=torch.bool),
-        insert_score=torch.tensor([1.0, 0.9, 0.8, 0.1]),
+        source_flat_idx=torch.arange(6),
+        source_hw=(1, 6),
+        insert_enabled=torch.ones(6, dtype=torch.bool),
+        insert_score=torch.tensor([1.0, 0.9, 0.8, 0.6, 0.1, 0.7]),
     )
 
-    inserted = mapper.insert_keyframe(seeds, _small_frontend_output(1), image=torch.zeros(3, 1, 4))
+    inserted = mapper.insert_keyframe(seeds, _small_frontend_output(1), image=torch.zeros(3, 1, 6))
 
     assert inserted == 3
-    assert mapper.stats.last_suppressed_insert == 1
-    assert mapper.stats.last_render_missing_pixels == 1
+    assert mapper.stats.last_suppressed_insert == 2
+    assert mapper.stats.last_render_missing_pixels == 2
     assert mapper.stats.last_render_depth_mismatch_pixels == 2
-    assert mapper.stats.last_render_bad_pixels == 3
+    assert mapper.stats.last_render_bad_pixels == 4
+    assert mapper.stats.last_missing_seed_candidates == 2
+    assert mapper.stats.last_depth_mismatch_seed_candidates == 2
+    assert mapper.stats.last_skipped_missing_budget == 1
+    assert mapper.stats.last_skipped_depth_mismatch_budget == 0
     assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
 
 

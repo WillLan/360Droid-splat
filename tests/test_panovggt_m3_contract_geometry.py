@@ -125,10 +125,14 @@ def test_m3_config_parser_defaults_and_explicit_values():
     assert parsed_file.dense_ba.logdepth_update_quantile == 0.99
     assert parsed_file.joint_inference.enabled is True
     assert parsed_file.joint_inference.max_history_frames == 3
-    assert parsed_file.alignment.use_common_history is True
+    assert parsed_file.alignment.use_common_history is False
+    assert parsed_file.alignment.history_point_budget_ratio == 0.0
     assert parsed_file.keyframe_anchor.enabled is True
     assert parsed_file.keyframe_anchor.min_keyframe_interval == 4
     assert parsed_file.keyframe_anchor.max_keyframe_interval == 8
+    assert parsed_file.keyframe_anchor.m3_score_threshold == 0.43
+    assert file_cfg["PanoVGGT"]["min_overlap_points"] == 2048
+    assert file_cfg["PanoVGGT"]["max_align_rmse"] == 0.35
     assert parsed_file.matching_head.descriptor_dim == 24
     assert parsed_file.matching_head.matching_checkpoint.endswith("/matching_head.pt")
     assert parsed_file.matching_head.sky_checkpoint.endswith("/sky_head.pt")

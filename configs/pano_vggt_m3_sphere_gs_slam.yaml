@@ -31,8 +31,8 @@ PanoVGGT:
   align_mode: sim3
   require_aligned_world_points: true
   emit_unaligned: false
-  min_overlap_points: 4096
-  max_align_rmse: 0.25
+  min_overlap_points: 2048
+  max_align_rmse: 0.35
   min_inlier_ratio: 0.35
   max_scale_jump: 2.0
   loop_enable: false
@@ -55,6 +55,7 @@ PanoVGGT:
     match_coverage_threshold: 0.0
     translation_threshold: 2.0
     translation_depth_ratio_threshold: 0.30
+    m3_score_threshold: 0.43
     min_keyframe_interval: 4
     max_keyframe_interval: 8
     sky_threshold: 0.5
@@ -66,8 +67,8 @@ PanoVGGT:
     max_history_frames: 3
 
   Alignment:
-    use_common_history: true
-    history_point_budget_ratio: 0.5
+    use_common_history: false
+    history_point_budget_ratio: 0.0
 
   MatchingHead:
     enabled: true
@@ -170,11 +171,15 @@ Mapping:
     strategy: pfgs360
     voxel_size: 0.12
     first_keyframe_max_seeds: 160000
-    keyframe_max_seeds: 60000
+    keyframe_max_seeds: 30000
     global_anchor_budget: 3000000
     temporal_pair_conf_min: 0.70
     render_alpha_min: 0.20
+    missing_alpha_min: 0.05
     render_depth_rel_threshold: 0.10
+    max_missing_seeds_per_keyframe: 12000
+    max_depth_mismatch_seeds_per_keyframe: 30000
+    prioritize_depth_mismatch: true
     near_grid_radius: 1
     near_distance_factor: 1.0
     reset_after_outlier_observations: 3
