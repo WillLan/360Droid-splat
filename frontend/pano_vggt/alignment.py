@@ -89,6 +89,7 @@ class SubmapAligner:
         min_inlier_ratio: float = 0.35,
         max_scale_change: float = 2.5,
         min_points: int = 32,
+        return_rejected_transform: bool = False,
     ) -> None:
         mode = str(align_mode).lower()
         if mode not in {"sim3", "se3"}:
@@ -98,6 +99,7 @@ class SubmapAligner:
         self.min_inlier_ratio = float(min_inlier_ratio)
         self.max_scale_change = float(max_scale_change)
         self.min_points = int(min_points)
+        self.return_rejected_transform = bool(return_rejected_transform)
 
     def align(
         self,
@@ -138,6 +140,8 @@ class SubmapAligner:
         transform.inlier_ratio = inlier_ratio
         transform.accepted = bool(accepted)
         if not transform.accepted:
+            if self.return_rejected_transform:
+                return transform
             fallback = SimilarityTransform.identity(device=source.device, dtype=source.dtype)
             fallback.residual = residual
             fallback.inlier_ratio = inlier_ratio

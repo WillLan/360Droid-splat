@@ -77,6 +77,7 @@ class _AlignmentDebug:
     scale: float = 1.0
     residual: float = 0.0
     inlier_ratio: float = 0.0
+    forced_accepted: bool = False
 
 
 def _relative_from_c2w(c2w_i: torch.Tensor, c2w_j: torch.Tensor) -> torch.Tensor:
@@ -267,6 +268,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         max_align_rmse: float = 0.25,
         min_inlier_ratio: float = 0.35,
         max_scale_jump: float = 2.0,
+        force_accept_alignment: bool = False,
         require_aligned_world_points: bool = True,
         emit_unaligned: bool = False,
         novel_insertion_enabled: bool = False,
@@ -285,6 +287,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.max_alignment_points = int(max_alignment_points)
         self.max_alignment_cache_frames = int(max_alignment_cache_frames)
         self.min_overlap_points = int(min_overlap_points)
+        self.force_accept_alignment = bool(force_accept_alignment)
         self.require_aligned_world_points = bool(require_aligned_world_points)
         self.emit_unaligned = bool(emit_unaligned)
         self.novel_insertion_enabled = bool(novel_insertion_enabled)
@@ -303,6 +306,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             min_inlier_ratio=float(min_inlier_ratio),
             max_scale_change=float(max_scale_jump),
             min_points=max(3, int(min_overlap_points)),
+            return_rejected_transform=self.force_accept_alignment,
         )
         self.pose_graph = FrontendPoseGraph()
         self.loop_manager = LoopManager(enabled=loop_enable)
@@ -669,6 +673,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                     "residual": float(self.last_alignment_debug.residual),
                     "alignment_rmse": float(self.last_alignment_debug.residual),
                     "inlier_ratio": float(self.last_alignment_debug.inlier_ratio),
+                    "forced_accepted": bool(self.last_alignment_debug.forced_accepted),
                 },
                 "keyframe_anchor": {
                     int(frame_ids[local_idx]): metrics.frame_mean_pair_conf
@@ -694,6 +699,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                         "residual": float(self.last_alignment_debug.residual),
                         "alignment_rmse": float(self.last_alignment_debug.residual),
                         "inlier_ratio": float(self.last_alignment_debug.inlier_ratio),
+                        "forced_accepted": bool(self.last_alignment_debug.forced_accepted),
                     },
                 }
         mark_profile("m3_debug")
@@ -1246,6 +1252,19 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             inlier_ratio=float(transform.inlier_ratio),
         )
         if not transform.accepted:
+            if self.force_accept_alignment:
+                transform.accepted = True
+                self.last_alignment_debug.forced_accepted = True
+                self.pose_graph.add_edge(
+                    PoseGraphEdge(
+                        source_chunk=self.chunk_count,
+                        target_chunk=max(0, self.chunk_count - 1),
+                        transform=transform,
+                        residual=transform.residual,
+                        edge_type="sequential_forced",
+                    )
+                )
+                return transform
             return self._handle_alignment_failure(
                 (
                     f"alignment rejected: rmse={transform.residual:.4f}, "
@@ -1809,6 +1828,7 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         max_align_rmse=float(pano_cfg.get("max_align_rmse", 0.25)),
         min_inlier_ratio=float(pano_cfg.get("min_inlier_ratio", 0.35)),
         max_scale_jump=float(pano_cfg.get("max_scale_jump", 2.0)),
+        force_accept_alignment=bool(pano_cfg.get("force_accept_alignment", False)),
         require_aligned_world_points=bool(pano_cfg.get("require_aligned_world_points", True)),
         emit_unaligned=bool(pano_cfg.get("emit_unaligned", False)),
         novel_insertion_enabled=bool(novel_cfg.get("enabled", m3_enabled)),

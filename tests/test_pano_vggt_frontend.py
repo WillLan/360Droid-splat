@@ -9,7 +9,14 @@ import yaml
 from frontend.pano_droid.dataset import discover_erp_images
 from frontend.pano_droid.interfaces import PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
-from frontend.pano_vggt import FakePanoVGGTInferenceEngine, PanoVGGTAlignmentError, PanoVGGTLongTracker, SubmapAligner
+from frontend.pano_vggt import (
+    FakePanoVGGTInferenceEngine,
+    PanoVGGTAlignmentError,
+    PanoVGGTLocalPrediction,
+    PanoVGGTLongTracker,
+    SubmapAligner,
+    build_panovggt_frontend_from_config,
+)
 from frontend.pano_vggt.alignment import sample_overlap_points
 from frontend.pano_vggt.engine import _ceil_size_to_multiple, _resize_prediction, normalize_panovggt_output
 from scripts.run_pano_vggt_panocity_blocks import build_block_config, discover_panocity_blocks
@@ -200,6 +207,53 @@ def test_panovggt_tracker_raises_on_alignment_failure():
     tracker.pop_ready_outputs()
     with pytest.raises(PanoVGGTAlignmentError):
         tracker.track(PanoFrame(image=torch.rand(3, 8, 16), timestamp=1.0, frame_id=1))
+
+
+def test_panovggt_tracker_can_force_accept_rejected_alignment_transform():
+    tracker = PanoVGGTLongTracker(
+        engine=FakePanoVGGTInferenceEngine(image_size=(4, 4)),
+        device="cpu",
+        chunk_size=1,
+        overlap=0,
+        emit_delay=0,
+        min_overlap_points=4,
+        max_alignment_points=4,
+        max_scale_jump=1.1,
+        force_accept_alignment=True,
+        require_aligned_world_points=True,
+        emit_unaligned=False,
+    )
+    yy, xx = torch.meshgrid(torch.arange(2, dtype=torch.float32), torch.arange(2, dtype=torch.float32), indexing="ij")
+    source = torch.stack([xx, yy, torch.zeros_like(xx)], dim=-1)
+    target = 2.0 * source + torch.tensor([0.25, -0.5, 0.0])
+    pred = PanoVGGTLocalPrediction(
+        poses_c2w=torch.eye(4).unsqueeze(0),
+        depth=torch.ones(1, 1, 2, 2),
+        confidence=torch.ones(1, 1, 2, 2),
+        chunk_world_points=source.unsqueeze(0),
+    )
+    tracker.global_points_by_frame[7] = target.clone()
+
+    transform = tracker._align_chunk(pred, (7,))
+
+    assert transform.accepted
+    assert tracker.last_alignment_debug.forced_accepted
+    assert transform.scale > 1.5
+    assert tracker.pose_graph.edges[-1].edge_type == "sequential_forced"
+
+
+def test_panovggt_builder_reads_force_accept_alignment_flag():
+    tracker = build_panovggt_frontend_from_config(
+        {
+            "PanoVGGT": {
+                "engine": "fake",
+                "image_size": [4, 4],
+                "force_accept_alignment": True,
+            }
+        }
+    )
+
+    assert tracker.force_accept_alignment is True
 
 
 def test_panocity_pano_images_are_discoverable(tmp_path: Path):

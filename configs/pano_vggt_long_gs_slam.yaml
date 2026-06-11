@@ -33,6 +33,7 @@ PanoVGGT:
   max_align_rmse: 0.25
   min_inlier_ratio: 0.35
   max_scale_jump: 2.0
+  force_accept_alignment: false
   loop_enable: false
   max_alignment_points: 4096
   max_alignment_cache_frames: 128
