@@ -202,6 +202,7 @@ def test_panovggt_tracker_raises_on_alignment_failure():
         keyframe_threshold=0.0,
         force_keyframe_interval=1,
         min_overlap_points=16,
+        force_accept_alignment=False,
     )
     tracker.track(PanoFrame(image=torch.rand(3, 8, 16), timestamp=0.0, frame_id=0))
     tracker.pop_ready_outputs()
@@ -249,6 +250,19 @@ def test_panovggt_builder_reads_force_accept_alignment_flag():
                 "engine": "fake",
                 "image_size": [4, 4],
                 "force_accept_alignment": True,
+            }
+        }
+    )
+
+    assert tracker.force_accept_alignment is True
+
+
+def test_panovggt_builder_defaults_force_accept_alignment_enabled():
+    tracker = build_panovggt_frontend_from_config(
+        {
+            "PanoVGGT": {
+                "engine": "fake",
+                "image_size": [4, 4],
             }
         }
     )
