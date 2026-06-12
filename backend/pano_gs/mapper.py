@@ -1088,7 +1088,7 @@ class PanoGaussianMapper:
         kept_depth_mismatch = 0
         kept_insert_only = 0
         depth_budget = int(self.max_depth_mismatch_seeds_per_keyframe)
-        insert_only_budget = int(self.max_missing_seeds_per_keyframe)
+        insert_only_budget = 0 if first_keyframe else int(self.max_missing_seeds_per_keyframe)
         for seed_idx in order.tolist():
             key = (0, int(grid_cpu[seed_idx, 0]), int(grid_cpu[seed_idx, 1]), int(grid_cpu[seed_idx, 2]))
             hits = occupied.get(key, [])
@@ -1242,7 +1242,7 @@ class PanoGaussianMapper:
             aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
             valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
-            missing = (alpha < max(0.0, min(1.0, float(self.pfgs360_missing_alpha_min)))) | (~valid_aligned)
+            missing = ~valid_aligned
             insert_mask = (valid_aligned & (rel >= float(self.replace_fuse_insert_rel_min))) | missing
             delete_mask = (
                 valid_aligned

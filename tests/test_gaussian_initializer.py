@@ -510,6 +510,39 @@ def test_replace_fuse_refreshes_voxel_from_current_xyz_before_fusing():
     assert torch.equal(mapper.map._anchor_grid_coord[0], torch.tensor([1, 0, 0], dtype=torch.int32))
 
 
+def test_replace_fuse_first_keyframe_ignores_missing_seed_budget():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 3,
+                "keyframe_max_seeds": 3,
+                "global_anchor_budget": 10,
+                "max_missing_seeds_per_keyframe": 1,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    seeds = _pfgs_seed_batch(
+        torch.tensor(
+            [
+                [0.005, 0.0, 0.0],
+                [0.045, 0.0, 0.0],
+                [0.085, 0.0, 0.0],
+            ]
+        ),
+        frame_id=0,
+    )
+
+    inserted = mapper.insert_keyframe(seeds, _frontend_output_for_mapper(0))
+
+    assert inserted == 3
+    assert mapper.map.anchor_count() == 3
+    assert mapper.stats.last_skipped_missing_budget == 0
+
+
 def test_replace_fuse_compacts_duplicate_anchors_after_voxel_refresh():
     config = {
         "Mapping": {

@@ -177,7 +177,7 @@ Mapping:
     replace_front_depth_rel_tol: 0.02
     max_replace_delete_per_keyframe: 30000
     compact_voxels: true
-    max_missing_seeds_per_keyframe: 12000
+    max_missing_seeds_per_keyframe: 30000
     max_depth_mismatch_seeds_per_keyframe: 30000
     prioritize_depth_mismatch: true
     near_grid_radius: 1
