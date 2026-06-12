@@ -212,6 +212,16 @@ def _scalar_tensor_to_pil(value: torch.Tensor) -> Image.Image:
     return Image.fromarray(_scalar_to_rgb(tensor.numpy(), valid.numpy()), mode="RGB")
 
 
+def _mask_tensor_to_pil(value: torch.Tensor) -> Image.Image:
+    tensor = value.detach().cpu().bool()
+    while tensor.ndim > 2:
+        tensor = tensor[0]
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected mask image as HxW, 1xHxW, or Bx1xHxW, got {tuple(value.shape)}")
+    arr = tensor.numpy().astype(np.uint8) * 255
+    return Image.fromarray(arr, mode="L").convert("RGB")
+
+
 def _inverse_depth_to_pil(inverse_depth: torch.Tensor) -> Image.Image:
     inv = inverse_depth.detach().cpu().float()
     if inv.ndim == 3:
@@ -411,11 +421,14 @@ _COMPACT_SLAM_WANDB_KEYS = frozenset(
         "backend/render_vs_gt_panorama",
         "backend/kf_opt_loss",
         "backend/kf_opt_psnr",
+        "backend/kf_render_opt",
+        "backend/kf_depth_opt",
         "m3/chunk",
         "m3/ba_success",
         "m3/valid_factor_ratio",
         "m3/residual_drop_deg",
         "m3/match_lines",
+        "m3/sky_mask",
         "mapping/depth_insertion",
         "mapping/keyframe_frame_id",
         "mapping/keyframe_inserted_gaussians",
@@ -927,7 +940,6 @@ class SlamRuntimeLogger:
             rgb = rgb.resize((width, height), Image.BILINEAR)
         render_depth = scalar_hw(getattr(diagnostic, "render_depth", None))
         predicted_depth = scalar_hw(getattr(diagnostic, "predicted_depth", None))
-        rel_error = scalar_hw(getattr(diagnostic, "rel_depth_error", None))
         missing = mask_hw(getattr(diagnostic, "missing_mask", None))
         depth_mismatch = mask_hw(getattr(diagnostic, "depth_mismatch_mask", None))
         need_insert = mask_hw(getattr(diagnostic, "render_bad_mask", None))
@@ -948,12 +960,7 @@ class SlamRuntimeLogger:
         need_rgb[miss_np] = np.array([255, 210, 30], dtype=np.uint8)
         need_rgb[mismatch_np] = np.array([255, 40, 40], dtype=np.uint8)
         need_panel = Image.fromarray(need_rgb, mode="RGB")
-        ImageDraw.Draw(need_panel).text((8, 8), "need insert: yellow=missing red=depth", fill=(255, 255, 255))
-
-        inserted_rgb = np.zeros((height, width, 3), dtype=np.uint8)
-        inserted_rgb[..., 0] = inserted_mask.numpy().astype(np.uint8) * 255
-        inserted_panel = Image.fromarray(inserted_rgb, mode="RGB")
-        ImageDraw.Draw(inserted_panel).text((8, 8), "inserted seed pixels", fill=(255, 255, 255))
+        ImageDraw.Draw(need_panel).text((8, 8), "inconsistent mask", fill=(255, 255, 255))
 
         overlay = np.asarray(rgb).astype(np.float32)
         overlay[need_np] = 0.55 * overlay[need_np] + 0.45 * np.array([255.0, 210.0, 30.0])
@@ -966,13 +973,10 @@ class SlamRuntimeLogger:
         pred_label = "frontend predicted depth aligned"
         scale = float(getattr(diagnostic, "depth_scale", 1.0))
         shift = float(getattr(diagnostic, "depth_shift", 0.0))
-        rel_label = f"relative depth error scale={scale:.3g} shift={shift:.3g}"
         panels = (
             scalar_panel(render_depth, render_label),
             scalar_panel(predicted_depth, pred_label),
-            scalar_panel(rel_error, rel_label, require_positive=False),
             need_panel,
-            inserted_panel,
             overlay_panel,
         )
 
@@ -1015,6 +1019,32 @@ class SlamRuntimeLogger:
                 if path is not None:
                     payload["mapping/depth_insertion_png"] = str(path)
             self._log_wandb_payload(payload, step=step)
+        return path
+
+    def observe_sky_mask(
+        self,
+        *,
+        frame_id: int,
+        sky_mask: torch.Tensor | None,
+        step: int | None = None,
+    ) -> Path | None:
+        if sky_mask is None:
+            return None
+        try:
+            image = _mask_tensor_to_pil(sky_mask)
+        except Exception:
+            return None
+        path = None
+        if self.save_local:
+            out_dir = self.visualization_dir / "sky_masks"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"frame_{int(frame_id):06d}.png"
+            image.save(path)
+        if self.run is not None and self._wandb is not None:
+            self._log_wandb_payload(
+                {"m3/sky_mask": self._wandb.Image(str(path) if path is not None else image)},
+                step=step,
+            )
         return path
 
     def save_keyframe_diagnostic(self, diagnostic, *, render_dir: Path, depth_dir: Path) -> tuple[Path | None, Path | None]:
@@ -1070,23 +1100,39 @@ class SlamRuntimeLogger:
         return _resize_to_max_width(canvas, self.kf_opt_max_width)
 
     def _make_keyframe_opt_depth_panel(self, diagnostic) -> Image.Image:
-        depth = getattr(diagnostic, "depth", None)
-        if not torch.is_tensor(depth):
+        render_depth = getattr(diagnostic, "depth", None)
+        target_depth = getattr(diagnostic, "target_depth", None)
+        if not torch.is_tensor(render_depth) and not torch.is_tensor(target_depth):
             image = Image.new("RGB", (900, 480), "white")
             ImageDraw.Draw(image).text((20, 20), "no optimized keyframe depth", fill=(0, 0, 0))
             return image
-        depth_t = depth.detach().cpu().float()
-        if depth_t.ndim == 3:
-            depth_t = depth_t[0]
-        if depth_t.ndim != 2:
-            image = Image.new("RGB", (900, 480), "white")
-            ImageDraw.Draw(image).text((20, 20), f"bad depth shape: {tuple(depth.shape)}", fill=(0, 0, 0))
-            return image
-        valid = torch.isfinite(depth_t) & (depth_t > 1e-6)
-        depth_rgb = Image.fromarray(_scalar_to_rgb(depth_t.numpy(), valid.numpy()), mode="RGB")
-        draw = ImageDraw.Draw(depth_rgb)
-        draw.text((8, 7), f"KF {int(getattr(diagnostic, 'frame_id')):04d} optimized depth", fill=(255, 255, 255))
-        return _resize_to_max_width(depth_rgb, self.kf_opt_max_width)
+
+        def depth_panel(value, label: str) -> Image.Image:
+            if not torch.is_tensor(value):
+                panel = Image.new("RGB", (900, 480), "black")
+                ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
+                return panel
+            depth_t = value.detach().cpu().float()
+            while depth_t.ndim > 2:
+                depth_t = depth_t[0]
+            if depth_t.ndim != 2:
+                panel = Image.new("RGB", (900, 480), "black")
+                ImageDraw.Draw(panel).text((8, 8), f"bad depth shape: {tuple(value.shape)}", fill=(255, 255, 255))
+                return panel
+            valid = torch.isfinite(depth_t) & (depth_t > 1e-6)
+            panel = Image.fromarray(_scalar_to_rgb(depth_t.numpy(), valid.numpy()), mode="RGB")
+            ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
+            return panel
+
+        target_panel = depth_panel(target_depth, "frontend keyframe depth")
+        render_panel = depth_panel(render_depth, "render depth")
+        if render_panel.size != target_panel.size:
+            render_panel = render_panel.resize(target_panel.size, Image.BILINEAR)
+        w, h = target_panel.size
+        canvas = Image.new("RGB", (2 * w, h), "white")
+        canvas.paste(target_panel, (0, 0))
+        canvas.paste(render_panel, (w, 0))
+        return _resize_to_max_width(canvas, self.kf_opt_max_width)
 
     def _save_keyframe_opt_image(self, image: Image.Image, directory: Path, *, frame_id: int) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
@@ -1484,6 +1530,7 @@ class PanoDroidGSSlamSystem:
             sky_mask_cloud_brightness=float(mapping_cfg.get("sky_mask_cloud_brightness", 0.72)),
             sky_mask_cloud_saturation=float(mapping_cfg.get("sky_mask_cloud_saturation", 0.22)),
             sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
+            sky_mask_source=str(mapping_cfg.get("sky_mask_source", "heuristic")),
             voxel_sizes=tuple(config.get("Hierarchical", {}).get("voxel_size_lis", [0.12, 0.45, 1.8])),
             seed_source=str(mapping_cfg.get("seed_source", default_seed_source)),
             insertion_strategy=str(novel_cfg.get("strategy", "legacy")),
@@ -1705,9 +1752,17 @@ class PanoDroidGSSlamSystem:
         last_profiled_frontend_chunk: int | None = None
         last_feedforward_metrics: dict = {}
         frame_cache: dict[int, PanoFrame] = {}
+        final_frame_records: dict[int, dict] = {}
         frame_count = 0
         keyframes = 0
         last_status = None
+        frontend_sky_required = str(mapping_cfg.get("sky_mask_source", "heuristic") or "heuristic").lower() in {
+            "panovggt",
+            "panovggt_head",
+            "pano_vggt",
+            "m3",
+            "m3_head",
+        }
 
         def write_profile(event: str, **values) -> None:
             if not profiling_enabled:
@@ -1717,6 +1772,28 @@ class PanoDroidGSSlamSystem:
                 profile_file.write(json.dumps(profile, sort_keys=True) + "\n")
                 profile_file.flush()
             logger.observe_profile(profile)
+
+        def frontend_sky_mask_for_frame(frame_id: int, image: torch.Tensor) -> torch.Tensor | None:
+            getter = getattr(self.frontend, "sky_mask_for_frame", None)
+            height, width = int(image.shape[-2]), int(image.shape[-1])
+            mask = getter(int(frame_id), image_size=(height, width)) if callable(getter) else None
+            if mask is None and frontend_sky_required:
+                raise RuntimeError(
+                    f"frame {int(frame_id)}: Mapping.sky_mask_source=panovggt_head requires PanoVGGT sky head mask."
+                )
+            return None if mask is None else mask.detach().cpu().bool()
+
+        def remember_final_frame(out: FrontendOutput, source_frame: PanoFrame, sky_mask: torch.Tensor | None) -> None:
+            gt_pose = None
+            meta = source_frame.meta or {}
+            if meta.get("gt_c2w") is not None:
+                gt_pose = torch.as_tensor(meta["gt_c2w"]).detach().cpu().float()
+            final_frame_records[int(out.frame_id)] = {
+                "image": source_frame.image.detach().cpu().float(),
+                "pose_c2w": out.pose_c2w.detach().cpu().float(),
+                "gt_c2w": gt_pose,
+                "sky_mask": None if sky_mask is None else sky_mask.detach().cpu().bool(),
+            }
 
         def update_frontend_graph_window_hint(out) -> None:
             if not bool(backend_cfg.get("use_frontend_graph_window", False)):
@@ -1797,6 +1874,7 @@ class PanoDroidGSSlamSystem:
                 conf = conf_by_frame.get(fid) if isinstance(conf_by_frame, dict) else None
                 if pose is None or inv is None:
                     continue
+                sky_mask = frontend_sky_mask_for_frame(fid, source_frame.image)
                 self.mapper.register_observation_values(
                     frame_id=fid,
                     image=source_frame.image,
@@ -1804,6 +1882,7 @@ class PanoDroidGSSlamSystem:
                     inverse_depth=inv,
                     depth_confidence=conf,
                     is_keyframe=fid in registered_keyframes,
+                    sky_mask=sky_mask,
                 )
                 count += 1
             return count
@@ -1826,6 +1905,17 @@ class PanoDroidGSSlamSystem:
             if not metrics:
                 return
             last_feedforward_metrics = dict(metrics)
+            diagnostic_step = max(1, int(logger._step) + 1)
+            for out in outputs:
+                if not bool(getattr(out, "is_keyframe", False)):
+                    continue
+                try:
+                    diagnostic = self.mapper.render_keyframe_diagnostic(int(out.frame_id))
+                    logger.observe_keyframe_opt(diagnostic, step=diagnostic_step)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(
+                        f"frame {int(out.frame_id)}: post-chunk keyframe render failed: {exc!r}"
+                    )
             section_start = time.perf_counter()
             feedback_updates, feedback_decisions = self._collect_backend_feedback_updates(metrics)
             feedback_collect_sec = float(time.perf_counter() - section_start)
@@ -1870,11 +1960,19 @@ class PanoDroidGSSlamSystem:
                 output_profile["total_sec"] = float(time.perf_counter() - process_start)
                 write_profile("process_output", **output_profile)
                 return
+            sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), source_frame.image)
+            remember_final_frame(out, source_frame, sky_mask)
             if feedforward_window_enabled and out.inverse_depth is not None:
                 section_start = time.perf_counter()
-                self.mapper.register_observation(out, source_frame.image, is_keyframe=bool(out.is_keyframe))
+                self.mapper.register_observation(
+                    out,
+                    source_frame.image,
+                    is_keyframe=bool(out.is_keyframe),
+                    sky_mask=sky_mask,
+                )
                 output_profile["mapper_register_observation_sec"] = float(time.perf_counter() - section_start)
             output_wandb_step = max(1, int(logger._step) + 1)
+            logger.observe_sky_mask(frame_id=int(out.frame_id), sky_mask=sky_mask, step=output_wandb_step)
             frontend_profile = getattr(self.frontend, "last_profile", None)
             if isinstance(frontend_profile, dict):
                 chunk_index = int(frontend_profile.get("chunk_index", -1))
@@ -1893,6 +1991,9 @@ class PanoDroidGSSlamSystem:
                 section_start = time.perf_counter()
                 consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
                 insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
+                if sky_mask is not None:
+                    insertion_hints = dict(insertion_hints or {})
+                    insertion_hints["sky_mask"] = sky_mask.detach().cpu().bool()
                 seeds = self.initializer.from_frontend_output(
                     out,
                     source_frame.image,
@@ -1902,7 +2003,12 @@ class PanoDroidGSSlamSystem:
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
                 section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization:
-                    inserted_count = self.mapper.insert_keyframe(seeds, out, image=source_frame.image)
+                    inserted_count = self.mapper.insert_keyframe(
+                        seeds,
+                        out,
+                        image=source_frame.image,
+                        sky_mask=sky_mask,
+                    )
                 else:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)
                 output_profile["mapper_insert_keyframe_sec"] = float(time.perf_counter() - section_start)
@@ -2070,6 +2176,7 @@ class PanoDroidGSSlamSystem:
                         image=source_frame.image,
                         c2w=out.pose_c2w,
                         steps=refine_steps,
+                        sky_mask=sky_mask,
                     )
                     output_profile["backend_refine_keyframe_call_sec"] = float(time.perf_counter() - section_start)
                     backend_loss = metrics.get("loss")
@@ -2098,7 +2205,11 @@ class PanoDroidGSSlamSystem:
             if self.map.anchor_count() > 0:
                 try:
                     section_start = time.perf_counter()
-                    backend_render_pkg = self.mapper.render_view(image=source_frame.image, c2w=render_pose)
+                    backend_render_pkg = self.mapper.render_view(
+                        image=source_frame.image,
+                        c2w=render_pose,
+                        sky_mask=sky_mask,
+                    )
                     output_profile["backend_render_view_sec"] = float(time.perf_counter() - section_start)
                 except Exception as exc:
                     self.mapper.stats.notes.append(f"frame {out.frame_id}: backend visualization render failed: {exc!r}")
@@ -2123,11 +2234,98 @@ class PanoDroidGSSlamSystem:
             output_profile["total_sec"] = float(time.perf_counter() - process_start)
             write_profile("process_output", **output_profile)
 
+        def save_final_all_frame_renders() -> dict | None:
+            enabled = bool(
+                results_cfg.get(
+                    "render_final_all_frames",
+                    results_cfg.get("save_final_all_frame_renders", False),
+                )
+            )
+            if not enabled:
+                return None
+            root = output_dir / "final_all_frames"
+            panel_dir = root / "render_vs_gt"
+            panel_dir.mkdir(parents=True, exist_ok=True)
+            records = final_frame_records
+            if not records:
+                metrics = {"render_count": 0, "mean_psnr": None, "ate_rmse": None, "ate_count": 0}
+                with open(root / "metrics.json", "w", encoding="utf-8") as f:
+                    json.dump(metrics, f, indent=2)
+                return {"root": str(root), "metrics": metrics}
+
+            per_frame: list[dict] = []
+            psnrs: list[float] = []
+            pred_xyz: list[np.ndarray] = []
+            gt_xyz: list[np.ndarray] = []
+            for frame_id in sorted(records):
+                rec = records[int(frame_id)]
+                image = rec["image"]
+                pose = self.mapper.refined_pose_c2w(int(frame_id))
+                if pose is None:
+                    pose = rec["pose_c2w"]
+                sky_mask = rec.get("sky_mask")
+                try:
+                    pkg = self.mapper.render_view(image=image, c2w=pose, sky_mask=sky_mask)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(f"frame {int(frame_id)}: final all-frame render failed: {exc!r}")
+                    continue
+                if pkg is None or not torch.is_tensor(pkg.get("render")):
+                    continue
+                render = pkg["render"].detach().cpu().float().clamp(0.0, 1.0)
+                target = image.detach().cpu().float().clamp(0.0, 1.0)
+                if tuple(render.shape[-2:]) != tuple(target.shape[-2:]):
+                    render = F.interpolate(
+                        render.unsqueeze(0),
+                        size=tuple(int(v) for v in target.shape[-2:]),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0]
+                mse = torch.mean((render - target).square()).clamp_min(1.0e-12)
+                psnr = float((-10.0 * torch.log10(mse)).item())
+                psnrs.append(psnr)
+
+                target_img = _image_tensor_to_pil(target)
+                render_img = _image_tensor_to_pil(render)
+                w, h = target_img.size
+                canvas = Image.new("RGB", (2 * w, h + 26), "white")
+                canvas.paste(target_img, (0, 26))
+                canvas.paste(render_img, (w, 26))
+                draw = ImageDraw.Draw(canvas)
+                draw.text((8, 6), "target panorama", fill=(0, 0, 0))
+                draw.text((w + 8, 6), f"final render PSNR={psnr:.2f}dB", fill=(0, 0, 0))
+                canvas = _resize_to_max_width(canvas, int(results_cfg.get("final_all_frames_max_width", 1600)))
+                panel_path = panel_dir / f"frame_{int(frame_id):06d}.png"
+                canvas.save(panel_path)
+                per_frame.append({"frame_id": int(frame_id), "psnr": psnr, "render_vs_gt": str(panel_path)})
+
+                gt_pose = rec.get("gt_c2w")
+                if torch.is_tensor(gt_pose) and tuple(gt_pose.shape) == (4, 4) and tuple(pose.shape) == (4, 4):
+                    pred_xyz.append(pose.detach().cpu().float()[:3, 3].numpy())
+                    gt_xyz.append(gt_pose.detach().cpu().float()[:3, 3].numpy())
+
+            ate_metrics: dict[str, float] = {}
+            if len(pred_xyz) >= 1 and len(pred_xyz) == len(gt_xyz):
+                _, _, ate_metrics, _ = _compute_ape_translation(
+                    np.asarray(pred_xyz, dtype=np.float32),
+                    np.asarray(gt_xyz, dtype=np.float32),
+                )
+            metrics = {
+                "render_count": int(len(per_frame)),
+                "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
+                "ate_rmse": ate_metrics.get("rmse"),
+                "ate_count": int(len(pred_xyz)),
+            }
+            payload = {"metrics": metrics, "frames": per_frame}
+            with open(root / "metrics.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            return {"root": str(root), "metrics": metrics}
+
         def save_final_artifacts() -> dict:
-            artifacts: dict[str, str | int | list[str] | None] = {
+            artifacts: dict[str, object] = {
                 "final_ply": None,
                 "final_checkpoint": None,
                 "final_keyframe_render_count": 0,
+                "final_all_frames": None,
                 "final_skybox_erp_preview": None,
                 "final_skybox_faces": None,
             }
@@ -2195,6 +2393,9 @@ class PanoDroidGSSlamSystem:
                         logger.log_image_file("skybox/final_cubemap_faces", faces_path)
                 except Exception as exc:
                     self.mapper.stats.notes.append(f"final skybox preview save failed: {exc!r}")
+            final_all_frames = save_final_all_frame_renders()
+            if final_all_frames is not None:
+                artifacts["final_all_frames"] = final_all_frames
             return artifacts
 
         try:
@@ -2253,6 +2454,13 @@ class PanoDroidGSSlamSystem:
                 step=frame_count,
             )
             final_artifacts = save_final_artifacts()
+            final_all_frames = final_artifacts.get("final_all_frames")
+            final_all_metrics = (
+                final_all_frames.get("metrics")
+                if isinstance(final_all_frames, dict)
+                and isinstance(final_all_frames.get("metrics"), dict)
+                else {}
+            )
             dense_ba_summary = _summarize_dense_ba_stats(self.frontend)
             summary = {
                 "frames": frame_count,
@@ -2280,6 +2488,8 @@ class PanoDroidGSSlamSystem:
                 "backend_last_sky_pruned": self.mapper.stats.last_sky_pruned,
                 "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,
+                "final_all_frames_ate_rmse": final_all_metrics.get("ate_rmse"),
+                "final_all_frames_mean_psnr": final_all_metrics.get("mean_psnr"),
                 "backend_final_trajectory_png": final_backend_traj,
                 "artifacts": final_artifacts,
                 "dense_ba": dense_ba_summary,

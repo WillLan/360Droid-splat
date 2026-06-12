@@ -67,6 +67,7 @@ class GaussianInitializer:
         sky_mask_cloud_brightness: float = 0.72,
         sky_mask_cloud_saturation: float = 0.22,
         sky_mask_texture_threshold: float = 0.08,
+        sky_mask_source: str = "heuristic",
         seed_source: str = "depth_pose",
         insertion_strategy: str = "legacy",
         pfgs360_voxel_size: float = 0.12,
@@ -92,6 +93,7 @@ class GaussianInitializer:
         self.sky_mask_cloud_brightness = float(sky_mask_cloud_brightness)
         self.sky_mask_cloud_saturation = float(sky_mask_cloud_saturation)
         self.sky_mask_texture_threshold = float(sky_mask_texture_threshold)
+        self.sky_mask_source = str(sky_mask_source or "heuristic").lower()
         self.seed_source = seed_source
         self.insertion_strategy = str(insertion_strategy or "legacy").lower()
         self.pfgs360_voxel_size = max(float(pfgs360_voxel_size), 1.0e-6)
@@ -152,7 +154,7 @@ class GaussianInitializer:
             & (conf_t >= self.min_confidence)
         )
         if self.sky_mask_enable:
-            sky = self._sky_mask_from_image(img).to(device=mask.device)
+            sky = self._configured_sky_mask(img, (H, W), device=mask.device, insertion_hints=insertion_hints)
             mask = mask & ~sky
         flat_idx = torch.nonzero(mask.view(-1), as_tuple=False).flatten()
         if flat_idx.numel() == 0:
@@ -260,7 +262,7 @@ class GaussianInitializer:
             & (conf_t >= self.min_confidence)
         )
         if self.sky_mask_enable:
-            sky = self._sky_mask_from_image(img).to(device=mask.device)
+            sky = self._configured_sky_mask(img, (H, W), device=mask.device, insertion_hints=insertion_hints)
             mask = mask & ~sky
         flat_idx = torch.nonzero(mask.view(-1), as_tuple=False).flatten()
         if flat_idx.numel() == 0:
@@ -305,7 +307,7 @@ class GaussianInitializer:
         mask = finite & valid_t & torch.isfinite(conf_t) & (conf_t >= self.min_confidence)
 
         if self.sky_mask_enable:
-            sky = self._sky_mask_from_image(img).to(device=mask.device)
+            sky = self._configured_sky_mask(img, (H, W), device=mask.device, insertion_hints=insertion_hints)
             mask = mask & ~sky
 
         hints = insertion_hints or {}
@@ -451,6 +453,26 @@ class GaussianInitializer:
         if tuple(valid_t.shape[-2:]) != (H, W):
             raise ValueError(f"World-points mask shape {tuple(valid_t.shape[-2:])} does not match image {(H, W)}")
         return valid_t.to(device=points.device)
+
+    def _configured_sky_mask(
+        self,
+        image: torch.Tensor,
+        size: tuple[int, int],
+        *,
+        device: torch.device,
+        insertion_hints: dict | None,
+    ) -> torch.Tensor:
+        hints = insertion_hints or {}
+        hint_sky = self._hint_mask(hints.get("sky_mask"), size, device=device)
+        if self.sky_mask_source in {"panovggt", "panovggt_head", "pano_vggt", "m3", "m3_head"}:
+            if hint_sky is None:
+                raise ValueError(
+                    "Mapping.sky_mask_source=panovggt_head requires insertion_hints['sky_mask']."
+                )
+            return hint_sky
+        if self.sky_mask_source in {"hint", "frontend", "frontend_hint"} and hint_sky is not None:
+            return hint_sky
+        return self._sky_mask_from_image(image).to(device=device)
 
     @staticmethod
     def _hint_field(

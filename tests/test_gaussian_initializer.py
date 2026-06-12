@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.interfaces import FrontendOutput
@@ -102,6 +103,53 @@ def test_gaussian_initializer_sky_mask_skips_blue_upper_pixels():
 
     assert len(seeds) == (H - 3) * W
     assert torch.allclose(seeds.rgb, torch.full_like(seeds.rgb, 0.25))
+
+
+def test_gaussian_initializer_panovggt_sky_mask_source_requires_hint():
+    H, W = 3, 4
+    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
+    points = torch.stack([xx.float(), yy.float(), torch.ones(H, W)], dim=-1)
+    conf = torch.ones(1, H, W)
+    output = FrontendOutput(
+        frame_id=40,
+        timestamp=40.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked",
+        world_points=points,
+        world_points_confidence=conf,
+        valid_world_points_mask=torch.ones(1, H, W, dtype=torch.bool),
+    )
+    image = torch.rand(3, H, W)
+    initializer = GaussianInitializer(
+        max_seeds_per_keyframe=0,
+        seed_source="world_points_only",
+        sky_mask_enable=True,
+        sky_mask_source="panovggt_head",
+        insertion_strategy="pfgs360_replace_fuse",
+    )
+
+    with pytest.raises(ValueError, match="requires insertion_hints"):
+        initializer.from_frontend_output(output, image)
+
+    sky_mask = torch.zeros(1, H, W, dtype=torch.bool)
+    sky_mask[0, 0, 0] = True
+    seeds = initializer.from_frontend_output(
+        output,
+        image,
+        insertion_hints={"sky_mask": sky_mask},
+        first_keyframe=True,
+    )
+
+    assert len(seeds) == H * W - 1
+    assert 0 not in set(int(v) for v in seeds.source_flat_idx.tolist())
 
 
 def test_gaussian_initializer_world_points_only_uses_input_xyz_exactly():

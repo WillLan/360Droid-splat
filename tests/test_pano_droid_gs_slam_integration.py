@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper, PanoRenderCamera
@@ -920,6 +921,44 @@ def test_skybox_init_requires_sky_mask_by_default():
     assert gaussian_map._skybox_initialized is False
 
 
+def test_mapper_panovggt_sky_mask_source_requires_explicit_mask():
+    cfg = {
+        "Mapping": {"sky_mask_source": "panovggt_head"},
+        "SkyBox": {
+            "enabled": True,
+            "optimization_mask_enable": True,
+            "sky_mask_top_ratio": 1.0,
+            "sky_mask_min_blue": 0.4,
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+    }
+    gaussian_map = PanoGaussianMap(config=cfg)
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_CountingRenderer())
+    image = torch.zeros(3, 4, 8)
+    image[2] = 1.0
+
+    with pytest.raises(ValueError, match="requires explicit sky_mask"):
+        mapper.register_observation_values(
+            frame_id=3,
+            image=image,
+            c2w=torch.eye(4),
+            inverse_depth=torch.ones(1, 4, 8),
+            depth_confidence=torch.ones(1, 4, 8),
+        )
+
+    explicit = torch.zeros(1, 4, 8, dtype=torch.bool)
+    mapper.register_observation_values(
+        frame_id=3,
+        image=image,
+        c2w=torch.eye(4),
+        inverse_depth=torch.ones(1, 4, 8),
+        depth_confidence=torch.ones(1, 4, 8),
+        sky_mask=explicit,
+    )
+
+    assert int(mapper.observations[3].sky_mask.sum()) == 0
+
+
 def test_system_runs_synthetic_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 3, "height": 16, "width": 32},
@@ -1016,6 +1055,7 @@ def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
             "save_final_ply": True,
             "save_final_checkpoint": True,
             "save_final_keyframe_renders": True,
+            "render_final_all_frames": True,
             "save_skybox_previews": True,
             "skybox_preview_height": 16,
             "skybox_preview_width": 32,
@@ -1033,6 +1073,9 @@ def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
     assert "anchor_birth_frame" in checkpoint
     assert "anchor_outlier_obs" in checkpoint
     assert summary["artifacts"]["final_keyframe_render_count"] >= 1
+    assert summary["artifacts"]["final_all_frames"]["metrics"]["render_count"] >= 1
+    assert summary["final_all_frames_mean_psnr"] is not None
+    assert (tmp_path / "final_all_frames" / "metrics.json").is_file()
     assert Path(summary["artifacts"]["final_skybox_erp_preview"]).is_file()
     assert Path(summary["artifacts"]["final_skybox_faces"]).is_file()
     assert any((tmp_path / "init_vis").rglob("iter_*_render.png"))

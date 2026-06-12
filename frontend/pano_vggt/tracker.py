@@ -327,6 +327,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.pose_by_frame: dict[int, torch.Tensor] = {}
         self.depth_by_frame: dict[int, torch.Tensor] = {}
         self.conf_by_frame: dict[int, torch.Tensor] = {}
+        self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
         memory_keyframes = max(1, int(self.m3_config.dense_ba.history_keyframes))
@@ -424,6 +425,19 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
 
     def consume_insertion_hints(self, frame_id: int) -> dict[str, torch.Tensor] | None:
         return self._pending_insertion_hints.pop(int(frame_id), None)
+
+    def sky_mask_for_frame(
+        self,
+        frame_id: int,
+        image_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor | None:
+        mask = self.sky_mask_by_frame.get(int(frame_id))
+        if mask is None:
+            return None
+        out = mask.detach().cpu().bool()
+        if image_size is not None and tuple(out.shape[-2:]) != tuple(int(v) for v in image_size):
+            out = (_resize_nearest(out.float(), (int(image_size[0]), int(image_size[1]))) > 0.5).bool()
+        return out
 
     def flush(self) -> list[FrontendOutput]:
         self._run_ready_chunks(final=True)
@@ -748,6 +762,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 pose = (backend_correction @ pose).detach()
                 points = self._apply_pose_correction_to_points(points, backend_correction).detach()
             points_full = _resize_points(points, image_size).detach()
+            sky_prob = pred.sky_prob[local_idx].detach() if pred.sky_prob is not None else None
+            if sky_prob is not None:
+                self.sky_mask_by_frame[frame_id] = self._sky_prob_to_mask(sky_prob, image_size).detach().cpu()
             valid_world = (
                 torch.isfinite(points_full).all(dim=-1, keepdim=False)
                 & torch.isfinite(inv_full[0])
@@ -766,7 +783,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 points_full,
                 valid_world,
                 anchor_metrics.get(local_idx),
-                pred.sky_prob[local_idx].detach() if pred.sky_prob is not None else None,
+                sky_prob,
                 alignment_residual,
                 "tracked_panovggt_long" + ba_stats.status_suffix,
             )
@@ -1390,6 +1407,18 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             valid_world_points_mask=output_valid.detach().cpu(),
         )
 
+    def _sky_prob_to_mask(self, sky_prob: torch.Tensor, image_size: tuple[int, int]) -> torch.Tensor:
+        tensor = sky_prob.detach().float()
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim == 3:
+            if int(tensor.shape[0]) != 1:
+                tensor = tensor[:1]
+        else:
+            raise ValueError(f"Expected sky probability as HxW or 1xHxW, got {tuple(sky_prob.shape)}")
+        resized = _resize_field(tensor, (int(image_size[0]), int(image_size[1])))
+        return (resized >= float(self.m3_config.keyframe_anchor.sky_threshold)).detach().cpu().bool()
+
     def _remember_keyframe_record(
         self,
         frame_id: int,
@@ -1763,6 +1792,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             non_sky_feature = None
         if non_sky_feature is not None:
             hints["non_sky"] = (_resize_nearest(non_sky_feature.float(), image_size) > 0.5).detach().cpu()
+        if sky_prob is not None:
+            hints["sky_mask"] = self._sky_prob_to_mask(sky_prob, image_size).detach().cpu()
         if anchor_metrics is not None:
             hints["pair_confidence"] = _resize_field(
                 anchor_metrics.pair_confidence.detach().float(),

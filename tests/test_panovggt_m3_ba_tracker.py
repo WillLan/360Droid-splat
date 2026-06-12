@@ -1222,6 +1222,49 @@ def test_pfgs360_insertion_hints_do_not_replace_valid_world_mask():
     assert hints["pair_confidence"].shape == (1, 4, 8)
 
 
+def test_tracker_exposes_panovggt_sky_mask_without_frontend_output_api_change():
+    pred = _prediction(feature_hw=(2, 4))
+    assert pred.sky_prob is not None
+    pred.sky_prob[1, 0, 0, 1] = 0.95
+    cfg = _anchor_cfg()
+    tracker = PanoVGGTLongTracker(
+        engine=_StaticEngine(pred),
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=2,
+        overlap=0,
+        emit_delay=0,
+        min_overlap_points=1,
+        require_aligned_world_points=False,
+        emit_unaligned=True,
+        novel_insertion_enabled=True,
+        novel_insertion_strategy="pfgs360",
+    )
+
+    def fake_align(aligned_pred, frame_ids, **kwargs):
+        _ = aligned_pred, frame_ids, kwargs
+        return SimilarityTransform.identity(device=pred.depth.device, dtype=pred.depth.dtype)
+
+    tracker._align_chunk = fake_align
+    for idx in range(2):
+        tracker.track(PanoFrame(image=torch.zeros(3, 4, 8), timestamp=float(idx), frame_id=idx))
+    outputs = tracker.pop_ready_outputs()
+    mask = tracker.sky_mask_for_frame(1, image_size=(4, 8))
+    hints = tracker._pfgs360_insertion_hints(
+        image_size=(4, 8),
+        anchor_metrics=None,
+        sky_prob=pred.sky_prob[1],
+        first_keyframe=True,
+    )
+
+    assert outputs
+    assert mask is not None
+    assert mask.shape == (1, 4, 8)
+    assert bool(mask.any())
+    assert "sky_mask" in hints
+    assert hints["sky_mask"].shape == (1, 4, 8)
+
+
 def test_tracker_shadow_mode_runs_ba_but_alignment_receives_original_prediction():
     pred0 = _prediction()
     refined = replace(pred0, poses_c2w=pred0.poses_c2w.clone())
@@ -1624,8 +1667,8 @@ def test_slam_logger_compact_wandb_keeps_depth_insertion_and_insert_count(tmp_pa
     logged_keys = set().union(*(payload.keys() for payload, _ in logger.run.logged))
     assert "backend/kf_opt_loss" in logged_keys
     assert "backend/kf_opt_psnr" in logged_keys
-    assert "backend/kf_render_opt" not in logged_keys
-    assert "backend/kf_depth_opt" not in logged_keys
+    assert "backend/kf_render_opt" in logged_keys
+    assert "backend/kf_depth_opt" in logged_keys
     assert "mapping/keyframe_inserted_gaussians" in logged_keys
     assert "mapping/new_gaussians_inserted" in logged_keys
     assert "mapping/depth_insertion" in logged_keys

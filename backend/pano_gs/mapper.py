@@ -93,6 +93,7 @@ class KeyframeRenderDiagnostic:
     target: torch.Tensor
     render: torch.Tensor
     depth: torch.Tensor | None
+    target_depth: torch.Tensor | None
     loss: float
     psnr: float
     anchor_count: int
@@ -579,6 +580,7 @@ class PanoGaussianMapper:
         self.pfgs360_insertion_enabled = bool(
             self.novel_insertion_enabled and self.novel_insertion_strategy in {"pfgs360", "pfgs360_replace_fuse"}
         )
+        self.sky_mask_source = str(mapping_cfg.get("sky_mask_source", "heuristic") or "heuristic").lower()
         self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
         self.replace_fuse_delete_rel_min = float(novel_cfg.get("replace_delete_rel_min", 0.10))
         self.replace_fuse_delete_rel_max = float(novel_cfg.get("replace_delete_rel_max", 0.20))
@@ -654,6 +656,7 @@ class PanoGaussianMapper:
         seeds: GaussianSeedBatch,
         frontend_output: FrontendOutput,
         image: torch.Tensor | None = None,
+        sky_mask: torch.Tensor | None = None,
     ) -> int:
         requested = len(seeds)
         current_kf_ord = int(self.stats.n_keyframes)
@@ -662,7 +665,11 @@ class PanoGaussianMapper:
         )
         self.last_source_hw = seeds.source_hw
         self.last_depth_insertion_diagnostic = None
-        sky_mask = self._skybox_mask_from_image(image) if image is not None else None
+        sky_mask = self._resolve_input_sky_mask(
+            image,
+            sky_mask,
+            context=f"frame {int(frontend_output.frame_id)} keyframe insertion",
+        )
         if image is not None and self.map.has_skybox:
             self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
         seeds, filter_stats = self._filter_novel_seeds(
@@ -795,7 +802,11 @@ class PanoGaussianMapper:
         if img.ndim != 3:
             return
         frame_id = int(frame_id)
-        sky = sky_mask if sky_mask is not None else self._skybox_mask_from_image(img)
+        sky = self._resolve_input_sky_mask(
+            img,
+            sky_mask,
+            context=f"frame {int(frame_id)} observation registration",
+        )
         depth, conf = self._target_depth_from_tensors(
             inverse_depth=inverse_depth,
             world_points=world_points,
@@ -1982,7 +1993,13 @@ class PanoGaussianMapper:
             self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
         return applied
 
-    def render_view(self, *, image: torch.Tensor, c2w: torch.Tensor) -> dict | None:
+    def render_view(
+        self,
+        *,
+        image: torch.Tensor,
+        c2w: torch.Tensor,
+        sky_mask: torch.Tensor | None = None,
+    ) -> dict | None:
         if self.map.anchor_count() == 0 and not self.map.has_skybox:
             return None
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
@@ -1990,7 +2007,7 @@ class PanoGaussianMapper:
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         with torch.no_grad():
             pkg = self.renderer.render(camera, self.map)
-            return self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target))
+            return self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, sky_mask))
 
     def _skybox_optimization_mask_enabled(self) -> bool:
         return bool(self._skybox_mask_enabled() and getattr(self.map, "skybox_optimize", False))
@@ -2001,7 +2018,37 @@ class PanoGaussianMapper:
             and getattr(self.map, "skybox_optimization_mask_enable", True)
         )
 
+    def _requires_frontend_sky_mask(self) -> bool:
+        return self.sky_mask_source in {"panovggt", "panovggt_head", "pano_vggt", "m3", "m3_head"}
+
+    def _resolve_input_sky_mask(
+        self,
+        image: torch.Tensor | None,
+        sky_mask: torch.Tensor | None,
+        *,
+        context: str,
+    ) -> torch.Tensor | None:
+        if sky_mask is not None:
+            mask = sky_mask.detach().bool()
+            if image is not None:
+                img = image.detach()
+                if img.ndim == 4:
+                    img = img[0]
+                if img.ndim == 3:
+                    mask = self._normalize_skybox_mask(
+                        mask,
+                        height=int(img.shape[-2]),
+                        width=int(img.shape[-1]),
+                        device=torch.device("cpu"),
+                    )
+            return mask.detach().cpu().bool()
+        if self._requires_frontend_sky_mask():
+            raise ValueError(f"{context}: Mapping.sky_mask_source=panovggt_head requires explicit sky_mask.")
+        return self._skybox_mask_from_image(image)
+
     def _skybox_mask_from_image(self, image: torch.Tensor | None) -> torch.Tensor | None:
+        if self._requires_frontend_sky_mask():
+            return None
         if image is None or not self._skybox_mask_enabled():
             return None
         img = image.detach().float()
@@ -2109,6 +2156,11 @@ class PanoGaussianMapper:
                 target=target.detach().cpu(),
                 render=render.cpu(),
                 depth=depth.detach().cpu() if torch.is_tensor(depth) else None,
+                target_depth=(
+                    keyframe.target_depth.detach().cpu()
+                    if torch.is_tensor(keyframe.target_depth)
+                    else None
+                ),
                 loss=float(loss.detach().cpu()),
                 psnr=float(psnr.detach().cpu()),
                 anchor_count=self.map.anchor_count(),
@@ -2121,13 +2173,14 @@ class PanoGaussianMapper:
         image: torch.Tensor,
         c2w: torch.Tensor,
         steps: int = 1,
+        sky_mask: torch.Tensor | None = None,
     ) -> dict[str, float]:
         if (self.map.anchor_count() == 0 and not self.map.has_skybox) or int(steps) <= 0:
             return {"loss": 0.0, "steps": 0.0}
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
-        sky_mask = self._skybox_mask_for_target(target)
+        sky_mask = self._skybox_mask_for_target(target, sky_mask)
         last = {"loss": 0.0}
         for _ in range(int(steps)):
             self.optimizer.zero_grad(set_to_none=True)

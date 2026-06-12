@@ -152,6 +152,7 @@ Mapping:
   sky_mask_cloud_brightness: 0.72
   sky_mask_cloud_saturation: 0.22
   sky_mask_texture_threshold: 0.08
+  sky_mask_source: panovggt_head
   lr: 0.002
   refine_steps_per_keyframe: 0
   NovelGaussianInsertion:
@@ -288,7 +289,7 @@ Visualization:
   log_every: 20
   m3_log_every: 20
   m3_max_matches: 80
-  save_kf_opt: false
+  save_kf_opt: true
   kf_opt_log_every: 1
   kf_opt_max_width: 1920
 
@@ -299,6 +300,7 @@ Results:
   save_final_ply: true
   save_final_checkpoint: true
   save_final_keyframe_renders: false
+  render_final_all_frames: true
   final_keyframe_render_stride: 1
   final_keyframe_render_max: 50
   save_skybox_previews: false
