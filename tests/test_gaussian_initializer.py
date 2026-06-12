@@ -212,6 +212,53 @@ def test_pfgs360_initializer_uses_single_voxel_and_aggregates_candidates():
     assert torch.equal(seeds.source_flat_idx.cpu(), torch.tensor([1, 2, 3]))
 
 
+def test_replace_fuse_initializer_decouples_voxel_and_erp_depth_latitude_scale():
+    H, W = 8, 16
+    grid = pixel_grid(H, W, device=torch.device("cpu"), dtype=torch.float32).view(-1, 2)
+    points = erp_pixel_to_bearing(grid, H, W).view(H, W, 3) * 0.05
+    conf = torch.ones(1, H, W, dtype=torch.float32)
+    valid = torch.ones(1, H, W, dtype=torch.bool)
+    output = FrontendOutput(
+        frame_id=9,
+        timestamp=9.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+        world_points=points,
+        world_points_confidence=conf,
+        valid_world_points_mask=valid,
+    )
+    initializer = GaussianInitializer(
+        max_seeds_per_keyframe=0,
+        seed_source="world_points_only",
+        insertion_strategy="pfgs360_replace_fuse",
+        pfgs360_voxel_size=0.02,
+        pfgs360_gaussian_scale_mode="erp_depth_latitude",
+        pfgs360_gaussian_scale_factor=1.25,
+        pfgs360_gaussian_scale_min=0.008,
+        pfgs360_gaussian_scale_max=0.08,
+        pfgs360_gaussian_scale_lat_cos_min=0.25,
+    )
+
+    seeds = initializer.from_frontend_output(output, torch.rand(3, H, W), first_keyframe=True)
+
+    assert seeds.grid_coord is not None
+    assert torch.equal(seeds.grid_coord.cpu(), torch.floor(seeds.xyz.detach().cpu() / 0.02).to(torch.int32))
+    assert torch.all(seeds.scale >= 0.008)
+    assert torch.all(seeds.scale <= 0.08)
+    assert not torch.allclose(seeds.scale, torch.full_like(seeds.scale, 0.02))
+    top_scale = seeds.scale[seeds.source_flat_idx.cpu() // W == 0].mean()
+    mid_scale = seeds.scale[seeds.source_flat_idx.cpu() // W == H // 2].mean()
+    assert float(mid_scale) > float(top_scale)
+
+
 def _seed_batch(xyz: torch.Tensor, confidence: torch.Tensor | None = None, *, frame_id: int = 0) -> GaussianSeedBatch:
     n = int(xyz.shape[0])
     if confidence is None:
@@ -431,3 +478,60 @@ def test_pfgs360_mapper_hash_hits_near_hits_and_suppressed_misses():
     assert mapper.stats.last_skipped_voxel == 2
     assert mapper.stats.last_suppressed_insert == 1
     assert int(mapper.map._anchor_obs_count[0]) == before_obs + 2
+
+
+def test_replace_fuse_refreshes_voxel_from_current_xyz_before_fusing():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    first = _pfgs_seed_batch(torch.tensor([[0.005, 0.0, 0.0]]), frame_id=0)
+    assert mapper.insert_keyframe(first, _frontend_output_for_mapper(0)) == 1
+    with torch.no_grad():
+        mapper.map.xyz.data[0] = torch.tensor([0.031, 0.0, 0.0])
+
+    second = _pfgs_seed_batch(torch.tensor([[0.032, 0.0, 0.0]]), frame_id=1)
+    inserted = mapper.insert_keyframe(second, _frontend_output_for_mapper(1))
+
+    assert inserted == 0
+    assert mapper.map.anchor_count() == 1
+    assert mapper.stats.last_hash_hits == 1
+    assert mapper.stats.last_replace_fused == 1
+    assert int(mapper.map._anchor_last_update_kf_ord[0]) == 1
+    assert torch.equal(mapper.map._anchor_grid_coord[0], torch.tensor([1, 0, 0], dtype=torch.int32))
+
+
+def test_replace_fuse_compacts_duplicate_anchors_after_voxel_refresh():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    seeds = _pfgs_seed_batch(torch.tensor([[0.005, 0.0, 0.0], [0.045, 0.0, 0.0]]), frame_id=0)
+    assert mapper.insert_keyframe(seeds, _frontend_output_for_mapper(0)) == 2
+    with torch.no_grad():
+        mapper.map.xyz.data[1] = torch.tensor([0.006, 0.0, 0.0])
+
+    compacted = mapper._refresh_pfgs360_voxel_cache(compact=True)
+
+    assert compacted == 1
+    assert mapper.map.anchor_count() == 1
+    index = mapper._build_replace_fuse_voxel_index()
+    assert all(len(rows) == 1 for rows in index.values())

@@ -1473,6 +1473,7 @@ class PanoDroidGSSlamSystem:
         mapping_cfg = config.get("Mapping", {})
         frontend_mode = str(config.get("Frontend", {}).get("mode", "graph")).lower()
         default_seed_source = "world_points_only" if frontend_mode == "panovggt_long" else "depth_pose"
+        novel_cfg = (mapping_cfg.get("NovelGaussianInsertion", {}) or {})
         self.initializer = GaussianInitializer(
             max_seeds_per_keyframe=int(mapping_cfg.get("max_seeds_per_keyframe", 2048)),
             min_confidence=float(mapping_cfg.get("min_depth_confidence", 0.15)),
@@ -1485,11 +1486,14 @@ class PanoDroidGSSlamSystem:
             sky_mask_texture_threshold=float(mapping_cfg.get("sky_mask_texture_threshold", 0.08)),
             voxel_sizes=tuple(config.get("Hierarchical", {}).get("voxel_size_lis", [0.12, 0.45, 1.8])),
             seed_source=str(mapping_cfg.get("seed_source", default_seed_source)),
-            insertion_strategy=str((mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("strategy", "legacy")),
-            pfgs360_voxel_size=float((mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("voxel_size", 0.12)),
-            temporal_pair_conf_min=float(
-                (mapping_cfg.get("NovelGaussianInsertion", {}) or {}).get("temporal_pair_conf_min", 0.70)
-            ),
+            insertion_strategy=str(novel_cfg.get("strategy", "legacy")),
+            pfgs360_voxel_size=float(novel_cfg.get("voxel_size", 0.12)),
+            pfgs360_gaussian_scale_mode=str(novel_cfg.get("gaussian_scale_mode", "voxel")),
+            pfgs360_gaussian_scale_factor=float(novel_cfg.get("gaussian_scale_factor", 1.25)),
+            pfgs360_gaussian_scale_min=float(novel_cfg.get("gaussian_scale_min", 0.008)),
+            pfgs360_gaussian_scale_max=float(novel_cfg.get("gaussian_scale_max", 0.08)),
+            pfgs360_gaussian_scale_lat_cos_min=float(novel_cfg.get("gaussian_scale_lat_cos_min", 0.25)),
+            temporal_pair_conf_min=float(novel_cfg.get("temporal_pair_conf_min", 0.70)),
         )
         self.map = PanoGaussianMap(config=config)
         render_cfg = config.get("Renderer", {})
@@ -1513,9 +1517,21 @@ class PanoDroidGSSlamSystem:
         if not isinstance(backend_cfg, dict):
             return
         ff_cfg = backend_cfg.get("FeedForwardWindow", {})
-        if not isinstance(ff_cfg, dict) or not bool(ff_cfg.get("enabled", False)):
+        ff_enabled = isinstance(ff_cfg, dict) and bool(ff_cfg.get("enabled", False))
+        chunk_enabled = bool(backend_cfg.get("optimize_after_every_chunk", False))
+        if not ff_enabled and not chunk_enabled:
             return
-        history_keyframes = max(0, int(ff_cfg.get("history_keyframes", 2)))
+        history_keyframes = max(
+            0,
+            int(
+                ff_cfg.get(
+                    "history_keyframes",
+                    backend_cfg.get("recent_keyframe_observation_frames", 2),
+                )
+                if isinstance(ff_cfg, dict)
+                else backend_cfg.get("recent_keyframe_observation_frames", 2)
+            ),
+        )
         pano_cfg = config.setdefault("PanoVGGT", {})
         if not isinstance(pano_cfg, dict):
             return
@@ -1666,7 +1682,9 @@ class PanoDroidGSSlamSystem:
         backend_cfg = self.config.get("BackendOptimization", {})
         feedforward_cfg = backend_cfg.get("FeedForwardWindow", {}) if isinstance(backend_cfg, dict) else {}
         feedforward_cfg = feedforward_cfg if isinstance(feedforward_cfg, dict) else {}
-        feedforward_window_enabled = bool(feedforward_cfg.get("enabled", False))
+        feedforward_window_enabled = bool(feedforward_cfg.get("enabled", False)) or bool(
+            backend_cfg.get("optimize_after_every_chunk", False)
+        )
         non_keyframe_steps = int(backend_cfg.get("non_keyframe_steps", 0))
         pano_cfg = self.config.get("PanoVGGT", {})
         keyframe_anchor_cfg = pano_cfg.get("KeyframeAnchor", {}) if isinstance(pano_cfg, dict) else {}
@@ -1934,6 +1952,9 @@ class PanoDroidGSSlamSystem:
                     "skipped_depth_mismatch_budget": int(
                         getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
                     ),
+                    "replace_deleted": int(getattr(self.mapper.stats, "last_replace_deleted", 0)),
+                    "replace_fused": int(getattr(self.mapper.stats, "last_replace_fused", 0)),
+                    "replace_compacted": int(getattr(self.mapper.stats, "last_replace_compacted", 0)),
                 }
                 if bool(novel_cfg.get("save_visualization", False)):
                     section_start = time.perf_counter()
@@ -2253,6 +2274,10 @@ class PanoDroidGSSlamSystem:
                 "backend_last_trainable_pose_count": self.mapper.stats.last_trainable_pose_count,
                 "backend_last_feedforward_opacity_resets": self.mapper.stats.last_feedforward_opacity_resets,
                 "backend_last_feedforward_pruned": self.mapper.stats.last_feedforward_pruned,
+                "backend_last_replace_deleted": self.mapper.stats.last_replace_deleted,
+                "backend_last_replace_fused": self.mapper.stats.last_replace_fused,
+                "backend_last_replace_compacted": self.mapper.stats.last_replace_compacted,
+                "backend_last_sky_pruned": self.mapper.stats.last_sky_pruned,
                 "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,
                 "backend_final_trajectory_png": final_backend_traj,

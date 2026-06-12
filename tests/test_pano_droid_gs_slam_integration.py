@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper, PanoRenderCamera
-from backend.pano_gs.losses import backend_render_loss
+from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, _se3_blend_pose
@@ -51,6 +51,31 @@ class _DepthGateRenderer:
             "visibility_filter": torch.zeros(total, dtype=torch.bool, device=render.device),
             "radii": torch.zeros(total, dtype=torch.int32, device=render.device),
             "n_touched": torch.zeros(total, dtype=torch.int32, device=render.device),
+            "render_distort": None,
+        }
+
+
+class _ReplaceBandRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        H, W = int(camera.image_height), int(camera.image_width)
+        device = camera.c2w.device
+        dtype = camera.c2w.dtype
+        render = torch.zeros(3, H, W, device=device, dtype=dtype)
+        depth = torch.ones(1, H, W, device=device, dtype=dtype)
+        if W >= 2:
+            depth[:, :, 1] = 1.15
+        if W >= 3:
+            depth[:, :, 2] = 1.50
+        alpha = torch.ones(1, H, W, device=device, dtype=dtype)
+        total = int(gaussian_map.anchor_count())
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "visibility_filter": torch.zeros(total, dtype=torch.bool, device=device),
+            "radii": torch.zeros(total, dtype=torch.int32, device=device),
+            "n_touched": torch.zeros(total, dtype=torch.int32, device=device),
             "render_distort": None,
         }
 
@@ -231,6 +256,49 @@ def test_pfgs360_mapper_render_depth_gate_budgets_missing_and_depth_mismatch_reg
     assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
 
 
+def test_replace_fuse_depth_error_bands_split_delete_and_insert_only_regions():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "replace_insert_rel_min": 0.10,
+                "replace_delete_rel_min": 0.10,
+                "replace_delete_rel_max": 0.20,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_ReplaceBandRenderer())
+    mapper.insert_keyframe(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.02),
+            level=torch.zeros(1, dtype=torch.int8),
+            frame_id=0,
+        ),
+        _small_frontend_output(0),
+        image=torch.zeros(3, 1, 4),
+    )
+
+    masks, stats = mapper._pfgs360_replace_fuse_masks_and_delete(
+        _small_frontend_output(1),
+        torch.zeros(3, 1, 4),
+        sky_mask=None,
+    )
+
+    assert masks is not None
+    assert torch.equal(masks["insert"], torch.tensor([[[False, True, True, False]]]))
+    assert torch.equal(masks["delete"], torch.tensor([[[False, True, False, False]]]))
+    assert stats["replace_deleted"] == 0
+
+
 def test_mapper_force_sky_render_uses_skybox_inside_sky_mask():
     config = {
         "SkyBox": {
@@ -257,6 +325,28 @@ def test_mapper_force_sky_render_uses_skybox_inside_sky_mask():
     assert bool(out["skybox_force_sky_render"])
     assert torch.allclose(out["render"][:, 0, 0], torch.tensor([0.0, 0.0, 1.0]))
     assert torch.allclose(out["render"][:, 0, 1], torch.tensor([1.0, 0.0, 0.0]))
+
+
+def test_backend_l1_dssim_loss_has_gradient_without_opacity_penalty():
+    render = torch.zeros(3, 4, 8, requires_grad=True)
+    target = torch.ones(3, 4, 8)
+    alpha = torch.ones(1, 4, 8, requires_grad=True)
+    weights = BackendLossWeights(
+        photometric_mode="l1_dssim",
+        rgb_l1_weight=0.8,
+        dssim_weight=0.2,
+        depth=0.0,
+        opacity=0.0,
+    )
+
+    loss, metrics = backend_render_loss({"render": render, "alpha": alpha}, target, weights=weights)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert render.grad is not None
+    assert float(render.grad.abs().sum()) > 0.0
+    assert alpha.grad is None or float(alpha.grad.abs().sum()) == 0.0
+    assert float(metrics["opacity"]) > 0.0
 
 
 def test_mapper_random_window_optimizes_one_sample_per_step():
@@ -368,6 +458,101 @@ def test_mapper_feedforward_window_uses_history_and_non_keyframes():
     assert mapper.stats.last_window_observations == [2, 3, 10, 11]
     assert mapper.stats.last_window_keyframes == [2, 3]
     assert renderer.frame_ids == [2, 3, 10, 11]
+
+
+def test_replace_fuse_chunk_optimizer_samples_current_chunk_and_recent_keyframes():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": True,
+            "steps_per_chunk": 3,
+            "sample_frames_per_step": 1,
+            "current_chunk_observation_frames": 4,
+            "recent_keyframe_observation_frames": 2,
+            "recent_insert_keyframes": 2,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    for frame_id in (1, 2):
+        image = torch.full((3, 4, 8), 0.2 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.insert_keyframe(_small_seed_batch(frame_id), _small_frontend_output(frame_id), image=image)
+    for frame_id in (10, 11, 12, 13):
+        image = torch.full((3, 4, 8), 0.1 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.register_observation(_small_non_keyframe_output(frame_id), image)
+    renderer.calls = 0
+    renderer.frame_ids.clear()
+
+    metrics = mapper.optimize_feedforward_window(current_frame_ids=[10, 11, 12, 13], history_frame_ids=[99])
+
+    assert renderer.calls == 3
+    assert metrics["window_size"] == 6.0
+    assert metrics["sampled_window_size"] == 1.0
+    assert mapper.stats.last_window_observations == [10, 11, 12, 13, 1, 2]
+    assert len(mapper.stats.last_sampled_keyframes) == 1
+
+
+def test_replace_fuse_chunk_optimizer_prunes_visible_sky_gaussians():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": True,
+            "steps_per_chunk": 1,
+            "sample_frames_per_step": 1,
+            "recent_keyframe_observation_frames": 0,
+            "recent_insert_keyframes": 2,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_BadEvidenceRenderer())
+    mapper.insert_keyframe(_small_seed_batch(1), _small_frontend_output(1), image=torch.zeros(3, 4, 8))
+    mapper.register_observation_values(
+        frame_id=10,
+        image=torch.zeros(3, 4, 8),
+        c2w=_small_non_keyframe_output(10).pose_c2w,
+        inverse_depth=torch.ones(1, 4, 8),
+        depth_confidence=torch.ones(1, 4, 8),
+        is_keyframe=False,
+        sky_mask=torch.ones(1, 4, 8, dtype=torch.bool),
+    )
+
+    metrics = mapper.optimize_feedforward_window(current_frame_ids=[10], history_frame_ids=[])
+
+    assert metrics["sky_pruned"] == 1.0
+    assert mapper.stats.last_sky_pruned == 1
+    assert gaussian_map.anchor_count() == 0
 
 
 def test_mapper_feedforward_window_freezes_non_window_gaussians():

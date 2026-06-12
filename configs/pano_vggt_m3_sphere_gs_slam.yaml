@@ -171,8 +171,13 @@ Mapping:
   refine_steps_per_keyframe: 0
   NovelGaussianInsertion:
     enabled: true
-    strategy: pfgs360
-    voxel_size: 0.12
+    strategy: pfgs360_replace_fuse
+    voxel_size: 0.02
+    gaussian_scale_mode: erp_depth_latitude
+    gaussian_scale_factor: 1.25
+    gaussian_scale_min: 0.008
+    gaussian_scale_max: 0.08
+    gaussian_scale_lat_cos_min: 0.25
     first_keyframe_max_seeds: 160000
     keyframe_max_seeds: 30000
     global_anchor_budget: 3000000
@@ -180,13 +185,20 @@ Mapping:
     render_alpha_min: 0.20
     missing_alpha_min: 0.05
     render_depth_rel_threshold: 0.10
+    replace_insert_rel_min: 0.10
+    replace_delete_rel_min: 0.10
+    replace_delete_rel_max: 0.20
+    replace_front_depth_abs_tol: 0.03
+    replace_front_depth_rel_tol: 0.02
+    max_replace_delete_per_keyframe: 30000
+    compact_voxels: true
     max_missing_seeds_per_keyframe: 12000
     max_depth_mismatch_seeds_per_keyframe: 30000
     prioritize_depth_mismatch: true
     near_grid_radius: 1
     near_distance_factor: 1.0
-    reset_after_outlier_observations: 3
-    prune_after_outlier_observations: 6
+    reset_after_outlier_observations: 0
+    prune_after_outlier_observations: 0
     protect_recent_keyframes: 8
     max_prune_per_keyframe: 500
     save_visualization: false
@@ -202,6 +214,12 @@ BackendOptimization:
   enabled: true
   gaussian_refine_enable: true
   pose_refine_enable: true
+  optimize_after_every_chunk: true
+  steps_per_chunk: 200
+  sample_frames_per_step: 1
+  current_chunk_observation_frames: 4
+  recent_keyframe_observation_frames: 2
+  recent_insert_keyframes: 2
   keyframe_steps: 0
   keyframe_optimize_pose: false
   non_keyframe_steps: 0
@@ -216,6 +234,18 @@ BackendOptimization:
   use_frontend_graph_window: true
   fixed_window_frames: 1
   gaussian_lr: 0.002
+  xyz_lr: 0.0005
+  feature_lr: 0.002
+  opacity_lr: 0.001
+  scaling_lr: 0.0001
+  rotation_lr: 0.0001
+  photometric_loss_mode: l1_dssim
+  rgb_l1_weight: 0.8
+  dssim_weight: 0.2
+  depth_loss_weight: 0.03
+  depth_loss_mode: relative_clamped
+  depth_residual_clamp: 0.20
+  opacity_loss_weight: 0.0
   pose_lr: 0.001
   skybox_lr: 0.01
   optimize_skybox: true
@@ -227,7 +257,7 @@ BackendOptimization:
     optimize_non_keyframe_observations: true
     gaussian_scope: selected_birth_keyframes
     prune:
-      enabled: true
+      enabled: false
       reset_after_bad: 3
       prune_after_bad: 6
       min_seen: 2

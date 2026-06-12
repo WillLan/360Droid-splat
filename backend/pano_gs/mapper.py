@@ -46,6 +46,10 @@ class MapperStats:
     last_trainable_pose_count: int = 0
     last_feedforward_opacity_resets: int = 0
     last_feedforward_pruned: int = 0
+    last_replace_deleted: int = 0
+    last_replace_fused: int = 0
+    last_replace_compacted: int = 0
+    last_sky_pruned: int = 0
     last_hash_hits: int = 0
     last_hash_near_hits: int = 0
     last_suppressed_insert: int = 0
@@ -132,6 +136,7 @@ class PanoGaussianMap(nn.Module):
         self._anchor_conf_accum = torch.zeros(0, dtype=torch.float32)
         self._anchor_birth_frame = torch.zeros(0, dtype=torch.int32)
         self._anchor_last_seen_kf = torch.zeros(0, dtype=torch.int32)
+        self._anchor_last_update_kf_ord = torch.zeros(0, dtype=torch.int32)
         self._anchor_inlier_obs = torch.zeros(0, dtype=torch.int32)
         self._anchor_outlier_obs = torch.zeros(0, dtype=torch.int32)
 
@@ -211,7 +216,13 @@ class PanoGaussianMap(nn.Module):
     def anchor_count(self) -> int:
         return int(self.xyz.shape[0])
 
-    def add_seeds(self, seeds: GaussianSeedBatch) -> int:
+    def add_seeds(
+        self,
+        seeds: GaussianSeedBatch,
+        *,
+        voxel_size: float | None = None,
+        last_update_kf_ord: int | None = None,
+    ) -> int:
         if len(seeds) == 0:
             return 0
         device = self.xyz.device
@@ -241,6 +252,8 @@ class PanoGaussianMap(nn.Module):
         )
         if seeds.grid_coord is not None and int(seeds.grid_coord.shape[0]) == int(len(seeds)):
             grid = seeds.grid_coord.detach().cpu().to(torch.int32)
+        elif voxel_size is not None and float(voxel_size) > 0.0:
+            grid = torch.floor(seeds.xyz.detach().cpu() / float(voxel_size)).to(torch.int32)
         else:
             grid = torch.floor(seeds.xyz.detach().cpu() / seeds.scale.detach().cpu().view(-1, 1).clamp_min(1e-6)).to(torch.int32)
         self._anchor_grid_coord = torch.cat([self._anchor_grid_coord, grid.to(torch.int32)], dim=0)
@@ -253,6 +266,11 @@ class PanoGaussianMap(nn.Module):
         frame_ids = torch.full((len(seeds),), int(seeds.frame_id), dtype=torch.int32)
         self._anchor_birth_frame = torch.cat([self._anchor_birth_frame, frame_ids], dim=0)
         self._anchor_last_seen_kf = torch.cat([self._anchor_last_seen_kf, frame_ids], dim=0)
+        update_ord = int(seeds.frame_id) if last_update_kf_ord is None else int(last_update_kf_ord)
+        self._anchor_last_update_kf_ord = torch.cat(
+            [self._anchor_last_update_kf_ord, torch.full((len(seeds),), update_ord, dtype=torch.int32)],
+            dim=0,
+        )
         self._anchor_inlier_obs = torch.cat([self._anchor_inlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         self._anchor_outlier_obs = torch.cat([self._anchor_outlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         return int(xyz.shape[0])
@@ -280,6 +298,7 @@ class PanoGaussianMap(nn.Module):
         self._anchor_conf_accum = self._anchor_conf_accum[keep_cpu]
         self._anchor_birth_frame = self._anchor_birth_frame[keep_cpu]
         self._anchor_last_seen_kf = self._anchor_last_seen_kf[keep_cpu]
+        self._anchor_last_update_kf_ord = self._anchor_last_update_kf_ord[keep_cpu]
         self._anchor_inlier_obs = self._anchor_inlier_obs[keep_cpu]
         self._anchor_outlier_obs = self._anchor_outlier_obs[keep_cpu]
         return n_pruned
@@ -515,6 +534,7 @@ class PanoGaussianMap(nn.Module):
                 "anchor_conf_accum": self._anchor_conf_accum,
                 "anchor_birth_frame": self._anchor_birth_frame,
                 "anchor_last_seen_kf": self._anchor_last_seen_kf,
+                "anchor_last_update_kf_ord": self._anchor_last_update_kf_ord,
                 "anchor_inlier_obs": self._anchor_inlier_obs,
                 "anchor_outlier_obs": self._anchor_outlier_obs,
                 "config": self.config,
@@ -553,10 +573,20 @@ class PanoGaussianMapper:
         m3_enabled = bool((pano_cfg.get("M3Sphere", {}) or {}).get("enabled", False)) if isinstance(pano_cfg, dict) else False
         self.novel_insertion_enabled = bool(novel_cfg.get("enabled", m3_enabled))
         self.novel_insertion_strategy = str(novel_cfg.get("strategy", "legacy") or "legacy").lower()
+        self.pfgs360_replace_fuse_enabled = bool(
+            self.novel_insertion_enabled and self.novel_insertion_strategy == "pfgs360_replace_fuse"
+        )
         self.pfgs360_insertion_enabled = bool(
-            self.novel_insertion_enabled and self.novel_insertion_strategy == "pfgs360"
+            self.novel_insertion_enabled and self.novel_insertion_strategy in {"pfgs360", "pfgs360_replace_fuse"}
         )
         self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
+        self.replace_fuse_delete_rel_min = float(novel_cfg.get("replace_delete_rel_min", 0.10))
+        self.replace_fuse_delete_rel_max = float(novel_cfg.get("replace_delete_rel_max", 0.20))
+        self.replace_fuse_insert_rel_min = float(novel_cfg.get("replace_insert_rel_min", self.replace_fuse_delete_rel_min))
+        self.replace_fuse_front_depth_abs_tol = float(novel_cfg.get("replace_front_depth_abs_tol", 0.03))
+        self.replace_fuse_front_depth_rel_tol = float(novel_cfg.get("replace_front_depth_rel_tol", 0.02))
+        self.replace_fuse_max_delete_per_keyframe = max(0, int(novel_cfg.get("max_replace_delete_per_keyframe", 30000)))
+        self.replace_fuse_compact_voxels = bool(novel_cfg.get("compact_voxels", True))
         self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
         self.pfgs360_missing_alpha_min = float(novel_cfg.get("missing_alpha_min", self.pfgs360_render_alpha_min))
         self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.10))
@@ -564,8 +594,10 @@ class PanoGaussianMapper:
         self.pfgs360_photometric_error_threshold = float(novel_cfg.get("photometric_error_threshold", 0.08))
         self.pfgs360_near_grid_radius = max(0, int(novel_cfg.get("near_grid_radius", 1)))
         self.pfgs360_near_distance_factor = max(0.0, float(novel_cfg.get("near_distance_factor", 1.0)))
-        self.pfgs360_reset_after_outliers = max(0, int(novel_cfg.get("reset_after_outlier_observations", 3)))
-        self.pfgs360_prune_after_outliers = max(0, int(novel_cfg.get("prune_after_outlier_observations", 6)))
+        default_reset = 0 if self.pfgs360_replace_fuse_enabled else 3
+        default_prune = 0 if self.pfgs360_replace_fuse_enabled else 6
+        self.pfgs360_reset_after_outliers = max(0, int(novel_cfg.get("reset_after_outlier_observations", default_reset)))
+        self.pfgs360_prune_after_outliers = max(0, int(novel_cfg.get("prune_after_outlier_observations", default_prune)))
         self.pfgs360_protect_recent_keyframes = max(0, int(novel_cfg.get("protect_recent_keyframes", 8)))
         self.pfgs360_max_prune_per_keyframe = max(0, int(novel_cfg.get("max_prune_per_keyframe", 500)))
         self.first_keyframe_max_seeds = int(novel_cfg.get("first_keyframe_max_seeds", 80000))
@@ -590,11 +622,23 @@ class PanoGaussianMapper:
         self.last_source_hw: tuple[int, int] | None = None
         self.last_depth_insertion_diagnostic: DepthInsertionDiagnostic | None = None
         self.frontend_graph_window_ids: tuple[int, ...] = ()
+        if loss_weights is None and self.pfgs360_replace_fuse_enabled:
+            sky_cfg = gaussian_map.config.get("SkyBox", {}) if isinstance(gaussian_map.config, dict) else {}
+            self.loss_weights = BackendLossWeights(
+                depth=float(self.optim_cfg.get("depth_loss_weight", 0.03)),
+                opacity=float(self.optim_cfg.get("opacity_loss_weight", 0.0)),
+                sky_alpha=float(sky_cfg.get("sky_alpha_loss_weight", 0.0)),
+                photometric_mode=str(self.optim_cfg.get("photometric_loss_mode", "l1_dssim")),
+                rgb_l1_weight=float(self.optim_cfg.get("rgb_l1_weight", 0.8)),
+                dssim_weight=float(self.optim_cfg.get("dssim_weight", 0.2)),
+                depth_loss_mode=str(self.optim_cfg.get("depth_loss_mode", "relative_clamped")),
+                depth_residual_clamp=float(self.optim_cfg.get("depth_residual_clamp", 0.20)),
+            )
 
     @property
     def feedforward_window_enabled(self) -> bool:
         cfg = self._feedforward_window_cfg()
-        return bool(cfg.get("enabled", False))
+        return bool(cfg.get("enabled", False)) or bool(self.optim_cfg.get("optimize_after_every_chunk", False))
 
     def _feedforward_window_cfg(self) -> dict:
         cfg = self.optim_cfg.get("FeedForwardWindow", {}) if isinstance(self.optim_cfg, dict) else {}
@@ -612,6 +656,7 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
     ) -> int:
         requested = len(seeds)
+        current_kf_ord = int(self.stats.n_keyframes)
         self.last_requested_source_flat_idx = (
             None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
         )
@@ -632,9 +677,19 @@ class PanoGaussianMapper:
         if self.last_source_hw is None:
             self.last_source_hw = seeds.source_hw
         start = self.map.anchor_count()
-        n = self.map.add_seeds(seeds)
+        n = self.map.add_seeds(
+            seeds,
+            voxel_size=self.pfgs360_voxel_size if self.pfgs360_replace_fuse_enabled else None,
+            last_update_kf_ord=current_kf_ord if self.pfgs360_replace_fuse_enabled else None,
+        )
         end = start + int(n)
         self.last_inserted_range = (start, end)
+        if self.pfgs360_replace_fuse_enabled:
+            compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+            if compacted > 0:
+                filter_stats["compacted"] = int(filter_stats.get("compacted", 0)) + int(compacted)
+                self._rebuild_keyframe_ranges_from_birth_frames()
+                self.last_inserted_range = self._range_for_birth_frame(int(frontend_output.frame_id))
         self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
         self.stats.n_keyframes += 1
         self.stats.n_anchors = self.map.anchor_count()
@@ -657,8 +712,12 @@ class PanoGaussianMapper:
         self.stats.last_skipped_depth_mismatch_budget = int(
             filter_stats.get("skipped_depth_mismatch_budget", 0)
         )
+        self.stats.last_replace_deleted = int(filter_stats.get("replace_deleted", 0))
+        self.stats.last_replace_fused = int(filter_stats.get("fused", 0))
+        self.stats.last_replace_compacted = int(filter_stats.get("compacted", 0))
         if image is not None:
-            self._register_keyframe(frontend_output, image, start=start, end=end, sky_mask=sky_mask)
+            register_start, register_end = self.last_inserted_range
+            self._register_keyframe(frontend_output, image, start=register_start, end=register_end, sky_mask=sky_mask)
             self.register_observation(frontend_output, image, is_keyframe=True, sky_mask=sky_mask)
         if n == 0:
             self.stats.notes.append(f"frame {frontend_output.frame_id}: no seeds inserted")
@@ -816,6 +875,13 @@ class PanoGaussianMapper:
         image: torch.Tensor | None,
         sky_mask: torch.Tensor | None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
+        if self.pfgs360_replace_fuse_enabled:
+            return self._filter_replace_fuse_seeds(
+                seeds,
+                frontend_output=frontend_output,
+                image=image,
+                sky_mask=sky_mask,
+            )
         seeds = self._with_pfgs360_seed_metadata(seeds)
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
         budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
@@ -944,6 +1010,127 @@ class PanoGaussianMapper:
         keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
         return self._subset_seeds(seeds, keep_idx), stats
 
+    def _filter_replace_fuse_seeds(
+        self,
+        seeds: GaussianSeedBatch,
+        *,
+        frontend_output: FrontendOutput | None,
+        image: torch.Tensor | None,
+        sky_mask: torch.Tensor | None,
+    ) -> tuple[GaussianSeedBatch, dict[str, int]]:
+        seeds = self._with_pfgs360_seed_metadata(seeds)
+        per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
+        budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
+        if self.global_anchor_budget > 0:
+            budget = min(budget, max(0, int(self.global_anchor_budget) - self.map.anchor_count()))
+        budget = max(0, int(budget))
+
+        stats = {
+            "skipped_voxel": 0,
+            "skipped_budget": 0,
+            "hash_hits": 0,
+            "hash_near_hits": 0,
+            "suppressed_insert": 0,
+            "outlier_resets": 0,
+            "outlier_pruned": 0,
+            "replace_deleted": 0,
+            "fused": 0,
+            "compacted": 0,
+            "missing_pixels": 0,
+            "depth_mismatch_pixels": 0,
+            "render_bad_pixels": 0,
+            "missing_seed_candidates": 0,
+            "depth_mismatch_seed_candidates": 0,
+            "skipped_missing_budget": 0,
+            "skipped_depth_mismatch_budget": 0,
+        }
+        current_kf_ord = int(self.stats.n_keyframes)
+        if self.map.anchor_count() > 0:
+            stats["compacted"] += self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+        insert_enabled = (
+            torch.ones(len(seeds), dtype=torch.bool)
+            if seeds.insert_enabled is None
+            else seeds.insert_enabled.detach().cpu().bool()
+        )
+        first_keyframe = self.stats.n_keyframes == 0 or self.map.anchor_count() == 0
+        insert_seed_mask = torch.ones(len(seeds), dtype=torch.bool)
+        depth_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
+        if first_keyframe and frontend_output is not None and image is not None:
+            image_hw = tuple(int(v) for v in image.shape[-2:])
+            self.last_depth_insertion_diagnostic = self._prediction_depth_insertion_diagnostic(
+                frontend_output,
+                image_hw,
+            )
+        elif frontend_output is not None and image is not None:
+            image_hw = tuple(int(v) for v in image.shape[-2:])
+            render_masks, evidence_stats = self._pfgs360_replace_fuse_masks_and_delete(
+                frontend_output,
+                image,
+                sky_mask=sky_mask,
+            )
+            stats.update({key: int(stats.get(key, 0)) + int(value) for key, value in evidence_stats.items()})
+            if render_masks is not None:
+                insert_seed_mask = self._sample_seed_mask(render_masks["insert"], seeds).detach().cpu().bool()
+                depth_seed_mask = self._sample_seed_mask(render_masks["delete"], seeds).detach().cpu().bool()
+                insert_enabled &= insert_seed_mask
+                stats["depth_mismatch_seed_candidates"] = int(depth_seed_mask.sum().item())
+                stats["missing_seed_candidates"] = int((insert_seed_mask & ~depth_seed_mask).sum().item())
+
+        score = seeds.insert_score if seeds.insert_score is not None else seeds.confidence
+        score_cpu = score.detach().cpu().float()
+        conf_cpu = seeds.confidence.detach().cpu().float()
+        xyz_cpu = seeds.xyz.detach().cpu().float()
+        grid_cpu = torch.floor(xyz_cpu / float(self.pfgs360_voxel_size)).to(torch.int32)
+        order = torch.argsort(score_cpu, descending=True)
+        occupied = self._build_replace_fuse_voxel_index()
+        anchor_xyz_cpu = self.map.get_xyz.detach().cpu().float() if self.map.anchor_count() > 0 else torch.zeros(0, 3)
+        kept: list[int] = []
+        kept_depth_mismatch = 0
+        kept_insert_only = 0
+        depth_budget = int(self.max_depth_mismatch_seeds_per_keyframe)
+        insert_only_budget = int(self.max_missing_seeds_per_keyframe)
+        for seed_idx in order.tolist():
+            key = (0, int(grid_cpu[seed_idx, 0]), int(grid_cpu[seed_idx, 1]), int(grid_cpu[seed_idx, 2]))
+            hits = occupied.get(key, [])
+            valid_hits = [int(hit) for hit in hits if int(hit) >= 0]
+            if valid_hits:
+                hit = self._select_replace_fuse_hit(valid_hits, xyz_cpu[seed_idx], anchor_xyz_cpu)
+                self._fuse_seed_into_anchor(hit, seeds, int(seed_idx), current_kf_ord=current_kf_ord)
+                stats["hash_hits"] += 1
+                stats["skipped_voxel"] += 1
+                stats["fused"] += 1
+                if int(hit) < int(anchor_xyz_cpu.shape[0]):
+                    anchor_xyz_cpu[hit] = self.map.get_xyz.detach().cpu().float()[hit]
+                continue
+            if hits:
+                stats["skipped_voxel"] += 1
+                continue
+            if not bool(insert_enabled[seed_idx]):
+                stats["suppressed_insert"] += 1
+                continue
+            is_delete_band_seed = bool(depth_seed_mask[seed_idx])
+            if is_delete_band_seed and depth_budget > 0 and kept_depth_mismatch >= depth_budget:
+                stats["skipped_depth_mismatch_budget"] += 1
+                stats["skipped_budget"] += 1
+                continue
+            if (not is_delete_band_seed) and insert_only_budget > 0 and kept_insert_only >= insert_only_budget:
+                stats["skipped_missing_budget"] += 1
+                stats["skipped_budget"] += 1
+                continue
+            if len(kept) >= budget:
+                stats["skipped_budget"] += 1
+                continue
+            kept.append(int(seed_idx))
+            if is_delete_band_seed:
+                kept_depth_mismatch += 1
+            else:
+                kept_insert_only += 1
+            occupied[key] = [-1]
+        if not kept:
+            return self._empty_seed_like(seeds), stats
+        keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
+        return self._subset_seeds(seeds, keep_idx), stats
+
     def _with_pfgs360_seed_metadata(self, seeds: GaussianSeedBatch) -> GaussianSeedBatch:
         n = len(seeds)
         device = seeds.xyz.device
@@ -957,7 +1144,11 @@ class PanoGaussianMapper:
             xyz=seeds.xyz,
             rgb=seeds.rgb,
             confidence=seeds.confidence,
-            scale=torch.full((n,), float(self.pfgs360_voxel_size), device=device, dtype=dtype),
+            scale=(
+                seeds.scale.to(device=device, dtype=dtype)
+                if self.pfgs360_replace_fuse_enabled
+                else torch.full((n,), float(self.pfgs360_voxel_size), device=device, dtype=dtype)
+            ),
             level=torch.zeros(n, dtype=torch.int8, device=device),
             frame_id=int(seeds.frame_id),
             source_flat_idx=seeds.source_flat_idx,
@@ -1005,6 +1196,296 @@ class PanoGaussianMapper:
                         best_dist = dist
                         best_row = int(row)
         return best_row, best_row is not None
+
+    def _pfgs360_replace_fuse_masks_and_delete(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None,
+    ) -> tuple[dict[str, torch.Tensor] | None, dict[str, int]]:
+        stats = {
+            "replace_deleted": 0,
+            "missing_pixels": 0,
+            "depth_mismatch_pixels": 0,
+            "render_bad_pixels": 0,
+        }
+        if self.map.anchor_count() == 0:
+            return None, stats
+        target = image.detach().to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
+        if target.ndim == 4:
+            target = target[0]
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        target_depth, depth_conf = self._target_depth_from_output(frontend_output, (H, W), target.device, target.dtype)
+        if target_depth is None:
+            return None, stats
+        with torch.no_grad():
+            camera = PanoRenderCamera(
+                image_height=H,
+                image_width=W,
+                c2w=frontend_output.pose_c2w.detach().to(device=target.device, dtype=target.dtype),
+            )
+            pkg = self.renderer.render(camera, self.map)
+            pkg = self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, sky_mask))
+            render_depth = pkg.get("depth")
+            alpha = pkg.get("alpha", pkg.get("opacity"))
+            if not torch.is_tensor(render_depth):
+                return None, stats
+            if not torch.is_tensor(alpha):
+                alpha = torch.ones_like(render_depth)
+            render_depth = render_depth.to(device=target.device, dtype=target.dtype)
+            alpha = alpha.to(device=target.device, dtype=target.dtype)
+            valid = torch.isfinite(target_depth) & torch.isfinite(render_depth) & (target_depth > 1.0e-6) & (render_depth > 1.0e-6)
+            if depth_conf is not None:
+                valid = valid & (depth_conf.to(device=target.device, dtype=target.dtype) > 1.0e-6)
+            scale, shift = self._robust_depth_scale_shift(target_depth, render_depth, valid & (alpha >= self.pfgs360_render_alpha_min))
+            aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
+            valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
+            rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
+            missing = (alpha < max(0.0, min(1.0, float(self.pfgs360_missing_alpha_min)))) | (~valid_aligned)
+            insert_mask = (valid_aligned & (rel >= float(self.replace_fuse_insert_rel_min))) | missing
+            delete_mask = (
+                valid_aligned
+                & (rel >= float(self.replace_fuse_delete_rel_min))
+                & (rel <= float(self.replace_fuse_delete_rel_max))
+            )
+            if sky_mask is not None:
+                non_sky = ~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device)
+                missing = missing & non_sky
+                insert_mask = insert_mask & non_sky
+                delete_mask = delete_mask & non_sky
+            stats["missing_pixels"] = int(missing.sum().detach().cpu())
+            stats["depth_mismatch_pixels"] = int(delete_mask.sum().detach().cpu())
+            stats["render_bad_pixels"] = int(insert_mask.sum().detach().cpu())
+            stats["replace_deleted"] = self._delete_responsible_replace_fuse_anchors(
+                delete_mask.detach(),
+                pkg,
+                frontend_output,
+                H,
+                W,
+            )
+            masks = {
+                "insert": insert_mask.detach().cpu().bool(),
+                "delete": delete_mask.detach().cpu().bool(),
+                "missing": missing.detach().cpu().bool(),
+                "depth_mismatch": delete_mask.detach().cpu().bool(),
+                "render_bad": insert_mask.detach().cpu().bool(),
+            }
+            self.last_depth_insertion_diagnostic = DepthInsertionDiagnostic(
+                frame_id=int(frontend_output.frame_id),
+                render_depth=render_depth.detach().cpu().float(),
+                predicted_depth=aligned_target.detach().cpu().float(),
+                rel_depth_error=rel.detach().cpu().float(),
+                missing_mask=masks["missing"],
+                depth_mismatch_mask=masks["depth_mismatch"],
+                render_bad_mask=masks["render_bad"],
+                depth_scale=float(scale.detach().cpu()),
+                depth_shift=float(shift.detach().cpu()),
+            )
+            return masks, stats
+
+    def _delete_responsible_replace_fuse_anchors(
+        self,
+        delete_mask: torch.Tensor,
+        render_pkg: dict,
+        frontend_output: FrontendOutput,
+        H: int,
+        W: int,
+    ) -> int:
+        n = self.map.anchor_count()
+        if n <= 0:
+            return 0
+        render_depth = render_pkg.get("depth")
+        if not torch.is_tensor(render_depth):
+            return 0
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        xyz = self.map.get_xyz.detach()
+        c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
+        w2c = torch.linalg.inv(c2w)
+        xyz_h = torch.cat([xyz, torch.ones(n, 1, device=device, dtype=dtype)], dim=1)
+        cam = (w2c @ xyz_h.T).T[:, :3]
+        dist = torch.linalg.norm(cam, dim=-1)
+        valid = dist > 1.0e-6
+        visibility = render_pkg.get("visibility_filter")
+        if torch.is_tensor(visibility) and int(visibility.numel()) == n:
+            valid = valid & visibility.to(device=device, dtype=torch.bool).view(-1)
+        rows = torch.nonzero(valid, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return 0
+        cam_rows = cam.index_select(0, rows)
+        pixels = bearing_to_erp_pixel(cam_rows, int(H), int(W))
+        ui = pixels[:, 0].round().long().remainder(int(W))
+        vi = pixels[:, 1].round().long().clamp(0, int(H) - 1)
+        delete_at_pixel = delete_mask.to(device=device, dtype=torch.bool)[0, vi, ui]
+        rd = render_depth.to(device=device, dtype=dtype)[0, vi, ui].clamp_min(1.0e-6)
+        anchor_depth = dist.index_select(0, rows)
+        tol = torch.maximum(
+            rd.new_full(rd.shape, float(self.replace_fuse_front_depth_abs_tol)),
+            rd * float(self.replace_fuse_front_depth_rel_tol),
+        )
+        front_surface = (anchor_depth - rd).abs() <= tol
+        prune_rows = rows[delete_at_pixel & front_surface]
+        if prune_rows.numel() == 0:
+            return 0
+        max_delete = int(self.replace_fuse_max_delete_per_keyframe)
+        if max_delete > 0 and prune_rows.numel() > max_delete:
+            prune_rows = prune_rows[:max_delete]
+        prune_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        prune_mask[prune_rows] = True
+        deleted = self.map.prune_anchors(prune_mask)
+        if deleted > 0:
+            self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+            self.stats.n_anchors = self.map.anchor_count()
+            self._rebuild_keyframe_ranges_from_birth_frames()
+            self._refresh_pfgs360_voxel_cache(compact=False)
+        return int(deleted)
+
+    def _build_replace_fuse_voxel_index(self) -> dict[tuple[int, int, int, int], list[int]]:
+        occupied: dict[tuple[int, int, int, int], list[int]] = {}
+        if self.map.anchor_count() <= 0:
+            return occupied
+        self._refresh_pfgs360_voxel_cache(compact=False)
+        levels = self.map._anchor_level.detach().cpu().tolist()
+        coords = self.map._anchor_grid_coord.detach().cpu().tolist()
+        for idx, (level, coord) in enumerate(zip(levels, coords)):
+            key = (int(level), int(coord[0]), int(coord[1]), int(coord[2]))
+            occupied.setdefault(key, []).append(int(idx))
+        return occupied
+
+    def _refresh_pfgs360_voxel_cache(self, *, compact: bool) -> int:
+        n = self.map.anchor_count()
+        if n <= 0:
+            self.map._anchor_grid_coord = torch.zeros(0, 3, dtype=torch.int32)
+            return 0
+        grid = torch.floor(self.map.get_xyz.detach().cpu().float() / float(self.pfgs360_voxel_size)).to(torch.int32)
+        self.map._anchor_grid_coord = grid
+        if not compact:
+            return 0
+        return self._compact_replace_fuse_voxels()
+
+    def _compact_replace_fuse_voxels(self) -> int:
+        n = self.map.anchor_count()
+        if n <= 1:
+            return 0
+        index = self._build_replace_fuse_voxel_index_no_refresh()
+        duplicate_rows: list[int] = []
+        opacity = self.map.get_opacity.detach().cpu().view(-1)
+        obs = self.map._anchor_obs_count[:n].detach().cpu().float().clamp_min(1.0)
+        score = opacity * obs
+        for rows in index.values():
+            if len(rows) <= 1:
+                continue
+            rows_t = torch.tensor(rows, dtype=torch.long)
+            keeper = int(rows_t[torch.argmax(score.index_select(0, rows_t))])
+            for row in rows:
+                if int(row) == keeper:
+                    continue
+                self._merge_anchor_into_anchor(keeper, int(row))
+                duplicate_rows.append(int(row))
+        if not duplicate_rows:
+            return 0
+        prune_mask = torch.zeros(n, dtype=torch.bool, device=self.map.get_xyz.device)
+        prune_mask[torch.tensor(duplicate_rows, dtype=torch.long, device=prune_mask.device)] = True
+        pruned = self.map.prune_anchors(prune_mask)
+        if pruned > 0:
+            self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+            self.stats.n_anchors = self.map.anchor_count()
+            self._rebuild_keyframe_ranges_from_birth_frames()
+            self._refresh_pfgs360_voxel_cache(compact=False)
+        return int(pruned)
+
+    def _build_replace_fuse_voxel_index_no_refresh(self) -> dict[tuple[int, int, int, int], list[int]]:
+        occupied: dict[tuple[int, int, int, int], list[int]] = {}
+        levels = self.map._anchor_level.detach().cpu().tolist()
+        coords = self.map._anchor_grid_coord.detach().cpu().tolist()
+        for idx, (level, coord) in enumerate(zip(levels, coords)):
+            key = (int(level), int(coord[0]), int(coord[1]), int(coord[2]))
+            occupied.setdefault(key, []).append(int(idx))
+        return occupied
+
+    @staticmethod
+    def _select_replace_fuse_hit(
+        hits: list[int],
+        seed_xyz: torch.Tensor,
+        anchor_xyz_cpu: torch.Tensor,
+    ) -> int:
+        if len(hits) == 1:
+            return int(hits[0])
+        rows = torch.tensor(hits, dtype=torch.long)
+        dist = torch.linalg.norm(anchor_xyz_cpu.index_select(0, rows) - seed_xyz.view(1, 3), dim=-1)
+        return int(rows[torch.argmin(dist)])
+
+    def _fuse_seed_into_anchor(
+        self,
+        anchor_idx: int,
+        seeds: GaussianSeedBatch,
+        seed_idx: int,
+        *,
+        current_kf_ord: int,
+    ) -> None:
+        if int(anchor_idx) < 0 or int(anchor_idx) >= self.map.anchor_count():
+            return
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        idx = int(anchor_idx)
+        seed_xyz = seeds.xyz[int(seed_idx)].detach().to(device=device, dtype=dtype)
+        seed_rgb = seeds.rgb[int(seed_idx)].detach().to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        seed_conf = float(seeds.confidence[int(seed_idx)].detach().cpu().clamp(1.0e-4, 1.0))
+        seed_scale = seeds.scale[int(seed_idx)].detach().to(device=device, dtype=dtype).clamp_min(1.0e-5)
+        old_w = float(self.map._anchor_conf_accum[idx]) if idx < int(self.map._anchor_conf_accum.shape[0]) else 1.0
+        new_w = max(seed_conf, 1.0e-4)
+        denom = max(old_w + new_w, 1.0e-6)
+        with torch.no_grad():
+            self.map.xyz.data[idx] = (self.map.xyz.data[idx] * old_w + seed_xyz * new_w) / denom
+            old_rgb = self.map.get_features.detach()[idx]
+            fused_rgb = (old_rgb * old_w + seed_rgb * new_w) / denom
+            self.map.features.data[idx] = self.map._inv_sigmoid(fused_rgb.view(1, 3)).view(3)
+            old_opacity = self.map.get_opacity.detach()[idx, 0]
+            fused_opacity = torch.maximum(old_opacity, seed_conf * old_opacity.new_tensor(1.0))
+            self.map.opacity_logit.data[idx, 0] = self.map._inv_sigmoid(fused_opacity.view(1, 1)).view(())
+            old_scale = self.map.get_scaling.detach()[idx]
+            fused_scale = torch.minimum(old_scale, seed_scale.expand_as(old_scale))
+            self.map.scaling.data[idx] = torch.log(torch.expm1(fused_scale.clamp_min(1.0e-5)))
+        self._accumulate_existing_observation(idx, seed_conf, frame_id=int(seeds.frame_id))
+        if idx < int(self.map._anchor_last_update_kf_ord.shape[0]):
+            self.map._anchor_last_update_kf_ord[idx] = int(current_kf_ord)
+        if idx < int(self.map._anchor_voxel_size.shape[0]):
+            self.map._anchor_voxel_size[idx] = float(seed_scale.detach().cpu())
+
+    def _merge_anchor_into_anchor(self, keeper: int, other: int) -> None:
+        if keeper == other or keeper < 0 or other < 0:
+            return
+        if keeper >= self.map.anchor_count() or other >= self.map.anchor_count():
+            return
+        device = self.map.get_xyz.device
+        with torch.no_grad():
+            keep_w = float(self.map._anchor_conf_accum[keeper].clamp_min(1.0e-4))
+            other_w = float(self.map._anchor_conf_accum[other].clamp_min(1.0e-4))
+            denom = max(keep_w + other_w, 1.0e-6)
+            self.map.xyz.data[keeper] = (self.map.xyz.data[keeper] * keep_w + self.map.xyz.data[other] * other_w) / denom
+            rgb = (self.map.get_features.detach()[keeper] * keep_w + self.map.get_features.detach()[other] * other_w) / denom
+            self.map.features.data[keeper] = self.map._inv_sigmoid(rgb.view(1, 3)).view(3)
+            opacity = torch.maximum(self.map.get_opacity.detach()[keeper], self.map.get_opacity.detach()[other])
+            self.map.opacity_logit.data[keeper] = self.map._inv_sigmoid(opacity.view(1, 1)).view(1)
+            scale = torch.minimum(self.map.get_scaling.detach()[keeper], self.map.get_scaling.detach()[other])
+            self.map.scaling.data[keeper] = torch.log(torch.expm1(scale.clamp_min(1.0e-5)))
+        self.map._anchor_obs_count[keeper] += self.map._anchor_obs_count[other]
+        self.map._anchor_conf_accum[keeper] += self.map._anchor_conf_accum[other]
+        self.map._anchor_last_seen_kf[keeper] = max(
+            int(self.map._anchor_last_seen_kf[keeper]),
+            int(self.map._anchor_last_seen_kf[other]),
+        )
+        if self.map._anchor_last_update_kf_ord.shape[0] > max(keeper, other):
+            self.map._anchor_last_update_kf_ord[keeper] = max(
+                int(self.map._anchor_last_update_kf_ord[keeper]),
+                int(self.map._anchor_last_update_kf_ord[other]),
+            )
+        if self.map._anchor_voxel_size.shape[0] > max(keeper, other):
+            self.map._anchor_voxel_size[keeper] = min(
+                float(self.map._anchor_voxel_size[keeper]),
+                float(self.map._anchor_voxel_size[other]),
+            )
 
     def _pfgs360_render_bad_mask(
         self,
@@ -1671,7 +2152,10 @@ class PanoGaussianMapper:
         if not self.uses_joint_optimization or not self.feedforward_window_enabled:
             return {}
         cfg = self._feedforward_window_cfg()
-        steps = int(cfg.get("steps", self.optim_cfg.get("sliding_window_steps", 0)))
+        if self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
+            steps = int(self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200)))
+        else:
+            steps = int(cfg.get("steps", self.optim_cfg.get("sliding_window_steps", 0)))
         window_ids = self._feedforward_window_ids(current_frame_ids, history_frame_ids)
         observations = self._selected_observations_for_ids(window_ids)
         if not observations:
@@ -1702,11 +2186,14 @@ class PanoGaussianMapper:
         if pose_params:
             param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
         if not param_groups:
+            sky_pruned = self._prune_sky_observations(observations) if self.pfgs360_replace_fuse_enabled else 0
+            self.stats.last_sky_pruned = int(sky_pruned)
             return {
                 "loss": 0.0,
                 "steps": 0.0,
                 "window_size": float(len(observations)),
                 "feedforward_window_size": float(len(observations)),
+                "sky_pruned": float(sky_pruned),
                 "profile_backend_feedforward_window_sec": float(time.perf_counter() - total_start),
             }
         optimizer = torch.optim.AdamW(
@@ -1723,10 +2210,12 @@ class PanoGaussianMapper:
         sample_sec = 0.0
         render_loss_sec = 0.0
         backward_step_sec = 0.0
+        sky_pruned_total = 0
         for step_idx in range(max(0, steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
+            sky_prune_mask = None
             section_start = time.perf_counter()
             sampled = self._sample_observations_for_step(observations)
             sample_sec += time.perf_counter() - section_start
@@ -1740,6 +2229,17 @@ class PanoGaussianMapper:
                 pkg = self.renderer.render(camera, self.map)
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+                if self.pfgs360_replace_fuse_enabled:
+                    mask_i = self._sky_prune_mask_from_render_pkg(
+                        obs,
+                        pkg,
+                        sky_mask,
+                        c2w,
+                        H,
+                        W,
+                    )
+                    if mask_i is not None:
+                        sky_prune_mask = mask_i if sky_prune_mask is None else (sky_prune_mask | mask_i)
                 target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
                 depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
                 loss_i, metrics_i = backend_render_loss(
@@ -1768,7 +2268,27 @@ class PanoGaussianMapper:
                 if gaussian_enabled and gaussian_scales is not None:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+                if self.pfgs360_replace_fuse_enabled:
+                    self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
+            if self.pfgs360_replace_fuse_enabled and sky_prune_mask is not None and bool(sky_prune_mask.any().detach().cpu()):
+                pruned = self._apply_sky_prune_mask(sky_prune_mask)
+                if pruned > 0:
+                    sky_pruned_total += int(pruned)
+                    gaussian_scales = self._feedforward_gaussian_scales(selected_keyframe_ids)
+                    gaussian_enabled = (
+                        gaussian_scales is not None
+                        and self.map.anchor_count() > 0
+                        and bool((gaussian_scales > 0).any().detach().cpu())
+                    )
+                    param_groups = self._map_param_groups(gaussian_enabled=gaussian_enabled, phase="feedforward_window")
+                    if pose_params:
+                        param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
+                    if param_groups:
+                        optimizer = torch.optim.AdamW(
+                            param_groups,
+                            weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)),
+                        )
             actual_steps = step_idx + 1
             last = {
                 key: float(torch.stack(values).mean().detach().cpu())
@@ -1789,10 +2309,14 @@ class PanoGaussianMapper:
         active_mask = None
         if self.map.anchor_count() > 0:
             active_mask = self._active_anchor_mask_for_keyframes(selected_keyframe_ids)
-        prune_stats = self._maybe_prune_feedforward_window(
-            observations,
-            active_mask=active_mask,
-            selected_keyframe_ids=selected_keyframe_ids,
+        prune_stats = (
+            {"opacity_resets": 0, "pruned": 0}
+            if self.pfgs360_replace_fuse_enabled
+            else self._maybe_prune_feedforward_window(
+                observations,
+                active_mask=active_mask,
+                selected_keyframe_ids=selected_keyframe_ids,
+            )
         )
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
         total_sec = float(time.perf_counter() - total_start)
@@ -1807,6 +2331,7 @@ class PanoGaussianMapper:
         last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
         last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
         last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
+        last["sky_pruned"] = float(sky_pruned_total)
         last["profile_backend_feedforward_window_sec"] = total_sec
         last["profile_backend_feedforward_window_step_avg_sec"] = total_sec / max(1, actual_steps)
         last["profile_backend_feedforward_window_sample_sec"] = float(sample_sec)
@@ -1825,11 +2350,29 @@ class PanoGaussianMapper:
         self.stats.last_trainable_pose_count = int(len(trainable_pose_ids))
         self.stats.last_feedforward_opacity_resets = int(prune_stats.get("opacity_resets", 0))
         self.stats.last_feedforward_pruned = int(prune_stats.get("pruned", 0))
+        self.stats.last_sky_pruned = int(sky_pruned_total)
         self.stats.optimization_steps += int(actual_steps)
         return last
 
     def _feedforward_window_ids(self, current_frame_ids, history_frame_ids=None) -> list[int]:
         cfg = self._feedforward_window_cfg()
+        if self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
+            current_limit = max(1, int(self.optim_cfg.get("current_chunk_observation_frames", cfg.get("current_chunk_observation_frames", 4))))
+            recent_keyframes = max(
+                0,
+                int(self.optim_cfg.get("recent_keyframe_observation_frames", cfg.get("recent_keyframe_observation_frames", 2))),
+            )
+            ids: list[int] = []
+            current = [] if current_frame_ids is None else [int(fid) for fid in current_frame_ids]
+            for fid in current[-current_limit:]:
+                if fid not in ids:
+                    ids.append(fid)
+            if recent_keyframes > 0:
+                for keyframe in self.keyframes[-recent_keyframes:]:
+                    fid = int(keyframe.frame_id)
+                    if fid not in ids:
+                        ids.append(fid)
+            return ids
         hist_limit = max(0, int(cfg.get("history_keyframes", 2)))
         ids: list[int] = []
         history = [] if history_frame_ids is None else [int(fid) for fid in history_frame_ids]
@@ -1867,13 +2410,29 @@ class PanoGaussianMapper:
     def _active_anchor_mask_for_keyframes(self, keyframe_ids: list[int]) -> torch.Tensor:
         n = self.map.anchor_count()
         device = self.map.get_xyz.device
-        if n <= 0 or not keyframe_ids:
+        if n <= 0:
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        if self.pfgs360_replace_fuse_enabled:
+            return self._active_anchor_mask_for_recent_updates()
+        if not keyframe_ids:
             return torch.zeros(n, dtype=torch.bool, device=device)
         birth = self.map._anchor_birth_frame.to(device=device)
         mask = torch.zeros(n, dtype=torch.bool, device=device)
         for fid in keyframe_ids:
             mask |= birth == int(fid)
         return mask
+
+    def _active_anchor_mask_for_recent_updates(self) -> torch.Tensor:
+        n = self.map.anchor_count()
+        device = self.map.get_xyz.device
+        if n <= 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        recent_kfs = max(1, int(self.optim_cfg.get("recent_insert_keyframes", 2)))
+        latest_ord = max(0, int(self.stats.n_keyframes) - 1)
+        min_ord = max(0, latest_ord - recent_kfs + 1)
+        if int(self.map._anchor_last_update_kf_ord.shape[0]) != n:
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        return self.map._anchor_last_update_kf_ord.to(device=device) >= int(min_ord)
 
     def _feedforward_gaussian_scales(self, selected_keyframe_ids: list[int]) -> torch.Tensor | None:
         if not bool(self.optim_cfg.get("gaussian_refine_enable", True)):
@@ -1885,6 +2444,10 @@ class PanoGaussianMapper:
         if n <= 0:
             return scales
         cfg = self._feedforward_window_cfg()
+        if self.pfgs360_replace_fuse_enabled:
+            active = self._active_anchor_mask_for_recent_updates()
+            scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
+            return scales
         scope = str(cfg.get("gaussian_scope", "selected_birth_keyframes")).lower()
         if scope == "all":
             scales.fill_(float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("existing_gaussian_lr_scale", 0.1))))
@@ -1895,6 +2458,12 @@ class PanoGaussianMapper:
 
     def _sample_observations_for_step(self, observations: list[MapperObservation]) -> list[MapperObservation]:
         cfg = self._feedforward_window_cfg()
+        if self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
+            sample_n = max(
+                1,
+                int(self.optim_cfg.get("sample_frames_per_step", cfg.get("sample_observations_per_step", 1))),
+            )
+            return random.sample(observations, min(sample_n, len(observations))) if len(observations) > 1 else list(observations)
         random_window = bool(cfg.get("random_observation_per_iter", False))
         if random_window and len(observations) > 1:
             sample_n = max(1, int(cfg.get("sample_observations_per_step", self.optim_cfg.get("sample_keyframes_per_step", 1))))
@@ -1908,6 +2477,101 @@ class PanoGaussianMapper:
         if int(obs.frame_id) in trainable_pose_ids:
             return pose_delta()
         return pose_delta().detach()
+
+    def _sky_prune_mask_from_render_pkg(
+        self,
+        obs: MapperObservation,
+        render_pkg: dict,
+        sky_mask: torch.Tensor | None,
+        c2w: torch.Tensor,
+        H: int,
+        W: int,
+    ) -> torch.Tensor | None:
+        n = self.map.anchor_count()
+        if n <= 0:
+            return None
+        if sky_mask is None and obs.sky_mask is not None:
+            sky_mask = self._normalize_skybox_mask(
+                obs.sky_mask,
+                height=int(H),
+                width=int(W),
+                device=self.map.get_xyz.device,
+            )
+        if sky_mask is None:
+            return None
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        visibility = render_pkg.get("visibility_filter")
+        visible = torch.ones(n, dtype=torch.bool, device=device)
+        if torch.is_tensor(visibility) and int(visibility.numel()) == n:
+            visible = visibility.to(device=device, dtype=torch.bool).view(-1)
+        rows = torch.nonzero(visible, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return None
+        xyz = self.map.get_xyz.detach()
+        w2c = torch.linalg.inv(c2w.detach().to(device=device, dtype=dtype))
+        xyz_h = torch.cat([xyz.index_select(0, rows), torch.ones(rows.numel(), 1, device=device, dtype=dtype)], dim=1)
+        cam = (w2c @ xyz_h.T).T[:, :3]
+        dist = torch.linalg.norm(cam, dim=-1)
+        valid = dist > 1.0e-6
+        if not bool(valid.any()):
+            return None
+        rows = rows.index_select(0, torch.nonzero(valid, as_tuple=False).flatten())
+        cam = cam[valid]
+        pixels = bearing_to_erp_pixel(cam, int(H), int(W))
+        ui = pixels[:, 0].round().long().remainder(int(W))
+        vi = pixels[:, 1].round().long().clamp(0, int(H) - 1)
+        sky = sky_mask.to(device=device, dtype=torch.bool)[0, vi, ui]
+        if not bool(sky.any()):
+            return None
+        prune_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        prune_mask[rows[sky]] = True
+        return prune_mask
+
+    def _apply_sky_prune_mask(self, prune_mask: torch.Tensor) -> int:
+        n = self.map.anchor_count()
+        if n <= 0:
+            return 0
+        mask = prune_mask.detach().to(device=self.map.get_xyz.device, dtype=torch.bool).view(-1)
+        if int(mask.numel()) != n or not bool(mask.any().detach().cpu()):
+            return 0
+        pruned = self.map.prune_anchors(mask)
+        if pruned > 0:
+            self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+            self.stats.n_anchors = self.map.anchor_count()
+            self._rebuild_keyframe_ranges_from_birth_frames()
+            if self.pfgs360_replace_fuse_enabled:
+                self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+        return int(pruned)
+
+    def _prune_sky_observations(self, observations: list[MapperObservation]) -> int:
+        if not observations or self.map.anchor_count() <= 0:
+            return 0
+        total = 0
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        with torch.no_grad():
+            for obs in observations:
+                if self.map.anchor_count() <= 0:
+                    break
+                target = obs.image.to(device=device, dtype=dtype)
+                H, W = int(target.shape[-2]), int(target.shape[-1])
+                c2w = self._observation_pose(obs, trainable_pose_ids=set()).to(device=device, dtype=dtype)
+                pkg = self.renderer.render(PanoRenderCamera(image_height=H, image_width=W, c2w=c2w), self.map)
+                sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
+                mask = self._sky_prune_mask_from_render_pkg(obs, pkg, sky_mask, c2w, H, W)
+                if mask is not None:
+                    total += self._apply_sky_prune_mask(mask)
+        return int(total)
+
+    def _clamp_replace_fuse_scaling(self) -> None:
+        if self.map.anchor_count() <= 0:
+            return
+        min_scale = max(1.0e-5, float(self.optim_cfg.get("gaussian_scale_min", 0.008)))
+        max_scale = max(min_scale, float(self.optim_cfg.get("gaussian_scale_max", 0.08)))
+        with torch.no_grad():
+            scale = self.map.get_scaling.detach().clamp(min=min_scale, max=max_scale)
+            self.map.scaling.data.copy_(torch.log(torch.expm1(scale.clamp_min(1.0e-5))))
 
     def _maybe_prune_feedforward_window(
         self,
@@ -2102,6 +2766,13 @@ class PanoGaussianMapper:
         latest = self.keyframes[-1]
         return (int(latest.gaussian_start), int(latest.gaussian_end))
 
+    def _range_for_birth_frame(self, frame_id: int) -> tuple[int, int]:
+        birth = self.map._anchor_birth_frame.detach().cpu().long()
+        rows = torch.nonzero(birth == int(frame_id), as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return (0, 0)
+        return (int(rows.min().item()), int(rows.max().item()) + 1)
+
     def optimize_after_keyframe(self) -> dict[str, float]:
         """Run local and sliding-window joint Gaussian/pose optimization."""
         if self.feedforward_window_enabled:
@@ -2246,6 +2917,8 @@ class PanoGaussianMapper:
                 if gaussian_scales is not None:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+                if self.pfgs360_replace_fuse_enabled:
+                    self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
             last = {k: float(v.detach().cpu()) for k, v in metrics.items()}
             last["loss"] = float(loss.detach().cpu())
@@ -2334,13 +3007,44 @@ class PanoGaussianMapper:
     def _map_param_groups(self, *, gaussian_enabled: bool, phase: str) -> list[dict]:
         groups: list[dict] = []
         if gaussian_enabled:
-            groups.append(
-                {
-                    "params": self.map.gaussian_parameters(),
-                    "lr": float(self.optim_cfg.get("gaussian_lr", self.optimizer.param_groups[0]["lr"])),
-                    "name": "gaussians",
-                }
-            )
+            if self.pfgs360_replace_fuse_enabled:
+                groups.extend(
+                    [
+                        {
+                            "params": [self.map.xyz],
+                            "lr": float(self.optim_cfg.get("xyz_lr", 5.0e-4)),
+                            "name": "xyz",
+                        },
+                        {
+                            "params": [self.map.features],
+                            "lr": float(self.optim_cfg.get("feature_lr", 2.0e-3)),
+                            "name": "features",
+                        },
+                        {
+                            "params": [self.map.opacity_logit],
+                            "lr": float(self.optim_cfg.get("opacity_lr", 1.0e-3)),
+                            "name": "opacity",
+                        },
+                        {
+                            "params": [self.map.scaling],
+                            "lr": float(self.optim_cfg.get("scaling_lr", 1.0e-4)),
+                            "name": "scaling",
+                        },
+                        {
+                            "params": [self.map.rotation],
+                            "lr": float(self.optim_cfg.get("rotation_lr", 1.0e-4)),
+                            "name": "rotation",
+                        },
+                    ]
+                )
+            else:
+                groups.append(
+                    {
+                        "params": self.map.gaussian_parameters(),
+                        "lr": float(self.optim_cfg.get("gaussian_lr", self.optimizer.param_groups[0]["lr"])),
+                        "name": "gaussians",
+                    }
+                )
         if bool(self.optim_cfg.get("optimize_skybox", True)):
             sky_params = self.map.skybox_parameters()
             if sky_params:
@@ -2520,6 +3224,8 @@ class PanoGaussianMapper:
                 if gaussian_enabled:
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 optimizer.step()
+                if self.pfgs360_replace_fuse_enabled:
+                    self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
             actual_steps = step_idx + 1
             last = {

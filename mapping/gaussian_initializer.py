@@ -70,6 +70,11 @@ class GaussianInitializer:
         seed_source: str = "depth_pose",
         insertion_strategy: str = "legacy",
         pfgs360_voxel_size: float = 0.12,
+        pfgs360_gaussian_scale_mode: str = "voxel",
+        pfgs360_gaussian_scale_factor: float = 1.25,
+        pfgs360_gaussian_scale_min: float = 0.008,
+        pfgs360_gaussian_scale_max: float = 0.08,
+        pfgs360_gaussian_scale_lat_cos_min: float = 0.25,
         temporal_pair_conf_min: float = 0.70,
     ) -> None:
         seed_source = str(seed_source).lower()
@@ -90,6 +95,14 @@ class GaussianInitializer:
         self.seed_source = seed_source
         self.insertion_strategy = str(insertion_strategy or "legacy").lower()
         self.pfgs360_voxel_size = max(float(pfgs360_voxel_size), 1.0e-6)
+        self.pfgs360_gaussian_scale_mode = str(pfgs360_gaussian_scale_mode or "voxel").lower()
+        self.pfgs360_gaussian_scale_factor = float(pfgs360_gaussian_scale_factor)
+        self.pfgs360_gaussian_scale_min = max(float(pfgs360_gaussian_scale_min), 1.0e-8)
+        self.pfgs360_gaussian_scale_max = max(float(pfgs360_gaussian_scale_max), self.pfgs360_gaussian_scale_min)
+        self.pfgs360_gaussian_scale_lat_cos_min = min(
+            1.0,
+            max(0.0, float(pfgs360_gaussian_scale_lat_cos_min)),
+        )
         self.temporal_pair_conf_min = float(temporal_pair_conf_min)
 
     def from_frontend_output(
@@ -203,7 +216,7 @@ class GaussianInitializer:
         if tuple(points.shape[:2]) != (H, W):
             raise ValueError(f"World-points shape {tuple(points.shape[:2])} does not match image {(H, W)}")
 
-        if self.insertion_strategy == "pfgs360":
+        if self.insertion_strategy in {"pfgs360", "pfgs360_replace_fuse"}:
             return self._from_world_points_pfgs360(
                 output,
                 img,
@@ -361,11 +374,26 @@ class GaussianInitializer:
             source_flat_idx = source_flat_idx.index_select(0, order)
 
         n = int(xyz.shape[0])
+        if self.insertion_strategy == "pfgs360_replace_fuse" and self.pfgs360_gaussian_scale_mode in {
+            "erp_depth_latitude",
+            "depth_latitude",
+        }:
+            scale = self._pfgs360_depth_latitude_scale(
+                output,
+                xyz,
+                source_flat_idx,
+                H,
+                W,
+                device=points.device,
+                dtype=points.dtype,
+            )
+        else:
+            scale = torch.full((n,), float(self.pfgs360_voxel_size), device=points.device, dtype=points.dtype)
         return GaussianSeedBatch(
             xyz=xyz,
             rgb=rgb,
             confidence=conf,
-            scale=torch.full((n,), float(self.pfgs360_voxel_size), device=points.device, dtype=points.dtype),
+            scale=scale,
             level=torch.zeros(n, dtype=torch.int8, device=points.device),
             frame_id=int(output.frame_id),
             source_flat_idx=source_flat_idx.detach().to(device=points.device, dtype=torch.long),
@@ -374,6 +402,27 @@ class GaussianInitializer:
             insert_score=insert_score.detach().to(device=points.device, dtype=points.dtype),
             grid_coord=unique_grid.detach().to(device=points.device, dtype=torch.int32),
         )
+
+    def _pfgs360_depth_latitude_scale(
+        self,
+        output: FrontendOutput,
+        xyz: torch.Tensor,
+        source_flat_idx: torch.Tensor,
+        H: int,
+        W: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        c2w = output.pose_c2w.detach().to(device=device, dtype=dtype)
+        center = c2w[:3, 3] if tuple(c2w.shape) == (4, 4) else torch.zeros(3, device=device, dtype=dtype)
+        depth = torch.linalg.norm(xyz.to(device=device, dtype=dtype) - center.view(1, 3), dim=-1).clamp_min(self.depth_min)
+        rows = torch.div(source_flat_idx.to(device=device, dtype=torch.long), int(W), rounding_mode="floor").to(dtype=dtype)
+        lat = math.pi * 0.5 - (rows + 0.5) * math.pi / float(H)
+        cos_lat = torch.cos(lat).clamp(float(self.pfgs360_gaussian_scale_lat_cos_min), 1.0)
+        angular = math.sqrt((2.0 * math.pi / float(W)) * (math.pi / float(H))) * torch.sqrt(cos_lat)
+        scale = float(self.pfgs360_gaussian_scale_factor) * depth * angular
+        return scale.clamp(float(self.pfgs360_gaussian_scale_min), float(self.pfgs360_gaussian_scale_max))
 
     def _world_confidence(self, output: FrontendOutput, points: torch.Tensor, H: int, W: int) -> torch.Tensor:
         conf = output.world_points_confidence
