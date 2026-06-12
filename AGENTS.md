@@ -61,11 +61,11 @@
 ## Remote experiment safety
 
 - For experiments on server `50902` at `lanboyang@172.19.53.39`, always run jobs inside `tmux` so the experiment survives terminal disconnects.
-- Do not run more than 2 experiment groups at the same time.
+- Do not run more than 4 experiment groups at the same time.
 - Run these experiments in the `pfgs360` conda environment:
   `/mnt/disk1/lanboyang/miniconda3/envs/pfgs360/bin/python`
 - Full SLAM / end-to-end mapping experiment groups should use one GPU per group;
-  at most 2 GPUs may be used by those full-pipeline experiment queues at once.
+  at most 4 GPUs may be used by those full-pipeline experiment queues at once.
 - PanoVGGT-M3-Sphere head training is the exception: it may use up to 2 GPUs
   per head-training experiment group, and at most 4 GPUs total across the
   concurrent head-training queue. Keep this to at most 2 concurrent groups
