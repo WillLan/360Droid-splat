@@ -260,6 +260,52 @@ def test_pfgs360_initializer_uses_single_voxel_and_aggregates_candidates():
     assert torch.equal(seeds.source_flat_idx.cpu(), torch.tensor([1, 2, 3]))
 
 
+def test_replace_fuse_initializer_keeps_dense_candidates_without_pair_conf_gate():
+    H, W = 1, 4
+    points = torch.tensor(
+        [
+            [[0.01, 0.0, 1.0], [0.05, 0.0, 1.0], [0.25, 0.0, 1.0], [0.37, 0.0, 1.0]],
+        ],
+        dtype=torch.float32,
+    )
+    output = FrontendOutput(
+        frame_id=8,
+        timestamp=8.0,
+        pose_c2w=torch.eye(4),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=1.0,
+        is_keyframe=True,
+        ba_residual=0.0,
+        tracking_status="tracked_panovggt_long",
+        world_points=points,
+        world_points_confidence=torch.ones(1, H, W),
+        valid_world_points_mask=torch.ones(1, H, W, dtype=torch.bool),
+    )
+    hints = {
+        "non_sky": torch.ones(1, H, W, dtype=torch.bool),
+        "pair_confidence": torch.tensor([[[0.1, 0.2, 0.3, 0.4]]], dtype=torch.float32),
+    }
+    initializer = GaussianInitializer(
+        max_seeds_per_keyframe=0,
+        seed_source="world_points_only",
+        insertion_strategy="pfgs360_replace_fuse",
+        pfgs360_voxel_size=0.12,
+        temporal_pair_conf_min=0.7,
+    )
+
+    seeds = initializer.from_frontend_output(output, torch.rand(3, H, W), insertion_hints=hints, first_keyframe=False)
+
+    assert len(seeds) == W
+    assert seeds.grid_coord is not None
+    assert torch.equal(seeds.grid_coord.cpu(), torch.floor(points.reshape(-1, 3) / 0.12).to(torch.int32))
+    assert torch.equal(seeds.insert_enabled.cpu(), torch.ones(W, dtype=torch.bool))
+    assert torch.equal(seeds.source_flat_idx.cpu(), torch.arange(W, dtype=torch.long))
+
+
 def test_replace_fuse_initializer_decouples_voxel_and_erp_depth_latitude_scale():
     H, W = 8, 16
     grid = pixel_grid(H, W, device=torch.device("cpu"), dtype=torch.float32).view(-1, 2)
@@ -554,8 +600,43 @@ def test_replace_fuse_refreshes_voxel_from_current_xyz_before_fusing():
     assert mapper.map.anchor_count() == 1
     assert mapper.stats.last_hash_hits == 1
     assert mapper.stats.last_replace_fused == 1
+    assert mapper.stats.last_replace_fused_existing == 1
+    assert mapper.stats.last_replace_newly_inserted == 0
     assert int(mapper.map._anchor_last_update_kf_ord[0]) == 1
     assert torch.equal(mapper.map._anchor_grid_coord[0], torch.tensor([1, 0, 0], dtype=torch.int32))
+
+
+def test_replace_fuse_hash_insert_fuses_new_candidates_in_same_voxel():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    seeds = _pfgs_seed_batch(
+        torch.tensor([[0.005, 0.0, 0.0], [0.006, 0.0, 0.0], [0.045, 0.0, 0.0]]),
+        frame_id=0,
+        source_flat_idx=torch.tensor([1, 2, 3], dtype=torch.long),
+        source_hw=(1, 4),
+    )
+
+    inserted = mapper.insert_keyframe(seeds, _frontend_output_for_mapper(0))
+
+    assert inserted == 2
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_dense_seed_candidates == 3
+    assert mapper.stats.last_insert_mask_seed_candidates == 3
+    assert mapper.stats.last_voxel_seed_candidates == 2
+    assert mapper.stats.last_replace_fused_new_duplicate == 1
+    assert mapper.stats.last_replace_newly_inserted == 2
+    assert all(len(rows) == 1 for rows in mapper._build_replace_fuse_voxel_index().values())
 
 
 def test_replace_fuse_first_keyframe_ignores_missing_seed_budget():

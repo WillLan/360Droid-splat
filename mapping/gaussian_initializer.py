@@ -315,8 +315,11 @@ class GaussianInitializer:
         if non_sky is not None:
             mask = mask & non_sky
 
+        replace_fuse = self.insertion_strategy == "pfgs360_replace_fuse"
         pair_conf = self._hint_field(hints.get("pair_confidence"), (H, W), device=points.device, dtype=points.dtype)
-        if bool(first_keyframe):
+        if replace_fuse:
+            temporal_ok = torch.ones_like(mask, dtype=torch.bool)
+        elif bool(first_keyframe):
             temporal_ok = torch.ones_like(mask, dtype=torch.bool)
         elif pair_conf is None:
             temporal_ok = torch.ones_like(mask, dtype=torch.bool)
@@ -337,7 +340,40 @@ class GaussianInitializer:
         rgb_sel = rgb_flat[flat_idx].clamp(0.0, 1.0)
         conf_sel = conf_flat[flat_idx].clamp(0.0, 1.0)
         insert_pixel = temporal_flat[flat_idx].bool()
-        score_sel = conf_sel if pair_flat is None else (conf_sel * pair_flat[flat_idx].clamp(0.0, 1.0))
+        score_sel = (
+            conf_sel
+            if replace_fuse or pair_flat is None
+            else (conf_sel * pair_flat[flat_idx].clamp(0.0, 1.0))
+        )
+
+        if replace_fuse:
+            n = int(xyz_sel.shape[0])
+            grid = torch.floor(xyz_sel / float(self.pfgs360_voxel_size)).to(torch.int32)
+            if self.pfgs360_gaussian_scale_mode in {"erp_depth_latitude", "depth_latitude"}:
+                scale = self._pfgs360_depth_latitude_scale(
+                    output,
+                    xyz_sel,
+                    flat_idx,
+                    H,
+                    W,
+                    device=points.device,
+                    dtype=points.dtype,
+                )
+            else:
+                scale = torch.full((n,), float(self.pfgs360_voxel_size), device=points.device, dtype=points.dtype)
+            return GaussianSeedBatch(
+                xyz=xyz_sel,
+                rgb=rgb_sel,
+                confidence=conf_sel,
+                scale=scale,
+                level=torch.zeros(n, dtype=torch.int8, device=points.device),
+                frame_id=int(output.frame_id),
+                source_flat_idx=flat_idx.detach().to(device=points.device, dtype=torch.long),
+                source_hw=(int(H), int(W)),
+                insert_enabled=insert_pixel.detach().to(device=points.device, dtype=torch.bool),
+                insert_score=score_sel.detach().to(device=points.device, dtype=points.dtype),
+                grid_coord=grid.detach().to(device=points.device, dtype=torch.int32),
+            )
 
         grid = torch.floor(xyz_sel / float(self.pfgs360_voxel_size)).to(torch.int32)
         unique_grid, inverse = torch.unique(grid, dim=0, return_inverse=True)

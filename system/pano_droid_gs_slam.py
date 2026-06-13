@@ -985,12 +985,22 @@ class SlamRuntimeLogger:
         for idx, panel in enumerate(panels):
             canvas.paste(panel, (idx * width, title_h))
         draw = ImageDraw.Draw(canvas)
+        stats = stats or {}
+        seed_stats = (
+            f"dense={int(stats.get('dense_seed_candidates', 0))} "
+            f"mask_seed={int(stats.get('insert_mask_seed_candidates', 0))} "
+            f"vox_seed={int(stats.get('voxel_seed_candidates', 0))} "
+            f"new={int(stats.get('replace_newly_inserted', int(inserted_mask.sum().item())))} "
+            f"fuse_old={int(stats.get('replace_fused_existing', 0))} "
+            f"fuse_dup={int(stats.get('replace_fused_new_duplicate', 0))} "
+            f"compact={int(stats.get('replace_compacted', 0))}"
+        )
         draw.text(
             (8, 8),
             (
                 f"KF {int(frame_id):06d} need={int(need_insert.sum().item())} "
                 f"missing={int(missing.sum().item())} depth={int(depth_mismatch.sum().item())} "
-                f"inserted={int(inserted_mask.sum().item())}"
+                f"inserted={int(inserted_mask.sum().item())} {seed_stats}"
             ),
             fill=(0, 0, 0),
         )
@@ -1011,9 +1021,8 @@ class SlamRuntimeLogger:
                 "mapping/depth_insertion_depth_scale": float(scale),
                 "mapping/depth_insertion_depth_shift": float(shift),
             }
-            if stats:
-                for key, value in stats.items():
-                    payload[f"mapping/depth_insertion_{key}"] = float(value)
+            for key, value in stats.items():
+                payload[f"mapping/depth_insertion_{key}"] = float(value)
             if self._wandb is not None:
                 payload["mapping/depth_insertion"] = self._wandb.Image(str(path) if path is not None else canvas)
                 if path is not None:
@@ -2035,6 +2044,30 @@ class PanoDroidGSSlamSystem:
                 output_profile["skipped_depth_mismatch_budget"] = int(
                     getattr(self.mapper.stats, "last_skipped_depth_mismatch_budget", 0)
                 )
+                output_profile["dense_seed_candidates"] = int(
+                    getattr(self.mapper.stats, "last_dense_seed_candidates", 0)
+                )
+                output_profile["insert_mask_seed_candidates"] = int(
+                    getattr(self.mapper.stats, "last_insert_mask_seed_candidates", 0)
+                )
+                output_profile["voxel_seed_candidates"] = int(
+                    getattr(self.mapper.stats, "last_voxel_seed_candidates", 0)
+                )
+                output_profile["replace_fused_existing"] = int(
+                    getattr(self.mapper.stats, "last_replace_fused_existing", 0)
+                )
+                output_profile["replace_fused_new_duplicate"] = int(
+                    getattr(self.mapper.stats, "last_replace_fused_new_duplicate", 0)
+                )
+                output_profile["replace_newly_inserted"] = int(
+                    getattr(self.mapper.stats, "last_replace_newly_inserted", 0)
+                )
+                output_profile["anchor_count_before_insert"] = int(
+                    getattr(self.mapper.stats, "last_anchor_count_before_insert", 0)
+                )
+                output_profile["anchor_count_after_insert"] = int(
+                    getattr(self.mapper.stats, "last_anchor_count_after_insert", 0)
+                )
                 keyframes += 1
                 novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
                 insertion_stats = {
@@ -2061,8 +2094,32 @@ class PanoDroidGSSlamSystem:
                     "replace_deleted": int(getattr(self.mapper.stats, "last_replace_deleted", 0)),
                     "replace_fused": int(getattr(self.mapper.stats, "last_replace_fused", 0)),
                     "replace_compacted": int(getattr(self.mapper.stats, "last_replace_compacted", 0)),
+                    "dense_seed_candidates": int(getattr(self.mapper.stats, "last_dense_seed_candidates", 0)),
+                    "insert_mask_seed_candidates": int(
+                        getattr(self.mapper.stats, "last_insert_mask_seed_candidates", 0)
+                    ),
+                    "voxel_seed_candidates": int(getattr(self.mapper.stats, "last_voxel_seed_candidates", 0)),
+                    "replace_fused_existing": int(
+                        getattr(self.mapper.stats, "last_replace_fused_existing", 0)
+                    ),
+                    "replace_fused_new_duplicate": int(
+                        getattr(self.mapper.stats, "last_replace_fused_new_duplicate", 0)
+                    ),
+                    "replace_newly_inserted": int(
+                        getattr(self.mapper.stats, "last_replace_newly_inserted", 0)
+                    ),
+                    "anchor_count_before_insert": int(
+                        getattr(self.mapper.stats, "last_anchor_count_before_insert", 0)
+                    ),
+                    "anchor_count_after_insert": int(
+                        getattr(self.mapper.stats, "last_anchor_count_after_insert", 0)
+                    ),
                 }
-                if bool(novel_cfg.get("save_visualization", False)):
+                save_new_gaussian_vis = bool(novel_cfg.get("save_visualization", False)) or (
+                    bool(getattr(self.mapper, "pfgs360_replace_fuse_enabled", False))
+                    and bool(novel_cfg.get("save_depth_insertion_visualization", False))
+                )
+                if save_new_gaussian_vis:
                     section_start = time.perf_counter()
                     logger.observe_new_gaussians(
                         frame_id=int(out.frame_id),
@@ -2485,6 +2542,14 @@ class PanoDroidGSSlamSystem:
                 "backend_last_replace_deleted": self.mapper.stats.last_replace_deleted,
                 "backend_last_replace_fused": self.mapper.stats.last_replace_fused,
                 "backend_last_replace_compacted": self.mapper.stats.last_replace_compacted,
+                "backend_last_dense_seed_candidates": self.mapper.stats.last_dense_seed_candidates,
+                "backend_last_insert_mask_seed_candidates": self.mapper.stats.last_insert_mask_seed_candidates,
+                "backend_last_voxel_seed_candidates": self.mapper.stats.last_voxel_seed_candidates,
+                "backend_last_replace_fused_existing": self.mapper.stats.last_replace_fused_existing,
+                "backend_last_replace_fused_new_duplicate": self.mapper.stats.last_replace_fused_new_duplicate,
+                "backend_last_replace_newly_inserted": self.mapper.stats.last_replace_newly_inserted,
+                "backend_last_anchor_count_before_insert": self.mapper.stats.last_anchor_count_before_insert,
+                "backend_last_anchor_count_after_insert": self.mapper.stats.last_anchor_count_after_insert,
                 "backend_last_sky_pruned": self.mapper.stats.last_sky_pruned,
                 "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,

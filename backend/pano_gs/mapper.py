@@ -62,6 +62,14 @@ class MapperStats:
     last_depth_mismatch_seed_candidates: int = 0
     last_skipped_missing_budget: int = 0
     last_skipped_depth_mismatch_budget: int = 0
+    last_dense_seed_candidates: int = 0
+    last_insert_mask_seed_candidates: int = 0
+    last_voxel_seed_candidates: int = 0
+    last_replace_fused_existing: int = 0
+    last_replace_fused_new_duplicate: int = 0
+    last_replace_newly_inserted: int = 0
+    last_anchor_count_before_insert: int = 0
+    last_anchor_count_after_insert: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -691,12 +699,15 @@ class PanoGaussianMapper:
         )
         end = start + int(n)
         self.last_inserted_range = (start, end)
+        filter_stats["newly_inserted"] = int(n)
         if self.pfgs360_replace_fuse_enabled:
             compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
             if compacted > 0:
                 filter_stats["compacted"] = int(filter_stats.get("compacted", 0)) + int(compacted)
                 self._rebuild_keyframe_ranges_from_birth_frames()
                 self.last_inserted_range = self._range_for_birth_frame(int(frontend_output.frame_id))
+        filter_stats["anchors_before"] = int(start)
+        filter_stats["anchors_after"] = int(self.map.anchor_count())
         self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
         self.stats.n_keyframes += 1
         self.stats.n_anchors = self.map.anchor_count()
@@ -722,6 +733,14 @@ class PanoGaussianMapper:
         self.stats.last_replace_deleted = int(filter_stats.get("replace_deleted", 0))
         self.stats.last_replace_fused = int(filter_stats.get("fused", 0))
         self.stats.last_replace_compacted = int(filter_stats.get("compacted", 0))
+        self.stats.last_dense_seed_candidates = int(filter_stats.get("dense_seed_candidates", requested))
+        self.stats.last_insert_mask_seed_candidates = int(filter_stats.get("insert_mask_seed_candidates", 0))
+        self.stats.last_voxel_seed_candidates = int(filter_stats.get("voxel_seed_candidates", 0))
+        self.stats.last_replace_fused_existing = int(filter_stats.get("fused_existing", 0))
+        self.stats.last_replace_fused_new_duplicate = int(filter_stats.get("fused_new_duplicate", 0))
+        self.stats.last_replace_newly_inserted = int(filter_stats.get("newly_inserted", n))
+        self.stats.last_anchor_count_before_insert = int(filter_stats.get("anchors_before", start))
+        self.stats.last_anchor_count_after_insert = int(filter_stats.get("anchors_after", self.map.anchor_count()))
         if image is not None:
             register_start, register_end = self.last_inserted_range
             self._register_keyframe(frontend_output, image, start=register_start, end=register_end, sky_mask=sky_mask)
@@ -1046,14 +1065,22 @@ class PanoGaussianMapper:
             "outlier_pruned": 0,
             "replace_deleted": 0,
             "fused": 0,
+            "fused_existing": 0,
+            "fused_new_duplicate": 0,
             "compacted": 0,
             "missing_pixels": 0,
             "depth_mismatch_pixels": 0,
             "render_bad_pixels": 0,
             "missing_seed_candidates": 0,
             "depth_mismatch_seed_candidates": 0,
+            "dense_seed_candidates": int(len(seeds)),
+            "insert_mask_seed_candidates": 0,
+            "voxel_seed_candidates": 0,
+            "newly_inserted": 0,
             "skipped_missing_budget": 0,
             "skipped_depth_mismatch_budget": 0,
+            "anchors_before": int(self.map.anchor_count()),
+            "anchors_after": int(self.map.anchor_count()),
         }
         current_kf_ord = int(self.stats.n_keyframes)
         if self.map.anchor_count() > 0:
@@ -1084,15 +1111,90 @@ class PanoGaussianMapper:
                 insert_seed_mask = self._sample_seed_mask(render_masks["insert"], seeds).detach().cpu().bool()
                 depth_seed_mask = self._sample_seed_mask(render_masks["delete"], seeds).detach().cpu().bool()
                 insert_enabled &= insert_seed_mask
-                stats["depth_mismatch_seed_candidates"] = int(depth_seed_mask.sum().item())
-                stats["missing_seed_candidates"] = int((insert_seed_mask & ~depth_seed_mask).sum().item())
+        stats["insert_mask_seed_candidates"] = int(insert_enabled.sum().item())
+        stats["suppressed_insert"] = int((~insert_enabled).sum().item())
+        if not bool(insert_enabled.any()):
+            return self._empty_seed_like(seeds), stats
 
         score = seeds.insert_score if seeds.insert_score is not None else seeds.confidence
         score_cpu = score.detach().cpu().float()
         conf_cpu = seeds.confidence.detach().cpu().float()
         xyz_cpu = seeds.xyz.detach().cpu().float()
+        rgb_cpu = seeds.rgb.detach().cpu().float()
+        scale_cpu = seeds.scale.detach().cpu().float()
+        level_cpu = seeds.level.detach().cpu()
         grid_cpu = torch.floor(xyz_cpu / float(self.pfgs360_voxel_size)).to(torch.int32)
-        order = torch.argsort(score_cpu, descending=True)
+        active_rows = torch.nonzero(insert_enabled, as_tuple=False).flatten()
+        active_grid = grid_cpu.index_select(0, active_rows)
+        unique_grid, inverse = torch.unique(active_grid, dim=0, return_inverse=True)
+        n_voxels = int(unique_grid.shape[0])
+        stats["voxel_seed_candidates"] = n_voxels
+        stats["fused_new_duplicate"] = int(max(0, int(active_rows.numel()) - n_voxels))
+        stats["fused"] += int(stats["fused_new_duplicate"])
+        if n_voxels <= 0:
+            return self._empty_seed_like(seeds), stats
+
+        weights = conf_cpu.index_select(0, active_rows).clamp_min(1.0e-4)
+        sum_w = torch.zeros(n_voxels, dtype=torch.float32)
+        sum_w.index_add_(0, inverse, weights)
+        xyz_sum = torch.zeros(n_voxels, 3, dtype=torch.float32)
+        rgb_sum = torch.zeros(n_voxels, 3, dtype=torch.float32)
+        xyz_sum.index_add_(0, inverse, xyz_cpu.index_select(0, active_rows) * weights.unsqueeze(-1))
+        rgb_sum.index_add_(0, inverse, rgb_cpu.index_select(0, active_rows) * weights.unsqueeze(-1))
+        voxel_xyz = xyz_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
+        voxel_rgb = rgb_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
+
+        count = torch.zeros(n_voxels, dtype=torch.float32)
+        count.index_add_(0, inverse, torch.ones_like(weights))
+        conf_sum = torch.zeros(n_voxels, dtype=torch.float32)
+        conf_sum.index_add_(0, inverse, conf_cpu.index_select(0, active_rows))
+        voxel_conf = (conf_sum / count.clamp_min(1.0)).clamp(0.0, 1.0)
+
+        score_active = score_cpu.index_select(0, active_rows)
+        best_score = torch.full((n_voxels,), -float("inf"), dtype=torch.float32)
+        best_score.scatter_reduce_(0, inverse, score_active, reduce="amax", include_self=True)
+        active_pos = torch.arange(active_rows.numel(), dtype=torch.long)
+        is_best = score_active >= best_score.index_select(0, inverse)
+        sentinel = torch.full_like(active_pos, int(active_rows.numel()))
+        pos_candidates = torch.where(is_best, active_pos, sentinel)
+        best_pos = torch.full((n_voxels,), int(active_rows.numel()), dtype=torch.long)
+        best_pos.scatter_reduce_(0, inverse, pos_candidates, reduce="amin", include_self=True)
+        best_rows = active_rows.index_select(0, best_pos.clamp_max(max(0, int(active_rows.numel()) - 1)))
+
+        voxel_score = best_score.clamp_min(0.0)
+        voxel_level = level_cpu.index_select(0, best_rows).to(torch.int8)
+        if hasattr(torch.Tensor, "scatter_reduce_"):
+            voxel_scale = torch.full((n_voxels,), float("inf"), dtype=torch.float32)
+            voxel_scale.scatter_reduce_(0, inverse, scale_cpu.index_select(0, active_rows), reduce="amin", include_self=True)
+            voxel_scale = voxel_scale.clamp_min(1.0e-8)
+        else:
+            voxel_scale = scale_cpu.index_select(0, best_rows).clone()
+            for idx in range(n_voxels):
+                rows = active_rows.index_select(0, torch.nonzero(inverse == idx, as_tuple=False).flatten())
+                voxel_scale[idx] = scale_cpu.index_select(0, rows).min()
+        depth_counts = torch.zeros(n_voxels, dtype=torch.int32)
+        depth_counts.index_add_(0, inverse, depth_seed_mask.index_select(0, active_rows).to(torch.int32))
+        voxel_depth_seed = depth_counts > 0
+        stats["depth_mismatch_seed_candidates"] = int(voxel_depth_seed.sum().item())
+        stats["missing_seed_candidates"] = int((~voxel_depth_seed).sum().item())
+
+        source_flat_idx = None
+        if seeds.source_flat_idx is not None:
+            source_flat_idx = seeds.source_flat_idx.detach().cpu().long().index_select(0, best_rows)
+        voxel_seeds = GaussianSeedBatch(
+            xyz=voxel_xyz.to(device=seeds.xyz.device, dtype=seeds.xyz.dtype),
+            rgb=voxel_rgb.to(device=seeds.rgb.device, dtype=seeds.rgb.dtype),
+            confidence=voxel_conf.to(device=seeds.confidence.device, dtype=seeds.confidence.dtype),
+            scale=voxel_scale.to(device=seeds.scale.device, dtype=seeds.scale.dtype),
+            level=voxel_level.to(device=seeds.level.device),
+            frame_id=int(seeds.frame_id),
+            source_flat_idx=None if source_flat_idx is None else source_flat_idx.to(device=seeds.xyz.device),
+            source_hw=seeds.source_hw,
+            insert_enabled=torch.ones(n_voxels, dtype=torch.bool, device=seeds.xyz.device),
+            insert_score=voxel_score.to(device=seeds.xyz.device, dtype=seeds.xyz.dtype),
+            grid_coord=unique_grid.to(device=seeds.xyz.device, dtype=torch.int32),
+        )
+        order = torch.argsort(voxel_score, descending=True)
         occupied = self._build_replace_fuse_voxel_index()
         anchor_xyz_cpu = self.map.get_xyz.detach().cpu().float() if self.map.anchor_count() > 0 else torch.zeros(0, 3)
         kept: list[int] = []
@@ -1101,25 +1203,28 @@ class PanoGaussianMapper:
         depth_budget = int(self.max_depth_mismatch_seeds_per_keyframe)
         insert_only_budget = 0 if first_keyframe else int(self.max_missing_seeds_per_keyframe)
         for seed_idx in order.tolist():
-            key = (0, int(grid_cpu[seed_idx, 0]), int(grid_cpu[seed_idx, 1]), int(grid_cpu[seed_idx, 2]))
+            key = (
+                0,
+                int(unique_grid[seed_idx, 0]),
+                int(unique_grid[seed_idx, 1]),
+                int(unique_grid[seed_idx, 2]),
+            )
             hits = occupied.get(key, [])
             valid_hits = [int(hit) for hit in hits if int(hit) >= 0]
             if valid_hits:
-                hit = self._select_replace_fuse_hit(valid_hits, xyz_cpu[seed_idx], anchor_xyz_cpu)
-                self._fuse_seed_into_anchor(hit, seeds, int(seed_idx), current_kf_ord=current_kf_ord)
+                hit = self._select_replace_fuse_hit(valid_hits, voxel_xyz[seed_idx], anchor_xyz_cpu)
+                self._fuse_seed_into_anchor(hit, voxel_seeds, int(seed_idx), current_kf_ord=current_kf_ord)
                 stats["hash_hits"] += 1
                 stats["skipped_voxel"] += 1
                 stats["fused"] += 1
+                stats["fused_existing"] += 1
                 if int(hit) < int(anchor_xyz_cpu.shape[0]):
                     anchor_xyz_cpu[hit] = self.map.get_xyz.detach().cpu().float()[hit]
                 continue
             if hits:
                 stats["skipped_voxel"] += 1
                 continue
-            if not bool(insert_enabled[seed_idx]):
-                stats["suppressed_insert"] += 1
-                continue
-            is_delete_band_seed = bool(depth_seed_mask[seed_idx])
+            is_delete_band_seed = bool(voxel_depth_seed[seed_idx])
             if is_delete_band_seed and depth_budget > 0 and kept_depth_mismatch >= depth_budget:
                 stats["skipped_depth_mismatch_budget"] += 1
                 stats["skipped_budget"] += 1
@@ -1139,8 +1244,9 @@ class PanoGaussianMapper:
             occupied[key] = [-1]
         if not kept:
             return self._empty_seed_like(seeds), stats
-        keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
-        return self._subset_seeds(seeds, keep_idx), stats
+        stats["newly_inserted"] = int(len(kept))
+        keep_idx = torch.tensor(kept, dtype=torch.long, device=voxel_seeds.xyz.device)
+        return self._subset_seeds(voxel_seeds, keep_idx), stats
 
     def _with_pfgs360_seed_metadata(self, seeds: GaussianSeedBatch) -> GaussianSeedBatch:
         n = len(seeds)
