@@ -1355,7 +1355,13 @@ class PanoGaussianMapper:
             valid = torch.isfinite(target_depth) & torch.isfinite(render_depth) & (target_depth > 1.0e-6) & (render_depth > 1.0e-6)
             if depth_conf is not None:
                 valid = valid & (depth_conf.to(device=target.device, dtype=target.dtype) > 1.0e-6)
-            scale, shift = self._robust_depth_scale_shift(target_depth, render_depth, valid & (alpha >= self.pfgs360_render_alpha_min))
+            non_sky = None
+            if sky_mask is not None:
+                non_sky = ~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device)
+            scale_valid = valid & (alpha >= self.pfgs360_render_alpha_min)
+            if non_sky is not None:
+                scale_valid = scale_valid & non_sky
+            scale, shift = self._robust_depth_scale_shift(target_depth, render_depth, scale_valid)
             aligned_target = (target_depth * scale + shift).clamp_min(1.0e-6)
             valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
@@ -1366,8 +1372,7 @@ class PanoGaussianMapper:
                 & (rel >= float(self.replace_fuse_delete_rel_min))
                 & (rel <= float(self.replace_fuse_delete_rel_max))
             )
-            if sky_mask is not None:
-                non_sky = ~self._normalize_skybox_mask(sky_mask, height=H, width=W, device=target.device)
+            if non_sky is not None:
                 missing = missing & non_sky
                 insert_mask = insert_mask & non_sky
                 delete_mask = delete_mask & non_sky
@@ -2353,6 +2358,7 @@ class PanoGaussianMapper:
                 "window_size": float(len(observations)),
                 "feedforward_window_size": float(len(observations)),
                 "sky_pruned": float(sky_pruned),
+                "profile_backend_feedforward_window_sky_pruned": float(sky_pruned),
                 "profile_backend_feedforward_window_sec": float(time.perf_counter() - total_start),
             }
         optimizer = torch.optim.AdamW(
@@ -2491,6 +2497,7 @@ class PanoGaussianMapper:
         last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
         last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
         last["sky_pruned"] = float(sky_pruned_total)
+        last["profile_backend_feedforward_window_sky_pruned"] = float(sky_pruned_total)
         last["profile_backend_feedforward_window_sec"] = total_sec
         last["profile_backend_feedforward_window_step_avg_sec"] = total_sec / max(1, actual_steps)
         last["profile_backend_feedforward_window_sample_sec"] = float(sample_sec)

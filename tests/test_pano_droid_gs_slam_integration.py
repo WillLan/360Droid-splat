@@ -106,6 +106,28 @@ class _ReplaceMissingDepthRenderer:
         }
 
 
+class _SkyBiasedScaleRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        H, W = int(camera.image_height), int(camera.image_width)
+        device = camera.c2w.device
+        dtype = camera.c2w.dtype
+        render = torch.zeros(3, H, W, device=device, dtype=dtype)
+        depth = torch.ones(1, H, W, device=device, dtype=dtype)
+        depth[:, :, : max(0, W - 16)] = 4.0
+        alpha = torch.ones(1, H, W, device=device, dtype=dtype)
+        total = int(gaussian_map.anchor_count())
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "visibility_filter": torch.zeros(total, dtype=torch.bool, device=device),
+            "radii": torch.zeros(total, dtype=torch.int32, device=device),
+            "n_touched": torch.zeros(total, dtype=torch.int32, device=device),
+            "render_distort": None,
+        }
+
+
 class _BadEvidenceRenderer:
     def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
         H, W = int(camera.image_height), int(camera.image_width)
@@ -143,6 +165,24 @@ def _small_frontend_output(frame_id: int) -> FrontendOutput:
         is_keyframe=True,
         ba_residual=None,
         tracking_status="tracked",
+    )
+
+
+def _frontend_output_with_size(frame_id: int, H: int, W: int) -> FrontendOutput:
+    out = _small_frontend_output(frame_id)
+    return FrontendOutput(
+        frame_id=out.frame_id,
+        timestamp=out.timestamp,
+        pose_c2w=out.pose_c2w,
+        relative_pose=out.relative_pose,
+        pose_confidence=out.pose_confidence,
+        inverse_depth=torch.ones(1, H, W),
+        depth_confidence=torch.ones(1, H, W),
+        spherical_flow=out.spherical_flow,
+        keyframe_score=out.keyframe_score,
+        is_keyframe=out.is_keyframe,
+        ba_residual=out.ba_residual,
+        tracking_status=out.tracking_status,
     )
 
 
@@ -367,6 +407,55 @@ def test_replace_fuse_missing_ignores_low_alpha_when_render_depth_is_valid():
     assert torch.equal(masks["missing"], torch.tensor([[[False, True, False]]]))
     assert torch.equal(masks["insert"], torch.tensor([[[False, True, False]]]))
     assert stats["missing_pixels"] == 1
+
+
+def test_replace_fuse_depth_scale_shift_excludes_sky_pixels():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "render_alpha_min": 0.20,
+                "replace_insert_rel_min": 0.10,
+                "replace_delete_rel_min": 0.10,
+                "replace_delete_rel_max": 0.20,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_SkyBiasedScaleRenderer())
+    mapper.insert_keyframe(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.02),
+            level=torch.zeros(1, dtype=torch.int8),
+            frame_id=0,
+        ),
+        _frontend_output_with_size(0, 1, 40),
+        image=torch.zeros(3, 1, 40),
+    )
+    sky_mask = torch.zeros(1, 1, 40, dtype=torch.bool)
+    sky_mask[:, :, :24] = True
+
+    masks, stats = mapper._pfgs360_replace_fuse_masks_and_delete(
+        _frontend_output_with_size(1, 1, 40),
+        torch.zeros(3, 1, 40),
+        sky_mask=sky_mask,
+    )
+
+    assert masks is not None
+    assert not bool(masks["insert"].any())
+    assert not bool(masks["delete"].any())
+    assert stats["render_bad_pixels"] == 0
+    diagnostic = mapper.last_depth_insertion_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.depth_scale == pytest.approx(1.0)
 
 
 def test_mapper_force_sky_render_uses_skybox_inside_sky_mask():
@@ -621,6 +710,7 @@ def test_replace_fuse_chunk_optimizer_prunes_visible_sky_gaussians():
     metrics = mapper.optimize_feedforward_window(current_frame_ids=[10], history_frame_ids=[])
 
     assert metrics["sky_pruned"] == 1.0
+    assert metrics["profile_backend_feedforward_window_sky_pruned"] == 1.0
     assert mapper.stats.last_sky_pruned == 1
     assert gaussian_map.anchor_count() == 0
 

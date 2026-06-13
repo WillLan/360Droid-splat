@@ -423,6 +423,7 @@ _COMPACT_SLAM_WANDB_KEYS = frozenset(
         "backend/kf_opt_psnr",
         "backend/kf_render_opt",
         "backend/kf_depth_opt",
+        "backend/sky_pruned",
         "m3/chunk",
         "m3/ba_success",
         "m3/valid_factor_ratio",
@@ -1915,6 +1916,10 @@ class PanoDroidGSSlamSystem:
                 return
             last_feedforward_metrics = dict(metrics)
             diagnostic_step = max(1, int(logger._step) + 1)
+            logger._log_wandb_payload(
+                {"backend/sky_pruned": float(metrics.get("sky_pruned", 0.0))},
+                step=diagnostic_step,
+            )
             for out in outputs:
                 if not bool(getattr(out, "is_keyframe", False)):
                     continue
