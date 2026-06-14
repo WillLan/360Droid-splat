@@ -7,6 +7,7 @@ PFGS360 adapter while keeping anchor-scaffold metadata local to this project.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import random
 import time
@@ -68,6 +69,9 @@ class MapperStats:
     last_replace_fused_existing: int = 0
     last_replace_fused_new_duplicate: int = 0
     last_replace_newly_inserted: int = 0
+    last_pred_depth_generated_seeds: int = 0
+    last_pred_depth_invalid_pixels: int = 0
+    last_insert_mask_pixels: int = 0
     last_anchor_count_before_insert: int = 0
     last_anchor_count_after_insert: int = 0
     notes: list[str] = field(default_factory=list)
@@ -604,6 +608,17 @@ class PanoGaussianMapper:
         self.pfgs360_photometric_error_threshold = float(novel_cfg.get("photometric_error_threshold", 0.08))
         self.pfgs360_near_grid_radius = max(0, int(novel_cfg.get("near_grid_radius", 1)))
         self.pfgs360_near_distance_factor = max(0.0, float(novel_cfg.get("near_distance_factor", 1.0)))
+        self.pfgs360_gaussian_scale_mode = str(novel_cfg.get("gaussian_scale_mode", "voxel") or "voxel").lower()
+        self.pfgs360_gaussian_scale_factor = float(novel_cfg.get("gaussian_scale_factor", 1.25))
+        self.pfgs360_gaussian_scale_min = max(float(novel_cfg.get("gaussian_scale_min", 0.008)), 1.0e-8)
+        self.pfgs360_gaussian_scale_max = max(
+            self.pfgs360_gaussian_scale_min,
+            float(novel_cfg.get("gaussian_scale_max", 0.08)),
+        )
+        self.pfgs360_gaussian_scale_lat_cos_min = min(
+            1.0,
+            max(0.0, float(novel_cfg.get("gaussian_scale_lat_cos_min", 0.25))),
+        )
         default_reset = 0 if self.pfgs360_replace_fuse_enabled else 3
         default_prune = 0 if self.pfgs360_replace_fuse_enabled else 6
         self.pfgs360_reset_after_outliers = max(0, int(novel_cfg.get("reset_after_outlier_observations", default_reset)))
@@ -739,6 +754,9 @@ class PanoGaussianMapper:
         self.stats.last_replace_fused_existing = int(filter_stats.get("fused_existing", 0))
         self.stats.last_replace_fused_new_duplicate = int(filter_stats.get("fused_new_duplicate", 0))
         self.stats.last_replace_newly_inserted = int(filter_stats.get("newly_inserted", n))
+        self.stats.last_pred_depth_generated_seeds = int(filter_stats.get("pred_depth_generated_seeds", 0))
+        self.stats.last_pred_depth_invalid_pixels = int(filter_stats.get("pred_depth_invalid_pixels", 0))
+        self.stats.last_insert_mask_pixels = int(filter_stats.get("insert_mask_pixels", 0))
         self.stats.last_anchor_count_before_insert = int(filter_stats.get("anchors_before", start))
         self.stats.last_anchor_count_after_insert = int(filter_stats.get("anchors_after", self.map.anchor_count()))
         if image is not None:
@@ -853,7 +871,9 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
-        if not self.novel_insertion_enabled or len(seeds) == 0:
+        if not self.novel_insertion_enabled:
+            return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
+        if len(seeds) == 0 and not self.pfgs360_replace_fuse_enabled:
             return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
         if self.pfgs360_insertion_enabled:
             return self._filter_pfgs360_seeds(
@@ -1049,11 +1069,6 @@ class PanoGaussianMapper:
         sky_mask: torch.Tensor | None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         seeds = self._with_pfgs360_seed_metadata(seeds)
-        per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
-        budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
-        if self.global_anchor_budget > 0:
-            budget = min(budget, max(0, int(self.global_anchor_budget) - self.map.anchor_count()))
-        budget = max(0, int(budget))
 
         stats = {
             "skipped_voxel": 0,
@@ -1077,6 +1092,9 @@ class PanoGaussianMapper:
             "insert_mask_seed_candidates": 0,
             "voxel_seed_candidates": 0,
             "newly_inserted": 0,
+            "pred_depth_generated_seeds": 0,
+            "pred_depth_invalid_pixels": 0,
+            "insert_mask_pixels": 0,
             "skipped_missing_budget": 0,
             "skipped_depth_mismatch_budget": 0,
             "anchors_before": int(self.map.anchor_count()),
@@ -1091,7 +1109,6 @@ class PanoGaussianMapper:
             else seeds.insert_enabled.detach().cpu().bool()
         )
         first_keyframe = self.stats.n_keyframes == 0 or self.map.anchor_count() == 0
-        insert_seed_mask = torch.ones(len(seeds), dtype=torch.bool)
         depth_seed_mask = torch.zeros(len(seeds), dtype=torch.bool)
         if first_keyframe and frontend_output is not None and image is not None:
             image_hw = tuple(int(v) for v in image.shape[-2:])
@@ -1100,7 +1117,6 @@ class PanoGaussianMapper:
                 image_hw,
             )
         elif frontend_output is not None and image is not None:
-            image_hw = tuple(int(v) for v in image.shape[-2:])
             render_masks, evidence_stats = self._pfgs360_replace_fuse_masks_and_delete(
                 frontend_output,
                 image,
@@ -1108,9 +1124,24 @@ class PanoGaussianMapper:
             )
             stats.update({key: int(stats.get(key, 0)) + int(value) for key, value in evidence_stats.items()})
             if render_masks is not None:
-                insert_seed_mask = self._sample_seed_mask(render_masks["insert"], seeds).detach().cpu().bool()
-                depth_seed_mask = self._sample_seed_mask(render_masks["delete"], seeds).detach().cpu().bool()
-                insert_enabled &= insert_seed_mask
+                seeds, depth_seed_mask, pred_stats = self._replace_fuse_seeds_from_pred_depth(
+                    frontend_output,
+                    image,
+                    render_masks,
+                    frame_id=int(seeds.frame_id),
+                )
+                stats.update({key: int(stats.get(key, 0)) + int(value) for key, value in pred_stats.items()})
+                insert_enabled = torch.ones(len(seeds), dtype=torch.bool)
+                stats["dense_seed_candidates"] = int(len(seeds))
+            else:
+                seeds = self._empty_seed_like(seeds)
+                insert_enabled = torch.zeros(0, dtype=torch.bool)
+                depth_seed_mask = torch.zeros(0, dtype=torch.bool)
+        per_keyframe_budget = self.first_keyframe_max_seeds if first_keyframe else self.keyframe_max_seeds
+        budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
+        if self.global_anchor_budget > 0:
+            budget = min(budget, max(0, int(self.global_anchor_budget) - self.map.anchor_count()))
+        budget = max(0, int(budget))
         stats["insert_mask_seed_candidates"] = int(insert_enabled.sum().item())
         stats["suppressed_insert"] = int((~insert_enabled).sum().item())
         if not bool(insert_enabled.any()):
@@ -1283,6 +1314,195 @@ class PanoGaussianMapper:
             grid_coord=grid,
         )
 
+    def _replace_fuse_seeds_from_pred_depth(
+        self,
+        frontend_output: FrontendOutput,
+        image: torch.Tensor,
+        masks: dict[str, torch.Tensor],
+        *,
+        frame_id: int,
+    ) -> tuple[GaussianSeedBatch, torch.Tensor, dict[str, int]]:
+        target = image.detach()
+        if target.ndim == 4:
+            target = target[0]
+        if target.ndim != 3:
+            raise ValueError(f"Expected keyframe image as 3xHxW, got {tuple(target.shape)}")
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        target = target.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        H, W = int(target.shape[-2]), int(target.shape[-1])
+        stats = {
+            "pred_depth_generated_seeds": 0,
+            "pred_depth_invalid_pixels": 0,
+            "insert_mask_pixels": 0,
+        }
+
+        insert_mask_t = masks.get("insert", masks.get("render_bad"))
+        if not torch.is_tensor(insert_mask_t):
+            return self._empty_pred_depth_seed_batch(frame_id, H, W, device, dtype), torch.zeros(0, dtype=torch.bool), stats
+        insert_mask = insert_mask_t.detach().bool()
+        if insert_mask.ndim == 2:
+            insert_mask = insert_mask.unsqueeze(0)
+        if tuple(insert_mask.shape[-2:]) != (H, W):
+            insert_mask = F.interpolate(
+                insert_mask.float().view(1, 1, *insert_mask.shape[-2:]),
+                size=(H, W),
+                mode="nearest",
+            )[0] > 0.5
+        insert_mask = insert_mask.to(device=device, dtype=torch.bool)
+        stats["insert_mask_pixels"] = int(insert_mask.sum().detach().cpu())
+        if stats["insert_mask_pixels"] <= 0:
+            return self._empty_pred_depth_seed_batch(frame_id, H, W, device, dtype), torch.zeros(0, dtype=torch.bool), stats
+
+        depth_t = masks.get("predicted_depth")
+        if torch.is_tensor(depth_t):
+            pred_depth = depth_t.detach().float()
+            if pred_depth.ndim == 2:
+                pred_depth = pred_depth.unsqueeze(0)
+            if tuple(pred_depth.shape[-2:]) != (H, W):
+                pred_depth = F.interpolate(pred_depth.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+            pred_depth = pred_depth.to(device=device, dtype=dtype)
+        else:
+            pred_depth, _ = self._target_depth_from_output(frontend_output, (H, W), device, dtype)
+            if pred_depth is None:
+                stats["pred_depth_invalid_pixels"] = stats["insert_mask_pixels"]
+                return self._empty_pred_depth_seed_batch(frame_id, H, W, device, dtype), torch.zeros(0, dtype=torch.bool), stats
+
+        numeric_valid = torch.isfinite(pred_depth) & (pred_depth > 1.0e-6)
+        raw_valid = self._raw_predicted_depth_valid_mask(frontend_output, (H, W), device)
+        if raw_valid is not None:
+            numeric_valid = numeric_valid & raw_valid
+        seed_pixel_mask = insert_mask & numeric_valid
+        stats["pred_depth_invalid_pixels"] = int((insert_mask & ~numeric_valid).sum().detach().cpu())
+        flat_idx = torch.nonzero(seed_pixel_mask.reshape(-1), as_tuple=False).flatten()
+        if flat_idx.numel() == 0:
+            return self._empty_pred_depth_seed_batch(frame_id, H, W, device, dtype), torch.zeros(0, dtype=torch.bool), stats
+
+        grid = pixel_grid(H, W, device=device, dtype=dtype).view(-1, 2).index_select(0, flat_idx)
+        bearing = erp_pixel_to_bearing(grid, H, W).to(device=device, dtype=dtype)
+        depth = pred_depth.reshape(-1).index_select(0, flat_idx).clamp_min(1.0e-6)
+        pts_cam = bearing * depth.unsqueeze(-1)
+        c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
+        pts_h = torch.cat([pts_cam, torch.ones(int(flat_idx.numel()), 1, device=device, dtype=dtype)], dim=-1)
+        xyz = (c2w @ pts_h.T).T[:, :3]
+
+        rgb = target.permute(1, 2, 0).reshape(-1, 3).index_select(0, flat_idx).contiguous()
+        confidence = torch.ones(int(flat_idx.numel()), device=device, dtype=dtype)
+        scale = self._replace_fuse_seed_scale_from_depth(
+            xyz,
+            flat_idx,
+            H,
+            W,
+            c2w,
+            device=device,
+            dtype=dtype,
+        )
+        delete_mask = masks.get("delete", masks.get("depth_mismatch"))
+        if torch.is_tensor(delete_mask):
+            delete_t = delete_mask.detach().bool()
+            if delete_t.ndim == 2:
+                delete_t = delete_t.unsqueeze(0)
+            if tuple(delete_t.shape[-2:]) != (H, W):
+                delete_t = F.interpolate(
+                    delete_t.float().view(1, 1, *delete_t.shape[-2:]),
+                    size=(H, W),
+                    mode="nearest",
+                )[0] > 0.5
+            depth_seed_mask = delete_t.reshape(-1).to(device=device, dtype=torch.bool).index_select(0, flat_idx)
+        else:
+            depth_seed_mask = torch.zeros(int(flat_idx.numel()), dtype=torch.bool, device=device)
+
+        seeds = GaussianSeedBatch(
+            xyz=xyz,
+            rgb=rgb,
+            confidence=confidence,
+            scale=scale,
+            level=torch.zeros(int(flat_idx.numel()), dtype=torch.int8, device=device),
+            frame_id=int(frame_id),
+            source_flat_idx=flat_idx.to(device=device, dtype=torch.long),
+            source_hw=(H, W),
+            insert_enabled=torch.ones(int(flat_idx.numel()), dtype=torch.bool, device=device),
+            insert_score=torch.ones(int(flat_idx.numel()), dtype=dtype, device=device),
+            grid_coord=torch.floor(xyz.detach() / float(self.pfgs360_voxel_size)).to(device=device, dtype=torch.int32),
+        )
+        stats["pred_depth_generated_seeds"] = int(len(seeds))
+        return seeds, depth_seed_mask.detach().cpu().bool(), stats
+
+    @staticmethod
+    def _empty_pred_depth_seed_batch(
+        frame_id: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> GaussianSeedBatch:
+        return GaussianSeedBatch(
+            xyz=torch.zeros(0, 3, device=device, dtype=dtype),
+            rgb=torch.zeros(0, 3, device=device, dtype=dtype),
+            confidence=torch.zeros(0, device=device, dtype=dtype),
+            scale=torch.zeros(0, device=device, dtype=dtype),
+            level=torch.zeros(0, dtype=torch.int8, device=device),
+            frame_id=int(frame_id),
+            source_flat_idx=torch.zeros(0, dtype=torch.long, device=device),
+            source_hw=(int(H), int(W)),
+            insert_enabled=torch.zeros(0, dtype=torch.bool, device=device),
+            insert_score=torch.zeros(0, device=device, dtype=dtype),
+            grid_coord=torch.zeros(0, 3, dtype=torch.int32, device=device),
+        )
+
+    def _replace_fuse_seed_scale_from_depth(
+        self,
+        xyz: torch.Tensor,
+        source_flat_idx: torch.Tensor,
+        H: int,
+        W: int,
+        c2w: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if str(self.pfgs360_gaussian_scale_mode).lower() not in {"erp_depth_latitude", "depth_latitude"}:
+            return torch.full((int(xyz.shape[0]),), float(self.pfgs360_voxel_size), device=device, dtype=dtype)
+        center = c2w[:3, 3] if tuple(c2w.shape) == (4, 4) else torch.zeros(3, device=device, dtype=dtype)
+        depth = torch.linalg.norm(xyz.to(device=device, dtype=dtype) - center.view(1, 3), dim=-1).clamp_min(1.0e-6)
+        rows = torch.div(source_flat_idx.to(device=device, dtype=torch.long), int(W), rounding_mode="floor").to(dtype=dtype)
+        lat = math.pi * 0.5 - (rows + 0.5) * math.pi / float(H)
+        cos_lat = torch.cos(lat).clamp(float(self.pfgs360_gaussian_scale_lat_cos_min), 1.0)
+        angular = math.sqrt((2.0 * math.pi / float(W)) * (math.pi / float(H))) * torch.sqrt(cos_lat)
+        scale = float(self.pfgs360_gaussian_scale_factor) * depth * angular
+        return scale.clamp(float(self.pfgs360_gaussian_scale_min), float(self.pfgs360_gaussian_scale_max))
+
+    def _raw_predicted_depth_valid_mask(
+        self,
+        frontend_output: FrontendOutput,
+        size: tuple[int, int],
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        H, W = int(size[0]), int(size[1])
+        if frontend_output.inverse_depth is not None:
+            inv = frontend_output.inverse_depth.detach().float()
+            if inv.ndim == 2:
+                inv = inv.unsqueeze(0)
+            valid = torch.isfinite(inv) & (inv > 1.0e-6)
+        elif frontend_output.world_points is not None:
+            pts = frontend_output.world_points.detach().float()
+            if pts.ndim == 4 and int(pts.shape[0]) == 1:
+                pts = pts[0]
+            if pts.ndim != 3 or int(pts.shape[-1]) != 3:
+                return None
+            valid = torch.isfinite(pts).all(dim=-1, keepdim=False).unsqueeze(0)
+            valid_mask = frontend_output.valid_world_points_mask
+            if valid_mask is not None:
+                extra = valid_mask.detach().bool()
+                if extra.ndim == 2:
+                    extra = extra.unsqueeze(0)
+                valid = valid & extra
+        else:
+            return None
+        if tuple(valid.shape[-2:]) != (H, W):
+            valid = F.interpolate(valid.float().unsqueeze(0), size=(H, W), mode="nearest")[0] > 0.5
+        return valid.to(device=device, dtype=torch.bool)
+
     def _find_pfgs360_hash_hit(
         self,
         occupied: dict[tuple[int, int, int, int], int],
@@ -1392,6 +1612,7 @@ class PanoGaussianMapper:
                 "missing": missing.detach().cpu().bool(),
                 "depth_mismatch": delete_mask.detach().cpu().bool(),
                 "render_bad": insert_mask.detach().cpu().bool(),
+                "predicted_depth": aligned_target.detach().cpu().float(),
             }
             self.last_depth_insertion_diagnostic = DepthInsertionDiagnostic(
                 frame_id=int(frontend_output.frame_id),

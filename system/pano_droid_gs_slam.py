@@ -992,6 +992,8 @@ class SlamRuntimeLogger:
             f"mask_seed={int(stats.get('insert_mask_seed_candidates', 0))} "
             f"vox_seed={int(stats.get('voxel_seed_candidates', 0))} "
             f"new={int(stats.get('replace_newly_inserted', int(inserted_mask.sum().item())))} "
+            f"pred={int(stats.get('pred_depth_generated_seeds', 0))} "
+            f"bad_depth={int(stats.get('pred_depth_invalid_pixels', 0))} "
             f"fuse_old={int(stats.get('replace_fused_existing', 0))} "
             f"fuse_dup={int(stats.get('replace_fused_new_duplicate', 0))} "
             f"compact={int(stats.get('replace_compacted', 0))}"
@@ -2067,6 +2069,15 @@ class PanoDroidGSSlamSystem:
                 output_profile["replace_newly_inserted"] = int(
                     getattr(self.mapper.stats, "last_replace_newly_inserted", 0)
                 )
+                output_profile["pred_depth_generated_seeds"] = int(
+                    getattr(self.mapper.stats, "last_pred_depth_generated_seeds", 0)
+                )
+                output_profile["pred_depth_invalid_pixels"] = int(
+                    getattr(self.mapper.stats, "last_pred_depth_invalid_pixels", 0)
+                )
+                output_profile["insert_mask_pixels"] = int(
+                    getattr(self.mapper.stats, "last_insert_mask_pixels", 0)
+                )
                 output_profile["anchor_count_before_insert"] = int(
                     getattr(self.mapper.stats, "last_anchor_count_before_insert", 0)
                 )
@@ -2112,6 +2123,15 @@ class PanoDroidGSSlamSystem:
                     ),
                     "replace_newly_inserted": int(
                         getattr(self.mapper.stats, "last_replace_newly_inserted", 0)
+                    ),
+                    "pred_depth_generated_seeds": int(
+                        getattr(self.mapper.stats, "last_pred_depth_generated_seeds", 0)
+                    ),
+                    "pred_depth_invalid_pixels": int(
+                        getattr(self.mapper.stats, "last_pred_depth_invalid_pixels", 0)
+                    ),
+                    "insert_mask_pixels": int(
+                        getattr(self.mapper.stats, "last_insert_mask_pixels", 0)
                     ),
                     "anchor_count_before_insert": int(
                         getattr(self.mapper.stats, "last_anchor_count_before_insert", 0)
@@ -2553,6 +2573,9 @@ class PanoDroidGSSlamSystem:
                 "backend_last_replace_fused_existing": self.mapper.stats.last_replace_fused_existing,
                 "backend_last_replace_fused_new_duplicate": self.mapper.stats.last_replace_fused_new_duplicate,
                 "backend_last_replace_newly_inserted": self.mapper.stats.last_replace_newly_inserted,
+                "backend_last_pred_depth_generated_seeds": self.mapper.stats.last_pred_depth_generated_seeds,
+                "backend_last_pred_depth_invalid_pixels": self.mapper.stats.last_pred_depth_invalid_pixels,
+                "backend_last_insert_mask_pixels": self.mapper.stats.last_insert_mask_pixels,
                 "backend_last_anchor_count_before_insert": self.mapper.stats.last_anchor_count_before_insert,
                 "backend_last_anchor_count_after_insert": self.mapper.stats.last_anchor_count_after_insert,
                 "backend_last_sky_pruned": self.mapper.stats.last_sky_pruned,

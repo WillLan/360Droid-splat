@@ -204,6 +204,17 @@ def _small_seed_batch(frame_id: int) -> GaussianSeedBatch:
     )
 
 
+def _empty_seed_batch(frame_id: int) -> GaussianSeedBatch:
+    return GaussianSeedBatch(
+        xyz=torch.zeros(0, 3, dtype=torch.float32),
+        rgb=torch.zeros(0, 3, dtype=torch.float32),
+        confidence=torch.zeros(0, dtype=torch.float32),
+        scale=torch.zeros(0, dtype=torch.float32),
+        level=torch.zeros(0, dtype=torch.int8),
+        frame_id=int(frame_id),
+    )
+
+
 def test_mapper_renders_keyframe_diagnostic():
     config = {"Training": {"panorama_render_mode": "pfgs360_gsplat"}}
     gaussian_map = PanoGaussianMap(config=config, device="cpu")
@@ -363,6 +374,99 @@ def test_replace_fuse_depth_error_bands_split_delete_and_insert_only_regions():
     assert torch.equal(masks["insert"], torch.tensor([[[False, True, True, False]]]))
     assert torch.equal(masks["delete"], torch.tensor([[[False, True, False, False]]]))
     assert stats["replace_deleted"] == 0
+
+
+def test_replace_fuse_non_first_inserts_from_pred_depth_mask_without_initializer_seeds():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "replace_insert_rel_min": 0.10,
+                "replace_delete_rel_min": 0.10,
+                "replace_delete_rel_max": 0.20,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 20,
+                "gaussian_scale_mode": "erp_depth_latitude",
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_ReplaceBandRenderer())
+    mapper.insert_keyframe(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.02),
+            level=torch.zeros(1, dtype=torch.int8),
+            frame_id=0,
+        ),
+        _frontend_output_with_size(0, 1, 4),
+        image=torch.zeros(3, 1, 4),
+    )
+
+    inserted = mapper.insert_keyframe(
+        _empty_seed_batch(1),
+        _frontend_output_with_size(1, 1, 4),
+        image=torch.zeros(3, 1, 4),
+    )
+
+    assert inserted == 2
+    assert mapper.stats.last_insert_mask_pixels == 2
+    assert mapper.stats.last_pred_depth_generated_seeds == 2
+    assert mapper.stats.last_pred_depth_invalid_pixels == 0
+    assert mapper.stats.last_dense_seed_candidates == 2
+    assert mapper.stats.last_insert_mask_seed_candidates == 2
+    assert mapper.stats.last_voxel_seed_candidates == 2
+    assert set(mapper.last_inserted_source_flat_idx.tolist()) == {1, 2}
+
+
+def test_replace_fuse_pred_depth_generation_respects_sky_mask():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "replace_insert_rel_min": 0.10,
+                "replace_delete_rel_min": 0.10,
+                "replace_delete_rel_max": 0.20,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 20,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_ReplaceBandRenderer())
+    mapper.insert_keyframe(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.02),
+            level=torch.zeros(1, dtype=torch.int8),
+            frame_id=0,
+        ),
+        _frontend_output_with_size(0, 1, 4),
+        image=torch.zeros(3, 1, 4),
+    )
+    sky_mask = torch.tensor([[[False, True, False, False]]])
+
+    inserted = mapper.insert_keyframe(
+        _empty_seed_batch(1),
+        _frontend_output_with_size(1, 1, 4),
+        image=torch.zeros(3, 1, 4),
+        sky_mask=sky_mask,
+    )
+
+    assert inserted == 1
+    assert mapper.stats.last_insert_mask_pixels == 1
+    assert mapper.stats.last_pred_depth_generated_seeds == 1
+    assert mapper.last_inserted_source_flat_idx.tolist() == [2]
 
 
 def test_replace_fuse_missing_ignores_low_alpha_when_render_depth_is_valid():
