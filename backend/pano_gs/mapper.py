@@ -2786,7 +2786,15 @@ class PanoGaussianMapper:
     def _feedforward_window_ids(self, current_frame_ids, history_frame_ids=None) -> list[int]:
         cfg = self._feedforward_window_cfg()
         if self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
-            current_limit = max(1, int(self.optim_cfg.get("current_chunk_observation_frames", cfg.get("current_chunk_observation_frames", 4))))
+            current_per_chunk = max(
+                1,
+                int(self.optim_cfg.get("current_chunk_observation_frames", cfg.get("current_chunk_observation_frames", 4))),
+            )
+            recent_chunks = max(
+                1,
+                int(self.optim_cfg.get("recent_chunk_observation_chunks", cfg.get("recent_chunk_observation_chunks", 1))),
+            )
+            current_limit = max(1, current_per_chunk * recent_chunks)
             recent_keyframes = max(
                 0,
                 int(self.optim_cfg.get("recent_keyframe_observation_frames", cfg.get("recent_keyframe_observation_frames", 2))),

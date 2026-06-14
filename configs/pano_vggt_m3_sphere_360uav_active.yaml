@@ -199,11 +199,12 @@ BackendOptimization:
   gaussian_refine_enable: true
   pose_refine_enable: true
   optimize_after_every_chunk: true
-  steps_per_chunk: 200
+  steps_per_chunk: 300
   sample_frames_per_step: 1
   current_chunk_observation_frames: 4
-  recent_keyframe_observation_frames: 2
-  recent_insert_keyframes: 2
+  recent_chunk_observation_chunks: 4
+  recent_keyframe_observation_frames: 4
+  recent_insert_keyframes: 4
   keyframe_steps: 0
   keyframe_optimize_pose: false
   non_keyframe_steps: 0

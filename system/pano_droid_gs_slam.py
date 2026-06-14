@@ -1763,6 +1763,7 @@ class PanoDroidGSSlamSystem:
         backend_feedback_applied_count = 0
         last_profiled_frontend_chunk: int | None = None
         last_feedforward_metrics: dict = {}
+        recent_feedforward_chunks: list[tuple[int | None, list[int]]] = []
         frame_cache: dict[int, PanoFrame] = {}
         final_frame_records: dict[int, dict] = {}
         frame_count = 0
@@ -1856,6 +1857,58 @@ class PanoDroidGSSlamSystem:
                 return 0
             return int(apply_updates(updates))
 
+        def recent_chunk_observation_chunks() -> int:
+            return max(
+                1,
+                int(
+                    backend_cfg.get(
+                        "recent_chunk_observation_chunks",
+                        feedforward_cfg.get("recent_chunk_observation_chunks", 1),
+                    )
+                ),
+            )
+
+        def current_frontend_chunk_index() -> int | None:
+            profile = getattr(self.frontend, "last_profile", None)
+            if not isinstance(profile, dict) or "chunk_index" not in profile:
+                return None
+            try:
+                return int(profile.get("chunk_index"))
+            except (TypeError, ValueError):
+                return None
+
+        def remember_recent_feedforward_chunk(current_ids: list[int]) -> list[int]:
+            ids: list[int] = []
+            for fid in current_ids:
+                value = int(fid)
+                if value not in ids:
+                    ids.append(value)
+            if not ids:
+                return []
+            chunk_key = current_frontend_chunk_index()
+            replaced = False
+            if chunk_key is not None:
+                for idx, (key, _) in enumerate(recent_feedforward_chunks):
+                    if key == chunk_key:
+                        recent_feedforward_chunks[idx] = (chunk_key, ids)
+                        replaced = True
+                        break
+            if not replaced:
+                if chunk_key is None and recent_feedforward_chunks and recent_feedforward_chunks[-1][1] == ids:
+                    recent_feedforward_chunks[-1] = (None, ids)
+                else:
+                    recent_feedforward_chunks.append((chunk_key, ids))
+            chunk_limit = recent_chunk_observation_chunks()
+            if len(recent_feedforward_chunks) > chunk_limit:
+                del recent_feedforward_chunks[: len(recent_feedforward_chunks) - chunk_limit]
+            out: list[int] = []
+            for _, chunk_ids in recent_feedforward_chunks[-chunk_limit:]:
+                for fid in chunk_ids:
+                    value = int(fid)
+                    if value not in out:
+                        out.append(value)
+            return out
+
         def feedforward_debug_window(output_ids: list[int]) -> tuple[list[int], list[int]]:
             current_limit = max(
                 1,
@@ -1935,6 +1988,7 @@ class PanoDroidGSSlamSystem:
                 return
             output_ids = [int(out.frame_id) for out in outputs]
             current_ids, history_ids = feedforward_debug_window(output_ids)
+            current_ids = remember_recent_feedforward_chunk(current_ids)
             section_start = time.perf_counter()
             registered_count = register_cached_feedforward_observations(current_ids, history_ids)
             register_sec = float(time.perf_counter() - section_start)

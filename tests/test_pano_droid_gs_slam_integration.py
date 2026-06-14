@@ -954,6 +954,92 @@ def test_replace_fuse_chunk_optimizer_samples_current_chunk_and_recent_keyframes
     assert len(mapper.stats.last_sampled_keyframes) == 1
 
 
+def test_replace_fuse_chunk_optimizer_uses_recent_chunk_and_keyframe_window():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": True,
+            "steps_per_chunk": 1,
+            "sample_frames_per_step": 1,
+            "current_chunk_observation_frames": 4,
+            "recent_chunk_observation_chunks": 4,
+            "recent_keyframe_observation_frames": 4,
+            "recent_insert_keyframes": 4,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+
+    for frame_id in (1, 2, 3, 4):
+        image = torch.full((3, 4, 8), 0.2 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.insert_keyframe(_small_seed_batch(frame_id), _small_frontend_output(frame_id), image=image)
+    for frame_id in range(10, 30):
+        image = torch.full((3, 4, 8), 0.1 + 0.01 * frame_id, dtype=torch.float32)
+        mapper.register_observation(_small_non_keyframe_output(frame_id), image)
+
+    metrics = mapper.optimize_feedforward_window(current_frame_ids=list(range(10, 30)), history_frame_ids=[])
+
+    assert metrics["window_size"] == 20.0
+    assert mapper.stats.last_window_observations == [*range(14, 30), 1, 2, 3, 4]
+    assert mapper.stats.last_window_keyframes == [1, 2, 3, 4]
+    assert metrics["sampled_window_size"] == 1.0
+
+
+def test_replace_fuse_recent_update_mask_tracks_recent_four_keyframes():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "optimize_after_every_chunk": True,
+            "recent_insert_keyframes": 4,
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_CountingRenderer())
+    mapper.map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[float(idx), 0.0, 1.0] for idx in range(5)], dtype=torch.float32),
+            rgb=torch.full((5, 3), 0.5, dtype=torch.float32),
+            confidence=torch.ones(5),
+            scale=torch.full((5,), 0.1),
+            level=torch.zeros(5, dtype=torch.long),
+            frame_id=0,
+        ),
+        voxel_size=0.02,
+        last_update_kf_ord=0,
+    )
+    mapper.map._anchor_last_update_kf_ord = torch.arange(5, dtype=torch.int32)
+    mapper.stats.n_keyframes = 5
+
+    active = mapper._active_anchor_mask_for_recent_updates().detach().cpu()
+    assert active.tolist() == [False, True, True, True, True]
+
+
 def test_replace_fuse_chunk_optimizer_prunes_visible_sky_gaussians():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
