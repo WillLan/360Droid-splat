@@ -376,6 +376,55 @@ def test_replace_fuse_depth_error_bands_split_delete_and_insert_only_regions():
     assert stats["replace_deleted"] == 0
 
 
+def test_replace_fuse_deletes_foreground_and_near_back_depth_anchors():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "replace_front_depth_abs_tol": 0.03,
+                "replace_front_depth_rel_tol": 0.02,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_ReplaceBandRenderer())
+    seeds = GaussianSeedBatch(
+        xyz=torch.tensor(
+            [
+                [0.80, 0.0, 0.0],
+                [1.02, 0.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [1.20, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+        rgb=torch.zeros(4, 3),
+        confidence=torch.ones(4),
+        scale=torch.full((4,), 0.01),
+        level=torch.zeros(4, dtype=torch.int8),
+        frame_id=0,
+    )
+    assert mapper.insert_keyframe(seeds, _small_frontend_output(0), image=torch.zeros(3, 1, 4)) == 4
+
+    deleted = mapper._delete_responsible_replace_fuse_anchors(
+        torch.ones(1, 1, 4, dtype=torch.bool),
+        torch.ones(1, 1, 4, dtype=torch.float32),
+        {"visibility_filter": torch.ones(4, dtype=torch.bool)},
+        _small_frontend_output(0),
+        1,
+        4,
+    )
+
+    assert deleted == 2
+    xyz = mapper.map.get_xyz.detach().cpu()
+    assert torch.allclose(xyz[:, 0], torch.tensor([1.05, 1.20]), atol=1.0e-6)
+
+
 def test_replace_fuse_non_first_inserts_from_pred_depth_mask_without_initializer_seeds():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

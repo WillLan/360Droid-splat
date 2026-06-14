@@ -51,6 +51,7 @@ class MapperStats:
     last_replace_fused: int = 0
     last_replace_compacted: int = 0
     last_sky_pruned: int = 0
+    last_sky_compacted: int = 0
     last_hash_hits: int = 0
     last_hash_near_hits: int = 0
     last_suppressed_insert: int = 0
@@ -716,11 +717,7 @@ class PanoGaussianMapper:
         self.last_inserted_range = (start, end)
         filter_stats["newly_inserted"] = int(n)
         if self.pfgs360_replace_fuse_enabled:
-            compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
-            if compacted > 0:
-                filter_stats["compacted"] = int(filter_stats.get("compacted", 0)) + int(compacted)
-                self._rebuild_keyframe_ranges_from_birth_frames()
-                self.last_inserted_range = self._range_for_birth_frame(int(frontend_output.frame_id))
+            self._refresh_pfgs360_voxel_cache(compact=False)
         filter_stats["anchors_before"] = int(start)
         filter_stats["anchors_after"] = int(self.map.anchor_count())
         self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
@@ -1601,6 +1598,7 @@ class PanoGaussianMapper:
             stats["render_bad_pixels"] = int(insert_mask.sum().detach().cpu())
             stats["replace_deleted"] = self._delete_responsible_replace_fuse_anchors(
                 delete_mask.detach(),
+                aligned_target.detach(),
                 pkg,
                 frontend_output,
                 H,
@@ -1630,6 +1628,7 @@ class PanoGaussianMapper:
     def _delete_responsible_replace_fuse_anchors(
         self,
         delete_mask: torch.Tensor,
+        target_depth: torch.Tensor,
         render_pkg: dict,
         frontend_output: FrontendOutput,
         H: int,
@@ -1638,8 +1637,7 @@ class PanoGaussianMapper:
         n = self.map.anchor_count()
         if n <= 0:
             return 0
-        render_depth = render_pkg.get("depth")
-        if not torch.is_tensor(render_depth):
+        if not torch.is_tensor(target_depth):
             return 0
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
@@ -1661,14 +1659,15 @@ class PanoGaussianMapper:
         ui = pixels[:, 0].round().long().remainder(int(W))
         vi = pixels[:, 1].round().long().clamp(0, int(H) - 1)
         delete_at_pixel = delete_mask.to(device=device, dtype=torch.bool)[0, vi, ui]
-        rd = render_depth.to(device=device, dtype=dtype)[0, vi, ui].clamp_min(1.0e-6)
+        td = target_depth.to(device=device, dtype=dtype)[0, vi, ui]
+        valid_target_depth = torch.isfinite(td) & (td > 1.0e-6)
         anchor_depth = dist.index_select(0, rows)
         tol = torch.maximum(
-            rd.new_full(rd.shape, float(self.replace_fuse_front_depth_abs_tol)),
-            rd * float(self.replace_fuse_front_depth_rel_tol),
+            td.new_full(td.shape, float(self.replace_fuse_front_depth_abs_tol)),
+            td.clamp_min(1.0e-6) * float(self.replace_fuse_front_depth_rel_tol),
         )
-        front_surface = (anchor_depth - rd).abs() <= tol
-        prune_rows = rows[delete_at_pixel & front_surface]
+        remove_depth = anchor_depth <= (td + tol)
+        prune_rows = rows[delete_at_pixel & valid_target_depth & remove_depth]
         if prune_rows.numel() == 0:
             return 0
         max_delete = int(self.replace_fuse_max_delete_per_keyframe)
@@ -2572,14 +2571,22 @@ class PanoGaussianMapper:
             param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
         if not param_groups:
             sky_pruned = self._prune_sky_observations(observations) if self.pfgs360_replace_fuse_enabled else 0
+            sky_compacted = (
+                self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+                if self.pfgs360_replace_fuse_enabled
+                else 0
+            )
             self.stats.last_sky_pruned = int(sky_pruned)
+            self.stats.last_sky_compacted = int(sky_compacted)
             return {
                 "loss": 0.0,
                 "steps": 0.0,
                 "window_size": float(len(observations)),
                 "feedforward_window_size": float(len(observations)),
                 "sky_pruned": float(sky_pruned),
+                "sky_compacted": float(sky_compacted),
                 "profile_backend_feedforward_window_sky_pruned": float(sky_pruned),
+                "profile_backend_feedforward_window_compacted": float(sky_compacted),
                 "profile_backend_feedforward_window_sec": float(time.perf_counter() - total_start),
             }
         optimizer = torch.optim.AdamW(
@@ -2597,11 +2604,11 @@ class PanoGaussianMapper:
         render_loss_sec = 0.0
         backward_step_sec = 0.0
         sky_pruned_total = 0
+        chunk_compacted = 0
         for step_idx in range(max(0, steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
-            sky_prune_mask = None
             section_start = time.perf_counter()
             sampled = self._sample_observations_for_step(observations)
             sample_sec += time.perf_counter() - section_start
@@ -2615,17 +2622,6 @@ class PanoGaussianMapper:
                 pkg = self.renderer.render(camera, self.map)
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
-                if self.pfgs360_replace_fuse_enabled:
-                    mask_i = self._sky_prune_mask_from_render_pkg(
-                        obs,
-                        pkg,
-                        sky_mask,
-                        c2w,
-                        H,
-                        W,
-                    )
-                    if mask_i is not None:
-                        sky_prune_mask = mask_i if sky_prune_mask is None else (sky_prune_mask | mask_i)
                 target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
                 depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
                 loss_i, metrics_i = backend_render_loss(
@@ -2657,24 +2653,6 @@ class PanoGaussianMapper:
                 if self.pfgs360_replace_fuse_enabled:
                     self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
-            if self.pfgs360_replace_fuse_enabled and sky_prune_mask is not None and bool(sky_prune_mask.any().detach().cpu()):
-                pruned = self._apply_sky_prune_mask(sky_prune_mask)
-                if pruned > 0:
-                    sky_pruned_total += int(pruned)
-                    gaussian_scales = self._feedforward_gaussian_scales(selected_keyframe_ids)
-                    gaussian_enabled = (
-                        gaussian_scales is not None
-                        and self.map.anchor_count() > 0
-                        and bool((gaussian_scales > 0).any().detach().cpu())
-                    )
-                    param_groups = self._map_param_groups(gaussian_enabled=gaussian_enabled, phase="feedforward_window")
-                    if pose_params:
-                        param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
-                    if param_groups:
-                        optimizer = torch.optim.AdamW(
-                            param_groups,
-                            weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)),
-                        )
             actual_steps = step_idx + 1
             last = {
                 key: float(torch.stack(values).mean().detach().cpu())
@@ -2704,6 +2682,9 @@ class PanoGaussianMapper:
                 selected_keyframe_ids=selected_keyframe_ids,
             )
         )
+        if self.pfgs360_replace_fuse_enabled:
+            sky_pruned_total = self._prune_sky_observations(observations)
+            chunk_compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
         total_sec = float(time.perf_counter() - total_start)
         last["steps"] = float(actual_steps)
@@ -2718,7 +2699,9 @@ class PanoGaussianMapper:
         last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
         last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
         last["sky_pruned"] = float(sky_pruned_total)
+        last["sky_compacted"] = float(chunk_compacted)
         last["profile_backend_feedforward_window_sky_pruned"] = float(sky_pruned_total)
+        last["profile_backend_feedforward_window_compacted"] = float(chunk_compacted)
         last["profile_backend_feedforward_window_sec"] = total_sec
         last["profile_backend_feedforward_window_step_avg_sec"] = total_sec / max(1, actual_steps)
         last["profile_backend_feedforward_window_sample_sec"] = float(sample_sec)
@@ -2738,6 +2721,7 @@ class PanoGaussianMapper:
         self.stats.last_feedforward_opacity_resets = int(prune_stats.get("opacity_resets", 0))
         self.stats.last_feedforward_pruned = int(prune_stats.get("pruned", 0))
         self.stats.last_sky_pruned = int(sky_pruned_total)
+        self.stats.last_sky_compacted = int(chunk_compacted)
         self.stats.optimization_steps += int(actual_steps)
         return last
 
@@ -2928,7 +2912,7 @@ class PanoGaussianMapper:
             self.stats.n_anchors = self.map.anchor_count()
             self._rebuild_keyframe_ranges_from_birth_frames()
             if self.pfgs360_replace_fuse_enabled:
-                self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+                self._refresh_pfgs360_voxel_cache(compact=False)
         return int(pruned)
 
     def _prune_sky_observations(self, observations: list[MapperObservation]) -> int:
@@ -2944,8 +2928,14 @@ class PanoGaussianMapper:
                 target = obs.image.to(device=device, dtype=dtype)
                 H, W = int(target.shape[-2]), int(target.shape[-1])
                 c2w = self._observation_pose(obs, trainable_pose_ids=set()).to(device=device, dtype=dtype)
+                sky_mask = (
+                    self._normalize_skybox_mask(obs.sky_mask, height=H, width=W, device=device)
+                    if obs.sky_mask is not None
+                    else self._skybox_mask_for_target(target)
+                )
+                if sky_mask is None:
+                    continue
                 pkg = self.renderer.render(PanoRenderCamera(image_height=H, image_width=W, c2w=c2w), self.map)
-                sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 mask = self._sky_prune_mask_from_render_pkg(obs, pkg, sky_mask, c2w, H, W)
                 if mask is not None:
                     total += self._apply_sky_prune_mask(mask)
@@ -3257,6 +3247,11 @@ class PanoGaussianMapper:
             diagnostic_callback=diagnostic_callback,
             diagnostic_every=diagnostic_every,
         )
+        if self.pfgs360_replace_fuse_enabled:
+            compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+            metrics["bootstrap_compacted"] = float(compacted)
+            metrics["profile_backend_bootstrap_compacted"] = float(compacted)
+            self.stats.last_replace_compacted = int(compacted)
         metrics["profile_backend_bootstrap_sec"] = float(time.perf_counter() - total_start)
         return metrics
 

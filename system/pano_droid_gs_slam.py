@@ -1857,16 +1857,46 @@ class PanoDroidGSSlamSystem:
             return int(apply_updates(updates))
 
         def feedforward_debug_window(output_ids: list[int]) -> tuple[list[int], list[int]]:
+            current_limit = max(
+                1,
+                int(
+                    backend_cfg.get(
+                        "current_chunk_observation_frames",
+                        feedforward_cfg.get("current_chunk_observation_frames", 4),
+                    )
+                ),
+            )
+            history_limit = max(
+                0,
+                int(
+                    backend_cfg.get(
+                        "recent_keyframe_observation_frames",
+                        feedforward_cfg.get("history_keyframes", 2),
+                    )
+                ),
+            )
             debug = getattr(self.frontend, "last_m3_debug", None)
             current_ids: list[int] = []
-            history_ids: list[int] = []
+            profile = getattr(self.frontend, "last_profile", None)
+            if isinstance(profile, dict) and "frame_start" in profile and "frame_end" in profile:
+                try:
+                    start = int(profile.get("frame_start"))
+                    end = int(profile.get("frame_end"))
+                    if end >= start:
+                        current_ids.extend(range(start, end + 1))
+                except (TypeError, ValueError):
+                    current_ids.clear()
             if isinstance(debug, dict):
-                current_ids.extend(int(fid) for fid in debug.get("frame_ids", ()) if fid is not None)
-                history_ids.extend(int(fid) for fid in debug.get("recent_history_ids", ()) if fid is not None)
+                for fid in debug.get("frame_ids", ()):
+                    if fid is not None and int(fid) not in current_ids:
+                        current_ids.append(int(fid))
             if not current_ids:
-                current_ids.extend(int(fid) for fid in output_ids)
-            history_limit = max(0, int(feedforward_cfg.get("history_keyframes", 2)))
-            return current_ids, history_ids[-history_limit:] if history_limit > 0 else []
+                if output_ids:
+                    end = max(int(fid) for fid in output_ids)
+                    current_ids.extend(range(max(0, end - current_limit + 1), end + 1))
+            current_ids = current_ids[-current_limit:]
+            history_ids = [int(kf.frame_id) for kf in self.mapper.keyframes[-history_limit:]] if history_limit > 0 else []
+            return current_ids, history_ids
 
         def register_cached_feedforward_observations(current_ids: list[int], history_ids: list[int]) -> int:
             pose_by_frame = getattr(self.frontend, "pose_by_frame", {})
@@ -1919,7 +1949,10 @@ class PanoDroidGSSlamSystem:
             last_feedforward_metrics = dict(metrics)
             diagnostic_step = max(1, int(logger._step) + 1)
             logger._log_wandb_payload(
-                {"backend/sky_pruned": float(metrics.get("sky_pruned", 0.0))},
+                {
+                    "backend/sky_pruned": float(metrics.get("sky_pruned", 0.0)),
+                    "backend/sky_compacted": float(metrics.get("sky_compacted", 0.0)),
+                },
                 step=diagnostic_step,
             )
             for out in outputs:
@@ -2068,6 +2101,12 @@ class PanoDroidGSSlamSystem:
                 )
                 output_profile["replace_newly_inserted"] = int(
                     getattr(self.mapper.stats, "last_replace_newly_inserted", 0)
+                )
+                output_profile["replace_deleted"] = int(
+                    getattr(self.mapper.stats, "last_replace_deleted", 0)
+                )
+                output_profile["replace_compacted"] = int(
+                    getattr(self.mapper.stats, "last_replace_compacted", 0)
                 )
                 output_profile["pred_depth_generated_seeds"] = int(
                     getattr(self.mapper.stats, "last_pred_depth_generated_seeds", 0)
@@ -2579,6 +2618,7 @@ class PanoDroidGSSlamSystem:
                 "backend_last_anchor_count_before_insert": self.mapper.stats.last_anchor_count_before_insert,
                 "backend_last_anchor_count_after_insert": self.mapper.stats.last_anchor_count_after_insert,
                 "backend_last_sky_pruned": self.mapper.stats.last_sky_pruned,
+                "backend_last_sky_compacted": self.mapper.stats.last_sky_compacted,
                 "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,
                 "final_all_frames_ate_rmse": final_all_metrics.get("ate_rmse"),
