@@ -172,8 +172,8 @@ Mapping:
     missing_alpha_min: 0.05
     render_depth_rel_threshold: 0.10
     replace_insert_rel_min: 0.10
-    replace_delete_rel_min: 0.10
-    replace_delete_rel_max: 0.20
+    replace_delete_rel_min: 0.20
+    replace_delete_rel_max: 0.30
     replace_front_depth_abs_tol: 0.03
     replace_front_depth_rel_tol: 0.02
     max_replace_delete_per_keyframe: 30000

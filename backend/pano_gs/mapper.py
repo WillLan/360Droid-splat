@@ -616,8 +616,8 @@ class PanoGaussianMapper:
         )
         self.sky_mask_source = str(mapping_cfg.get("sky_mask_source", "heuristic") or "heuristic").lower()
         self.pfgs360_voxel_size = max(float(novel_cfg.get("voxel_size", 0.12)), 1.0e-6)
-        self.replace_fuse_delete_rel_min = float(novel_cfg.get("replace_delete_rel_min", 0.10))
-        self.replace_fuse_delete_rel_max = float(novel_cfg.get("replace_delete_rel_max", 0.20))
+        self.replace_fuse_delete_rel_min = float(novel_cfg.get("replace_delete_rel_min", 0.20))
+        self.replace_fuse_delete_rel_max = float(novel_cfg.get("replace_delete_rel_max", 0.30))
         self.replace_fuse_insert_rel_min = float(novel_cfg.get("replace_insert_rel_min", self.replace_fuse_delete_rel_min))
         self.replace_fuse_front_depth_abs_tol = float(novel_cfg.get("replace_front_depth_abs_tol", 0.03))
         self.replace_fuse_front_depth_rel_tol = float(novel_cfg.get("replace_front_depth_rel_tol", 0.02))
@@ -1616,11 +1616,17 @@ class PanoGaussianMapper:
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
             missing = ~valid_aligned
             insert_mask = (valid_aligned & (rel >= float(self.replace_fuse_insert_rel_min))) | missing
-            delete_mask = (
+            delete_band = (
                 valid_aligned
                 & (rel >= float(self.replace_fuse_delete_rel_min))
                 & (rel <= float(self.replace_fuse_delete_rel_max))
             )
+            delete_foreground_large = (
+                valid_aligned
+                & (rel > float(self.replace_fuse_delete_rel_max))
+                & (render_depth < aligned_target)
+            )
+            delete_mask = delete_band | delete_foreground_large
             if non_sky is not None:
                 missing = missing & non_sky
                 insert_mask = insert_mask & non_sky

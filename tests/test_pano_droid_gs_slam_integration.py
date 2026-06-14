@@ -81,6 +81,33 @@ class _ReplaceBandRenderer:
         }
 
 
+class _ReplaceForegroundLargeRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        H, W = int(camera.image_height), int(camera.image_width)
+        device = camera.c2w.device
+        dtype = camera.c2w.dtype
+        render = torch.zeros(3, H, W, device=device, dtype=dtype)
+        depth = torch.ones(1, H, W, device=device, dtype=dtype)
+        if W >= 2:
+            depth[:, :, 1] = 1.30
+        if W >= 3:
+            depth[:, :, 2] = 0.60
+        if W >= 4:
+            depth[:, :, 3] = 1.50
+        alpha = torch.ones(1, H, W, device=device, dtype=dtype)
+        total = int(gaussian_map.anchor_count())
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "visibility_filter": torch.zeros(total, dtype=torch.bool, device=device),
+            "radii": torch.zeros(total, dtype=torch.int32, device=device),
+            "n_touched": torch.zeros(total, dtype=torch.int32, device=device),
+            "render_distort": None,
+        }
+
+
 class _ReplaceMissingDepthRenderer:
     def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
         H, W = int(camera.image_height), int(camera.image_width)
@@ -373,6 +400,50 @@ def test_replace_fuse_depth_error_bands_split_delete_and_insert_only_regions():
     assert masks is not None
     assert torch.equal(masks["insert"], torch.tensor([[[False, True, True, False]]]))
     assert torch.equal(masks["delete"], torch.tensor([[[False, True, False, False]]]))
+    assert stats["replace_deleted"] == 0
+
+
+def test_replace_fuse_deletes_large_error_only_when_render_depth_is_closer():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "replace_insert_rel_min": 0.20,
+                "replace_delete_rel_min": 0.20,
+                "replace_delete_rel_max": 0.30,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+            }
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_ReplaceForegroundLargeRenderer())
+    mapper.insert_keyframe(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[10.0, 0.0, 0.0]], dtype=torch.float32),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.02),
+            level=torch.zeros(1, dtype=torch.int8),
+            frame_id=0,
+        ),
+        _small_frontend_output(0),
+        image=torch.zeros(3, 1, 4),
+    )
+
+    masks, stats = mapper._pfgs360_replace_fuse_masks_and_delete(
+        _small_frontend_output(1),
+        torch.zeros(3, 1, 4),
+        sky_mask=None,
+    )
+
+    assert masks is not None
+    assert torch.equal(masks["insert"], torch.tensor([[[False, True, True, True]]]))
+    assert torch.equal(masks["delete"], torch.tensor([[[False, True, True, False]]]))
+    assert stats["depth_mismatch_pixels"] == 2
     assert stats["replace_deleted"] == 0
 
 
