@@ -868,6 +868,54 @@ def test_replace_fuse_chunk_optimizer_prunes_visible_sky_gaussians():
     assert gaussian_map.anchor_count() == 0
 
 
+def test_replace_fuse_chunk_optimizer_can_disable_sky_prune():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "sky_prune_enabled": False,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": True,
+            "steps_per_chunk": 1,
+            "sample_frames_per_step": 1,
+            "recent_keyframe_observation_frames": 0,
+            "recent_insert_keyframes": 2,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_BadEvidenceRenderer())
+    mapper.insert_keyframe(_small_seed_batch(1), _small_frontend_output(1), image=torch.zeros(3, 4, 8))
+    mapper.register_observation_values(
+        frame_id=10,
+        image=torch.zeros(3, 4, 8),
+        c2w=_small_non_keyframe_output(10).pose_c2w,
+        inverse_depth=torch.ones(1, 4, 8),
+        depth_confidence=torch.ones(1, 4, 8),
+        is_keyframe=False,
+        sky_mask=torch.ones(1, 4, 8, dtype=torch.bool),
+    )
+
+    metrics = mapper.optimize_feedforward_window(current_frame_ids=[10], history_frame_ids=[])
+
+    assert metrics["sky_pruned"] == 0.0
+    assert metrics["profile_backend_feedforward_window_sky_pruned"] == 0.0
+    assert mapper.stats.last_sky_pruned == 0
+    assert gaussian_map.anchor_count() == 1
+
+
 def test_mapper_feedforward_window_freezes_non_window_gaussians():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

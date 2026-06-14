@@ -602,6 +602,7 @@ class PanoGaussianMapper:
         self.replace_fuse_front_depth_rel_tol = float(novel_cfg.get("replace_front_depth_rel_tol", 0.02))
         self.replace_fuse_max_delete_per_keyframe = max(0, int(novel_cfg.get("max_replace_delete_per_keyframe", 30000)))
         self.replace_fuse_compact_voxels = bool(novel_cfg.get("compact_voxels", True))
+        self.replace_fuse_sky_prune_enabled = bool(novel_cfg.get("sky_prune_enabled", True))
         self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
         self.pfgs360_missing_alpha_min = float(novel_cfg.get("missing_alpha_min", self.pfgs360_render_alpha_min))
         self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.10))
@@ -2570,7 +2571,11 @@ class PanoGaussianMapper:
         if pose_params:
             param_groups.append({"params": pose_params, "lr": float(self.optim_cfg.get("pose_lr", 1e-3))})
         if not param_groups:
-            sky_pruned = self._prune_sky_observations(observations) if self.pfgs360_replace_fuse_enabled else 0
+            sky_pruned = (
+                self._prune_sky_observations(observations)
+                if self.pfgs360_replace_fuse_enabled and self.replace_fuse_sky_prune_enabled
+                else 0
+            )
             sky_compacted = (
                 self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
                 if self.pfgs360_replace_fuse_enabled
@@ -2683,7 +2688,8 @@ class PanoGaussianMapper:
             )
         )
         if self.pfgs360_replace_fuse_enabled:
-            sky_pruned_total = self._prune_sky_observations(observations)
+            if self.replace_fuse_sky_prune_enabled:
+                sky_pruned_total = self._prune_sky_observations(observations)
             chunk_compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
         total_sec = float(time.perf_counter() - total_start)
