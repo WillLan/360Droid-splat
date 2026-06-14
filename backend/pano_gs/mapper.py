@@ -2514,7 +2514,6 @@ class PanoGaussianMapper:
             loss, _ = backend_render_loss(
                 pkg,
                 target,
-                photometric_mask=non_sky_mask,
                 depth_mask=non_sky_mask,
                 weights=self.loss_weights,
             )
@@ -2561,7 +2560,6 @@ class PanoGaussianMapper:
             loss, metrics = backend_render_loss(
                 pkg,
                 target,
-                photometric_mask=non_sky_mask,
                 depth_mask=non_sky_mask,
                 weights=self.loss_weights,
             )
@@ -2681,7 +2679,6 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
-                    photometric_mask=non_sky_mask,
                     depth_mask=non_sky_mask,
                     weights=self.loss_weights,
                 )
@@ -3350,7 +3347,6 @@ class PanoGaussianMapper:
             loss, metrics = backend_render_loss(
                 pkg,
                 target,
-                photometric_mask=non_sky_mask,
                 depth_mask=non_sky_mask,
                 weights=self.loss_weights,
             )
@@ -3651,7 +3647,6 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
-                    photometric_mask=non_sky_mask,
                     depth_mask=non_sky_mask,
                     weights=self.loss_weights,
                 )
