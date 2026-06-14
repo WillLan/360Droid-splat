@@ -36,6 +36,13 @@ def _dssim_loss(
     _, H, W = render_rgb.shape
     x = render_rgb.unsqueeze(0)
     y = target_rgb.unsqueeze(0)
+    mask_f = None
+    if mask is not None:
+        mask_f = mask.to(device=render_rgb.device, dtype=render_rgb.dtype)
+        if mask_f.ndim == 2:
+            mask_f = mask_f.unsqueeze(0)
+        x = x * mask_f.unsqueeze(0)
+        y = y * mask_f.unsqueeze(0)
     kernel = 3
     padding = kernel // 2
     mu_x = torch.nn.functional.avg_pool2d(x, kernel, stride=1, padding=padding)
@@ -50,7 +57,7 @@ def _dssim_loss(
     ).clamp_min(1.0e-8)
     dssim = ((1.0 - ssim.clamp(-1.0, 1.0)) * 0.5).mean(dim=1, keepdim=True)[0]
     area = latitude_area_weight(H, W, device=render_rgb.device, dtype=render_rgb.dtype)
-    weight = area if mask is None else area * mask.to(device=render_rgb.device, dtype=render_rgb.dtype)
+    weight = area if mask_f is None else area * mask_f
     return (dssim * weight).sum() / weight.sum().clamp_min(1.0e-8)
 
 
@@ -88,6 +95,7 @@ def pano_depth_loss(
     target_depth: torch.Tensor,
     *,
     confidence: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
     eps: float = 1e-3,
     mode: str = "charbonnier",
     residual_clamp: float = 0.20,
@@ -101,6 +109,8 @@ def pano_depth_loss(
     weight = area
     if confidence is not None:
         weight = weight * confidence.to(device=render_depth.device, dtype=render_depth.dtype)
+    if mask is not None:
+        weight = weight * mask.to(device=render_depth.device, dtype=render_depth.dtype)
     if str(mode or "charbonnier").lower() in {"relative", "relative_clamped", "robust_relative"}:
         residual = (render_depth - target_depth) / torch.maximum(render_depth.abs(), target_depth.abs()).clamp_min(1.0e-6)
         if float(residual_clamp) > 0.0:
@@ -117,6 +127,8 @@ def backend_render_loss(
     *,
     target_depth: torch.Tensor | None = None,
     depth_confidence: torch.Tensor | None = None,
+    photometric_mask: torch.Tensor | None = None,
+    depth_mask: torch.Tensor | None = None,
     weights: BackendLossWeights | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or BackendLossWeights()
@@ -125,6 +137,7 @@ def backend_render_loss(
     photo = pano_photometric_loss(
         rgb,
         target_rgb,
+        mask=photometric_mask,
         mode=weights.photometric_mode,
         rgb_l1_weight=weights.rgb_l1_weight,
         dssim_weight=weights.dssim_weight,
@@ -137,6 +150,7 @@ def backend_render_loss(
             render_pkg["depth"],
             target_depth,
             confidence=depth_confidence,
+            mask=depth_mask,
             mode=weights.depth_loss_mode,
             residual_clamp=weights.depth_residual_clamp,
         )

@@ -179,7 +179,11 @@ class PFGS360Renderer:
             device=device,
             dtype=dtype,
         )
-        colors_sh = ((gaussians.get_features - 0.5) / SH_C0).unsqueeze(1)
+        colors_sh = (
+            gaussians.get_sh_coefficients
+            if hasattr(gaussians, "get_sh_coefficients")
+            else ((gaussians.get_features - 0.5) / SH_C0).unsqueeze(1)
+        )
         render, alpha, render_distort, info = rasterization(
             means=xyz,
             quats=gaussians.get_rotation,

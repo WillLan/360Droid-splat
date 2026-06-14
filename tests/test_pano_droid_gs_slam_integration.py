@@ -661,6 +661,68 @@ def test_backend_l1_dssim_loss_has_gradient_without_opacity_penalty():
     assert float(metrics["opacity"]) > 0.0
 
 
+def test_backend_render_loss_masks_sky_pixels_for_rgb_and_depth():
+    render = torch.zeros(3, 4, 8, requires_grad=True)
+    target = torch.ones(3, 4, 8)
+    render_depth = torch.ones(1, 4, 8, requires_grad=True)
+    target_depth = torch.full((1, 4, 8), 2.0)
+    non_sky = torch.zeros(1, 4, 8, dtype=torch.bool)
+    non_sky[:, :, :4] = True
+    weights = BackendLossWeights(
+        photometric_mode="l1_dssim",
+        rgb_l1_weight=0.8,
+        dssim_weight=0.2,
+        depth=0.03,
+        opacity=0.0,
+    )
+
+    loss, metrics = backend_render_loss(
+        {"render": render, "depth": render_depth},
+        target,
+        target_depth=target_depth,
+        photometric_mask=non_sky,
+        depth_mask=non_sky,
+        weights=weights,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert float(metrics["photometric"]) > 0.0
+    assert float(metrics["depth"]) > 0.0
+    assert float(render.grad[:, :, :4].abs().sum()) > 0.0
+    assert float(render.grad[:, :, 4:].abs().max()) == 0.0
+    assert float(render_depth.grad[:, :, :4].abs().sum()) > 0.0
+    assert float(render_depth.grad[:, :, 4:].abs().max()) == 0.0
+
+
+def test_mapper_observation_depth_confidence_excludes_sky_mask():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {"sky_mask_source": "panovggt_head"},
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    image = torch.zeros(3, 4, 8)
+    inverse_depth = torch.ones(1, 4, 8)
+    confidence = torch.ones(1, 4, 8)
+    sky_mask = torch.zeros(1, 4, 8, dtype=torch.bool)
+    sky_mask[:, :2, :] = True
+
+    mapper.register_observation_values(
+        frame_id=7,
+        image=image,
+        c2w=torch.eye(4),
+        inverse_depth=inverse_depth,
+        depth_confidence=confidence,
+        is_keyframe=False,
+        sky_mask=sky_mask,
+    )
+
+    obs = mapper.observations[7]
+    assert obs.depth_confidence is not None
+    assert float(obs.depth_confidence[:, :2, :].sum()) == 0.0
+    assert float(obs.depth_confidence[:, 2:, :].min()) == 1.0
+
+
 def test_mapper_random_window_optimizes_one_sample_per_step():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
@@ -1080,6 +1142,54 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     assert torch.allclose(seen["colors"], expected_sh)
     assert seen["sh_degree"] == gaussian_map.active_sh_degree
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
+
+
+def test_pfgs360_renderer_uses_configured_sh_degree_two_coefficients():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {"sh_degree": 2},
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    seeds = GaussianSeedBatch(
+        xyz=torch.tensor([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]], dtype=torch.float32),
+        rgb=torch.tensor([[0.9, 0.2, 0.1], [0.1, 0.8, 0.3]], dtype=torch.float32),
+        confidence=torch.ones(2),
+        scale=torch.full((2,), 0.1),
+        level=torch.zeros(2, dtype=torch.long),
+        frame_id=0,
+    )
+    gaussian_map.add_seeds(seeds)
+    with torch.no_grad():
+        gaussian_map.sh_rest.fill_(0.125)
+    seen: dict[str, torch.Tensor | tuple[int, ...] | int] = {}
+
+    def fake_rasterization(**kwargs):
+        colors = kwargs["colors"]
+        seen["colors_shape"] = tuple(colors.shape)
+        seen["colors"] = colors.detach().clone()
+        seen["sh_degree"] = int(kwargs["sh_degree"])
+        height = int(kwargs["height"])
+        width = int(kwargs["width"])
+        device = colors.device
+        dtype = colors.dtype
+        render = torch.zeros(1, height, width, 4, device=device, dtype=dtype)
+        alpha = torch.ones(1, height, width, 1, device=device, dtype=dtype)
+        info = {
+            "means2d": torch.zeros(1, colors.shape[0], 2, device=device, dtype=dtype),
+            "radii": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
+            "accum_times": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
+        }
+        return render, alpha, None, info
+
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    camera = PanoRenderCamera(image_height=4, image_width=8, c2w=torch.eye(4))
+    renderer._render_gsplat360(fake_rasterization, camera, gaussian_map, torch.zeros(3))
+
+    expected = gaussian_map.get_sh_coefficients.detach()
+    assert gaussian_map.active_sh_degree == 2
+    assert seen["colors_shape"] == (2, 9, 3)
+    assert torch.allclose(seen["colors"], expected)
+    assert seen["sh_degree"] == 2
 
 
 def test_backend_feedback_se3_blend_and_hard_gate():

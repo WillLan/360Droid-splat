@@ -234,12 +234,13 @@ BackendOptimization:
   final_global_steps: 100
   use_frontend_graph_window: true
   fixed_window_frames: 1
+  sh_degree: 2
   gaussian_lr: 0.002
   xyz_lr: 0.0005
   feature_lr: 0.002
   opacity_lr: 0.001
-  scaling_lr: 0.0001
-  rotation_lr: 0.0001
+  scaling_lr: 0.0005
+  rotation_lr: 0.0003
   photometric_loss_mode: l1_dssim
   rgb_l1_weight: 0.8
   dssim_weight: 0.2

@@ -139,7 +139,10 @@ class PanoGaussianMap(nn.Module):
         super().__init__()
         self.config = config or {}
         self.map_mode = "anchor_scaffold_panorama"
-        self.active_sh_degree = min(int(sh_degree), 0)
+        backend_cfg = self.config.get("BackendOptimization", {}) if isinstance(self.config, dict) else {}
+        configured_sh_degree = int(backend_cfg.get("sh_degree", sh_degree)) if isinstance(backend_cfg, dict) else int(sh_degree)
+        self.max_sh_degree = max(0, min(configured_sh_degree, 2))
+        self.active_sh_degree = self.max_sh_degree
         self.device_hint = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._reset_parameters()
         self._reset_skybox()
@@ -156,11 +159,13 @@ class PanoGaussianMap(nn.Module):
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
+        sh_rest_dim = max(0, (int(self.max_sh_degree) + 1) ** 2 - 1)
         self.xyz = nn.Parameter(torch.zeros(0, 3, device=device))
         self.rotation = nn.Parameter(torch.zeros(0, 4, device=device))
         self.scaling = nn.Parameter(torch.zeros(0, 3, device=device))
         self.opacity_logit = nn.Parameter(torch.zeros(0, 1, device=device))
         self.features = nn.Parameter(torch.zeros(0, 3, device=device))
+        self.sh_rest = nn.Parameter(torch.zeros(0, sh_rest_dim, 3, device=device))
 
     def _reset_skybox(self) -> None:
         cfg = self.config.get("SkyBox", {}) if isinstance(self.config, dict) else {}
@@ -204,6 +209,15 @@ class PanoGaussianMap(nn.Module):
     def get_features(self) -> torch.Tensor:
         return torch.sigmoid(self.features)
 
+    @property
+    def get_sh_coefficients(self) -> torch.Tensor:
+        from backend.pano_gs.adapter import SH_C0
+
+        dc = ((self.get_features - 0.5) / SH_C0).unsqueeze(1)
+        if int(self.sh_rest.shape[1]) <= 0:
+            return dc
+        return torch.cat([dc, self.sh_rest.to(device=dc.device, dtype=dc.dtype)], dim=1)
+
     @staticmethod
     def _inv_sigmoid(x: torch.Tensor) -> torch.Tensor:
         x = x.clamp(1e-5, 1.0 - 1e-5)
@@ -220,7 +234,10 @@ class PanoGaussianMap(nn.Module):
         return torch.sigmoid(self.skybox_logits)
 
     def gaussian_parameters(self) -> list[nn.Parameter]:
-        return [self.xyz, self.rotation, self.scaling, self.opacity_logit, self.features]
+        params = [self.xyz, self.rotation, self.scaling, self.opacity_logit, self.features]
+        if int(self.sh_rest.shape[1]) > 0:
+            params.append(self.sh_rest)
+        return params
 
     def skybox_parameters(self) -> list[nn.Parameter]:
         if self.skybox_logits is None or not self.skybox_optimize:
@@ -253,12 +270,15 @@ class PanoGaussianMap(nn.Module):
         new_scaling = torch.cat([self.scaling.detach(), torch.log(torch.expm1(scale.clamp_min(1e-5)))], dim=0)
         new_opacity = torch.cat([self.opacity_logit.detach(), self._inv_sigmoid(conf)], dim=0)
         new_features = torch.cat([self.features.detach(), self._inv_sigmoid(rgb)], dim=0)
+        sh_rest = torch.zeros(xyz.shape[0], int(self.sh_rest.shape[1]), 3, device=device, dtype=dtype)
+        new_sh_rest = torch.cat([self.sh_rest.detach(), sh_rest], dim=0)
 
         self.xyz = nn.Parameter(new_xyz)
         self.rotation = nn.Parameter(new_rot)
         self.scaling = nn.Parameter(new_scaling)
         self.opacity_logit = nn.Parameter(new_opacity)
         self.features = nn.Parameter(new_features)
+        self.sh_rest = nn.Parameter(new_sh_rest)
 
         self._anchor_level = torch.cat([self._anchor_level, seeds.level.detach().cpu().to(torch.int8)], dim=0)
         self._anchor_voxel_size = torch.cat(
@@ -304,6 +324,7 @@ class PanoGaussianMap(nn.Module):
         self.scaling = nn.Parameter(self.scaling.detach()[keep])
         self.opacity_logit = nn.Parameter(self.opacity_logit.detach()[keep])
         self.features = nn.Parameter(self.features.detach()[keep])
+        self.sh_rest = nn.Parameter(self.sh_rest.detach()[keep])
         keep_cpu = keep.detach().cpu()
         self._anchor_level = self._anchor_level[keep_cpu]
         self._anchor_voxel_size = self._anchor_voxel_size[keep_cpu]
@@ -851,6 +872,16 @@ class PanoGaussianMapper:
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
+        if depth is not None and sky is not None:
+            if conf is None:
+                conf = torch.ones_like(depth)
+            sky_depth_mask = self._normalize_skybox_mask(
+                sky,
+                height=int(img.shape[-2]),
+                width=int(img.shape[-1]),
+                device=torch.device("cpu"),
+            )
+            conf = conf.masked_fill(sky_depth_mask.bool(), 0.0)
         self.observations[frame_id] = MapperObservation(
             frame_id=frame_id,
             image=img,
@@ -2477,8 +2508,16 @@ class PanoGaussianMapper:
         with torch.no_grad():
             camera = PanoRenderCamera(image_height=H, image_width=W, c2w=pose_delta().detach())
             pkg = self.renderer.render(camera, self.map)
-            pkg = self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, keyframe.sky_mask))
-            loss, _ = backend_render_loss(pkg, target, weights=self.loss_weights)
+            sky_mask = self._skybox_mask_for_target(target, keyframe.sky_mask)
+            pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+            non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=target.device, dtype=torch.bool)
+            loss, _ = backend_render_loss(
+                pkg,
+                target,
+                photometric_mask=non_sky_mask,
+                depth_mask=non_sky_mask,
+                weights=self.loss_weights,
+            )
             render = pkg["render"].detach()
             mse = torch.mean((render - target).square()).clamp_min(1e-12)
             psnr = -10.0 * torch.log10(mse)
@@ -2513,12 +2552,19 @@ class PanoGaussianMapper:
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         sky_mask = self._skybox_mask_for_target(target, sky_mask)
+        non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=target.device, dtype=torch.bool)
         last = {"loss": 0.0}
         for _ in range(int(steps)):
             self.optimizer.zero_grad(set_to_none=True)
             pkg = self.renderer.render(camera, self.map)
             pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
-            loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
+            loss, metrics = backend_render_loss(
+                pkg,
+                target,
+                photometric_mask=non_sky_mask,
+                depth_mask=non_sky_mask,
+                weights=self.loss_weights,
+            )
             if loss.requires_grad:
                 loss.backward()
                 self.optimizer.step()
@@ -2627,6 +2673,7 @@ class PanoGaussianMapper:
                 pkg = self.renderer.render(camera, self.map)
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+                non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=device, dtype=torch.bool)
                 target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
                 depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
                 loss_i, metrics_i = backend_render_loss(
@@ -2634,6 +2681,8 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
+                    photometric_mask=non_sky_mask,
+                    depth_mask=non_sky_mask,
                     weights=self.loss_weights,
                 )
                 if sky_mask is not None:
@@ -3297,7 +3346,14 @@ class PanoGaussianMapper:
             section_start = time.perf_counter()
             pkg = self.renderer.render(camera, self.map)
             pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
-            loss, metrics = backend_render_loss(pkg, target, weights=self.loss_weights)
+            non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=target.device, dtype=torch.bool)
+            loss, metrics = backend_render_loss(
+                pkg,
+                target,
+                photometric_mask=non_sky_mask,
+                depth_mask=non_sky_mask,
+                weights=self.loss_weights,
+            )
             render_loss_sec += time.perf_counter() - section_start
             if loss.requires_grad:
                 section_start = time.perf_counter()
@@ -3396,6 +3452,10 @@ class PanoGaussianMapper:
         groups: list[dict] = []
         if gaussian_enabled:
             if self.pfgs360_replace_fuse_enabled:
+                feature_params = [self.map.features]
+                sh_rest = getattr(self.map, "sh_rest", None)
+                if torch.is_tensor(sh_rest) and sh_rest.ndim == 3 and int(sh_rest.shape[1]) > 0:
+                    feature_params.append(sh_rest)
                 groups.extend(
                     [
                         {
@@ -3404,7 +3464,7 @@ class PanoGaussianMapper:
                             "name": "xyz",
                         },
                         {
-                            "params": [self.map.features],
+                            "params": feature_params,
                             "lr": float(self.optim_cfg.get("feature_lr", 2.0e-3)),
                             "name": "features",
                         },
@@ -3583,6 +3643,7 @@ class PanoGaussianMapper:
                 pkg = self.renderer.render(camera, self.map)
                 sky_mask = self._skybox_mask_for_target(target, kf.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+                non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=device, dtype=torch.bool)
                 target_depth = None if kf.target_depth is None else kf.target_depth.to(device=device, dtype=dtype)
                 depth_confidence = None if kf.depth_confidence is None else kf.depth_confidence.to(device=device, dtype=dtype)
                 loss_i, metrics_i = backend_render_loss(
@@ -3590,6 +3651,8 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
+                    photometric_mask=non_sky_mask,
+                    depth_mask=non_sky_mask,
                     weights=self.loss_weights,
                 )
                 if sky_mask is not None:
