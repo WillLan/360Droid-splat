@@ -115,10 +115,17 @@ class PFGS360Renderer:
         *,
         background: torch.Tensor | None = None,
     ) -> RenderPackage:
+        source_gaussians = gaussians
+        materialized = None
+        if hasattr(gaussians, "materialize"):
+            materialized = gaussians.materialize(camera)
+            gaussians = materialized
         if background is None:
             background = torch.zeros(3, device=gaussians.get_xyz.device, dtype=gaussians.get_xyz.dtype)
         if int(gaussians.get_xyz.shape[0]) == 0:
-            return self._compose_skybox(camera, gaussians, _blank_package(camera, gaussians, background))
+            pkg = _blank_package(camera, gaussians, background)
+            pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
+            return self._compose_skybox(camera, source_gaussians, pkg)
 
         rasterization = _optional_gsplat360(self.extra_gsplat360_roots)
         if rasterization is None:
@@ -127,9 +134,18 @@ class PFGS360Renderer:
                     "gsplat360 is unavailable. Install/build the PFGS360 gsplat360 package "
                     "or enable the explicit smoke fallback."
                 )
-            return self._compose_skybox(camera, gaussians, self._render_fallback(camera, gaussians, background))
+            pkg = self._render_fallback(camera, gaussians, background)
+            pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
+            return self._compose_skybox(camera, source_gaussians, pkg)
 
-        return self._compose_skybox(camera, gaussians, self._render_gsplat360(rasterization, camera, gaussians, background))
+        pkg = self._render_gsplat360(rasterization, camera, gaussians, background)
+        pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
+        return self._compose_skybox(camera, source_gaussians, pkg)
+
+    def _postprocess_materialized(self, source_gaussians, materialized, pkg: RenderPackage) -> RenderPackage:
+        if materialized is None or not hasattr(source_gaussians, "postprocess_render_package"):
+            return pkg
+        return source_gaussians.postprocess_render_package(pkg, materialized)
 
     def _compose_skybox(self, camera: PanoRenderCamera, gaussians, pkg: RenderPackage) -> RenderPackage:
         if not bool(getattr(gaussians, "has_skybox", False)):
@@ -212,6 +228,8 @@ class PFGS360Renderer:
         depth = render[0, ..., 3:4].permute(2, 0, 1).contiguous()
         opacity = alpha[0].permute(2, 0, 1).contiguous()
         means2d = info["means2d"]
+        if torch.is_tensor(means2d) and means2d.ndim == 3 and int(means2d.shape[0]) == 1:
+            means2d = means2d[0]
         if means2d.requires_grad:
             means2d.retain_grad()
         radii = info["radii"][0]
@@ -283,6 +301,8 @@ class PFGS360Renderer:
         total = int(xyz.shape[0])
         radii = torch.zeros(total, device=device, dtype=torch.int32)
         radii[valid] = 1
+        viewspace_points = torch.zeros(total, 2, device=device, dtype=dtype)
+        viewspace_points[valid] = pixels
         return {
             "render": render,
             "gs_only": render,
@@ -295,6 +315,6 @@ class PFGS360Renderer:
             "radii": radii,
             "n_touched": radii,
             "accum_metric_counts": None,
-            "viewspace_points": pixels,
+            "viewspace_points": viewspace_points,
             "visibility_filter": radii > 0,
         }

@@ -611,6 +611,11 @@ class PanoGaussianMapper:
         self.pfgs360_replace_fuse_enabled = bool(
             self.novel_insertion_enabled and self.novel_insertion_strategy == "pfgs360_replace_fuse"
         )
+        if (
+            str(getattr(gaussian_map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
+            and self.pfgs360_replace_fuse_enabled
+        ):
+            raise ValueError("neural_anchor_scaffold_panorama does not support pfgs360_replace_fuse in this backend.")
         self.pfgs360_insertion_enabled = bool(
             self.novel_insertion_enabled and self.novel_insertion_strategy in {"pfgs360", "pfgs360_replace_fuse"}
         )
@@ -3461,7 +3466,9 @@ class PanoGaussianMapper:
     def _map_param_groups(self, *, gaussian_enabled: bool, phase: str) -> list[dict]:
         groups: list[dict] = []
         if gaussian_enabled:
-            if self.pfgs360_replace_fuse_enabled:
+            if hasattr(self.map, "get_optimizer_param_groups"):
+                groups.extend(self.map.get_optimizer_param_groups())
+            elif self.pfgs360_replace_fuse_enabled:
                 feature_params = [self.map.features]
                 sh_rest = getattr(self.map, "sh_rest", None)
                 if torch.is_tensor(sh_rest) and sh_rest.ndim == 3 and int(sh_rest.shape[1]) > 0:

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image, ImageDraw
 
-from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
+from backend.pano_gs import NeuralScaffoldPanoMap, PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.adapter import build_frontend_from_config
 from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
@@ -1554,7 +1554,17 @@ class PanoDroidGSSlamSystem:
             pfgs360_gaussian_scale_lat_cos_min=float(novel_cfg.get("gaussian_scale_lat_cos_min", 0.25)),
             temporal_pair_conf_min=float(novel_cfg.get("temporal_pair_conf_min", 0.70)),
         )
-        self.map = PanoGaussianMap(config=config)
+        map_cfg = config.get("MapRepresentation", {}) if isinstance(config, dict) else {}
+        map_mode = str(map_cfg.get("mode", "anchor_scaffold_panorama") or "anchor_scaffold_panorama").lower()
+        if map_mode == "anchor_scaffold_panorama":
+            self.map = PanoGaussianMap(config=config)
+        elif map_mode == "neural_anchor_scaffold_panorama":
+            self.map = NeuralScaffoldPanoMap(config=config)
+        else:
+            raise ValueError(
+                "Unsupported MapRepresentation.mode "
+                f"{map_mode!r}; expected 'anchor_scaffold_panorama' or 'neural_anchor_scaffold_panorama'."
+            )
         render_cfg = config.get("Renderer", {})
         self.renderer = PFGS360Renderer(
             config=config,

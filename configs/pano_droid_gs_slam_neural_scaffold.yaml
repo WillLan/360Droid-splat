@@ -1,0 +1,136 @@
+Dataset:
+  synthetic: true
+  synthetic_length: 4
+  height: 32
+  width: 64
+  pair_stride: 1
+
+Frontend:
+  mode: graph
+  checkpoint: null
+  keyframe_threshold: 0.5
+  force_keyframe_interval: 2
+  window_size: 5
+  num_updates: null
+
+PanoVGGT:
+  engine: external
+  repo_path: null
+  config_path: null
+  checkpoint: null
+  class_path: null
+  strict_checkpoint: false
+  image_size: [518, 1036]
+  chunk_size: 8
+  overlap: 4
+  emit_delay: 2
+  align_mode: sim3
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 128
+  amp: true
+  input_batch_dim: true
+
+Graph:
+  temporal_radius: 2
+  max_factors: 24
+  fixed_frames_inference: 1
+
+BA:
+  mode: differentiable
+  residual_mode: pixel
+  iters_per_update: 2
+  sample_stride: 1
+
+Model:
+  feature_dim: 32
+  context_dim: 32
+  hidden_dim: 48
+  encoder_base_dim: 32
+  feature_stride: 8
+  corr_levels: 4
+  corr_radius: 3
+  max_corr_elements: 80000000
+  use_spherical_corr: true
+  gru_kernel_size: 3
+  update_iters: 2
+  pose_scale: 0.02
+
+MapRepresentation:
+  mode: neural_anchor_scaffold_panorama
+
+NeuralScaffold:
+  enabled: true
+  feat_dim: 24
+  hidden_dim: 64
+  k_offsets: 4
+  sh_degree: 0
+  voxel_size: 0.1
+  insert_radius_factor: 2.0
+  duplicate_policy: keep_best_score_with_radius_gate
+  near_anchor_policy: reject
+  learn_anchor_xyz: true
+  learn_anchor_feat: true
+  learn_anchor_scale: true
+  learn_local_offsets: true
+  predict_opacity: true
+  predict_color: true
+  predict_cov: true
+  predict_rotation: true
+  predict_scale: true
+  init_feat_from_rgb: true
+  init_opacity: 0.15
+  init_scale_from_seed: true
+  opacity_mask_threshold: 0.0
+  latitude_aware: true
+  distance_aware: true
+  use_feature_bank: false
+  appearance_dim: 0
+  lr_anchor_xyz: 0.0005
+  lr_anchor_feat: 0.002
+  lr_anchor_scale: 0.0005
+  lr_local_offsets: 0.0005
+  lr_mlp_opacity: 0.001
+  lr_mlp_color: 0.001
+  lr_mlp_cov: 0.001
+  max_anchors: 200000
+  max_materialized_gaussians: 800000
+  allow_empty_map: true
+  materialize_cache: false
+  grow_prune_enabled: false
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Hierarchical:
+  voxel_size_lis: [0.12, 0.45, 1.8]
+
+Mapping:
+  max_seeds_per_keyframe: 512
+  min_depth_confidence: 0.15
+  lr: 0.002
+  refine_steps_per_keyframe: 0
+
+Renderer:
+  allow_smoke_fallback: true
+  extra_gsplat360_roots: []
+
+Visualization:
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  kf_opt_max_width: 1920
+
+Results:
+  save_dir: outputs/pano_droid_gs_slam_neural_scaffold
+  kf_render_format: png
+  kf_jpeg_quality: 95
