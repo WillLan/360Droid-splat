@@ -590,10 +590,10 @@ class NeuralScaffoldPanoMap(nn.Module):
         device = anchor_indices.device
         visibility = out.get("visibility_filter")
         if torch.is_tensor(visibility) and int(visibility.numel()) == int(anchor_indices.numel()):
-            src = visibility.to(device=device, dtype=torch.bool).view(-1)
-            dst = torch.zeros(n, device=device, dtype=torch.bool)
+            src = visibility.to(device=device, dtype=torch.int32).view(-1)
+            dst = torch.zeros(n, device=device, dtype=torch.int32)
             dst.scatter_reduce_(0, anchor_indices, src, reduce="amax", include_self=True)
-            out["visibility_filter"] = dst
+            out["visibility_filter"] = dst > 0
         radii = out.get("radii")
         if torch.is_tensor(radii) and int(radii.numel()) == int(anchor_indices.numel()):
             src = radii.to(device=device, dtype=torch.int32).view(-1)
