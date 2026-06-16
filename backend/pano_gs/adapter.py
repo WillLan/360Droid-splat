@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import sys
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -108,6 +109,19 @@ class PFGS360Renderer:
         cfg = getattr(gaussians, "config", None) or self.config
         return cfg.get("Training", {}) if isinstance(cfg, dict) else {}
 
+    def _sync_for_profile(self, device: torch.device) -> None:
+        cfg = self.config.get("Renderer", {}) if isinstance(self.config, dict) else {}
+        if not bool(cfg.get("profile_synchronize_cuda", False)):
+            return
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    @staticmethod
+    def _attach_profile(pkg: RenderPackage, profile: dict[str, float]) -> RenderPackage:
+        out = dict(pkg)
+        out.update(profile)
+        return out
+
     def render(
         self,
         camera: PanoRenderCamera,
@@ -115,17 +129,38 @@ class PFGS360Renderer:
         *,
         background: torch.Tensor | None = None,
     ) -> RenderPackage:
+        total_start = time.perf_counter()
+        profile: dict[str, float] = {
+            "profile_renderer_materialize_sec": 0.0,
+            "profile_renderer_rasterize_sec": 0.0,
+            "profile_renderer_postprocess_sec": 0.0,
+            "profile_renderer_skybox_sec": 0.0,
+            "profile_renderer_total_sec": 0.0,
+            "profile_renderer_materialized_gaussians": 0.0,
+        }
         source_gaussians = gaussians
         materialized = None
         if hasattr(gaussians, "materialize"):
+            section_start = time.perf_counter()
             materialized = gaussians.materialize(camera)
             gaussians = materialized
+            self._sync_for_profile(gaussians.get_xyz.device)
+            profile["profile_renderer_materialize_sec"] = float(time.perf_counter() - section_start)
+            profile["profile_renderer_materialized_gaussians"] = float(int(gaussians.get_xyz.shape[0]))
         if background is None:
             background = torch.zeros(3, device=gaussians.get_xyz.device, dtype=gaussians.get_xyz.dtype)
         if int(gaussians.get_xyz.shape[0]) == 0:
+            section_start = time.perf_counter()
             pkg = _blank_package(camera, gaussians, background)
+            profile["profile_renderer_rasterize_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
             pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
-            return self._compose_skybox(camera, source_gaussians, pkg)
+            profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
+            pkg = self._compose_skybox(camera, source_gaussians, pkg)
+            profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+            profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
+            return self._attach_profile(pkg, profile)
 
         rasterization = _optional_gsplat360(self.extra_gsplat360_roots)
         if rasterization is None:
@@ -134,13 +169,33 @@ class PFGS360Renderer:
                     "gsplat360 is unavailable. Install/build the PFGS360 gsplat360 package "
                     "or enable the explicit smoke fallback."
                 )
+            section_start = time.perf_counter()
             pkg = self._render_fallback(camera, gaussians, background)
+            self._sync_for_profile(gaussians.get_xyz.device)
+            profile["profile_renderer_rasterize_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
             pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
-            return self._compose_skybox(camera, source_gaussians, pkg)
+            profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
+            section_start = time.perf_counter()
+            pkg = self._compose_skybox(camera, source_gaussians, pkg)
+            self._sync_for_profile(gaussians.get_xyz.device)
+            profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+            profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
+            return self._attach_profile(pkg, profile)
 
+        section_start = time.perf_counter()
         pkg = self._render_gsplat360(rasterization, camera, gaussians, background)
+        self._sync_for_profile(gaussians.get_xyz.device)
+        profile["profile_renderer_rasterize_sec"] = float(time.perf_counter() - section_start)
+        section_start = time.perf_counter()
         pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
-        return self._compose_skybox(camera, source_gaussians, pkg)
+        profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
+        section_start = time.perf_counter()
+        pkg = self._compose_skybox(camera, source_gaussians, pkg)
+        self._sync_for_profile(gaussians.get_xyz.device)
+        profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+        profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
+        return self._attach_profile(pkg, profile)
 
     def _postprocess_materialized(self, source_gaussians, materialized, pkg: RenderPackage) -> RenderPackage:
         if materialized is None or not hasattr(source_gaussians, "postprocess_render_package"):

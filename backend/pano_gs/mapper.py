@@ -75,6 +75,10 @@ class MapperStats:
     last_insert_mask_pixels: int = 0
     last_anchor_count_before_insert: int = 0
     last_anchor_count_after_insert: int = 0
+    last_neural_insert_total_sec: float = 0.0
+    last_neural_insert_accept_sec: float = 0.0
+    last_neural_insert_append_sec: float = 0.0
+    last_neural_insert_compact_sec: float = 0.0
     notes: list[str] = field(default_factory=list)
 
 
@@ -741,6 +745,10 @@ class PanoGaussianMapper:
                 "dense_seed_candidates": int(getattr(self.map, "last_candidate_count", requested)),
                 "newly_inserted": int(n),
                 "compacted": int(getattr(self.map, "last_compacted_anchors", 0)),
+                "neural_insert_total_sec": float(getattr(self.map, "last_insert_total_sec", 0.0)),
+                "neural_insert_accept_sec": float(getattr(self.map, "last_insert_accept_sec", 0.0)),
+                "neural_insert_append_sec": float(getattr(self.map, "last_insert_append_sec", 0.0)),
+                "neural_insert_compact_sec": float(getattr(self.map, "last_insert_compact_sec", 0.0)),
             }
         else:
             seeds, filter_stats = self._filter_novel_seeds(
@@ -802,6 +810,10 @@ class PanoGaussianMapper:
         self.stats.last_insert_mask_pixels = int(filter_stats.get("insert_mask_pixels", 0))
         self.stats.last_anchor_count_before_insert = int(filter_stats.get("anchors_before", start))
         self.stats.last_anchor_count_after_insert = int(filter_stats.get("anchors_after", self.map.anchor_count()))
+        self.stats.last_neural_insert_total_sec = float(filter_stats.get("neural_insert_total_sec", 0.0))
+        self.stats.last_neural_insert_accept_sec = float(filter_stats.get("neural_insert_accept_sec", 0.0))
+        self.stats.last_neural_insert_append_sec = float(filter_stats.get("neural_insert_append_sec", 0.0))
+        self.stats.last_neural_insert_compact_sec = float(filter_stats.get("neural_insert_compact_sec", 0.0))
         if image is not None:
             register_start, register_end = self.last_inserted_range
             self._register_keyframe(frontend_output, image, start=register_start, end=register_end, sky_mask=sky_mask)
@@ -2685,7 +2697,10 @@ class PanoGaussianMapper:
         last_sampled_ids: list[int] = []
         sample_sec = 0.0
         render_loss_sec = 0.0
+        loss_eval_sec = 0.0
         backward_step_sec = 0.0
+        renderer_profile_totals: dict[str, float] = {}
+        renderer_profile_calls = 0
         sky_pruned_total = 0
         chunk_compacted = 0
         for step_idx in range(max(0, steps)):
@@ -2703,11 +2718,21 @@ class PanoGaussianMapper:
                 c2w = self._observation_pose(obs, trainable_pose_ids=trainable_pose_ids).to(device=device, dtype=dtype)
                 camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w)
                 pkg = self.renderer.render(camera, self.map)
+                renderer_profile_calls += 1
+                for key, value in pkg.items():
+                    if not str(key).startswith("profile_renderer_"):
+                        continue
+                    try:
+                        scalar = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    renderer_profile_totals[str(key)] = renderer_profile_totals.get(str(key), 0.0) + scalar
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
                 non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=device, dtype=torch.bool)
                 target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
                 depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
+                loss_start = time.perf_counter()
                 loss_i, metrics_i = backend_render_loss(
                     pkg,
                     target,
@@ -2716,6 +2741,7 @@ class PanoGaussianMapper:
                     depth_mask=non_sky_mask,
                     weights=self.loss_weights,
                 )
+                loss_eval_sec += time.perf_counter() - loss_start
                 if sky_mask is not None:
                     metrics_i = dict(metrics_i)
                     metrics_i["skybox_mask_ratio"] = sky_mask.to(device=device, dtype=dtype).mean().detach()
@@ -2792,7 +2818,19 @@ class PanoGaussianMapper:
         last["profile_backend_feedforward_window_step_avg_sec"] = total_sec / max(1, actual_steps)
         last["profile_backend_feedforward_window_sample_sec"] = float(sample_sec)
         last["profile_backend_feedforward_window_render_loss_sec"] = float(render_loss_sec)
+        last["profile_backend_feedforward_window_loss_eval_sec"] = float(loss_eval_sec)
         last["profile_backend_feedforward_window_backward_step_sec"] = float(backward_step_sec)
+        last["profile_backend_feedforward_window_renderer_calls"] = float(renderer_profile_calls)
+        for key, total in renderer_profile_totals.items():
+            suffix = str(key).removeprefix("profile_renderer_")
+            out_key = f"profile_backend_feedforward_window_renderer_{suffix}"
+            last[out_key] = float(total)
+            if renderer_profile_calls > 0:
+                if suffix.endswith("_sec"):
+                    avg_key = f"profile_backend_feedforward_window_renderer_{suffix[:-4]}_avg_sec"
+                else:
+                    avg_key = f"profile_backend_feedforward_window_renderer_{suffix}_avg"
+                last[avg_key] = float(total) / float(renderer_profile_calls)
         self.stats.last_loss = float(last.get("loss", 0.0))
         self.stats.last_phase = "feedforward_window"
         self.stats.last_pose_delta_norm = pose_norm

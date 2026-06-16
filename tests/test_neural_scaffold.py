@@ -231,7 +231,7 @@ def test_neural_scaffold_checkpoint_saves_mlp_state(tmp_path: Path):
     assert sidecar["input_mode"] == "anchor_feat_view_dir_ob_dist"
 
 
-def test_neural_scaffold_renderer_fallback_aggregates_materialized_stats():
+def test_neural_scaffold_renderer_fallback_skips_materialized_stats_by_default():
     neural_map = NeuralScaffoldPanoMap(config=_cfg(), device="cpu")
     neural_map.insert_from_seed_batch(_seed_batch(torch.tensor([[0.0, 0.0, 1.0], [0.12, 0.0, 1.0]])))
     _force_positive_opacity(neural_map)
@@ -240,10 +240,12 @@ def test_neural_scaffold_renderer_fallback_aggregates_materialized_stats():
 
     pkg = renderer.render(camera, neural_map)
 
-    assert pkg["visibility_filter"].shape == (2,)
-    assert pkg["radii"].shape == (2,)
-    assert pkg["n_touched"].shape == (2,)
-    assert pkg["viewspace_points"].shape == (2, 2)
+    assert pkg["visibility_filter"].shape == (20,)
+    assert pkg["radii"].shape == (20,)
+    assert pkg["n_touched"].shape == (20,)
+    assert pkg["viewspace_points"].shape == (20, 2)
+    assert pkg["profile_renderer_materialized_gaussians"] == 20.0
+    assert pkg["profile_renderer_postprocess_sec"] >= 0.0
 
 
 def test_system_map_factory_keeps_default_and_selects_neural(tmp_path: Path):

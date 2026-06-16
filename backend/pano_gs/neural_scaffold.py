@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -177,6 +178,8 @@ class NeuralScaffoldPanoMap(nn.Module):
         self.opacity_mask_threshold = float(self.neural_cfg.get("opacity_mask_threshold", 0.0))
         self.init_opacity = min(1.0 - 1.0e-5, max(1.0e-5, float(self.neural_cfg.get("init_opacity", 0.15))))
         self.max_scale = max(1.0e-5, float(self.neural_cfg.get("max_scale", 1.0)))
+        self.aggregate_render_stats = bool(self.neural_cfg.get("aggregate_render_stats", False))
+        self.aggregate_viewspace_points = bool(self.neural_cfg.get("aggregate_viewspace_points", False))
 
         self.decoder = NeuralGaussianDecoder(
             feat_dim=self.feat_dim,
@@ -188,6 +191,10 @@ class NeuralScaffoldPanoMap(nn.Module):
         self.last_source_hw: tuple[int, int] | None = None
         self.last_candidate_count = 0
         self.last_compacted_anchors = 0
+        self.last_insert_total_sec = 0.0
+        self.last_insert_accept_sec = 0.0
+        self.last_insert_append_sec = 0.0
+        self.last_insert_compact_sec = 0.0
         self.to(device=self.device_hint, dtype=self.dtype)
         self._reset_anchor_parameters()
         self._reset_anchor_metadata()
@@ -495,25 +502,40 @@ class NeuralScaffoldPanoMap(nn.Module):
         *,
         last_update_kf_ord: int | None = None,
     ) -> int:
+        total_start = time.perf_counter()
+        self.last_insert_total_sec = 0.0
+        self.last_insert_accept_sec = 0.0
+        self.last_insert_append_sec = 0.0
+        self.last_insert_compact_sec = 0.0
         self.last_candidate_count = int(len(candidates))
         self.last_inserted_source_flat_idx = None
         self.last_source_hw = candidates.source_hw
         self.last_compacted_anchors = 0
         if len(candidates) == 0:
+            self.last_insert_total_sec = float(time.perf_counter() - total_start)
             return 0
+        section_start = time.perf_counter()
         accepted = self._accepted_candidate_indices(candidates)
+        self.last_insert_accept_sec = float(time.perf_counter() - section_start)
         if not accepted:
+            self.last_insert_total_sec = float(time.perf_counter() - total_start)
             return 0
         if self.max_anchors > 0:
             room = max(0, self.max_anchors - self.anchor_count())
             accepted = accepted[:room]
             if not accepted:
+                self.last_insert_total_sec = float(time.perf_counter() - total_start)
                 return 0
         idx = torch.tensor(accepted, device=candidates.xyz.device, dtype=torch.long)
         before = self.anchor_count()
+        section_start = time.perf_counter()
         self._append_candidate_indices(candidates, idx, last_update_kf_ord=last_update_kf_ord)
+        self.last_insert_append_sec = float(time.perf_counter() - section_start)
+        section_start = time.perf_counter()
         self.last_compacted_anchors = self.compact_voxels()
+        self.last_insert_compact_sec = float(time.perf_counter() - section_start)
         after = self.anchor_count()
+        self.last_insert_total_sec = float(time.perf_counter() - total_start)
         return max(0, int(after - before))
 
     def _accepted_candidate_indices(self, candidates: NeuralAnchorCandidateBatch) -> list[int]:
@@ -747,6 +769,8 @@ class NeuralScaffoldPanoMap(nn.Module):
         return torch.arange(min(max_anchor_count, n), device=device, dtype=torch.long)
 
     def postprocess_render_package(self, pkg: dict, materialized: MaterializedGaussians) -> dict:
+        if not self.aggregate_render_stats:
+            return pkg
         n = int(materialized.source_anchor_count)
         if n <= 0:
             return pkg
@@ -774,7 +798,12 @@ class NeuralScaffoldPanoMap(nn.Module):
             dst.scatter_reduce_(0, anchor_indices, src, reduce="amax", include_self=True)
             out["n_touched"] = dst
         viewspace = out.get("viewspace_points")
-        if torch.is_tensor(viewspace) and viewspace.ndim >= 2 and int(viewspace.shape[0]) == int(anchor_indices.numel()):
+        if (
+            self.aggregate_viewspace_points
+            and torch.is_tensor(viewspace)
+            and viewspace.ndim >= 2
+            and int(viewspace.shape[0]) == int(anchor_indices.numel())
+        ):
             dst = torch.zeros(n, int(viewspace.shape[-1]), device=viewspace.device, dtype=viewspace.dtype)
             seen = torch.zeros(n, device=viewspace.device, dtype=torch.bool)
             for row in range(int(anchor_indices.numel())):
@@ -856,6 +885,11 @@ class NeuralScaffoldPanoMap(nn.Module):
             "mlp_frozen": int(bool(self.mlp_frozen)),
             "last_candidate_count": int(self.last_candidate_count),
             "last_compacted_anchors": int(self.last_compacted_anchors),
+            "aggregate_render_stats": int(bool(self.aggregate_render_stats)),
+            "last_insert_total_sec": float(self.last_insert_total_sec),
+            "last_insert_accept_sec": float(self.last_insert_accept_sec),
+            "last_insert_append_sec": float(self.last_insert_append_sec),
+            "last_insert_compact_sec": float(self.last_insert_compact_sec),
         }
 
     def mlp_state_payload(self) -> dict[str, Any]:

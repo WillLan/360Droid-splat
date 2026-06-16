@@ -109,6 +109,8 @@ NeuralScaffold:
   max_materialized_gaussians: 800000
   allow_empty_map: true
   materialize_cache: false
+  aggregate_render_stats: false
+  aggregate_viewspace_points: false
   grow_prune_enabled: false
 
 BackendOptimization:
@@ -141,6 +143,7 @@ Mapping:
 Renderer:
   allow_smoke_fallback: true
   extra_gsplat360_roots: []
+  profile_synchronize_cuda: false
 
 Visualization:
   save_local: true
@@ -153,3 +156,7 @@ Results:
   save_dir: outputs/pano_droid_gs_slam_neural_scaffold
   kf_render_format: png
   kf_jpeg_quality: 95
+
+RuntimeProfiling:
+  enabled: true
+  path: runtime_profile.jsonl

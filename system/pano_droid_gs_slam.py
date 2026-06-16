@@ -2217,6 +2217,18 @@ class PanoDroidGSSlamSystem:
                 output_profile["anchor_count_after_insert"] = int(
                     getattr(self.mapper.stats, "last_anchor_count_after_insert", 0)
                 )
+                output_profile["neural_insert_total_sec"] = float(
+                    getattr(self.mapper.stats, "last_neural_insert_total_sec", 0.0)
+                )
+                output_profile["neural_insert_accept_sec"] = float(
+                    getattr(self.mapper.stats, "last_neural_insert_accept_sec", 0.0)
+                )
+                output_profile["neural_insert_append_sec"] = float(
+                    getattr(self.mapper.stats, "last_neural_insert_append_sec", 0.0)
+                )
+                output_profile["neural_insert_compact_sec"] = float(
+                    getattr(self.mapper.stats, "last_neural_insert_compact_sec", 0.0)
+                )
                 keyframes += 1
                 novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
                 insertion_stats = {
