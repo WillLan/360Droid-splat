@@ -1890,7 +1890,7 @@ class PanoDroidGSSlamSystem:
                     points = points[0]
             else:
                 points = world_points_from_inverse_depth(inv, pose, (height, width)).detach().cpu().float()
-            inv_t = inv.detach().float()
+            inv_t = inv.detach().cpu().float()
             if inv_t.ndim == 2:
                 inv_t = inv_t.unsqueeze(0)
             elif inv_t.ndim == 3 and int(inv_t.shape[0]) != 1:
@@ -1899,7 +1899,7 @@ class PanoDroidGSSlamSystem:
                 inv_t = F.interpolate(inv_t.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
             conf_t = None
             if conf is not None:
-                conf_t = conf.detach().float()
+                conf_t = conf.detach().cpu().float()
                 if conf_t.ndim == 2:
                     conf_t = conf_t.unsqueeze(0)
                 elif conf_t.ndim == 3 and int(conf_t.shape[0]) != 1:
