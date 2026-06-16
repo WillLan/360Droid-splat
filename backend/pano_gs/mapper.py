@@ -1691,7 +1691,6 @@ class PanoGaussianMapper:
             valid_aligned = torch.isfinite(aligned_target) & torch.isfinite(render_depth) & (render_depth > 1.0e-6)
             rel = (aligned_target - render_depth).abs() / torch.maximum(aligned_target, render_depth).clamp_min(1.0e-6)
             missing = ~valid_aligned
-            insert_mask = (valid_aligned & (rel >= float(self.replace_fuse_insert_rel_min))) | missing
             delete_band = (
                 valid_aligned
                 & (rel >= float(self.replace_fuse_delete_rel_min))
@@ -1703,10 +1702,12 @@ class PanoGaussianMapper:
                 & (render_depth < aligned_target)
             )
             delete_mask = delete_band | delete_foreground_large
+            insert_depth_mask = valid_aligned & (rel >= float(self.replace_fuse_delete_rel_min))
             if non_sky is not None:
                 missing = missing & non_sky
-                insert_mask = insert_mask & non_sky
                 delete_mask = delete_mask & non_sky
+                insert_depth_mask = insert_depth_mask & non_sky
+            insert_mask = missing | insert_depth_mask
             stats["missing_pixels"] = int(missing.sum().detach().cpu())
             stats["depth_mismatch_pixels"] = int(delete_mask.sum().detach().cpu())
             stats["render_bad_pixels"] = int(insert_mask.sum().detach().cpu())

@@ -360,7 +360,7 @@ def test_pfgs360_mapper_render_depth_gate_budgets_missing_and_depth_mismatch_reg
     assert torch.equal(mapper.last_inserted_source_flat_idx, torch.tensor([0, 1, 2]))
 
 
-def test_replace_fuse_depth_error_bands_split_delete_and_insert_only_regions():
+def test_replace_fuse_inserts_missing_or_depth_error_above_delete_min():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
         "Mapping": {
