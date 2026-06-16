@@ -720,6 +720,7 @@ class PanoGaussianMapper:
         sky_mask: torch.Tensor | None = None,
         insert_occupancy_radius_voxels_override: float | None = None,
         compact_after_insert: bool = False,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> int:
         requested = len(seeds)
         current_kf_ord = int(self.stats.n_keyframes)
@@ -763,6 +764,7 @@ class PanoGaussianMapper:
                 image=image,
                 sky_mask=sky_mask,
                 insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
+                replace_delete_keyframe_ids=replace_delete_keyframe_ids,
             )
             self.last_inserted_source_flat_idx = (
                 None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
@@ -944,6 +946,7 @@ class PanoGaussianMapper:
         image: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
         insert_occupancy_radius_voxels_override: float | None = None,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if not self.novel_insertion_enabled:
             return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
@@ -956,6 +959,7 @@ class PanoGaussianMapper:
                 image=image,
                 sky_mask=sky_mask,
                 insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
+                replace_delete_keyframe_ids=replace_delete_keyframe_ids,
             )
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
         budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
@@ -1000,6 +1004,7 @@ class PanoGaussianMapper:
         image: torch.Tensor | None,
         sky_mask: torch.Tensor | None,
         insert_occupancy_radius_voxels_override: float | None = None,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if self.pfgs360_replace_fuse_enabled:
             return self._filter_replace_fuse_seeds(
@@ -1008,6 +1013,7 @@ class PanoGaussianMapper:
                 image=image,
                 sky_mask=sky_mask,
                 insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
+                replace_delete_keyframe_ids=replace_delete_keyframe_ids,
             )
         seeds = self._with_pfgs360_seed_metadata(seeds)
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
@@ -1145,6 +1151,7 @@ class PanoGaussianMapper:
         image: torch.Tensor | None,
         sky_mask: torch.Tensor | None,
         insert_occupancy_radius_voxels_override: float | None = None,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         seeds = self._with_pfgs360_seed_metadata(seeds)
 
@@ -1196,6 +1203,7 @@ class PanoGaussianMapper:
                 frontend_output,
                 image,
                 sky_mask=sky_mask,
+                replace_delete_keyframe_ids=replace_delete_keyframe_ids,
             )
             stats.update({key: int(stats.get(key, 0)) + int(value) for key, value in evidence_stats.items()})
             if render_masks is not None:
@@ -1636,6 +1644,7 @@ class PanoGaussianMapper:
         image: torch.Tensor,
         *,
         sky_mask: torch.Tensor | None,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict[str, int]]:
         stats = {
             "replace_deleted": 0,
@@ -1708,6 +1717,7 @@ class PanoGaussianMapper:
                 frontend_output,
                 H,
                 W,
+                replace_delete_keyframe_ids=replace_delete_keyframe_ids,
             )
             masks = {
                 "insert": insert_mask.detach().cpu().bool(),
@@ -1738,6 +1748,7 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput,
         H: int,
         W: int,
+        replace_delete_keyframe_ids: list[int] | tuple[int, ...] | None = None,
     ) -> int:
         n = self.map.anchor_count()
         if n <= 0:
@@ -1746,6 +1757,13 @@ class PanoGaussianMapper:
             return 0
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
+        allowed_mask = None
+        if replace_delete_keyframe_ids is not None:
+            allowed_mask = self._active_anchor_mask_for_keyframe_update_ids(
+                [int(fid) for fid in replace_delete_keyframe_ids]
+            ).to(device=device, dtype=torch.bool)
+            if int(allowed_mask.numel()) != n or not bool(allowed_mask.any().detach().cpu()):
+                return 0
         xyz = self.map.get_xyz.detach()
         c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
         w2c = torch.linalg.inv(c2w)
@@ -1756,6 +1774,8 @@ class PanoGaussianMapper:
         visibility = render_pkg.get("visibility_filter")
         if torch.is_tensor(visibility) and int(visibility.numel()) == n:
             valid = valid & visibility.to(device=device, dtype=torch.bool).view(-1)
+        if allowed_mask is not None:
+            valid = valid & allowed_mask
         rows = torch.nonzero(valid, as_tuple=False).flatten()
         if rows.numel() == 0:
             return 0

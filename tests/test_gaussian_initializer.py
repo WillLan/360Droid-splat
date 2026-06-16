@@ -812,3 +812,45 @@ def test_replace_fuse_active_mask_uses_selected_keyframe_update_ids():
     active = mapper._active_anchor_mask_for_keyframe_update_ids([1, 3]).detach().cpu()
 
     assert active.tolist() == [False, True, False, True]
+
+
+def test_replace_fuse_depth_delete_is_limited_to_selected_keyframe_updates():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "max_replace_delete_per_keyframe": 10,
+            }
+        }
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    mapper.map.add_seeds(
+        _pfgs_seed_batch(torch.tensor([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]]), frame_id=0),
+        voxel_size=0.02,
+        last_update_kf_ord=0,
+    )
+    mapper.map._anchor_last_update_kf_ord = torch.tensor([0, 1], dtype=torch.int32)
+    image = torch.zeros(3, 4, 8)
+    mapper.keyframes = [
+        MapperKeyframe(frame_id=0, image=image, gaussian_start=0, gaussian_end=1),
+        MapperKeyframe(frame_id=4, image=image, gaussian_start=1, gaussian_end=2),
+    ]
+    delete_mask = torch.ones(1, 4, 8, dtype=torch.bool)
+    target_depth = torch.full((1, 4, 8), 2.0)
+    render_pkg = {"visibility_filter": torch.ones(2, dtype=torch.bool)}
+
+    deleted = mapper._delete_responsible_replace_fuse_anchors(
+        delete_mask,
+        target_depth,
+        render_pkg,
+        _frontend_output_for_mapper(8),
+        4,
+        8,
+        replace_delete_keyframe_ids=[4],
+    )
+
+    assert deleted == 1
+    assert mapper.map.anchor_count() == 1
+    assert int(mapper.map._anchor_last_update_kf_ord[0]) == 0

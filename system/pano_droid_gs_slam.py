@@ -2168,6 +2168,21 @@ class PanoDroidGSSlamSystem:
             history_ids = [int(kf.frame_id) for kf in self.mapper.keyframes[-history_limit:]] if history_limit > 0 else []
             return current_ids, history_ids
 
+        def recent_chunk_keyframe_ids_for_deletion() -> list[int]:
+            chunk_limit = recent_chunk_observation_chunks()
+            ids: list[int] = []
+            for _, chunk_ids in recent_feedforward_chunks[-max(0, chunk_limit - 1):]:
+                for fid in chunk_ids:
+                    value = int(fid)
+                    if value not in ids:
+                        ids.append(value)
+            for fid in current_frontend_chunk_frame_ids_full():
+                value = int(fid)
+                if value not in ids:
+                    ids.append(value)
+            registered = {int(kf.frame_id) for kf in self.mapper.keyframes}
+            return [int(fid) for fid in ids if int(fid) in registered]
+
         def register_cached_feedforward_observations(current_ids: list[int], history_ids: list[int]) -> int:
             pose_by_frame = getattr(self.frontend, "pose_by_frame", {})
             depth_by_frame = getattr(self.frontend, "depth_by_frame", {})
@@ -2349,6 +2364,8 @@ class PanoDroidGSSlamSystem:
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
                 output_profile["first_chunk_multiframe_init"] = int(first_chunk_multiframe_used)
                 output_profile["seed_candidates"] = int(len(seeds))
+                replace_delete_keyframe_ids = recent_chunk_keyframe_ids_for_deletion()
+                output_profile["replace_delete_scope_keyframes"] = int(len(replace_delete_keyframe_ids))
                 section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization or neural_anchor_mode:
                     inserted_count = self.mapper.insert_keyframe(
@@ -2358,6 +2375,7 @@ class PanoDroidGSSlamSystem:
                         sky_mask=sky_mask,
                         insert_occupancy_radius_voxels_override=0.0 if first_chunk_multiframe_used else None,
                         compact_after_insert=bool(first_chunk_multiframe_used),
+                        replace_delete_keyframe_ids=replace_delete_keyframe_ids,
                     )
                 else:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)
