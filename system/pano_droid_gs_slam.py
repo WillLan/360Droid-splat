@@ -1805,6 +1805,13 @@ class PanoDroidGSSlamSystem:
                 raise RuntimeError(
                     f"frame {int(frame_id)}: Mapping.sky_mask_source=panovggt_head requires PanoVGGT sky head mask."
                 )
+            if mask is None and bool(mapping_cfg.get("sky_mask_enable", False)):
+                mask = self.initializer._configured_sky_mask(
+                    image,
+                    (height, width),
+                    device=torch.device("cpu"),
+                    insertion_hints=None,
+                )
             return None if mask is None else mask.detach().cpu().bool()
 
         def remember_final_frame(out: FrontendOutput, source_frame: PanoFrame, sky_mask: torch.Tensor | None) -> None:
