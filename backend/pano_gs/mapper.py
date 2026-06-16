@@ -40,6 +40,7 @@ class MapperStats:
     last_skipped_budget: int = 0
     last_window_size: int = 0
     last_window_keyframes: list[int] = field(default_factory=list)
+    last_active_keyframes: list[int] = field(default_factory=list)
     last_window_observations: list[int] = field(default_factory=list)
     last_feedforward_current_frames: list[int] = field(default_factory=list)
     last_feedforward_history_frames: list[int] = field(default_factory=list)
@@ -2633,6 +2634,7 @@ class PanoGaussianMapper:
         current_frame_ids,
         history_frame_ids=None,
         chunk_index: int | None = None,
+        active_keyframe_ids=None,
     ) -> dict[str, float]:
         if not self.uses_joint_optimization or not self.feedforward_window_enabled:
             return {}
@@ -2659,7 +2661,15 @@ class PanoGaussianMapper:
         dtype = self.map.get_xyz.dtype
         selected_keyframe_ids = self._feedforward_keyframe_ids(window_ids)
         current_keyframe_ids = self._feedforward_keyframe_ids(current_frame_ids)
-        gaussian_scales = self._feedforward_gaussian_scales(selected_keyframe_ids)
+        if active_keyframe_ids is None:
+            active_keyframe_ids_for_update = list(selected_keyframe_ids)
+        else:
+            active_keyframe_ids_for_update = []
+            for fid in active_keyframe_ids:
+                value = int(fid)
+                if value not in active_keyframe_ids_for_update:
+                    active_keyframe_ids_for_update.append(value)
+        gaussian_scales = self._feedforward_gaussian_scales(active_keyframe_ids_for_update)
         gaussian_enabled = (
             gaussian_scales is not None
             and self.map.anchor_count() > 0
@@ -2688,11 +2698,28 @@ class PanoGaussianMapper:
             )
             self.stats.last_sky_pruned = int(sky_pruned)
             self.stats.last_sky_compacted = int(sky_compacted)
+            self.stats.last_window_size = int(len(observations))
+            self.stats.last_window_observations = [int(obs.frame_id) for obs in observations]
+            self.stats.last_window_keyframes = list(selected_keyframe_ids)
+            self.stats.last_active_keyframes = list(active_keyframe_ids_for_update)
+            self.stats.last_feedforward_current_frames = [int(fid) for fid in current_frame_ids or []]
+            hist_limit = max(0, int(cfg.get("history_keyframes", 2)))
+            self.stats.last_feedforward_history_frames = [int(fid) for fid in (history_frame_ids or [])][-hist_limit:]
+            self.stats.last_sampled_keyframes = []
+            self.stats.last_trainable_pose_count = int(len(trainable_pose_ids))
+            active_gaussian_count = (
+                int((gaussian_scales > 0).sum().detach().cpu())
+                if gaussian_scales is not None
+                else 0
+            )
             return {
                 "loss": 0.0,
                 "steps": 0.0,
                 "window_size": float(len(observations)),
                 "feedforward_window_size": float(len(observations)),
+                "feedforward_keyframe_count": float(len(selected_keyframe_ids)),
+                "active_keyframe_count": float(len(active_keyframe_ids_for_update)),
+                "active_gaussian_count": float(active_gaussian_count),
                 "sky_pruned": float(sky_pruned),
                 "sky_compacted": float(sky_compacted),
                 "profile_backend_feedforward_window_sky_pruned": float(sky_pruned),
@@ -2798,7 +2825,7 @@ class PanoGaussianMapper:
                         break
         active_mask = None
         if self.map.anchor_count() > 0:
-            active_mask = self._active_anchor_mask_for_keyframes(selected_keyframe_ids)
+            active_mask = self._active_anchor_mask_for_keyframes(active_keyframe_ids_for_update)
         prune_stats = (
             {"opacity_resets": 0, "pruned": 0}
             if self.pfgs360_replace_fuse_enabled
@@ -2819,6 +2846,12 @@ class PanoGaussianMapper:
         last["window_size"] = float(len(observations))
         last["feedforward_window_size"] = float(len(observations))
         last["feedforward_keyframe_count"] = float(len(selected_keyframe_ids))
+        last["active_keyframe_count"] = float(len(active_keyframe_ids_for_update))
+        last["active_gaussian_count"] = (
+            float(int((gaussian_scales > 0).sum().detach().cpu()))
+            if gaussian_scales is not None
+            else 0.0
+        )
         last["sampled_window_size"] = float(len(last_sampled_ids))
         last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
         last["trainable_pose_count"] = float(len(trainable_pose_ids))
@@ -2852,6 +2885,7 @@ class PanoGaussianMapper:
         self.stats.last_window_size = int(len(observations))
         self.stats.last_window_observations = [int(obs.frame_id) for obs in observations]
         self.stats.last_window_keyframes = list(selected_keyframe_ids)
+        self.stats.last_active_keyframes = list(active_keyframe_ids_for_update)
         self.stats.last_feedforward_current_frames = [int(fid) for fid in current_frame_ids or []]
         hist_limit = max(0, int(cfg.get("history_keyframes", 2)))
         self.stats.last_feedforward_history_frames = [int(fid) for fid in (history_frame_ids or [])][-hist_limit:]

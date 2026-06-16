@@ -1002,6 +1002,66 @@ def test_replace_fuse_chunk_optimizer_uses_recent_chunk_and_keyframe_window():
     assert metrics["sampled_window_size"] == 1.0
 
 
+def test_replace_fuse_chunk_optimizer_limits_gaussian_updates_to_active_keyframe_scope():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "insert_occupancy_radius_voxels": 0.0,
+                "first_keyframe_max_seeds": 10,
+                "keyframe_max_seeds": 10,
+                "global_anchor_budget": 10,
+                "compact_voxels": False,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": True,
+            "steps_per_chunk": 1,
+            "sample_frames_per_step": 3,
+            "current_chunk_observation_frames": 4,
+            "recent_keyframe_observation_frames": 0,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+            "feature_lr": 1.0e-2,
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"), renderer=_CountingRenderer())
+    for ord_idx, frame_id in enumerate((1, 2, 3)):
+        start = mapper.map.anchor_count()
+        mapper.map.add_seeds(
+            _small_seed_batch(frame_id),
+            voxel_size=0.02,
+            last_update_kf_ord=ord_idx,
+        )
+        end = mapper.map.anchor_count()
+        out = _small_frontend_output(frame_id)
+        image = torch.zeros(3, 4, 8)
+        mapper._register_keyframe(out, image, start=start, end=end)
+        mapper.register_observation(out, image, is_keyframe=True)
+    mapper.stats.n_keyframes = len(mapper.keyframes)
+
+    before = mapper.map.features.detach().clone()
+    metrics = mapper.optimize_feedforward_window(
+        current_frame_ids=[1, 2, 3],
+        history_frame_ids=[],
+        active_keyframe_ids=[2],
+    )
+    after = mapper.map.features.detach()
+
+    changed = (after - before).abs().sum(dim=1) > 0.0
+    assert changed.tolist() == [False, True, False]
+    assert mapper.stats.last_window_keyframes == [1, 2, 3]
+    assert mapper.stats.last_active_keyframes == [2]
+    assert metrics["active_keyframe_count"] == 1.0
+    assert metrics["active_gaussian_count"] == 1.0
+
+
 def test_replace_fuse_recent_update_mask_tracks_recent_four_keyframes():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

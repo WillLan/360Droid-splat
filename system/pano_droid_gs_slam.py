@@ -2144,8 +2144,9 @@ class PanoDroidGSSlamSystem:
                 else:
                     recent_feedforward_chunks.append((chunk_key, ids))
             chunk_limit = recent_chunk_observation_chunks()
-            if len(recent_feedforward_chunks) > chunk_limit:
-                del recent_feedforward_chunks[: len(recent_feedforward_chunks) - chunk_limit]
+            stored_chunk_limit = max(2, chunk_limit)
+            if len(recent_feedforward_chunks) > stored_chunk_limit:
+                del recent_feedforward_chunks[: len(recent_feedforward_chunks) - stored_chunk_limit]
             out: list[int] = []
             for _, chunk_ids in recent_feedforward_chunks[-chunk_limit:]:
                 for fid in chunk_ids:
@@ -2196,18 +2197,34 @@ class PanoDroidGSSlamSystem:
             history_ids = [int(kf.frame_id) for kf in self.mapper.keyframes[-history_limit:]] if history_limit > 0 else []
             return current_ids, history_ids
 
-        def recent_chunk_keyframe_ids_for_deletion() -> list[int]:
-            chunk_limit = recent_chunk_observation_chunks()
-            ids: list[int] = []
-            for _, chunk_ids in recent_feedforward_chunks[-max(0, chunk_limit - 1):]:
+        def recent_backend_scope_frame_ids() -> list[int]:
+            chunks: list[list[int]] = []
+            for _, chunk_ids in recent_feedforward_chunks[-2:]:
+                ids: list[int] = []
                 for fid in chunk_ids:
                     value = int(fid)
                     if value not in ids:
                         ids.append(value)
+                if ids:
+                    chunks.append(ids)
+            current_ids: list[int] = []
             for fid in current_frontend_chunk_frame_ids_full():
                 value = int(fid)
-                if value not in ids:
-                    ids.append(value)
+                if value not in current_ids:
+                    current_ids.append(value)
+            if current_ids and current_ids not in chunks:
+                chunks.append(current_ids)
+            chunks = chunks[-2:]
+            out: list[int] = []
+            for chunk_ids in chunks:
+                for fid in chunk_ids:
+                    value = int(fid)
+                    if value not in out:
+                        out.append(value)
+            return out
+
+        def recent_chunk_keyframe_ids_for_backend_scope() -> list[int]:
+            ids = recent_backend_scope_frame_ids()
             registered = {int(kf.frame_id) for kf in self.mapper.keyframes}
             return [int(fid) for fid in ids if int(fid) in registered]
 
@@ -2254,6 +2271,7 @@ class PanoDroidGSSlamSystem:
             output_ids = [int(out.frame_id) for out in outputs]
             current_ids, history_ids = feedforward_debug_window(output_ids)
             current_ids = remember_recent_feedforward_chunk(current_ids)
+            active_keyframe_ids = recent_chunk_keyframe_ids_for_backend_scope()
             section_start = time.perf_counter()
             registered_count = register_cached_feedforward_observations(current_ids, history_ids)
             register_sec = float(time.perf_counter() - section_start)
@@ -2262,6 +2280,7 @@ class PanoDroidGSSlamSystem:
                 current_frame_ids=current_ids,
                 history_frame_ids=history_ids,
                 chunk_index=chunk_index,
+                active_keyframe_ids=active_keyframe_ids,
             )
             optimize_sec = float(time.perf_counter() - section_start)
             if not metrics:
@@ -2302,6 +2321,7 @@ class PanoDroidGSSlamSystem:
                 "backend_feedforward_window",
                 current_frame_count=float(len(current_ids)),
                 history_frame_count=float(len(history_ids)),
+                active_scope_keyframe_count=float(len(active_keyframe_ids)),
                 registered_cached_observations=float(registered_count),
                 register_sec=register_sec,
                 optimize_sec=optimize_sec,
@@ -2402,7 +2422,7 @@ class PanoDroidGSSlamSystem:
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
                 output_profile["first_chunk_multiframe_init"] = int(first_chunk_multiframe_used)
                 output_profile["seed_candidates"] = int(len(seeds))
-                replace_delete_keyframe_ids = recent_chunk_keyframe_ids_for_deletion()
+                replace_delete_keyframe_ids = recent_chunk_keyframe_ids_for_backend_scope()
                 output_profile["replace_delete_scope_keyframes"] = int(len(replace_delete_keyframe_ids))
                 section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization or neural_anchor_mode:
@@ -2976,6 +2996,7 @@ class PanoDroidGSSlamSystem:
                 "backend_pose_delta_norm": self.mapper.stats.last_pose_delta_norm,
                 "backend_last_window_size": self.mapper.stats.last_window_size,
                 "backend_last_window_keyframes": self.mapper.stats.last_window_keyframes,
+                "backend_last_active_keyframes": self.mapper.stats.last_active_keyframes,
                 "backend_last_window_observations": self.mapper.stats.last_window_observations,
                 "backend_last_feedforward_current_frames": self.mapper.stats.last_feedforward_current_frames,
                 "backend_last_feedforward_history_frames": self.mapper.stats.last_feedforward_history_frames,
