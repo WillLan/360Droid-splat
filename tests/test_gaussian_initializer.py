@@ -574,7 +574,7 @@ def test_pfgs360_mapper_hash_hits_near_hits_and_suppressed_misses():
     assert int(mapper.map._anchor_obs_count[0]) == before_obs + 2
 
 
-def test_replace_fuse_refreshes_voxel_from_current_xyz_before_fusing():
+def test_replace_fuse_refreshes_voxel_from_current_xyz_before_occupancy_reject():
     config = {
         "Mapping": {
             "NovelGaussianInsertion": {
@@ -599,14 +599,14 @@ def test_replace_fuse_refreshes_voxel_from_current_xyz_before_fusing():
     assert inserted == 0
     assert mapper.map.anchor_count() == 1
     assert mapper.stats.last_hash_hits == 1
-    assert mapper.stats.last_replace_fused == 1
-    assert mapper.stats.last_replace_fused_existing == 1
+    assert mapper.stats.last_replace_fused == 0
+    assert mapper.stats.last_replace_fused_existing == 0
     assert mapper.stats.last_replace_newly_inserted == 0
-    assert int(mapper.map._anchor_last_update_kf_ord[0]) == 1
+    assert int(mapper.map._anchor_last_update_kf_ord[0]) == 0
     assert torch.equal(mapper.map._anchor_grid_coord[0], torch.tensor([1, 0, 0], dtype=torch.int32))
 
 
-def test_replace_fuse_hash_insert_fuses_new_candidates_in_same_voxel():
+def test_replace_fuse_hash_insert_rejects_new_candidates_in_occupancy_radius():
     config = {
         "Mapping": {
             "NovelGaussianInsertion": {
@@ -621,7 +621,7 @@ def test_replace_fuse_hash_insert_fuses_new_candidates_in_same_voxel():
     }
     mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
     seeds = _pfgs_seed_batch(
-        torch.tensor([[0.005, 0.0, 0.0], [0.006, 0.0, 0.0], [0.045, 0.0, 0.0]]),
+        torch.tensor([[0.005, 0.0, 0.0], [0.006, 0.0, 0.0], [0.085, 0.0, 0.0]]),
         frame_id=0,
         source_flat_idx=torch.tensor([1, 2, 3], dtype=torch.long),
         source_hw=(1, 4),
@@ -633,7 +633,7 @@ def test_replace_fuse_hash_insert_fuses_new_candidates_in_same_voxel():
     assert mapper.map.anchor_count() == 2
     assert mapper.stats.last_dense_seed_candidates == 3
     assert mapper.stats.last_insert_mask_seed_candidates == 3
-    assert mapper.stats.last_voxel_seed_candidates == 2
+    assert mapper.stats.last_voxel_seed_candidates == 3
     assert mapper.stats.last_replace_fused_new_duplicate == 1
     assert mapper.stats.last_replace_newly_inserted == 2
     assert all(len(rows) == 1 for rows in mapper._build_replace_fuse_voxel_index().values())
@@ -658,8 +658,8 @@ def test_replace_fuse_first_keyframe_ignores_missing_seed_budget():
         torch.tensor(
             [
                 [0.005, 0.0, 0.0],
-                [0.045, 0.0, 0.0],
-                [0.085, 0.0, 0.0],
+                [0.055, 0.0, 0.0],
+                [0.105, 0.0, 0.0],
             ]
         ),
         frame_id=0,
@@ -683,17 +683,55 @@ def test_replace_fuse_compacts_duplicate_anchors_after_voxel_refresh():
                 "keyframe_max_seeds": 10,
                 "global_anchor_budget": 10,
             }
-        }
+        },
+        "BackendOptimization": {"sh_degree": 2},
     }
     mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
-    seeds = _pfgs_seed_batch(torch.tensor([[0.005, 0.0, 0.0], [0.045, 0.0, 0.0]]), frame_id=0)
+    seeds = _pfgs_seed_batch(torch.tensor([[0.005, 0.0, 0.0], [0.055, 0.0, 0.0]]), frame_id=0)
     assert mapper.insert_keyframe(seeds, _frontend_output_for_mapper(0)) == 2
     with torch.no_grad():
-        mapper.map.xyz.data[1] = torch.tensor([0.006, 0.0, 0.0])
+        mapper.map.xyz.data[0] = torch.tensor([0.004, 0.0, 0.0])
+        mapper.map.xyz.data[1] = torch.tensor([0.016, 0.0, 0.0])
+        mapper.map.features.data[:] = mapper.map._inv_sigmoid(
+            torch.tensor([[0.2, 0.4, 0.6], [0.6, 0.8, 0.2]], dtype=mapper.map.features.dtype)
+        )
+        mapper.map.opacity_logit.data[:] = mapper.map._inv_sigmoid(
+            torch.tensor([[0.25], [0.75]], dtype=mapper.map.opacity_logit.dtype)
+        )
+        scales = torch.tensor([[0.02, 0.04, 0.06], [0.06, 0.08, 0.10]], dtype=mapper.map.scaling.dtype)
+        mapper.map.scaling.data[:] = torch.log(torch.expm1(scales))
+        mapper.map.rotation.data[:] = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]],
+            dtype=mapper.map.rotation.dtype,
+        )
+        mapper.map.sh_rest.data[0].fill_(1.0)
+        mapper.map.sh_rest.data[1].fill_(3.0)
+        mapper.map._anchor_obs_count[:] = torch.tensor([2, 3], dtype=torch.int32)
+        mapper.map._anchor_conf_accum[:] = torch.tensor([0.7, 0.2], dtype=torch.float32)
+        mapper.map._anchor_last_seen_kf[:] = torch.tensor([5, 7], dtype=torch.int32)
+        mapper.map._anchor_last_update_kf_ord[:] = torch.tensor([1, 3], dtype=torch.int32)
+        mapper.map._anchor_birth_frame[:] = torch.tensor([10, 8], dtype=torch.int32)
+        mapper.map._anchor_inlier_obs[:] = torch.tensor([4, 6], dtype=torch.int32)
+        mapper.map._anchor_outlier_obs[:] = torch.tensor([1, 2], dtype=torch.int32)
+        mapper.map._anchor_voxel_size[:] = torch.tensor([0.04, 0.06], dtype=torch.float32)
 
     compacted = mapper._refresh_pfgs360_voxel_cache(compact=True)
 
     assert compacted == 1
     assert mapper.map.anchor_count() == 1
+    assert torch.allclose(mapper.map.get_xyz[0], torch.tensor([0.010, 0.0, 0.0]), atol=1.0e-6)
+    assert torch.allclose(mapper.map.get_features[0], torch.tensor([0.4, 0.6, 0.4]), atol=1.0e-6)
+    assert torch.allclose(mapper.map.get_opacity[0], torch.tensor([0.5]), atol=1.0e-6)
+    assert torch.allclose(mapper.map.get_scaling[0], torch.tensor([0.04, 0.06, 0.08]), atol=3.0e-5)
+    assert torch.allclose(mapper.map.get_rotation[0].abs(), torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1.0e-6)
+    assert torch.allclose(mapper.map.sh_rest[0], torch.full_like(mapper.map.sh_rest[0], 2.0), atol=1.0e-6)
+    assert int(mapper.map._anchor_obs_count[0]) == 5
+    assert torch.allclose(mapper.map._anchor_conf_accum[0], torch.tensor(0.9), atol=1.0e-6)
+    assert int(mapper.map._anchor_last_seen_kf[0]) == 7
+    assert int(mapper.map._anchor_last_update_kf_ord[0]) == 3
+    assert int(mapper.map._anchor_birth_frame[0]) == 8
+    assert int(mapper.map._anchor_inlier_obs[0]) == 10
+    assert int(mapper.map._anchor_outlier_obs[0]) == 3
+    assert torch.allclose(mapper.map._anchor_voxel_size[0], torch.tensor(0.05), atol=1.0e-6)
     index = mapper._build_replace_fuse_voxel_index()
     assert all(len(rows) == 1 for rows in index.values())

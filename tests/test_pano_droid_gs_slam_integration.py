@@ -455,6 +455,7 @@ def test_replace_fuse_deletes_foreground_and_near_back_depth_anchors():
                 "enabled": True,
                 "strategy": "pfgs360_replace_fuse",
                 "voxel_size": 0.02,
+                "insert_occupancy_radius_voxels": 0.0,
                 "first_keyframe_max_seeds": 10,
                 "keyframe_max_seeds": 10,
                 "global_anchor_budget": 10,
@@ -493,7 +494,7 @@ def test_replace_fuse_deletes_foreground_and_near_back_depth_anchors():
 
     assert deleted == 2
     xyz = mapper.map.get_xyz.detach().cpu()
-    assert torch.allclose(xyz[:, 0], torch.tensor([1.05, 1.20]), atol=1.0e-6)
+    assert torch.allclose(torch.sort(xyz[:, 0]).values, torch.tensor([1.05, 1.20]), atol=1.0e-6)
 
 
 def test_replace_fuse_non_first_inserts_from_pred_depth_mask_without_initializer_seeds():

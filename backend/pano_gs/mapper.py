@@ -634,6 +634,10 @@ class PanoGaussianMapper:
         self.replace_fuse_max_delete_per_keyframe = max(0, int(novel_cfg.get("max_replace_delete_per_keyframe", 30000)))
         self.replace_fuse_compact_voxels = bool(novel_cfg.get("compact_voxels", True))
         self.replace_fuse_sky_prune_enabled = bool(novel_cfg.get("sky_prune_enabled", True))
+        self.replace_fuse_insert_occupancy_radius_voxels = max(
+            0.0,
+            float(novel_cfg.get("insert_occupancy_radius_voxels", 2.0)),
+        )
         self.pfgs360_render_alpha_min = float(novel_cfg.get("render_alpha_min", 0.20))
         self.pfgs360_missing_alpha_min = float(novel_cfg.get("missing_alpha_min", self.pfgs360_render_alpha_min))
         self.pfgs360_render_depth_rel_threshold = float(novel_cfg.get("render_depth_rel_threshold", 0.10))
@@ -1165,9 +1169,6 @@ class PanoGaussianMapper:
             "anchors_before": int(self.map.anchor_count()),
             "anchors_after": int(self.map.anchor_count()),
         }
-        current_kf_ord = int(self.stats.n_keyframes)
-        if self.map.anchor_count() > 0:
-            stats["compacted"] += self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
         insert_enabled = (
             torch.ones(len(seeds), dtype=torch.bool)
             if seeds.insert_enabled is None
@@ -1212,115 +1213,69 @@ class PanoGaussianMapper:
         if not bool(insert_enabled.any()):
             return self._empty_seed_like(seeds), stats
 
-        score = seeds.insert_score if seeds.insert_score is not None else seeds.confidence
-        score_cpu = score.detach().cpu().float()
-        conf_cpu = seeds.confidence.detach().cpu().float()
         xyz_cpu = seeds.xyz.detach().cpu().float()
-        rgb_cpu = seeds.rgb.detach().cpu().float()
-        scale_cpu = seeds.scale.detach().cpu().float()
-        level_cpu = seeds.level.detach().cpu()
-        grid_cpu = torch.floor(xyz_cpu / float(self.pfgs360_voxel_size)).to(torch.int32)
         active_rows = torch.nonzero(insert_enabled, as_tuple=False).flatten()
-        active_grid = grid_cpu.index_select(0, active_rows)
-        unique_grid, inverse = torch.unique(active_grid, dim=0, return_inverse=True)
-        n_voxels = int(unique_grid.shape[0])
-        stats["voxel_seed_candidates"] = n_voxels
-        stats["fused_new_duplicate"] = int(max(0, int(active_rows.numel()) - n_voxels))
-        stats["fused"] += int(stats["fused_new_duplicate"])
-        if n_voxels <= 0:
+        if active_rows.numel() == 0:
             return self._empty_seed_like(seeds), stats
+        stats["voxel_seed_candidates"] = int(active_rows.numel())
+        active_depth_seed = depth_seed_mask.index_select(0, active_rows).bool()
+        stats["depth_mismatch_seed_candidates"] = int(active_depth_seed.sum().item())
+        stats["missing_seed_candidates"] = int((~active_depth_seed).sum().item())
 
-        weights = conf_cpu.index_select(0, active_rows).clamp_min(1.0e-4)
-        sum_w = torch.zeros(n_voxels, dtype=torch.float32)
-        sum_w.index_add_(0, inverse, weights)
-        xyz_sum = torch.zeros(n_voxels, 3, dtype=torch.float32)
-        rgb_sum = torch.zeros(n_voxels, 3, dtype=torch.float32)
-        xyz_sum.index_add_(0, inverse, xyz_cpu.index_select(0, active_rows) * weights.unsqueeze(-1))
-        rgb_sum.index_add_(0, inverse, rgb_cpu.index_select(0, active_rows) * weights.unsqueeze(-1))
-        voxel_xyz = xyz_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
-        voxel_rgb = rgb_sum / sum_w.clamp_min(1.0e-8).unsqueeze(-1)
-
-        count = torch.zeros(n_voxels, dtype=torch.float32)
-        count.index_add_(0, inverse, torch.ones_like(weights))
-        conf_sum = torch.zeros(n_voxels, dtype=torch.float32)
-        conf_sum.index_add_(0, inverse, conf_cpu.index_select(0, active_rows))
-        voxel_conf = (conf_sum / count.clamp_min(1.0)).clamp(0.0, 1.0)
-
-        score_active = score_cpu.index_select(0, active_rows)
-        best_score = torch.full((n_voxels,), -float("inf"), dtype=torch.float32)
-        best_score.scatter_reduce_(0, inverse, score_active, reduce="amax", include_self=True)
-        active_pos = torch.arange(active_rows.numel(), dtype=torch.long)
-        is_best = score_active >= best_score.index_select(0, inverse)
-        sentinel = torch.full_like(active_pos, int(active_rows.numel()))
-        pos_candidates = torch.where(is_best, active_pos, sentinel)
-        best_pos = torch.full((n_voxels,), int(active_rows.numel()), dtype=torch.long)
-        best_pos.scatter_reduce_(0, inverse, pos_candidates, reduce="amin", include_self=True)
-        best_rows = active_rows.index_select(0, best_pos.clamp_max(max(0, int(active_rows.numel()) - 1)))
-
-        voxel_score = best_score.clamp_min(0.0)
-        voxel_level = level_cpu.index_select(0, best_rows).to(torch.int8)
-        if hasattr(torch.Tensor, "scatter_reduce_"):
-            voxel_scale = torch.full((n_voxels,), float("inf"), dtype=torch.float32)
-            voxel_scale.scatter_reduce_(0, inverse, scale_cpu.index_select(0, active_rows), reduce="amin", include_self=True)
-            voxel_scale = voxel_scale.clamp_min(1.0e-8)
-        else:
-            voxel_scale = scale_cpu.index_select(0, best_rows).clone()
-            for idx in range(n_voxels):
-                rows = active_rows.index_select(0, torch.nonzero(inverse == idx, as_tuple=False).flatten())
-                voxel_scale[idx] = scale_cpu.index_select(0, rows).min()
-        depth_counts = torch.zeros(n_voxels, dtype=torch.int32)
-        depth_counts.index_add_(0, inverse, depth_seed_mask.index_select(0, active_rows).to(torch.int32))
-        voxel_depth_seed = depth_counts > 0
-        stats["depth_mismatch_seed_candidates"] = int(voxel_depth_seed.sum().item())
-        stats["missing_seed_candidates"] = int((~voxel_depth_seed).sum().item())
-
-        source_flat_idx = None
-        if seeds.source_flat_idx is not None:
-            source_flat_idx = seeds.source_flat_idx.detach().cpu().long().index_select(0, best_rows)
-        voxel_seeds = GaussianSeedBatch(
-            xyz=voxel_xyz.to(device=seeds.xyz.device, dtype=seeds.xyz.dtype),
-            rgb=voxel_rgb.to(device=seeds.rgb.device, dtype=seeds.rgb.dtype),
-            confidence=voxel_conf.to(device=seeds.confidence.device, dtype=seeds.confidence.dtype),
-            scale=voxel_scale.to(device=seeds.scale.device, dtype=seeds.scale.dtype),
-            level=voxel_level.to(device=seeds.level.device),
-            frame_id=int(seeds.frame_id),
-            source_flat_idx=None if source_flat_idx is None else source_flat_idx.to(device=seeds.xyz.device),
-            source_hw=seeds.source_hw,
-            insert_enabled=torch.ones(n_voxels, dtype=torch.bool, device=seeds.xyz.device),
-            insert_score=voxel_score.to(device=seeds.xyz.device, dtype=seeds.xyz.dtype),
-            grid_coord=unique_grid.to(device=seeds.xyz.device, dtype=torch.int32),
-        )
-        order = torch.argsort(voxel_score, descending=True)
-        occupied = self._build_replace_fuse_voxel_index()
         anchor_xyz_cpu = self.map.get_xyz.detach().cpu().float() if self.map.anchor_count() > 0 else torch.zeros(0, 3)
+        anchor_levels_cpu = (
+            self.map._anchor_level[: self.map.anchor_count()].detach().cpu().to(torch.int8)
+            if self.map.anchor_count() > 0
+            else torch.zeros(0, dtype=torch.int8)
+        )
+        old_index = self._build_replace_fuse_radius_index(anchor_xyz_cpu, anchor_levels_cpu)
+        new_index: dict[tuple[int, int, int, int], list[int]] = {}
+        accepted_xyz: list[torch.Tensor] = []
         kept: list[int] = []
         kept_depth_mismatch = 0
         kept_insert_only = 0
         depth_budget = int(self.max_depth_mismatch_seeds_per_keyframe)
         insert_only_budget = 0 if first_keyframe else int(self.max_missing_seeds_per_keyframe)
+        if budget <= 0:
+            stats["skipped_budget"] = int(active_rows.numel())
+            return self._empty_seed_like(seeds), stats
+        generator = torch.Generator()
+        generator.manual_seed(int(seeds.frame_id) & 0x7FFFFFFF)
+        order = active_rows.index_select(0, torch.randperm(int(active_rows.numel()), generator=generator))
+        radius = float(self.replace_fuse_insert_occupancy_radius_voxels) * float(self.pfgs360_voxel_size)
+        radius_cells = max(0, int(math.ceil(float(self.replace_fuse_insert_occupancy_radius_voxels))))
+        seed_levels_cpu = (
+            seeds.level.detach().cpu().to(torch.int32)
+            if seeds.level is not None and int(seeds.level.numel()) == len(seeds)
+            else torch.zeros(len(seeds), dtype=torch.int32)
+        )
         for seed_idx in order.tolist():
-            key = (
-                0,
-                int(unique_grid[seed_idx, 0]),
-                int(unique_grid[seed_idx, 1]),
-                int(unique_grid[seed_idx, 2]),
-            )
-            hits = occupied.get(key, [])
-            valid_hits = [int(hit) for hit in hits if int(hit) >= 0]
-            if valid_hits:
-                hit = self._select_replace_fuse_hit(valid_hits, voxel_xyz[seed_idx], anchor_xyz_cpu)
-                self._fuse_seed_into_anchor(hit, voxel_seeds, int(seed_idx), current_kf_ord=current_kf_ord)
+            seed_level = int(seed_levels_cpu[int(seed_idx)])
+            candidate_xyz = xyz_cpu[int(seed_idx)]
+            if self._replace_fuse_radius_hit(
+                old_index,
+                anchor_xyz_cpu,
+                candidate_xyz,
+                level=seed_level,
+                radius=radius,
+                radius_cells=radius_cells,
+            ) is not None:
                 stats["hash_hits"] += 1
                 stats["skipped_voxel"] += 1
-                stats["fused"] += 1
-                stats["fused_existing"] += 1
-                if int(hit) < int(anchor_xyz_cpu.shape[0]):
-                    anchor_xyz_cpu[hit] = self.map.get_xyz.detach().cpu().float()[hit]
                 continue
-            if hits:
+            if self._replace_fuse_radius_hit(
+                new_index,
+                accepted_xyz,
+                candidate_xyz,
+                level=seed_level,
+                radius=radius,
+                radius_cells=radius_cells,
+            ) is not None:
                 stats["skipped_voxel"] += 1
+                stats["fused"] += 1
+                stats["fused_new_duplicate"] += 1
                 continue
-            is_delete_band_seed = bool(voxel_depth_seed[seed_idx])
+            is_delete_band_seed = bool(depth_seed_mask[int(seed_idx)])
             if is_delete_band_seed and depth_budget > 0 and kept_depth_mismatch >= depth_budget:
                 stats["skipped_depth_mismatch_budget"] += 1
                 stats["skipped_budget"] += 1
@@ -1332,17 +1287,20 @@ class PanoGaussianMapper:
             if len(kept) >= budget:
                 stats["skipped_budget"] += 1
                 continue
-            kept.append(int(seed_idx))
+            seed_idx = int(seed_idx)
+            kept.append(seed_idx)
             if is_delete_band_seed:
                 kept_depth_mismatch += 1
             else:
                 kept_insert_only += 1
-            occupied[key] = [-1]
+            key = self._replace_fuse_spatial_key(candidate_xyz, level=seed_level)
+            new_index.setdefault(key, []).append(len(accepted_xyz))
+            accepted_xyz.append(candidate_xyz)
         if not kept:
             return self._empty_seed_like(seeds), stats
         stats["newly_inserted"] = int(len(kept))
-        keep_idx = torch.tensor(kept, dtype=torch.long, device=voxel_seeds.xyz.device)
-        return self._subset_seeds(voxel_seeds, keep_idx), stats
+        keep_idx = torch.tensor(kept, dtype=torch.long, device=seeds.xyz.device)
+        return self._subset_seeds(seeds, keep_idx), stats
 
     def _with_pfgs360_seed_metadata(self, seeds: GaussianSeedBatch) -> GaussianSeedBatch:
         n = len(seeds)
@@ -1567,6 +1525,65 @@ class PanoGaussianMapper:
         if tuple(valid.shape[-2:]) != (H, W):
             valid = F.interpolate(valid.float().unsqueeze(0), size=(H, W), mode="nearest")[0] > 0.5
         return valid.to(device=device, dtype=torch.bool)
+
+    def _replace_fuse_spatial_key(
+        self,
+        xyz_cpu: torch.Tensor,
+        *,
+        level: int = 0,
+    ) -> tuple[int, int, int, int]:
+        coord = torch.floor(xyz_cpu.detach().cpu().float() / float(self.pfgs360_voxel_size)).to(torch.int32)
+        return (int(level), int(coord[0]), int(coord[1]), int(coord[2]))
+
+    def _build_replace_fuse_radius_index(
+        self,
+        xyz_cpu: torch.Tensor,
+        levels_cpu: torch.Tensor | None = None,
+    ) -> dict[tuple[int, int, int, int], list[int]]:
+        index: dict[tuple[int, int, int, int], list[int]] = {}
+        if xyz_cpu.numel() == 0:
+            return index
+        xyz_cpu = xyz_cpu.detach().cpu().float()
+        levels = (
+            levels_cpu.detach().cpu().to(torch.int32).view(-1)
+            if torch.is_tensor(levels_cpu) and int(levels_cpu.numel()) == int(xyz_cpu.shape[0])
+            else torch.zeros(int(xyz_cpu.shape[0]), dtype=torch.int32)
+        )
+        coords = torch.floor(xyz_cpu / float(self.pfgs360_voxel_size)).to(torch.int32)
+        for idx in range(int(xyz_cpu.shape[0])):
+            key = (int(levels[idx]), int(coords[idx, 0]), int(coords[idx, 1]), int(coords[idx, 2]))
+            index.setdefault(key, []).append(int(idx))
+        return index
+
+    def _replace_fuse_radius_hit(
+        self,
+        index: dict[tuple[int, int, int, int], list[int]],
+        points,
+        candidate_xyz: torch.Tensor,
+        *,
+        level: int,
+        radius: float,
+        radius_cells: int,
+    ) -> int | None:
+        if radius <= 0.0 or not index:
+            return None
+        candidate = candidate_xyz.detach().cpu().float()
+        _, cx, cy, cz = self._replace_fuse_spatial_key(candidate, level=int(level))
+        radius_sq = float(radius) * float(radius)
+        best_idx: int | None = None
+        best_dist = float("inf")
+        for dx in range(-radius_cells, radius_cells + 1):
+            for dy in range(-radius_cells, radius_cells + 1):
+                for dz in range(-radius_cells, radius_cells + 1):
+                    rows = index.get((int(level), cx + dx, cy + dy, cz + dz), [])
+                    for row in rows:
+                        point = points[int(row)] if isinstance(points, list) else points[int(row)]
+                        diff = point.detach().cpu().float() - candidate
+                        dist_sq = float(torch.dot(diff, diff).item())
+                        if dist_sq <= radius_sq + 1.0e-12 and dist_sq < best_dist:
+                            best_dist = dist_sq
+                            best_idx = int(row)
+        return best_idx
 
     def _find_pfgs360_hash_hit(
         self,
@@ -1794,10 +1811,10 @@ class PanoGaussianMapper:
                 continue
             rows_t = torch.tensor(rows, dtype=torch.long)
             keeper = int(rows_t[torch.argmax(score.index_select(0, rows_t))])
+            self._merge_anchor_group_into_anchor(keeper, [int(row) for row in rows])
             for row in rows:
                 if int(row) == keeper:
                     continue
-                self._merge_anchor_into_anchor(keeper, int(row))
                 duplicate_rows.append(int(row))
         if not duplicate_rows:
             return 0
@@ -1820,88 +1837,49 @@ class PanoGaussianMapper:
             occupied.setdefault(key, []).append(int(idx))
         return occupied
 
-    @staticmethod
-    def _select_replace_fuse_hit(
-        hits: list[int],
-        seed_xyz: torch.Tensor,
-        anchor_xyz_cpu: torch.Tensor,
-    ) -> int:
-        if len(hits) == 1:
-            return int(hits[0])
-        rows = torch.tensor(hits, dtype=torch.long)
-        dist = torch.linalg.norm(anchor_xyz_cpu.index_select(0, rows) - seed_xyz.view(1, 3), dim=-1)
-        return int(rows[torch.argmin(dist)])
-
-    def _fuse_seed_into_anchor(
-        self,
-        anchor_idx: int,
-        seeds: GaussianSeedBatch,
-        seed_idx: int,
-        *,
-        current_kf_ord: int,
-    ) -> None:
-        if int(anchor_idx) < 0 or int(anchor_idx) >= self.map.anchor_count():
+    def _merge_anchor_group_into_anchor(self, keeper: int, rows: list[int]) -> None:
+        n = self.map.anchor_count()
+        unique_rows = sorted({int(row) for row in rows if 0 <= int(row) < n})
+        if int(keeper) not in unique_rows:
+            return
+        if len(unique_rows) <= 1:
             return
         device = self.map.get_xyz.device
-        dtype = self.map.get_xyz.dtype
-        idx = int(anchor_idx)
-        seed_xyz = seeds.xyz[int(seed_idx)].detach().to(device=device, dtype=dtype)
-        seed_rgb = seeds.rgb[int(seed_idx)].detach().to(device=device, dtype=dtype).clamp(0.0, 1.0)
-        seed_conf = float(seeds.confidence[int(seed_idx)].detach().cpu().clamp(1.0e-4, 1.0))
-        seed_scale = seeds.scale[int(seed_idx)].detach().to(device=device, dtype=dtype).clamp_min(1.0e-5)
-        old_w = float(self.map._anchor_conf_accum[idx]) if idx < int(self.map._anchor_conf_accum.shape[0]) else 1.0
-        new_w = max(seed_conf, 1.0e-4)
-        denom = max(old_w + new_w, 1.0e-6)
+        rows_t = torch.tensor(unique_rows, dtype=torch.long, device=device)
+        rows_cpu = torch.tensor(unique_rows, dtype=torch.long)
         with torch.no_grad():
-            self.map.xyz.data[idx] = (self.map.xyz.data[idx] * old_w + seed_xyz * new_w) / denom
-            old_rgb = self.map.get_features.detach()[idx]
-            fused_rgb = (old_rgb * old_w + seed_rgb * new_w) / denom
-            self.map.features.data[idx] = self.map._inv_sigmoid(fused_rgb.view(1, 3)).view(3)
-            old_opacity = self.map.get_opacity.detach()[idx, 0]
-            fused_opacity = torch.maximum(old_opacity, seed_conf * old_opacity.new_tensor(1.0))
-            self.map.opacity_logit.data[idx, 0] = self.map._inv_sigmoid(fused_opacity.view(1, 1)).view(())
-            old_scale = self.map.get_scaling.detach()[idx]
-            fused_scale = torch.minimum(old_scale, seed_scale.expand_as(old_scale))
-            self.map.scaling.data[idx] = torch.log(torch.expm1(fused_scale.clamp_min(1.0e-5)))
-        self._accumulate_existing_observation(idx, seed_conf, frame_id=int(seeds.frame_id))
-        if idx < int(self.map._anchor_last_update_kf_ord.shape[0]):
-            self.map._anchor_last_update_kf_ord[idx] = int(current_kf_ord)
-        if idx < int(self.map._anchor_voxel_size.shape[0]):
-            self.map._anchor_voxel_size[idx] = float(seed_scale.detach().cpu())
-
-    def _merge_anchor_into_anchor(self, keeper: int, other: int) -> None:
-        if keeper == other or keeper < 0 or other < 0:
-            return
-        if keeper >= self.map.anchor_count() or other >= self.map.anchor_count():
-            return
-        device = self.map.get_xyz.device
-        with torch.no_grad():
-            keep_w = float(self.map._anchor_conf_accum[keeper].clamp_min(1.0e-4))
-            other_w = float(self.map._anchor_conf_accum[other].clamp_min(1.0e-4))
-            denom = max(keep_w + other_w, 1.0e-6)
-            self.map.xyz.data[keeper] = (self.map.xyz.data[keeper] * keep_w + self.map.xyz.data[other] * other_w) / denom
-            rgb = (self.map.get_features.detach()[keeper] * keep_w + self.map.get_features.detach()[other] * other_w) / denom
+            self.map.xyz.data[keeper] = self.map.xyz.data.index_select(0, rows_t).mean(dim=0)
+            rgb = self.map.get_features.detach().index_select(0, rows_t).mean(dim=0).clamp(0.0, 1.0)
             self.map.features.data[keeper] = self.map._inv_sigmoid(rgb.view(1, 3)).view(3)
-            opacity = torch.maximum(self.map.get_opacity.detach()[keeper], self.map.get_opacity.detach()[other])
+            opacity = self.map.get_opacity.detach().index_select(0, rows_t).mean(dim=0).clamp(0.0, 1.0)
             self.map.opacity_logit.data[keeper] = self.map._inv_sigmoid(opacity.view(1, 1)).view(1)
-            scale = torch.minimum(self.map.get_scaling.detach()[keeper], self.map.get_scaling.detach()[other])
+            scale = self.map.get_scaling.detach().index_select(0, rows_t).mean(dim=0)
             self.map.scaling.data[keeper] = torch.log(torch.expm1(scale.clamp_min(1.0e-5)))
-        self.map._anchor_obs_count[keeper] += self.map._anchor_obs_count[other]
-        self.map._anchor_conf_accum[keeper] += self.map._anchor_conf_accum[other]
-        self.map._anchor_last_seen_kf[keeper] = max(
-            int(self.map._anchor_last_seen_kf[keeper]),
-            int(self.map._anchor_last_seen_kf[other]),
-        )
-        if self.map._anchor_last_update_kf_ord.shape[0] > max(keeper, other):
-            self.map._anchor_last_update_kf_ord[keeper] = max(
-                int(self.map._anchor_last_update_kf_ord[keeper]),
-                int(self.map._anchor_last_update_kf_ord[other]),
-            )
-        if self.map._anchor_voxel_size.shape[0] > max(keeper, other):
-            self.map._anchor_voxel_size[keeper] = min(
-                float(self.map._anchor_voxel_size[keeper]),
-                float(self.map._anchor_voxel_size[other]),
-            )
+            rotations = self.map.get_rotation.detach().index_select(0, rows_t)
+            ref_pos = unique_rows.index(int(keeper))
+            ref = rotations[ref_pos]
+            if torch.linalg.norm(ref) <= 1.0e-8:
+                ref = torch.zeros(4, device=device, dtype=rotations.dtype)
+                ref[0] = 1.0
+            dots = (rotations * ref.view(1, 4)).sum(dim=-1, keepdim=True)
+            aligned = torch.where(dots < 0.0, -rotations, rotations)
+            quat = aligned.sum(dim=0)
+            quat_norm = torch.linalg.norm(quat)
+            if quat_norm <= 1.0e-8:
+                quat = ref
+            else:
+                quat = quat / quat_norm
+            self.map.rotation.data[keeper] = quat
+            if int(self.map.sh_rest.shape[1]) > 0:
+                self.map.sh_rest.data[keeper] = self.map.sh_rest.data.index_select(0, rows_t).mean(dim=0)
+        self.map._anchor_obs_count[keeper] = self.map._anchor_obs_count.index_select(0, rows_cpu).sum()
+        self.map._anchor_conf_accum[keeper] = self.map._anchor_conf_accum.index_select(0, rows_cpu).sum()
+        self.map._anchor_last_seen_kf[keeper] = self.map._anchor_last_seen_kf.index_select(0, rows_cpu).max()
+        self.map._anchor_last_update_kf_ord[keeper] = self.map._anchor_last_update_kf_ord.index_select(0, rows_cpu).max()
+        self.map._anchor_birth_frame[keeper] = self.map._anchor_birth_frame.index_select(0, rows_cpu).min()
+        self.map._anchor_inlier_obs[keeper] = self.map._anchor_inlier_obs.index_select(0, rows_cpu).sum()
+        self.map._anchor_outlier_obs[keeper] = self.map._anchor_outlier_obs.index_select(0, rows_cpu).sum()
+        self.map._anchor_voxel_size[keeper] = self.map._anchor_voxel_size.index_select(0, rows_cpu).mean()
 
     def _pfgs360_render_bad_mask(
         self,
@@ -3492,12 +3470,18 @@ class PanoGaussianMapper:
             return {}
         max_kfs = int(self.optim_cfg.get("final_global_max_keyframes", 0))
         selected = self.keyframes if max_kfs <= 0 else self.keyframes[-max(1, max_kfs) :]
-        return self._optimize_keyframe_set(
+        metrics = self._optimize_keyframe_set(
             selected,
             steps=steps,
             phase="final_global",
             gaussian_scales=self._gaussian_scales_for_phase("final_global", selected),
         )
+        if self.pfgs360_replace_fuse_enabled:
+            compacted = self._refresh_pfgs360_voxel_cache(compact=self.replace_fuse_compact_voxels)
+            metrics["final_global_compacted"] = float(compacted)
+            metrics["profile_backend_final_global_compacted"] = float(compacted)
+            self.stats.last_replace_compacted = int(compacted)
+        return metrics
 
     def _gaussian_scales_for_phase(self, phase: str, selected: list[MapperKeyframe]) -> torch.Tensor | None:
         if not bool(self.optim_cfg.get("gaussian_refine_enable", True)):
