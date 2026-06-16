@@ -1885,7 +1885,7 @@ class PanoDroidGSSlamSystem:
                 return None
             height, width = int(source_frame.image.shape[-2]), int(source_frame.image.shape[-1])
             if fid == int(template.frame_id) and template.world_points is not None:
-                points = template.world_points.detach().float()
+                points = template.world_points.detach().cpu().float()
                 if points.ndim == 4 and int(points.shape[0]) == 1:
                     points = points[0]
             else:
