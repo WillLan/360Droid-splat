@@ -61,14 +61,20 @@ MapRepresentation:
 
 NeuralScaffold:
   enabled: true
-  feat_dim: 24
-  hidden_dim: 64
-  k_offsets: 4
+  scaffold_alignment: scaffold_gs_v2
+  feat_dim: 32
+  hidden_dim: 32
+  k_offsets: 10
   sh_degree: 0
-  voxel_size: 0.1
+  voxel_size: 0.05
   insert_radius_factor: 2.0
-  duplicate_policy: keep_best_score_with_radius_gate
+  insert_radius: 0.1
+  insertion_source: world_points
+  insertion_policy: nonsky_radius_then_voxel_compact
+  duplicate_policy: first_in_voxel
   near_anchor_policy: reject
+  use_insert_score: false
+  use_confidence_filter: false
   learn_anchor_xyz: true
   learn_anchor_feat: true
   learn_anchor_scale: true
@@ -78,14 +84,20 @@ NeuralScaffold:
   predict_cov: true
   predict_rotation: true
   predict_scale: true
-  init_feat_from_rgb: true
+  input_mode: anchor_feat_view_dir_ob_dist
+  use_rgb_prior_input: false
+  use_level_input: false
+  distance_mode: raw_ob_dist
+  init_feat_from_rgb: false
   init_opacity: 0.15
   init_scale_from_seed: true
   opacity_mask_threshold: 0.0
-  latitude_aware: true
+  latitude_aware: false
   distance_aware: true
   use_feature_bank: false
   appearance_dim: 0
+  freeze_mlp_after_first_chunk: true
+  save_mlp: true
   lr_anchor_xyz: 0.0005
   lr_anchor_feat: 0.002
   lr_anchor_scale: 0.0005
@@ -98,6 +110,13 @@ NeuralScaffold:
   allow_empty_map: true
   materialize_cache: false
   grow_prune_enabled: false
+
+BackendOptimization:
+  enabled: true
+  optimize_after_every_chunk: true
+  gaussian_refine_enable: true
+  first_chunk_steps: 1000
+  steps_per_chunk: 300
 
 Training:
   panorama_render_mode: pfgs360_gsplat

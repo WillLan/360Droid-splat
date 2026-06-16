@@ -21,7 +21,7 @@ from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
-from mapping.gaussian_initializer import GaussianInitializer
+from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
 def load_config(path: str | Path) -> dict:
@@ -2006,6 +2006,7 @@ class PanoDroidGSSlamSystem:
             metrics = self.mapper.optimize_feedforward_window(
                 current_frame_ids=current_ids,
                 history_frame_ids=history_ids,
+                chunk_index=current_frontend_chunk_index(),
             )
             optimize_sec = float(time.perf_counter() - section_start)
             if not metrics:
@@ -2100,22 +2101,36 @@ class PanoDroidGSSlamSystem:
                     write_profile("frontend_chunk", **chunk_profile)
             backend_loss = None
             keyframe_opt_diagnostic = None
-            if out.is_keyframe and out.inverse_depth is not None:
+            neural_anchor_mode = str(getattr(self.map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
+            if out.is_keyframe and (out.inverse_depth is not None or (neural_anchor_mode and out.world_points is not None)):
                 section_start = time.perf_counter()
-                consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
-                insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
-                if sky_mask is not None:
-                    insertion_hints = dict(insertion_hints or {})
-                    insertion_hints["sky_mask"] = sky_mask.detach().cpu().bool()
-                seeds = self.initializer.from_frontend_output(
-                    out,
-                    source_frame.image,
-                    insertion_hints=insertion_hints,
-                    first_keyframe=int(getattr(self.mapper.stats, "n_keyframes", 0)) == 0,
-                )
+                if neural_anchor_mode:
+                    empty = torch.zeros(0, device=source_frame.image.device, dtype=source_frame.image.dtype)
+                    seeds = GaussianSeedBatch(
+                        xyz=empty.view(0, 3),
+                        rgb=empty.view(0, 3),
+                        confidence=empty,
+                        scale=empty,
+                        level=torch.zeros(0, dtype=torch.long, device=source_frame.image.device),
+                        frame_id=int(out.frame_id),
+                        insert_score=empty,
+                        grid_coord=torch.zeros(0, 3, dtype=torch.int32, device=source_frame.image.device),
+                    )
+                else:
+                    consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
+                    insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
+                    if sky_mask is not None:
+                        insertion_hints = dict(insertion_hints or {})
+                        insertion_hints["sky_mask"] = sky_mask.detach().cpu().bool()
+                    seeds = self.initializer.from_frontend_output(
+                        out,
+                        source_frame.image,
+                        insertion_hints=insertion_hints,
+                        first_keyframe=int(getattr(self.mapper.stats, "n_keyframes", 0)) == 0,
+                    )
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
                 section_start = time.perf_counter()
-                if self.mapper.uses_joint_optimization:
+                if self.mapper.uses_joint_optimization or neural_anchor_mode:
                     inserted_count = self.mapper.insert_keyframe(
                         seeds,
                         out,
@@ -2509,6 +2524,7 @@ class PanoDroidGSSlamSystem:
             artifacts: dict[str, object] = {
                 "final_ply": None,
                 "final_checkpoint": None,
+                "final_mlp_state": None,
                 "final_keyframe_render_count": 0,
                 "final_all_frames": None,
                 "final_skybox_erp_preview": None,
@@ -2528,6 +2544,12 @@ class PanoDroidGSSlamSystem:
                     self.map.save_checkpoint(ckpt_path)
                     artifacts["final_checkpoint"] = str(ckpt_path)
                     logger.log_artifact_file(ckpt_path)
+                    neural_cfg = self.config.get("NeuralScaffold", {}) if isinstance(self.config, dict) else {}
+                    if bool(neural_cfg.get("save_mlp", False)) and hasattr(self.map, "save_mlp_state"):
+                        mlp_path = ckpt_path.parent / "mlp_state.pth"
+                        self.map.save_mlp_state(mlp_path)
+                        artifacts["final_mlp_state"] = str(mlp_path)
+                        logger.log_artifact_file(mlp_path)
                 except Exception as exc:
                     self.mapper.stats.notes.append(f"final checkpoint save failed: {exc!r}")
             if bool(results_cfg.get("save_final_keyframe_renders", False)):

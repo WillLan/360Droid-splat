@@ -17,6 +17,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing
 from mapping.gaussian_initializer import GaussianSeedBatch
 
 
@@ -64,72 +65,83 @@ class MaterializedGaussians:
         return ((self.features - 0.5) / SH_C0).unsqueeze(1)
 
 
+@dataclass
+class NeuralAnchorCandidateBatch:
+    """Raster-ordered neural anchor candidates built directly from frontend output."""
+
+    xyz: torch.Tensor
+    rgb: torch.Tensor
+    frame_id: int
+    source_flat_idx: torch.Tensor | None = None
+    source_hw: tuple[int, int] | None = None
+
+    def __len__(self) -> int:
+        return int(self.xyz.shape[0])
+
+
 class NeuralGaussianDecoder(nn.Module):
-    """Small MLP decoder for opacity, color and covariance attributes."""
+    """Scaffold-GS-style decoder for opacity, color and covariance attributes."""
 
     def __init__(
         self,
         *,
-        feat_dim: int = 24,
-        hidden_dim: int = 64,
-        k_offsets: int = 4,
-        latitude_aware: bool = True,
-        distance_aware: bool = True,
-        include_rgb_prior: bool = True,
+        feat_dim: int = 32,
+        hidden_dim: int = 32,
+        k_offsets: int = 10,
     ) -> None:
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.hidden_dim = int(hidden_dim)
         self.k_offsets = int(k_offsets)
-        self.latitude_aware = bool(latitude_aware)
-        self.distance_aware = bool(distance_aware)
-        self.include_rgb_prior = bool(include_rgb_prior)
-
         input_dim = self.feat_dim + 3 + 1
-        if self.distance_aware:
-            input_dim += 1
-        if self.latitude_aware:
-            input_dim += 1
-        if self.include_rgb_prior:
-            input_dim += 3
         self.input_dim = input_dim
 
-        self.mlp_opacity = self._make_mlp(input_dim, self.k_offsets)
-        self.mlp_color = self._make_mlp(input_dim, self.k_offsets * 3)
-        self.mlp_cov = self._make_mlp(input_dim, self.k_offsets * 7)
-
-    def _make_mlp(self, input_dim: int, output_dim: int) -> nn.Sequential:
-        return nn.Sequential(
+        self.mlp_opacity = nn.Sequential(
             nn.Linear(input_dim, self.hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.hidden_dim, output_dim),
+            nn.Linear(self.hidden_dim, self.k_offsets),
+            nn.Tanh(),
         )
+        self.mlp_color = nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.k_offsets * 3),
+            nn.Sigmoid(),
+        )
+        self.mlp_cov = nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.k_offsets * 7),
+        )
+
+        self._init_scaffold_outputs()
+
+    def _init_scaffold_outputs(self) -> None:
+        # Keep the first materialization visible and numerically stable.
+        with torch.no_grad():
+            opacity_linear = self.mlp_opacity[-2]
+            if isinstance(opacity_linear, nn.Linear):
+                opacity_linear.bias.fill_(0.1)
+            cov_linear = self.mlp_cov[-1]
+            if isinstance(cov_linear, nn.Linear):
+                cov_linear.bias.zero_()
+                for offset_idx in range(self.k_offsets):
+                    cov_linear.bias[offset_idx * 7 + 3] = 1.0
 
     def forward(
         self,
         *,
         anchor_feat: torch.Tensor,
-        rgb_prior: torch.Tensor,
         view_dir: torch.Tensor,
-        log_distance: torch.Tensor,
-        level_scalar: torch.Tensor,
+        ob_dist: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        parts = [anchor_feat, view_dir, level_scalar]
-        if self.distance_aware:
-            parts.append(log_distance)
-        if self.latitude_aware:
-            parts.append(view_dir[:, 2:3].clamp(-1.0, 1.0))
-        if self.include_rgb_prior:
-            parts.append(rgb_prior)
-        x = torch.cat(parts, dim=-1)
+        x = torch.cat([anchor_feat, view_dir, ob_dist], dim=-1)
         opacity_raw = self.mlp_opacity(x).view(-1, self.k_offsets)
-        color_raw = self.mlp_color(x).view(-1, self.k_offsets, 3)
+        color = self.mlp_color(x).view(-1, self.k_offsets, 3)
         cov_raw = self.mlp_cov(x).view(-1, self.k_offsets, 7)
         return (
-            torch.nan_to_num(opacity_raw, nan=-20.0, posinf=20.0, neginf=-20.0),
-            torch.nan_to_num(color_raw, nan=0.0, posinf=20.0, neginf=-20.0),
+            torch.nan_to_num(opacity_raw, nan=-1.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0),
+            torch.nan_to_num(color, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0),
             torch.nan_to_num(cov_raw, nan=0.0, posinf=20.0, neginf=-20.0),
         )
 
@@ -154,10 +166,10 @@ class NeuralScaffoldPanoMap(nn.Module):
         self.active_sh_degree = 0
         self.max_sh_degree = 0
 
-        self.feat_dim = int(self.neural_cfg.get("feat_dim", 24))
-        self.hidden_dim = int(self.neural_cfg.get("hidden_dim", 64))
-        self.k_offsets = max(1, int(self.neural_cfg.get("k_offsets", 4)))
-        self.voxel_size = max(float(self.neural_cfg.get("voxel_size", 0.1)), 1.0e-8)
+        self.feat_dim = int(self.neural_cfg.get("feat_dim", 32))
+        self.hidden_dim = int(self.neural_cfg.get("hidden_dim", self.feat_dim))
+        self.k_offsets = max(1, int(self.neural_cfg.get("k_offsets", 10)))
+        self.voxel_size = max(float(self.neural_cfg.get("voxel_size", 0.05)), 1.0e-8)
         self.insert_radius_factor = max(0.0, float(self.neural_cfg.get("insert_radius_factor", 2.0)))
         self.insert_radius = self.voxel_size * self.insert_radius_factor
         self.max_anchors = max(0, int(self.neural_cfg.get("max_anchors", 200000)))
@@ -170,10 +182,12 @@ class NeuralScaffoldPanoMap(nn.Module):
             feat_dim=self.feat_dim,
             hidden_dim=self.hidden_dim,
             k_offsets=self.k_offsets,
-            latitude_aware=bool(self.neural_cfg.get("latitude_aware", True)),
-            distance_aware=bool(self.neural_cfg.get("distance_aware", True)),
-            include_rgb_prior=True,
         )
+        self.mlp_frozen = False
+        self.last_inserted_source_flat_idx: torch.Tensor | None = None
+        self.last_source_hw: tuple[int, int] | None = None
+        self.last_candidate_count = 0
+        self.last_compacted_anchors = 0
         self.to(device=self.device_hint, dtype=self.dtype)
         self._reset_anchor_parameters()
         self._reset_anchor_metadata()
@@ -263,7 +277,7 @@ class NeuralScaffoldPanoMap(nn.Module):
 
     def get_optimizer_param_groups(self) -> list[dict]:
         cfg = self.neural_cfg
-        return [
+        groups = [
             {"params": [self.anchor_xyz], "lr": float(cfg.get("lr_anchor_xyz", 5.0e-4)), "name": "anchor_xyz"},
             {"params": [self.anchor_feat], "lr": float(cfg.get("lr_anchor_feat", 2.0e-3)), "name": "anchor_feat"},
             {
@@ -276,22 +290,40 @@ class NeuralScaffoldPanoMap(nn.Module):
                 "lr": float(cfg.get("lr_local_offsets", 5.0e-4)),
                 "name": "local_offsets",
             },
-            {
-                "params": list(self.decoder.mlp_opacity.parameters()),
-                "lr": float(cfg.get("lr_mlp_opacity", 1.0e-3)),
-                "name": "mlp_opacity",
-            },
-            {
-                "params": list(self.decoder.mlp_color.parameters()),
-                "lr": float(cfg.get("lr_mlp_color", 1.0e-3)),
-                "name": "mlp_color",
-            },
-            {
-                "params": list(self.decoder.mlp_cov.parameters()),
-                "lr": float(cfg.get("lr_mlp_cov", 1.0e-3)),
-                "name": "mlp_cov",
-            },
         ]
+        if not self.mlp_frozen:
+            groups.extend(
+                [
+                    {
+                        "params": [p for p in self.decoder.mlp_opacity.parameters() if p.requires_grad],
+                        "lr": float(cfg.get("lr_mlp_opacity", 1.0e-3)),
+                        "name": "mlp_opacity",
+                    },
+                    {
+                        "params": [p for p in self.decoder.mlp_color.parameters() if p.requires_grad],
+                        "lr": float(cfg.get("lr_mlp_color", 1.0e-3)),
+                        "name": "mlp_color",
+                    },
+                    {
+                        "params": [p for p in self.decoder.mlp_cov.parameters() if p.requires_grad],
+                        "lr": float(cfg.get("lr_mlp_cov", 1.0e-3)),
+                        "name": "mlp_cov",
+                    },
+                ]
+            )
+        return [group for group in groups if list(group.get("params", []))]
+
+    def freeze_mlp(self) -> None:
+        for param in self.decoder.parameters():
+            param.requires_grad_(False)
+        self.decoder.eval()
+        self.mlp_frozen = True
+
+    def unfreeze_mlp(self) -> None:
+        for param in self.decoder.parameters():
+            param.requires_grad_(True)
+        self.decoder.train()
+        self.mlp_frozen = False
 
     def make_optimizer(self, *, lr: float = 2e-3, weight_decay: float = 0.0) -> torch.optim.Optimizer:
         return torch.optim.AdamW(self.get_optimizer_param_groups(), weight_decay=float(weight_decay))
@@ -308,7 +340,168 @@ class NeuralScaffoldPanoMap(nn.Module):
     def insert_from_seed_batch(self, seed_batch: GaussianSeedBatch, *, last_update_kf_ord: int | None = None) -> int:
         if len(seed_batch) == 0:
             return 0
-        accepted = self._accepted_seed_indices(seed_batch)
+        enabled = seed_batch.insert_enabled
+        if enabled is not None and int(enabled.numel()) == len(seed_batch):
+            idx = torch.nonzero(enabled.detach().view(-1).bool(), as_tuple=False).flatten()
+        else:
+            idx = torch.arange(len(seed_batch), device=seed_batch.xyz.device, dtype=torch.long)
+        if idx.numel() == 0:
+            return 0
+        candidates = NeuralAnchorCandidateBatch(
+            xyz=seed_batch.xyz.index_select(0, idx),
+            rgb=seed_batch.rgb.index_select(0, idx),
+            frame_id=int(seed_batch.frame_id),
+            source_flat_idx=None
+            if seed_batch.source_flat_idx is None
+            else seed_batch.source_flat_idx.index_select(0, idx.to(seed_batch.source_flat_idx.device)),
+            source_hw=seed_batch.source_hw,
+        )
+        return self.insert_from_candidates(candidates, last_update_kf_ord=last_update_kf_ord)
+
+    def insert_from_frontend_output(
+        self,
+        frontend_output: Any,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None = None,
+        last_update_kf_ord: int | None = None,
+    ) -> int:
+        candidates = self._candidates_from_frontend_output(frontend_output, image, sky_mask=sky_mask)
+        return self.insert_from_candidates(candidates, last_update_kf_ord=last_update_kf_ord)
+
+    def _candidates_from_frontend_output(
+        self,
+        frontend_output: Any,
+        image: torch.Tensor,
+        *,
+        sky_mask: torch.Tensor | None,
+    ) -> NeuralAnchorCandidateBatch:
+        points = getattr(frontend_output, "world_points", None)
+        if points is None:
+            points = self._world_points_from_inverse_depth(frontend_output)
+            if points is None:
+                return NeuralAnchorCandidateBatch(
+                    xyz=torch.zeros(0, 3, device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype),
+                    rgb=torch.zeros(0, 3, device=self.anchor_xyz.device, dtype=self.anchor_xyz.dtype),
+                    frame_id=int(getattr(frontend_output, "frame_id", 0)),
+                )
+        pts = points.detach().float()
+        if pts.ndim == 4 and int(pts.shape[0]) == 1:
+            pts = pts[0]
+        if pts.ndim != 3 or int(pts.shape[-1]) != 3:
+            raise ValueError(f"Expected frontend world_points as HxWx3, got {tuple(pts.shape)}")
+        H, W = int(pts.shape[0]), int(pts.shape[1])
+        img = self._image_chw_for_size(image, H, W, device=pts.device, dtype=pts.dtype)
+        finite = torch.isfinite(pts).all(dim=-1)
+        valid = self._valid_world_mask(getattr(frontend_output, "valid_world_points_mask", None), (H, W), device=pts.device)
+        sky = self._mask_for_size(sky_mask, (H, W), device=pts.device)
+        keep = finite & valid
+        if sky is not None:
+            keep &= ~sky
+        flat_keep = keep.reshape(-1)
+        rows = torch.nonzero(flat_keep, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            empty = torch.zeros(0, 3, device=pts.device, dtype=pts.dtype)
+            return NeuralAnchorCandidateBatch(
+                xyz=empty,
+                rgb=empty.clone(),
+                frame_id=int(getattr(frontend_output, "frame_id", 0)),
+                source_flat_idx=rows.to(torch.long),
+                source_hw=(H, W),
+            )
+        rgb_hw = img.permute(1, 2, 0).contiguous().view(-1, 3)
+        return NeuralAnchorCandidateBatch(
+            xyz=pts.reshape(-1, 3).index_select(0, rows),
+            rgb=rgb_hw.index_select(0, rows).clamp(0.0, 1.0),
+            frame_id=int(getattr(frontend_output, "frame_id", 0)),
+            source_flat_idx=rows.detach().to(torch.long),
+            source_hw=(H, W),
+        )
+
+    def _world_points_from_inverse_depth(self, frontend_output: Any) -> torch.Tensor | None:
+        inv = getattr(frontend_output, "inverse_depth", None)
+        pose = getattr(frontend_output, "pose_c2w", None)
+        if inv is None or pose is None:
+            return None
+        inv_t = inv.detach().float()
+        if inv_t.ndim == 4 and int(inv_t.shape[0]) == 1:
+            inv_t = inv_t[0]
+        if inv_t.ndim == 3 and int(inv_t.shape[0]) == 1:
+            inv_t = inv_t[0]
+        if inv_t.ndim != 2:
+            return None
+        H, W = int(inv_t.shape[0]), int(inv_t.shape[1])
+        device = inv_t.device
+        dtype = inv_t.dtype
+        rows, cols = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        pixel = torch.stack([cols + 0.5, rows + 0.5], dim=-1)
+        bearing = erp_pixel_to_bearing(pixel, H, W).to(device=device, dtype=dtype)
+        valid = torch.isfinite(inv_t) & (inv_t > 1.0e-8)
+        depth = torch.where(valid, 1.0 / inv_t.clamp_min(1.0e-8), torch.full_like(inv_t, float("nan")))
+        cam = bearing * depth.unsqueeze(-1)
+        c2w = pose.detach().to(device=device, dtype=dtype)
+        if c2w.shape != (4, 4):
+            return None
+        world = torch.einsum("ij,hwj->hwi", c2w[:3, :3], cam) + c2w[:3, 3].view(1, 1, 3)
+        return world
+
+    @staticmethod
+    def _image_chw_for_size(image: torch.Tensor, H: int, W: int, *, device, dtype) -> torch.Tensor:
+        raw = image.detach()
+        img = raw.to(device=device, dtype=dtype)
+        if not raw.is_floating_point():
+            img = img / 255.0
+        if img.ndim == 4 and int(img.shape[0]) == 1:
+            img = img[0]
+        if img.ndim != 3:
+            raise ValueError(f"Expected image as CxHxW, got {tuple(img.shape)}")
+        if int(img.shape[0]) == 1:
+            img = img.expand(3, -1, -1)
+        if int(img.shape[0]) != 3:
+            raise ValueError(f"Expected image with 1 or 3 channels, got {int(img.shape[0])}")
+        if (int(img.shape[-2]), int(img.shape[-1])) != (H, W):
+            img = F.interpolate(img.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+        return img.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _mask_for_size(mask: torch.Tensor | None, size: tuple[int, int], *, device) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        H, W = int(size[0]), int(size[1])
+        m = mask.detach().to(device=device)
+        if m.ndim == 4 and int(m.shape[0]) == 1:
+            m = m[0]
+        if m.ndim == 3 and int(m.shape[0]) == 1:
+            m = m[0]
+        if m.ndim != 2:
+            raise ValueError(f"Expected mask as HxW or 1xHxW, got {tuple(m.shape)}")
+        if (int(m.shape[-2]), int(m.shape[-1])) != (H, W):
+            m = F.interpolate(m.float().view(1, 1, *m.shape[-2:]), size=(H, W), mode="nearest")[0, 0]
+        return m.bool()
+
+    def _valid_world_mask(self, valid_mask: torch.Tensor | None, size: tuple[int, int], *, device) -> torch.Tensor:
+        valid = self._mask_for_size(valid_mask, size, device=device)
+        if valid is None:
+            return torch.ones(int(size[0]), int(size[1]), device=device, dtype=torch.bool)
+        return valid
+
+    def insert_from_candidates(
+        self,
+        candidates: NeuralAnchorCandidateBatch,
+        *,
+        last_update_kf_ord: int | None = None,
+    ) -> int:
+        self.last_candidate_count = int(len(candidates))
+        self.last_inserted_source_flat_idx = None
+        self.last_source_hw = candidates.source_hw
+        self.last_compacted_anchors = 0
+        if len(candidates) == 0:
+            return 0
+        accepted = self._accepted_candidate_indices(candidates)
         if not accepted:
             return 0
         if self.max_anchors > 0:
@@ -316,69 +509,48 @@ class NeuralScaffoldPanoMap(nn.Module):
             accepted = accepted[:room]
             if not accepted:
                 return 0
-        idx = torch.tensor(accepted, device=seed_batch.xyz.device, dtype=torch.long)
-        self._append_seed_indices(seed_batch, idx, last_update_kf_ord=last_update_kf_ord)
-        return int(idx.numel())
+        idx = torch.tensor(accepted, device=candidates.xyz.device, dtype=torch.long)
+        before = self.anchor_count()
+        self._append_candidate_indices(candidates, idx, last_update_kf_ord=last_update_kf_ord)
+        self.last_compacted_anchors = self.compact_voxels()
+        after = self.anchor_count()
+        return max(0, int(after - before))
 
-    def _accepted_seed_indices(self, seed_batch: GaussianSeedBatch) -> list[int]:
-        xyz_cpu = seed_batch.xyz.detach().cpu().float()
+    def _accepted_candidate_indices(self, candidates: NeuralAnchorCandidateBatch) -> list[int]:
+        xyz_cpu = candidates.xyz.detach().cpu().float()
         n = int(xyz_cpu.shape[0])
         if n <= 0:
             return []
-        if seed_batch.insert_enabled is not None:
-            enabled = seed_batch.insert_enabled.detach().cpu().bool().view(-1)
-        else:
-            enabled = torch.ones(n, dtype=torch.bool)
-        if seed_batch.insert_score is not None and int(seed_batch.insert_score.numel()) == n:
-            score = seed_batch.insert_score.detach().cpu().float().view(-1)
-        else:
-            score = seed_batch.confidence.detach().cpu().float().view(-1)
-        finite = torch.isfinite(xyz_cpu).all(dim=1) & torch.isfinite(score) & enabled
-        order = torch.argsort(score, descending=True).tolist()
+        finite = torch.isfinite(xyz_cpu).all(dim=1)
         existing_index = self._existing_spatial_hash()
-        accepted_index: dict[tuple[int, int, int], list[int]] = {}
-        accepted_xyz: list[torch.Tensor] = []
         accepted: list[int] = []
-        for row in order:
+        for row in range(n):
             if not bool(finite[row]):
                 continue
-            point = xyz_cpu[row]
-            if self._has_near_existing_anchor(point, existing_index):
+            if self._has_near_existing_anchor(xyz_cpu[row], existing_index):
                 continue
-            if self._has_near_accepted_seed(point, accepted_xyz, accepted_index):
-                continue
-            cell = self._cell_key(point)
-            accepted_index.setdefault(cell, []).append(len(accepted_xyz))
-            accepted_xyz.append(point)
             accepted.append(int(row))
         return accepted
 
-    def _append_seed_indices(
+    def _append_candidate_indices(
         self,
-        seeds: GaussianSeedBatch,
+        candidates: NeuralAnchorCandidateBatch,
         idx: torch.Tensor,
         *,
         last_update_kf_ord: int | None,
     ) -> None:
         device = self.anchor_xyz.device
         dtype = self.anchor_xyz.dtype
-        xyz = seeds.xyz.index_select(0, idx).to(device=device, dtype=dtype)
-        rgb = seeds.rgb.index_select(0, idx).to(device=device, dtype=dtype).clamp(0.0, 1.0)
-        confidence = seeds.confidence.index_select(0, idx).to(device=device, dtype=dtype).view(-1).clamp(0.0, 1.0)
-        level = seeds.level.index_select(0, idx).to(device=device, dtype=torch.long).view(-1)
-        if seeds.insert_score is not None and int(seeds.insert_score.numel()) == int(len(seeds)):
-            insert_score = seeds.insert_score.index_select(0, idx).to(device=device, dtype=dtype).view(-1)
-        else:
-            insert_score = confidence
-        scale = seeds.scale.index_select(0, idx).to(device=device, dtype=dtype).view(-1, 1)
-        valid_scale = torch.isfinite(scale) & (scale > 1.0e-8)
-        scale = torch.where(valid_scale, scale, scale.new_full(scale.shape, self.voxel_size)).clamp(1.0e-5, self.max_scale)
-        log_scale = scale.log().expand(-1, 6).contiguous()
+        xyz = candidates.xyz.index_select(0, idx).to(device=device, dtype=dtype)
+        rgb = candidates.rgb.index_select(0, idx).to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        confidence = torch.ones(xyz.shape[0], device=device, dtype=dtype)
+        level = torch.zeros(xyz.shape[0], device=device, dtype=torch.long)
+        insert_score = torch.zeros(xyz.shape[0], device=device, dtype=dtype)
+        scale = self._initial_scale_for_xyz(xyz).view(-1, 1).to(device=device, dtype=dtype)
+        log_scale = scale.clamp(1.0e-5, self.max_scale).log().expand(-1, 6).contiguous()
 
-        feat = torch.randn(xyz.shape[0], self.feat_dim, device=device, dtype=dtype) * 0.01
-        if bool(self.neural_cfg.get("init_feat_from_rgb", True)):
-            feat[:, : min(3, self.feat_dim)] = rgb[:, : min(3, self.feat_dim)]
-        offsets = self._initial_offsets(xyz.shape[0], device=device, dtype=dtype)
+        feat = torch.zeros(xyz.shape[0], self.feat_dim, device=device, dtype=dtype)
+        offsets = torch.zeros(xyz.shape[0], self.k_offsets, 3, device=device, dtype=dtype)
 
         self.anchor_xyz = nn.Parameter(torch.cat([self.anchor_xyz.detach(), xyz], dim=0))
         self.anchor_feat = nn.Parameter(torch.cat([self.anchor_feat.detach(), feat], dim=0))
@@ -389,52 +561,56 @@ class NeuralScaffoldPanoMap(nn.Module):
         self.anchor_level = torch.cat([self.anchor_level.detach(), level.detach()], dim=0)
         self.anchor_insert_score = torch.cat([self.anchor_insert_score.detach(), insert_score.detach()], dim=0)
 
-        grid = self._seed_grid(seeds, idx)
+        grid = torch.floor(xyz.detach().cpu().float() / self.voxel_size).to(torch.int32).to(device=device)
         self.anchor_grid_coord = torch.cat([self.anchor_grid_coord.detach(), grid.to(device=device)], dim=0)
-        self._append_cpu_metadata(seeds, idx.detach().cpu(), grid.detach().cpu(), last_update_kf_ord=last_update_kf_ord)
+        if candidates.source_flat_idx is not None:
+            self.last_inserted_source_flat_idx = candidates.source_flat_idx.index_select(
+                0,
+                idx.to(candidates.source_flat_idx.device),
+            ).detach().cpu().long()
+        self._append_cpu_metadata(
+            frame_id=int(candidates.frame_id),
+            count=int(idx.numel()),
+            grid_cpu=grid.detach().cpu(),
+            last_update_kf_ord=last_update_kf_ord,
+        )
 
-    def _initial_offsets(self, n: int, *, device, dtype) -> torch.Tensor:
-        base = torch.zeros(self.k_offsets, 3, device=device, dtype=dtype)
-        pattern = [
-            (0.0, 0.0, 0.0),
-            (0.5, 0.0, 0.0),
-            (0.0, 0.5, 0.0),
-            (0.0, 0.0, 0.5),
-            (-0.5, 0.0, 0.0),
-            (0.0, -0.5, 0.0),
-            (0.0, 0.0, -0.5),
-        ]
-        for idx, value in enumerate(pattern[: self.k_offsets]):
-            base[idx] = torch.tensor(value, device=device, dtype=dtype)
-        return base.view(1, self.k_offsets, 3).expand(n, -1, -1).contiguous()
-
-    def _seed_grid(self, seeds: GaussianSeedBatch, idx: torch.Tensor) -> torch.Tensor:
-        if seeds.grid_coord is not None and int(seeds.grid_coord.shape[0]) == int(len(seeds)):
-            return seeds.grid_coord.index_select(0, idx).to(dtype=torch.int32)
-        grid = torch.floor(seeds.xyz.detach().index_select(0, idx).cpu().float() / self.voxel_size).to(torch.int32)
-        return grid.to(device=idx.device)
+    def _initial_scale_for_xyz(self, xyz: torch.Tensor) -> torch.Tensor:
+        n = int(xyz.shape[0])
+        fallback = xyz.new_full((n,), float(self.voxel_size))
+        total = int(self.anchor_xyz.shape[0]) + n
+        if n <= 1 or total <= 1 or n > 8192 or total > 65536:
+            return fallback
+        reference = torch.cat([self.anchor_xyz.detach(), xyz.detach()], dim=0)
+        dist = torch.cdist(xyz.detach(), reference)
+        if self.anchor_count() > 0:
+            row = torch.arange(n, device=xyz.device)
+            dist[row, self.anchor_count() + row] = float("inf")
+        else:
+            eye = torch.eye(n, device=xyz.device, dtype=torch.bool)
+            dist[:, :n] = dist[:, :n].masked_fill(eye, float("inf"))
+        nearest = dist.min(dim=1).values.clamp(1.0e-5, self.max_scale)
+        nearest = torch.where(torch.isfinite(nearest), nearest, fallback)
+        return nearest
 
     def _append_cpu_metadata(
         self,
-        seeds: GaussianSeedBatch,
-        idx_cpu: torch.Tensor,
-        grid_cpu: torch.Tensor,
         *,
+        frame_id: int,
+        count: int,
+        grid_cpu: torch.Tensor,
         last_update_kf_ord: int | None,
     ) -> None:
-        count = int(idx_cpu.numel())
-        self._anchor_level = torch.cat([self._anchor_level, seeds.level.detach().cpu().index_select(0, idx_cpu).to(torch.int8)], dim=0)
+        count = int(count)
+        self._anchor_level = torch.cat([self._anchor_level, torch.zeros(count, dtype=torch.int8)], dim=0)
         self._anchor_voxel_size = torch.cat([self._anchor_voxel_size, torch.full((count,), self.voxel_size, dtype=torch.float32)], dim=0)
         self._anchor_grid_coord = torch.cat([self._anchor_grid_coord, grid_cpu.to(torch.int32)], dim=0)
         self._anchor_obs_count = torch.cat([self._anchor_obs_count, torch.ones(count, dtype=torch.int32)], dim=0)
-        self._anchor_conf_accum = torch.cat(
-            [self._anchor_conf_accum, seeds.confidence.detach().cpu().index_select(0, idx_cpu).to(torch.float32)],
-            dim=0,
-        )
-        frame_ids = torch.full((count,), int(seeds.frame_id), dtype=torch.int32)
+        self._anchor_conf_accum = torch.cat([self._anchor_conf_accum, torch.ones(count, dtype=torch.float32)], dim=0)
+        frame_ids = torch.full((count,), int(frame_id), dtype=torch.int32)
         self._anchor_birth_frame = torch.cat([self._anchor_birth_frame, frame_ids], dim=0)
         self._anchor_last_seen_kf = torch.cat([self._anchor_last_seen_kf, frame_ids], dim=0)
-        update_ord = int(seeds.frame_id) if last_update_kf_ord is None else int(last_update_kf_ord)
+        update_ord = int(frame_id) if last_update_kf_ord is None else int(last_update_kf_ord)
         self._anchor_last_update_kf_ord = torch.cat(
             [self._anchor_last_update_kf_ord, torch.full((count,), update_ord, dtype=torch.int32)],
             dim=0,
@@ -515,24 +691,18 @@ class NeuralScaffoldPanoMap(nn.Module):
         anchor_rows = self._materialized_anchor_rows()
         xyz_anchor = self.anchor_xyz.index_select(0, anchor_rows)
         feat = self.anchor_feat.index_select(0, anchor_rows)
-        rgb_prior = self.anchor_rgb_prior.index_select(0, anchor_rows)
-        level = self.anchor_level.index_select(0, anchor_rows).to(device=device, dtype=dtype).view(-1, 1)
-        level_scalar = (level / 16.0).clamp(0.0, 1.0)
         camera_center = camera.c2w.to(device=device, dtype=dtype)[:3, 3]
         delta = xyz_anchor - camera_center.view(1, 3)
-        distance = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp_min(1.0e-6)
-        view_dir = delta / distance
-        log_distance = torch.log(distance)
+        ob_dist = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        view_dir = delta / ob_dist
         opacity_raw, color_raw, cov_raw = self.decoder(
             anchor_feat=feat,
-            rgb_prior=rgb_prior,
             view_dir=view_dir,
-            log_distance=log_distance,
-            level_scalar=level_scalar,
+            ob_dist=ob_dist,
         )
 
-        opacity = torch.sigmoid(opacity_raw.clamp(-10.0, 10.0)).view(-1, 1)
-        color = torch.sigmoid(color_raw).view(-1, 3)
+        opacity = opacity_raw.clamp_min(0.0).view(-1, 1)
+        color = color_raw.view(-1, 3)
         cov = cov_raw.view(-1, 7)
         scale_residual = torch.sigmoid(cov[:, :3])
         quat_raw = cov[:, 3:7]
@@ -574,10 +744,7 @@ class NeuralScaffoldPanoMap(nn.Module):
         if self.max_materialized_gaussians <= 0 or n * self.k_offsets <= self.max_materialized_gaussians:
             return torch.arange(n, device=device, dtype=torch.long)
         max_anchor_count = max(1, self.max_materialized_gaussians // self.k_offsets)
-        score = self.anchor_insert_score
-        if int(score.numel()) != n or not bool(torch.isfinite(score).any()):
-            score = self.anchor_confidence
-        return torch.topk(score.detach(), k=min(max_anchor_count, n), largest=True).indices.to(device=device)
+        return torch.arange(min(max_anchor_count, n), device=device, dtype=torch.long)
 
     def postprocess_render_package(self, pkg: dict, materialized: MaterializedGaussians) -> dict:
         n = int(materialized.source_anchor_count)
@@ -618,6 +785,27 @@ class NeuralScaffoldPanoMap(nn.Module):
             out["viewspace_points"] = dst
         return out
 
+    def compact_voxels(self) -> int:
+        n = self.anchor_count()
+        if n <= 1:
+            return 0
+        xyz = self.anchor_xyz.detach().cpu().float()
+        keep = torch.zeros(n, dtype=torch.bool)
+        seen: set[tuple[int, int, int]] = set()
+        for row in range(n):
+            if not bool(torch.isfinite(xyz[row]).all()):
+                continue
+            key = self._cell_key(xyz[row])
+            if key in seen:
+                continue
+            seen.add(key)
+            keep[row] = True
+        removed = int((~keep).sum().item())
+        if removed <= 0:
+            return 0
+        self._apply_anchor_keep_mask(keep.to(device=self.anchor_xyz.device))
+        return removed
+
     def prune_anchors(self, prune_mask: torch.Tensor) -> int:
         n = self.anchor_count()
         if n <= 0:
@@ -629,6 +817,11 @@ class NeuralScaffoldPanoMap(nn.Module):
         pruned = int(mask.sum().item())
         if pruned <= 0:
             return 0
+        self._apply_anchor_keep_mask(keep)
+        return pruned
+
+    def _apply_anchor_keep_mask(self, keep: torch.Tensor) -> None:
+        keep = keep.detach().to(device=self.anchor_xyz.device, dtype=torch.bool).view(-1)
         self.anchor_xyz = nn.Parameter(self.anchor_xyz.detach()[keep])
         self.anchor_feat = nn.Parameter(self.anchor_feat.detach()[keep])
         self.anchor_log_scale = nn.Parameter(self.anchor_log_scale.detach()[keep])
@@ -649,7 +842,6 @@ class NeuralScaffoldPanoMap(nn.Module):
         self._anchor_last_update_kf_ord = self._anchor_last_update_kf_ord[keep_cpu]
         self._anchor_inlier_obs = self._anchor_inlier_obs[keep_cpu]
         self._anchor_outlier_obs = self._anchor_outlier_obs[keep_cpu]
-        return pruned
 
     def initialize_skybox_from_image(self, *args, **kwargs) -> bool:
         return False
@@ -661,7 +853,28 @@ class NeuralScaffoldPanoMap(nn.Module):
             "voxel_size": float(self.voxel_size),
             "insert_radius": float(self.insert_radius),
             "feat_dim": self.feat_dim,
+            "mlp_frozen": int(bool(self.mlp_frozen)),
+            "last_candidate_count": int(self.last_candidate_count),
+            "last_compacted_anchors": int(self.last_compacted_anchors),
         }
+
+    def mlp_state_payload(self) -> dict[str, Any]:
+        return {
+            "mlp_opacity": self.decoder.mlp_opacity.state_dict(),
+            "mlp_color": self.decoder.mlp_color.state_dict(),
+            "mlp_cov": self.decoder.mlp_cov.state_dict(),
+            "feat_dim": int(self.feat_dim),
+            "hidden_dim": int(self.hidden_dim),
+            "k_offsets": int(self.k_offsets),
+            "input_mode": "anchor_feat_view_dir_ob_dist",
+            "mlp_frozen": bool(self.mlp_frozen),
+        }
+
+    def save_mlp_state(self, path: str | Path) -> str:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.mlp_state_payload(), path)
+        return str(path)
 
     def save_checkpoint(self, path: str | Path) -> str:
         path = Path(path)
@@ -669,6 +882,8 @@ class NeuralScaffoldPanoMap(nn.Module):
         torch.save(
             {
                 "state_dict": self.state_dict(),
+                "mlp_state": self.mlp_state_payload(),
+                "mlp_frozen": bool(self.mlp_frozen),
                 "map_mode": self.map_mode,
                 "config": self.config,
                 "stats": self.stats(),
@@ -685,6 +900,8 @@ class NeuralScaffoldPanoMap(nn.Module):
             },
             path,
         )
+        if bool(self.neural_cfg.get("save_mlp", False)):
+            self.save_mlp_state(path.parent / "mlp_state.pth")
         return str(path)
 
     def save_ply(self, path: str | Path) -> str:

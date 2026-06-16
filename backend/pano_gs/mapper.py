@@ -611,8 +611,9 @@ class PanoGaussianMapper:
         self.pfgs360_replace_fuse_enabled = bool(
             self.novel_insertion_enabled and self.novel_insertion_strategy == "pfgs360_replace_fuse"
         )
+        self.neural_anchor_mode = str(getattr(gaussian_map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
         if (
-            str(getattr(gaussian_map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
+            self.neural_anchor_mode
             and self.pfgs360_replace_fuse_enabled
         ):
             raise ValueError("neural_anchor_scaffold_panorama does not support pfgs360_replace_fuse in this backend.")
@@ -675,6 +676,7 @@ class PanoGaussianMapper:
         self.last_source_hw: tuple[int, int] | None = None
         self.last_depth_insertion_diagnostic: DepthInsertionDiagnostic | None = None
         self.frontend_graph_window_ids: tuple[int, ...] = ()
+        self._neural_first_chunk_optimized = False
         if loss_weights is None and self.pfgs360_replace_fuse_enabled:
             sky_cfg = gaussian_map.config.get("SkyBox", {}) if isinstance(gaussian_map.config, dict) else {}
             self.loss_weights = BackendLossWeights(
@@ -723,24 +725,41 @@ class PanoGaussianMapper:
         )
         if image is not None and self.map.has_skybox:
             self.map.initialize_skybox_from_image(image, frontend_output.pose_c2w, sky_mask=sky_mask)
-        seeds, filter_stats = self._filter_novel_seeds(
-            seeds,
-            frontend_output=frontend_output,
-            image=image,
-            sky_mask=sky_mask,
-        )
-        self.last_inserted_source_flat_idx = (
-            None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
-        )
-        if self.last_source_hw is None:
-            self.last_source_hw = seeds.source_hw
         start = self.map.anchor_count()
-        n = self.map.add_seeds(
-            seeds,
-            voxel_size=self.pfgs360_voxel_size if self.pfgs360_replace_fuse_enabled else None,
-            last_update_kf_ord=current_kf_ord if self.pfgs360_replace_fuse_enabled else None,
-        )
-        end = start + int(n)
+        if self.neural_anchor_mode and hasattr(self.map, "insert_from_frontend_output") and image is not None:
+            n = self.map.insert_from_frontend_output(
+                frontend_output,
+                image,
+                sky_mask=sky_mask,
+                last_update_kf_ord=current_kf_ord,
+            )
+            self.last_inserted_source_flat_idx = getattr(self.map, "last_inserted_source_flat_idx", None)
+            self.last_source_hw = getattr(self.map, "last_source_hw", None) or self.last_source_hw
+            filter_stats = {
+                "skipped_voxel": 0,
+                "skipped_budget": 0,
+                "dense_seed_candidates": int(getattr(self.map, "last_candidate_count", requested)),
+                "newly_inserted": int(n),
+                "compacted": int(getattr(self.map, "last_compacted_anchors", 0)),
+            }
+        else:
+            seeds, filter_stats = self._filter_novel_seeds(
+                seeds,
+                frontend_output=frontend_output,
+                image=image,
+                sky_mask=sky_mask,
+            )
+            self.last_inserted_source_flat_idx = (
+                None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
+            )
+            if self.last_source_hw is None:
+                self.last_source_hw = seeds.source_hw
+            n = self.map.add_seeds(
+                seeds,
+                voxel_size=self.pfgs360_voxel_size if self.pfgs360_replace_fuse_enabled else None,
+                last_update_kf_ord=current_kf_ord if self.pfgs360_replace_fuse_enabled else None,
+            )
+        end = self.map.anchor_count()
         self.last_inserted_range = (start, end)
         filter_stats["newly_inserted"] = int(n)
         if self.pfgs360_replace_fuse_enabled:
@@ -2588,11 +2607,15 @@ class PanoGaussianMapper:
         *,
         current_frame_ids,
         history_frame_ids=None,
+        chunk_index: int | None = None,
     ) -> dict[str, float]:
         if not self.uses_joint_optimization or not self.feedforward_window_enabled:
             return {}
         cfg = self._feedforward_window_cfg()
-        if self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
+        neural_first_chunk = self._neural_should_train_mlp_for_chunk(chunk_index)
+        if neural_first_chunk:
+            steps = int(self.optim_cfg.get("first_chunk_steps", self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200))))
+        elif self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
             steps = int(self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200)))
         else:
             steps = int(cfg.get("steps", self.optim_cfg.get("sliding_window_steps", 0)))
@@ -2786,7 +2809,23 @@ class PanoGaussianMapper:
         self.stats.last_sky_pruned = int(sky_pruned_total)
         self.stats.last_sky_compacted = int(chunk_compacted)
         self.stats.optimization_steps += int(actual_steps)
+        if neural_first_chunk and actual_steps > 0 and hasattr(self.map, "freeze_mlp"):
+            self.map.freeze_mlp()
+            self._neural_first_chunk_optimized = True
+            last["neural_mlp_frozen"] = 1.0
+        else:
+            last["neural_mlp_frozen"] = float(int(bool(getattr(self.map, "mlp_frozen", False))))
         return last
+
+    def _neural_should_train_mlp_for_chunk(self, chunk_index: int | None) -> bool:
+        if not self.neural_anchor_mode:
+            return False
+        neural_cfg = self.map.config.get("NeuralScaffold", {}) if isinstance(self.map.config, dict) else {}
+        if not bool(neural_cfg.get("freeze_mlp_after_first_chunk", True)):
+            return False
+        if self._neural_first_chunk_optimized or bool(getattr(self.map, "mlp_frozen", False)):
+            return False
+        return True
 
     def _feedforward_window_ids(self, current_frame_ids, history_frame_ids=None) -> list[int]:
         cfg = self._feedforward_window_cfg()
