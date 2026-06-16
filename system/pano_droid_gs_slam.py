@@ -1772,6 +1772,7 @@ class PanoDroidGSSlamSystem:
         backend_feedback_decision_count = 0
         backend_feedback_applied_count = 0
         last_profiled_frontend_chunk: int | None = None
+        last_optimized_frontend_chunk: int | None = None
         last_feedforward_metrics: dict = {}
         recent_feedforward_chunks: list[tuple[int | None, list[int]]] = []
         frame_cache: dict[int, PanoFrame] = {}
@@ -1994,7 +1995,12 @@ class PanoDroidGSSlamSystem:
 
         def optimize_feedforward_after_batch(outputs: list[FrontendOutput]) -> None:
             nonlocal backend_feedback_decision_count, backend_feedback_applied_count, last_feedforward_metrics
+            nonlocal last_optimized_frontend_chunk
             if not feedforward_window_enabled or not outputs:
+                return
+            chunk_index = current_frontend_chunk_index()
+            neural_anchor_mode = str(getattr(self.map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
+            if neural_anchor_mode and chunk_index is not None and chunk_index == last_optimized_frontend_chunk:
                 return
             output_ids = [int(out.frame_id) for out in outputs]
             current_ids, history_ids = feedforward_debug_window(output_ids)
@@ -2006,11 +2012,13 @@ class PanoDroidGSSlamSystem:
             metrics = self.mapper.optimize_feedforward_window(
                 current_frame_ids=current_ids,
                 history_frame_ids=history_ids,
-                chunk_index=current_frontend_chunk_index(),
+                chunk_index=chunk_index,
             )
             optimize_sec = float(time.perf_counter() - section_start)
             if not metrics:
                 return
+            if neural_anchor_mode and chunk_index is not None and float(metrics.get("steps", 0.0)) > 0.0:
+                last_optimized_frontend_chunk = int(chunk_index)
             last_feedforward_metrics = dict(metrics)
             diagnostic_step = max(1, int(logger._step) + 1)
             logger._log_wandb_payload(
