@@ -25,7 +25,7 @@ PanoVGGT:
   skip_dinov2_pretrain: true
   image_size: null
   patch_multiple: 14
-  chunk_size: 4
+  chunk_size: 8
   overlap: 2
   emit_delay: 1
   align_mode: sim3
@@ -134,7 +134,7 @@ PanoVGGT:
     line_search: true
 
   InferenceWindow:
-    size: 4
+    size: 8
     overlap: 2
     temporal_radius: 2
     max_edges: 24
@@ -173,6 +173,7 @@ Mapping:
   NovelGaussianInsertion:
     enabled: true
     strategy: pfgs360_replace_fuse
+    first_chunk_multiframe_init: true
     voxel_size: 0.02
     insert_occupancy_radius_voxels: 2.0
     gaussian_scale_mode: erp_depth_latitude
@@ -180,9 +181,9 @@ Mapping:
     gaussian_scale_min: 0.008
     gaussian_scale_max: 0.08
     gaussian_scale_lat_cos_min: 0.25
-    first_keyframe_max_seeds: 160000
-    keyframe_max_seeds: 30000
-    global_anchor_budget: 3000000
+    first_keyframe_max_seeds: 0
+    keyframe_max_seeds: 0
+    global_anchor_budget: 0
     temporal_pair_conf_min: 0.70
     render_alpha_min: 0.20
     missing_alpha_min: 0.05
@@ -194,8 +195,8 @@ Mapping:
     replace_front_depth_rel_tol: 0.02
     max_replace_delete_per_keyframe: 30000
     compact_voxels: true
-    max_missing_seeds_per_keyframe: 30000
-    max_depth_mismatch_seeds_per_keyframe: 30000
+    max_missing_seeds_per_keyframe: 0
+    max_depth_mismatch_seeds_per_keyframe: 0
     prioritize_depth_mismatch: true
     near_grid_radius: 1
     near_distance_factor: 1.0
@@ -209,7 +210,7 @@ Mapping:
 
   BootstrapOptimization:
     enabled: true
-    first_keyframe_steps: 300
+    first_keyframe_steps: 0
     save_every: 300
 
 BackendOptimization:
@@ -217,11 +218,12 @@ BackendOptimization:
   gaussian_refine_enable: true
   pose_refine_enable: true
   optimize_after_every_chunk: true
+  first_chunk_steps: 800
   steps_per_chunk: 300
   sample_frames_per_step: 1
-  current_chunk_observation_frames: 4
-  recent_chunk_observation_chunks: 4
-  recent_keyframe_observation_frames: 4
+  current_chunk_observation_frames: 8
+  recent_chunk_observation_chunks: 2
+  recent_keyframe_observation_frames: 0
   recent_insert_keyframes: 4
   keyframe_steps: 0
   keyframe_optimize_pose: false

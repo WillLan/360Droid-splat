@@ -718,6 +718,8 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput,
         image: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
+        insert_occupancy_radius_voxels_override: float | None = None,
+        compact_after_insert: bool = False,
     ) -> int:
         requested = len(seeds)
         current_kf_ord = int(self.stats.n_keyframes)
@@ -760,6 +762,7 @@ class PanoGaussianMapper:
                 frontend_output=frontend_output,
                 image=image,
                 sky_mask=sky_mask,
+                insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
             )
             self.last_inserted_source_flat_idx = (
                 None if seeds.source_flat_idx is None else seeds.source_flat_idx.detach().cpu().long()
@@ -775,7 +778,8 @@ class PanoGaussianMapper:
         self.last_inserted_range = (start, end)
         filter_stats["newly_inserted"] = int(n)
         if self.pfgs360_replace_fuse_enabled:
-            self._refresh_pfgs360_voxel_cache(compact=False)
+            compacted = self._refresh_pfgs360_voxel_cache(compact=bool(compact_after_insert))
+            filter_stats["compacted"] = int(filter_stats.get("compacted", 0)) + int(compacted)
         filter_stats["anchors_before"] = int(start)
         filter_stats["anchors_after"] = int(self.map.anchor_count())
         self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
@@ -939,6 +943,7 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput | None = None,
         image: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
+        insert_occupancy_radius_voxels_override: float | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if not self.novel_insertion_enabled:
             return seeds, {"skipped_voxel": 0, "skipped_budget": 0}
@@ -950,6 +955,7 @@ class PanoGaussianMapper:
                 frontend_output=frontend_output,
                 image=image,
                 sky_mask=sky_mask,
+                insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
             )
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
         budget = len(seeds) if per_keyframe_budget <= 0 else min(len(seeds), int(per_keyframe_budget))
@@ -993,6 +999,7 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput | None,
         image: torch.Tensor | None,
         sky_mask: torch.Tensor | None,
+        insert_occupancy_radius_voxels_override: float | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         if self.pfgs360_replace_fuse_enabled:
             return self._filter_replace_fuse_seeds(
@@ -1000,6 +1007,7 @@ class PanoGaussianMapper:
                 frontend_output=frontend_output,
                 image=image,
                 sky_mask=sky_mask,
+                insert_occupancy_radius_voxels_override=insert_occupancy_radius_voxels_override,
             )
         seeds = self._with_pfgs360_seed_metadata(seeds)
         per_keyframe_budget = self.first_keyframe_max_seeds if self.stats.n_keyframes == 0 else self.keyframe_max_seeds
@@ -1136,6 +1144,7 @@ class PanoGaussianMapper:
         frontend_output: FrontendOutput | None,
         image: torch.Tensor | None,
         sky_mask: torch.Tensor | None,
+        insert_occupancy_radius_voxels_override: float | None = None,
     ) -> tuple[GaussianSeedBatch, dict[str, int]]:
         seeds = self._with_pfgs360_seed_metadata(seeds)
 
@@ -1242,8 +1251,13 @@ class PanoGaussianMapper:
         generator = torch.Generator()
         generator.manual_seed(int(seeds.frame_id) & 0x7FFFFFFF)
         order = active_rows.index_select(0, torch.randperm(int(active_rows.numel()), generator=generator))
-        radius = float(self.replace_fuse_insert_occupancy_radius_voxels) * float(self.pfgs360_voxel_size)
-        radius_cells = max(0, int(math.ceil(float(self.replace_fuse_insert_occupancy_radius_voxels))))
+        radius_voxels = (
+            float(self.replace_fuse_insert_occupancy_radius_voxels)
+            if insert_occupancy_radius_voxels_override is None
+            else float(insert_occupancy_radius_voxels_override)
+        )
+        radius = max(0.0, radius_voxels) * float(self.pfgs360_voxel_size)
+        radius_cells = max(0, int(math.ceil(max(0.0, radius_voxels))))
         seed_levels_cpu = (
             seeds.level.detach().cpu().to(torch.int32)
             if seeds.level is not None and int(seeds.level.numel()) == len(seeds)
@@ -2605,6 +2619,8 @@ class PanoGaussianMapper:
         neural_first_chunk = self._neural_should_train_mlp_for_chunk(chunk_index)
         if neural_first_chunk:
             steps = int(self.optim_cfg.get("first_chunk_steps", self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200))))
+        elif self.pfgs360_replace_fuse_enabled and chunk_index is not None and int(chunk_index) == 0:
+            steps = int(self.optim_cfg.get("first_chunk_steps", self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200))))
         elif self.pfgs360_replace_fuse_enabled or bool(self.optim_cfg.get("optimize_after_every_chunk", False)):
             steps = int(self.optim_cfg.get("steps_per_chunk", cfg.get("steps", 200)))
         else:
@@ -2910,7 +2926,7 @@ class PanoGaussianMapper:
         if n <= 0:
             return torch.zeros(n, dtype=torch.bool, device=device)
         if self.pfgs360_replace_fuse_enabled:
-            return self._active_anchor_mask_for_recent_updates()
+            return self._active_anchor_mask_for_keyframe_update_ids(keyframe_ids)
         if not keyframe_ids:
             return torch.zeros(n, dtype=torch.bool, device=device)
         birth = self.map._anchor_birth_frame.to(device=device)
@@ -2931,6 +2947,25 @@ class PanoGaussianMapper:
             return torch.zeros(n, dtype=torch.bool, device=device)
         return self.map._anchor_last_update_kf_ord.to(device=device) >= int(min_ord)
 
+    def _active_anchor_mask_for_keyframe_update_ids(self, keyframe_ids: list[int]) -> torch.Tensor:
+        n = self.map.anchor_count()
+        device = self.map.get_xyz.device
+        if n <= 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        if not keyframe_ids or int(self.map._anchor_last_update_kf_ord.shape[0]) != n:
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        keyframe_set = {int(fid) for fid in keyframe_ids}
+        ords = [
+            int(ord_idx)
+            for ord_idx, keyframe in enumerate(self.keyframes)
+            if int(keyframe.frame_id) in keyframe_set
+        ]
+        if not ords:
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        ord_tensor = torch.tensor(ords, dtype=torch.int32, device=device)
+        updates = self.map._anchor_last_update_kf_ord.to(device=device, dtype=torch.int32)
+        return (updates.view(-1, 1) == ord_tensor.view(1, -1)).any(dim=1)
+
     def _feedforward_gaussian_scales(self, selected_keyframe_ids: list[int]) -> torch.Tensor | None:
         if not bool(self.optim_cfg.get("gaussian_refine_enable", True)):
             return None
@@ -2942,7 +2977,7 @@ class PanoGaussianMapper:
             return scales
         cfg = self._feedforward_window_cfg()
         if self.pfgs360_replace_fuse_enabled:
-            active = self._active_anchor_mask_for_recent_updates()
+            active = self._active_anchor_mask_for_keyframe_update_ids(selected_keyframe_ids)
             scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
             return scales
         scope = str(cfg.get("gaussian_scope", "selected_birth_keyframes")).lower()

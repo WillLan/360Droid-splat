@@ -19,6 +19,7 @@ from backend.pano_gs import NeuralScaffoldPanoMap, PFGS360Renderer, PanoGaussian
 from frontend.pano_droid.adapter import build_frontend_from_config
 from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
+from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
@@ -1744,6 +1745,13 @@ class PanoDroidGSSlamSystem:
         logger = SlamRuntimeLogger(self.config, output_dir)
         refine_steps = int(self.config.get("Mapping", {}).get("refine_steps_per_keyframe", 0))
         mapping_cfg = self.config.get("Mapping", {})
+        novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
+        novel_cfg = novel_cfg if isinstance(novel_cfg, dict) else {}
+        replace_fuse_enabled = (
+            bool(novel_cfg.get("enabled", False))
+            and str(novel_cfg.get("strategy", "legacy")).lower() == "pfgs360_replace_fuse"
+        )
+        first_chunk_multiframe_init = bool(novel_cfg.get("first_chunk_multiframe_init", False))
         bootstrap_cfg = mapping_cfg.get("BootstrapOptimization", {}) if isinstance(mapping_cfg, dict) else {}
         bootstrap_enabled = bool(bootstrap_cfg.get("enabled", False))
         bootstrap_steps = int(bootstrap_cfg.get("first_keyframe_steps", 0))
@@ -1813,6 +1821,197 @@ class PanoDroidGSSlamSystem:
                     insertion_hints=None,
                 )
             return None if mask is None else mask.detach().cpu().bool()
+
+        def current_frontend_chunk_frame_ids_full() -> list[int]:
+            ids: list[int] = []
+            profile = getattr(self.frontend, "last_profile", None)
+            if isinstance(profile, dict) and "frame_start" in profile and "frame_end" in profile:
+                try:
+                    start = int(profile.get("frame_start"))
+                    end = int(profile.get("frame_end"))
+                    if end >= start:
+                        ids.extend(range(start, end + 1))
+                except (TypeError, ValueError):
+                    ids.clear()
+            debug = getattr(self.frontend, "last_m3_debug", None)
+            if isinstance(debug, dict):
+                for fid in debug.get("frame_ids", ()):
+                    if fid is not None and int(fid) not in ids:
+                        ids.append(int(fid))
+            return [int(fid) for fid in ids]
+
+        def world_points_from_inverse_depth(
+            inverse_depth: torch.Tensor,
+            pose_c2w: torch.Tensor,
+            image_hw: tuple[int, int],
+        ) -> torch.Tensor:
+            height, width = int(image_hw[0]), int(image_hw[1])
+            inv = inverse_depth.detach().float()
+            if inv.ndim == 2:
+                inv = inv.unsqueeze(0)
+            elif inv.ndim == 3 and int(inv.shape[0]) != 1:
+                inv = inv[:1]
+            if tuple(inv.shape[-2:]) != (height, width):
+                inv = F.interpolate(inv.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+            depth = inv.clamp_min(1.0e-6).reciprocal()
+            pixels = pixel_grid(height, width, device=depth.device, dtype=depth.dtype)
+            bearings = erp_pixel_to_bearing(pixels, height, width).to(device=depth.device, dtype=depth.dtype)
+            cam_points = bearings * depth[0].unsqueeze(-1)
+            pose = pose_c2w.detach().to(device=depth.device, dtype=depth.dtype)
+            if tuple(pose.shape) != (4, 4):
+                raise ValueError(f"Expected pose_c2w as 4x4, got {tuple(pose.shape)}")
+            return (cam_points.reshape(-1, 3) @ pose[:3, :3].T + pose[:3, 3].view(1, 3)).reshape(height, width, 3)
+
+        def synthetic_frontend_output_for_seed(
+            *,
+            frame_id: int,
+            source_frame: PanoFrame,
+            template: FrontendOutput,
+        ) -> FrontendOutput | None:
+            fid = int(frame_id)
+            pose_by_frame = getattr(self.frontend, "pose_by_frame", {})
+            depth_by_frame = getattr(self.frontend, "depth_by_frame", {})
+            conf_by_frame = getattr(self.frontend, "conf_by_frame", {})
+            pose = template.pose_c2w if fid == int(template.frame_id) else (
+                pose_by_frame.get(fid) if isinstance(pose_by_frame, dict) else None
+            )
+            inv = template.inverse_depth if fid == int(template.frame_id) else (
+                depth_by_frame.get(fid) if isinstance(depth_by_frame, dict) else None
+            )
+            conf = template.depth_confidence if fid == int(template.frame_id) else (
+                conf_by_frame.get(fid) if isinstance(conf_by_frame, dict) else None
+            )
+            if pose is None or inv is None:
+                return None
+            height, width = int(source_frame.image.shape[-2]), int(source_frame.image.shape[-1])
+            if fid == int(template.frame_id) and template.world_points is not None:
+                points = template.world_points.detach().float()
+                if points.ndim == 4 and int(points.shape[0]) == 1:
+                    points = points[0]
+            else:
+                points = world_points_from_inverse_depth(inv, pose, (height, width)).detach().cpu().float()
+            inv_t = inv.detach().float()
+            if inv_t.ndim == 2:
+                inv_t = inv_t.unsqueeze(0)
+            elif inv_t.ndim == 3 and int(inv_t.shape[0]) != 1:
+                inv_t = inv_t[:1]
+            if tuple(inv_t.shape[-2:]) != (height, width):
+                inv_t = F.interpolate(inv_t.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+            conf_t = None
+            if conf is not None:
+                conf_t = conf.detach().float()
+                if conf_t.ndim == 2:
+                    conf_t = conf_t.unsqueeze(0)
+                elif conf_t.ndim == 3 and int(conf_t.shape[0]) != 1:
+                    conf_t = conf_t[:1]
+                if tuple(conf_t.shape[-2:]) != (height, width):
+                    conf_t = F.interpolate(conf_t.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+            if tuple(points.shape[:2]) != (height, width):
+                points = F.interpolate(
+                    points.permute(2, 0, 1).unsqueeze(0),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0].permute(1, 2, 0)
+            valid = torch.isfinite(points).all(dim=-1, keepdim=False).unsqueeze(0) & torch.isfinite(inv_t) & (inv_t > 0.0)
+            if conf_t is not None:
+                valid = valid & torch.isfinite(conf_t) & (conf_t > 0.0)
+            return FrontendOutput(
+                frame_id=fid,
+                timestamp=float(source_frame.timestamp),
+                pose_c2w=pose.detach().cpu().float(),
+                relative_pose=None,
+                pose_confidence=float(template.pose_confidence),
+                inverse_depth=inv_t.detach().cpu().float(),
+                depth_confidence=None if conf_t is None else conf_t.detach().cpu().float(),
+                spherical_flow=None,
+                keyframe_score=float(template.keyframe_score),
+                is_keyframe=fid == int(template.frame_id),
+                ba_residual=template.ba_residual,
+                tracking_status=template.tracking_status,
+                world_points=points.detach().cpu().float(),
+                world_points_confidence=None if conf_t is None else conf_t.detach().cpu().float(),
+                valid_world_points_mask=valid.detach().cpu().bool(),
+            )
+
+        def concatenate_seed_batches(
+            batches: list[GaussianSeedBatch],
+            *,
+            frame_id: int,
+        ) -> GaussianSeedBatch:
+            nonempty = [batch for batch in batches if len(batch) > 0]
+            if not nonempty:
+                empty = torch.zeros(0)
+                return GaussianSeedBatch(
+                    xyz=empty.view(0, 3),
+                    rgb=empty.view(0, 3),
+                    confidence=empty,
+                    scale=empty,
+                    level=torch.zeros(0, dtype=torch.int8),
+                    frame_id=int(frame_id),
+                )
+            return GaussianSeedBatch(
+                xyz=torch.cat([batch.xyz.detach().cpu() for batch in nonempty], dim=0),
+                rgb=torch.cat([batch.rgb.detach().cpu() for batch in nonempty], dim=0),
+                confidence=torch.cat([batch.confidence.detach().cpu() for batch in nonempty], dim=0),
+                scale=torch.cat([batch.scale.detach().cpu() for batch in nonempty], dim=0),
+                level=torch.cat([batch.level.detach().cpu().to(torch.int8) for batch in nonempty], dim=0),
+                frame_id=int(frame_id),
+                source_flat_idx=None,
+                source_hw=None,
+                insert_enabled=(
+                    torch.cat([batch.insert_enabled.detach().cpu().bool() for batch in nonempty], dim=0)
+                    if all(batch.insert_enabled is not None for batch in nonempty)
+                    else None
+                ),
+                insert_score=(
+                    torch.cat([batch.insert_score.detach().cpu() for batch in nonempty], dim=0)
+                    if all(batch.insert_score is not None for batch in nonempty)
+                    else None
+                ),
+                grid_coord=(
+                    torch.cat([batch.grid_coord.detach().cpu().to(torch.int32) for batch in nonempty], dim=0)
+                    if all(batch.grid_coord is not None for batch in nonempty)
+                    else None
+                ),
+            )
+
+        def first_chunk_multiframe_seed_batch(
+            template: FrontendOutput,
+            source_frame: PanoFrame,
+        ) -> GaussianSeedBatch | None:
+            if not (replace_fuse_enabled and first_chunk_multiframe_init):
+                return None
+            if int(getattr(self.mapper.stats, "n_keyframes", 0)) != 0:
+                return None
+            source_frames: dict[int, PanoFrame] = {int(template.frame_id): source_frame}
+            source_frames.update({int(fid): frame for fid, frame in frame_cache.items()})
+            batches: list[GaussianSeedBatch] = []
+            used_ids: list[int] = []
+            for fid in current_frontend_chunk_frame_ids_full():
+                frame = source_frames.get(int(fid))
+                if frame is None:
+                    continue
+                output = synthetic_frontend_output_for_seed(frame_id=int(fid), source_frame=frame, template=template)
+                if output is None:
+                    continue
+                frame_sky_mask = frontend_sky_mask_for_frame(int(fid), frame.image)
+                hints = {"sky_mask": frame_sky_mask.detach().cpu().bool()} if frame_sky_mask is not None else None
+                batch = self.initializer.from_frontend_output(
+                    output,
+                    frame.image,
+                    insertion_hints=hints,
+                    first_keyframe=True,
+                )
+                if len(batch) > 0:
+                    batches.append(batch)
+                    used_ids.append(int(fid))
+            if not batches:
+                return None
+            self.mapper.stats.notes.append(
+                f"frame {int(template.frame_id)}: first chunk initialization used frames {used_ids}"
+            )
+            return concatenate_seed_batches(batches, frame_id=int(template.frame_id))
 
         def remember_final_frame(out: FrontendOutput, source_frame: PanoFrame, sky_mask: torch.Tensor | None) -> None:
             gt_pose = None
@@ -2119,6 +2318,7 @@ class PanoDroidGSSlamSystem:
             neural_anchor_mode = str(getattr(self.map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
             if out.is_keyframe and (out.inverse_depth is not None or (neural_anchor_mode and out.world_points is not None)):
                 section_start = time.perf_counter()
+                first_chunk_multiframe_used = False
                 if neural_anchor_mode:
                     empty = torch.zeros(0, device=source_frame.image.device, dtype=source_frame.image.dtype)
                     seeds = GaussianSeedBatch(
@@ -2132,18 +2332,23 @@ class PanoDroidGSSlamSystem:
                         grid_coord=torch.zeros(0, 3, dtype=torch.int32, device=source_frame.image.device),
                     )
                 else:
-                    consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
-                    insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
-                    if sky_mask is not None:
-                        insertion_hints = dict(insertion_hints or {})
-                        insertion_hints["sky_mask"] = sky_mask.detach().cpu().bool()
-                    seeds = self.initializer.from_frontend_output(
-                        out,
-                        source_frame.image,
-                        insertion_hints=insertion_hints,
-                        first_keyframe=int(getattr(self.mapper.stats, "n_keyframes", 0)) == 0,
-                    )
+                    seeds = first_chunk_multiframe_seed_batch(out, source_frame)
+                    first_chunk_multiframe_used = seeds is not None
+                    if seeds is None:
+                        consume_hints = getattr(self.frontend, "consume_insertion_hints", None)
+                        insertion_hints = consume_hints(int(out.frame_id)) if callable(consume_hints) else None
+                        if sky_mask is not None:
+                            insertion_hints = dict(insertion_hints or {})
+                            insertion_hints["sky_mask"] = sky_mask.detach().cpu().bool()
+                        seeds = self.initializer.from_frontend_output(
+                            out,
+                            source_frame.image,
+                            insertion_hints=insertion_hints,
+                            first_keyframe=int(getattr(self.mapper.stats, "n_keyframes", 0)) == 0,
+                        )
                 output_profile["seed_init_sec"] = float(time.perf_counter() - section_start)
+                output_profile["first_chunk_multiframe_init"] = int(first_chunk_multiframe_used)
+                output_profile["seed_candidates"] = int(len(seeds))
                 section_start = time.perf_counter()
                 if self.mapper.uses_joint_optimization or neural_anchor_mode:
                     inserted_count = self.mapper.insert_keyframe(
@@ -2151,6 +2356,8 @@ class PanoDroidGSSlamSystem:
                         out,
                         image=source_frame.image,
                         sky_mask=sky_mask,
+                        insert_occupancy_radius_voxels_override=0.0 if first_chunk_multiframe_used else None,
+                        compact_after_insert=bool(first_chunk_multiframe_used),
                     )
                 else:
                     inserted_count = self.mapper.insert_keyframe(seeds, out)

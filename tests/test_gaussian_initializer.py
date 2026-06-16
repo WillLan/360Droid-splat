@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
+from backend.pano_gs.mapper import MapperKeyframe, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
@@ -735,3 +735,80 @@ def test_replace_fuse_compacts_duplicate_anchors_after_voxel_refresh():
     assert torch.allclose(mapper.map._anchor_voxel_size[0], torch.tensor(0.05), atol=1.0e-6)
     index = mapper._build_replace_fuse_voxel_index()
     assert all(len(rows) == 1 for rows in index.values())
+
+
+def test_replace_fuse_first_chunk_override_skips_radius_reject_and_compacts_same_voxel_only():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "insert_occupancy_radius_voxels": 2.0,
+                "first_keyframe_max_seeds": 0,
+                "keyframe_max_seeds": 0,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {"sh_degree": 2},
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    seeds = _pfgs_seed_batch(
+        torch.tensor(
+            [
+                [0.005, 0.0, 0.0],
+                [0.015, 0.0, 0.0],
+                [0.025, 0.0, 0.0],
+            ]
+        ),
+        frame_id=0,
+    )
+
+    inserted = mapper.insert_keyframe(
+        seeds,
+        _frontend_output_for_mapper(0),
+        insert_occupancy_radius_voxels_override=0.0,
+        compact_after_insert=True,
+    )
+
+    assert inserted == 3
+    assert mapper.map.anchor_count() == 2
+    assert mapper.stats.last_skipped_voxel == 0
+    assert mapper.stats.last_replace_compacted == 1
+    assert all(len(rows) == 1 for rows in mapper._build_replace_fuse_voxel_index().values())
+
+
+def test_replace_fuse_active_mask_uses_selected_keyframe_update_ids():
+    config = {
+        "Mapping": {
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "voxel_size": 0.02,
+                "first_keyframe_max_seeds": 0,
+                "keyframe_max_seeds": 0,
+                "global_anchor_budget": 10,
+            }
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "optimize_after_every_chunk": True,
+        },
+    }
+    mapper = PanoGaussianMapper(PanoGaussianMap(config=config, device="cpu"))
+    mapper.map.add_seeds(
+        _pfgs_seed_batch(torch.tensor([[float(idx), 0.0, 1.0] for idx in range(4)]), frame_id=0),
+        voxel_size=0.02,
+        last_update_kf_ord=0,
+    )
+    mapper.map._anchor_last_update_kf_ord = torch.arange(4, dtype=torch.int32)
+    image = torch.zeros(3, 2, 4)
+    mapper.keyframes = [
+        MapperKeyframe(frame_id=fid, image=image, gaussian_start=fid, gaussian_end=fid + 1)
+        for fid in range(4)
+    ]
+
+    active = mapper._active_anchor_mask_for_keyframe_update_ids([1, 3]).detach().cpu()
+
+    assert active.tolist() == [False, True, False, True]
