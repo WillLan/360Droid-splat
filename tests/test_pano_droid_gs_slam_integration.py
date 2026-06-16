@@ -1542,6 +1542,73 @@ def test_system_runs_synthetic_smoke(tmp_path: Path):
     assert summary["keyframe_decisions_path"] is None
 
 
+def test_system_first_chunk_block_keyframe_keeps_all_init_frames(tmp_path: Path):
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 8, "width": 16},
+        "Frontend": {"mode": "panovggt_long", "keyframe_threshold": 2.0, "force_keyframe_interval": 99},
+        "PanoVGGT": {
+            "engine": "fake",
+            "image_size": [8, 16],
+            "chunk_size": 4,
+            "overlap": 2,
+            "emit_delay": 0,
+            "align_mode": "sim3",
+            "min_overlap_points": 4,
+            "M3Sphere": {"enabled": True},
+            "KeyframeAnchor": {
+                "enabled": True,
+                "prepend_previous_keyframe": False,
+                "min_keyframe_interval": 0,
+                "max_keyframe_interval": 0,
+            },
+            "DenseBA": {"enabled": False},
+        },
+        "MapRepresentation": {"mode": "anchor_scaffold_panorama"},
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Hierarchical": {"voxel_size_lis": [0.2, 0.6, 1.8]},
+        "Mapping": {
+            "seed_source": "world_points_only",
+            "max_seeds_per_keyframe": 0,
+            "min_depth_confidence": 0.0,
+            "sky_mask_enable": False,
+            "refine_steps_per_keyframe": 0,
+            "NovelGaussianInsertion": {
+                "enabled": True,
+                "strategy": "pfgs360_replace_fuse",
+                "insert_keyframe_policy": "new_block_last",
+                "insert_keyframe_block_size": 4,
+                "first_chunk_multiframe_init": True,
+                "voxel_size": 0.02,
+                "insert_occupancy_radius_voxels": 0.0,
+                "first_keyframe_max_seeds": 0,
+                "keyframe_max_seeds": 0,
+                "max_missing_seeds_per_keyframe": 0,
+                "max_depth_mismatch_seeds_per_keyframe": 0,
+            },
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": False,
+            "pose_refine_enable": False,
+            "optimize_after_every_chunk": False,
+            "keyframe_steps": 0,
+            "non_keyframe_steps": 0,
+            "local_submap_steps": 0,
+            "sliding_window_steps": 0,
+            "final_global_steps": 0,
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+        "WeightsAndBiases": {"mode": "disabled"},
+        "Visualization": {"save_local": False},
+        "Results": {"save_dir": str(tmp_path)},
+    }
+
+    summary = PanoDroidGSSlamSystem(cfg).run(max_frames=4)
+
+    assert summary["keyframes"] == 1
+    assert any("first chunk initialization used frames [0, 1, 2, 3]" in note for note in summary["notes"])
+
+
 def test_system_saves_keyframe_optimized_render_and_depth(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 3, "height": 12, "width": 24},

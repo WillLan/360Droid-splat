@@ -828,6 +828,57 @@ def test_tracker_disabled_path_status_unchanged():
     assert tracker.pop_keyframe_decisions() == []
 
 
+def test_replace_fuse_keyframes_follow_new_block_last_policy():
+    cfg = _anchor_cfg(
+        {
+            "translation_threshold": 0.0,
+            "translation_depth_ratio_threshold": 0.0,
+            "min_keyframe_interval": 0,
+            "max_keyframe_interval": 0,
+        }
+    )
+    tracker = PanoVGGTLongTracker(
+        engine=_RecordingAnchorEngine(
+            current_conf_by_call=(1.0, 1.0, 1.0, 1.0),
+            translation_by_call=(0.0, 0.1, 0.2, 0.3),
+        ),
+        engine_config=cfg["PanoVGGT"],
+        device="cpu",
+        chunk_size=4,
+        overlap=2,
+        emit_delay=0,
+        min_overlap_points=1,
+        require_aligned_world_points=False,
+        emit_unaligned=True,
+        novel_insertion_enabled=True,
+        novel_insertion_strategy="pfgs360_replace_fuse",
+        novel_insert_keyframe_policy="new_block_last",
+        novel_insert_keyframe_block_size=4,
+    )
+
+    def fake_align(aligned_pred, frame_ids, **kwargs):
+        _ = aligned_pred, frame_ids, kwargs
+        return SimilarityTransform.identity(device=torch.device("cpu"), dtype=torch.float32)
+
+    tracker._align_chunk = fake_align
+    outputs = []
+    for idx in range(8):
+        tracker.track(PanoFrame(image=torch.zeros(3, 2, 4), timestamp=float(idx), frame_id=idx))
+        outputs.extend(tracker.pop_ready_outputs())
+
+    keyframes = [int(out.frame_id) for out in outputs if out.is_keyframe]
+    decisions = tracker.pop_keyframe_decisions()
+    accepted = [int(item["frame_id"]) for item in decisions if item.get("accepted")]
+
+    assert keyframes == [3, 7]
+    assert accepted == [3, 7]
+    assert all(
+        item.get("chunk_keyframe_policy") == "new_block_last"
+        for item in decisions
+        if int(item["frame_id"]) in {0, 1, 2, 3, 4, 5, 6, 7}
+    )
+
+
 def test_keyframe_anchor_uses_sidepath_without_prepending_main_forward():
     engine = _RecordingAnchorEngine(current_conf_by_call=(1.0, 1.0, 1.0))
     tracker = _tracker_for_anchor_tests(engine)

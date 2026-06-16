@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
 
@@ -1752,6 +1753,19 @@ class PanoDroidGSSlamSystem:
             and str(novel_cfg.get("strategy", "legacy")).lower() == "pfgs360_replace_fuse"
         )
         first_chunk_multiframe_init = bool(novel_cfg.get("first_chunk_multiframe_init", False))
+        insert_keyframe_policy = str(novel_cfg.get("insert_keyframe_policy", "frontend") or "frontend").lower()
+        insert_keyframe_block_size = max(
+            1,
+            int(
+                novel_cfg.get(
+                    "insert_keyframe_block_size",
+                    (self.config.get("PanoVGGT", {}) or {}).get("chunk_size", 1),
+                )
+            ),
+        )
+        force_chunk_block_insertions = bool(
+            replace_fuse_enabled and insert_keyframe_policy in {"new_block_last", "chunk_block_last"}
+        )
         bootstrap_cfg = mapping_cfg.get("BootstrapOptimization", {}) if isinstance(mapping_cfg, dict) else {}
         bootstrap_enabled = bool(bootstrap_cfg.get("enabled", False))
         bootstrap_steps = int(bootstrap_cfg.get("first_keyframe_steps", 0))
@@ -1785,6 +1799,7 @@ class PanoDroidGSSlamSystem:
         recent_feedforward_chunks: list[tuple[int | None, list[int]]] = []
         frame_cache: dict[int, PanoFrame] = {}
         final_frame_records: dict[int, dict] = {}
+        chunk_keyframe_anchor_frame_id: int | None = None
         frame_count = 0
         keyframes = 0
         last_status = None
@@ -1839,6 +1854,19 @@ class PanoDroidGSSlamSystem:
                     if fid is not None and int(fid) not in ids:
                         ids.append(int(fid))
             return [int(fid) for fid in ids]
+
+        def backend_effective_keyframe_flag(out: FrontendOutput) -> bool:
+            nonlocal chunk_keyframe_anchor_frame_id
+            if not force_chunk_block_insertions:
+                return bool(out.is_keyframe)
+            ids = current_frontend_chunk_frame_ids_full()
+            if chunk_keyframe_anchor_frame_id is None:
+                if ids:
+                    chunk_keyframe_anchor_frame_id = int(min(ids))
+                else:
+                    chunk_keyframe_anchor_frame_id = int(out.frame_id)
+            rel = int(out.frame_id) - int(chunk_keyframe_anchor_frame_id)
+            return bool(rel >= 0 and ((rel + 1) % int(insert_keyframe_block_size) == 0))
 
         def world_points_from_inverse_depth(
             inverse_depth: torch.Tensor,
@@ -2296,13 +2324,23 @@ class PanoDroidGSSlamSystem:
             }
             metrics: dict = {}
             last_status = out.tracking_status
-            source_frame = frame_cache.pop(int(out.frame_id), None)
+            source_frame = frame_cache.get(int(out.frame_id))
             if source_frame is None:
                 self.mapper.stats.notes.append(f"frame {out.frame_id}: missing source frame for frontend output")
                 output_profile["missing_source_frame"] = 1
                 output_profile["total_sec"] = float(time.perf_counter() - process_start)
                 write_profile("process_output", **output_profile)
                 return
+            frontend_is_keyframe = bool(out.is_keyframe)
+            effective_is_keyframe = backend_effective_keyframe_flag(out)
+            output_profile["frontend_is_keyframe"] = int(frontend_is_keyframe)
+            output_profile["effective_is_keyframe"] = int(effective_is_keyframe)
+            if force_chunk_block_insertions:
+                output_profile["insert_keyframe_policy_active"] = 1
+                output_profile["insert_keyframe_block_size"] = int(insert_keyframe_block_size)
+            if effective_is_keyframe != frontend_is_keyframe:
+                out = replace(out, is_keyframe=bool(effective_is_keyframe))
+            output_profile["is_keyframe"] = int(bool(out.is_keyframe))
             sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), source_frame.image)
             remember_final_frame(out, source_frame, sky_mask)
             if feedforward_window_enabled and out.inverse_depth is not None:
@@ -2873,6 +2911,8 @@ class PanoDroidGSSlamSystem:
                 pop_ready_sec = float(time.perf_counter() - section_start)
                 for ready in outputs:
                     process_output(ready)
+                for ready in outputs:
+                    frame_cache.pop(int(ready.frame_id), None)
                 optimize_feedforward_after_batch(outputs)
                 write_profile(
                     "input_frame",
@@ -2893,6 +2933,8 @@ class PanoDroidGSSlamSystem:
                     flushed += 1
                     flushed_outputs.append(ready)
                     process_output(ready)
+                for ready in flushed_outputs:
+                    frame_cache.pop(int(ready.frame_id), None)
                 optimize_feedforward_after_batch(flushed_outputs)
                 write_profile("frontend_flush", flushed_outputs=float(flushed), total_sec=float(time.perf_counter() - section_start))
 

@@ -277,6 +277,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         novel_spatial_cell_size: int = 0,
         novel_max_seeds_per_cell: int = 0,
         novel_insertion_strategy: str = "legacy",
+        novel_insert_keyframe_policy: str = "frontend",
+        novel_insert_keyframe_block_size: int = 0,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.chunk_size = max(1, int(chunk_size))
@@ -296,6 +298,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.novel_spatial_cell_size = max(0, int(novel_spatial_cell_size))
         self.novel_max_seeds_per_cell = max(0, int(novel_max_seeds_per_cell))
         self.novel_insertion_strategy = str(novel_insertion_strategy or "legacy").lower()
+        self.novel_insert_keyframe_policy = str(novel_insert_keyframe_policy or "frontend").lower()
+        self.novel_insert_keyframe_block_size = max(0, int(novel_insert_keyframe_block_size))
         self.engine = engine or build_panovggt_engine(engine_config or {}, device=self.device)
         self.m3_config = parse_m3_sphere_config({"PanoVGGT": engine_config or {}})
         self.dense_ba_refiner = PanoVGGTDenseBARefiner(self.m3_config)
@@ -343,6 +347,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.pending_keyframe_graph_pose_updates: dict[int, torch.Tensor] = {}
         self.last_keyframe_id: Optional[int] = None
         self.last_keyframe_anchor: _KeyframeAnchorRecord | None = None
+        self._active_chunk_frame_ids: tuple[int, ...] = ()
+        self._chunk_keyframe_anchor_frame_id: int | None = None
         self.chunk_count = 0
         self.last_dense_ba_stats: DenseBARefinerStats | None = None
         self.dense_ba_stats_history: list[DenseBARefinerStats] = []
@@ -554,6 +560,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         if range_key in self.processed_ranges:
             return
         self.processed_ranges.add(range_key)
+        self._active_chunk_frame_ids = frame_ids
 
         profile: dict = {
             "chunk_index": int(self.chunk_count),
@@ -1586,6 +1593,9 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         anchor_metrics: _AnchorFrameMetrics | None,
     ) -> tuple[bool, dict]:
         last_keyframe_id = int(self.last_keyframe_id) if self.last_keyframe_id is not None else None
+        forced = self._chunk_block_keyframe_decision(frame_id=frame_id, key_score=key_score)
+        if forced is not None:
+            return forced
         if not self.keyframe_anchor_enabled:
             gap = (
                 int(frame_id) - int(self.last_keyframe_id)
@@ -1715,6 +1725,39 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             decision["forced_by_max_interval"] = True
         accepted = bool(reasons)
         decision["accepted"] = accepted
+        return accepted, decision
+
+    def _chunk_block_keyframe_decision(self, *, frame_id: int, key_score: float) -> tuple[bool, dict] | None:
+        policy = str(self.novel_insert_keyframe_policy or "frontend").lower()
+        if policy not in {"new_block_last", "chunk_block_last"}:
+            return None
+        if self.novel_insertion_strategy != "pfgs360_replace_fuse":
+            return None
+        if self._chunk_keyframe_anchor_frame_id is None:
+            if self._active_chunk_frame_ids:
+                self._chunk_keyframe_anchor_frame_id = int(self._active_chunk_frame_ids[0])
+            else:
+                self._chunk_keyframe_anchor_frame_id = int(frame_id)
+        block_size = max(1, int(self.novel_insert_keyframe_block_size or self.chunk_size))
+        rel = int(frame_id) - int(self._chunk_keyframe_anchor_frame_id)
+        accepted = bool(rel >= 0 and ((rel + 1) % block_size == 0))
+        decision = {
+            "frame_id": int(frame_id),
+            "last_keyframe_id": int(self.last_keyframe_id) if self.last_keyframe_id is not None else None,
+            "accepted": accepted,
+            "reasons": ["chunk_block_last"] if accepted else [],
+            "keyframe_score": float(key_score),
+            "keyframe_gap": (
+                int(frame_id) - int(self.last_keyframe_id)
+                if self.last_keyframe_id is not None
+                else int(rel + 1)
+            ),
+            "chunk_keyframe_policy": policy,
+            "chunk_keyframe_block_size": int(block_size),
+            "chunk_keyframe_anchor_frame_id": int(self._chunk_keyframe_anchor_frame_id),
+        }
+        if not accepted:
+            decision["suppressed_by_chunk_keyframe_policy"] = True
         return accepted, decision
 
     def _record_keyframe_decision(self, decision: dict) -> None:
@@ -1868,4 +1911,6 @@ def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:
         novel_spatial_cell_size=int(novel_cfg.get("spatial_cell_size", 0)),
         novel_max_seeds_per_cell=int(novel_cfg.get("max_seeds_per_cell", 0)),
         novel_insertion_strategy=str(novel_cfg.get("strategy", "legacy")),
+        novel_insert_keyframe_policy=str(novel_cfg.get("insert_keyframe_policy", "frontend")),
+        novel_insert_keyframe_block_size=int(novel_cfg.get("insert_keyframe_block_size", 0)),
     )

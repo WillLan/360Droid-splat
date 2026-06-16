@@ -25,9 +25,9 @@ PanoVGGT:
   skip_dinov2_pretrain: true
   image_size: null
   patch_multiple: 14
-  chunk_size: 8
+  chunk_size: 4
   overlap: 2
-  emit_delay: 1
+  emit_delay: 0
   align_mode: sim3
   require_aligned_world_points: true
   emit_unaligned: false
@@ -134,7 +134,7 @@ PanoVGGT:
     line_search: true
 
   InferenceWindow:
-    size: 8
+    size: 4
     overlap: 2
     temporal_radius: 2
     max_edges: 24
@@ -173,6 +173,8 @@ Mapping:
   NovelGaussianInsertion:
     enabled: true
     strategy: pfgs360_replace_fuse
+    insert_keyframe_policy: new_block_last
+    insert_keyframe_block_size: 4
     first_chunk_multiframe_init: true
     voxel_size: 0.02
     insert_occupancy_radius_voxels: 2.0
@@ -222,7 +224,7 @@ BackendOptimization:
   first_chunk_steps: 800
   steps_per_chunk: 300
   sample_frames_per_step: 1
-  current_chunk_observation_frames: 8
+  current_chunk_observation_frames: 4
   recent_chunk_observation_chunks: 2
   recent_keyframe_observation_frames: 0
   recent_insert_keyframes: 4
