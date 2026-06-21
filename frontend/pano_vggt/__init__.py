@@ -5,6 +5,7 @@ from .dense_ba_refiner import DenseBARefinerStats, PanoVGGTDenseBARefiner
 from .dense_matcher import PoseGuidedDenseMatcher
 from .engine import ExternalPanoVGGTInferenceEngine, FakePanoVGGTInferenceEngine, PanoVGGTInferenceEngine
 from .factor_graph import DenseSphereFactor, DenseSphereFactorGraph
+from .gaussian_head import AnchorGaussianPrediction, ExplicitGaussianSet, IterativeGaussianRefiner, PanoVGGTAnchorGaussianHead
 from .keyframe_graph_refiner import KeyframeGraphBAStats, PanoVGGTKeyframeGraphRefiner
 from .keyframe_memory import KeyframeCorrespondenceEdge, KeyframeCorrespondenceGraph, KeyframeMemory, KeyframeRecord
 from .matching_dataset import Omni360SceneTrainingDataset, SyntheticOmni360TrainingDataset
@@ -16,10 +17,13 @@ from .types import PanoVGGTLocalPrediction
 
 __all__ = [
     "ExternalPanoVGGTInferenceEngine",
+    "AnchorGaussianPrediction",
+    "ExplicitGaussianSet",
     "FakePanoVGGTInferenceEngine",
     "DenseBARefinerStats",
     "Omni360SceneTrainingDataset",
     "PanoVGGTInferenceEngine",
+    "IterativeGaussianRefiner",
     "PanoVGGTAlignmentError",
     "DenseSphereFactor",
     "DenseSphereFactorGraph",
@@ -31,6 +35,7 @@ __all__ = [
     "PanoVGGTLocalPrediction",
     "PanoVGGTDenseBARefiner",
     "PanoVGGTLongTracker",
+    "PanoVGGTAnchorGaussianHead",
     "PanoVGGTKeyframeGraphRefiner",
     "PanoVGGTMatchingHead",
     "PanoVGGTMatchingLossWeights",

@@ -1,0 +1,126 @@
+Training:
+  mode: matching_only
+  steps: 200000
+  batch_size: 1
+  frames_per_sample: 4
+  input_frames: 3
+  target_frame: last
+  num_workers: 2
+  amp: false
+  seed: 1234
+  log_interval: 50
+  save_interval: 5000
+  output_dir: outputs/panovggt_m3_sphere_omni360_gaussian
+  grad_clip: 1.0
+
+Model:
+  panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
+  panovggt_config: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  use_synthetic_features: false
+  feature_hook: aggregator
+  feature_key: null
+  feature_dim: 2048
+  image_size: [518, 1036]
+  patch_size: 14
+  patch_multiple: 14
+  amp: true
+  input_batch_dim: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+
+GaussianHead:
+  hidden_dim: 128
+  anchor_feat_dim: 64
+  k_offsets: 4
+  num_conv_blocks: 2
+  anchor_stride: 1
+  max_anchors: 4096
+  min_scale: 0.002
+  max_scale: 0.12
+  init_scale: 0.02
+  depth_delta_limit: 0.35
+  iterations: 2
+  refiner_hidden_dim: 128
+
+Dataset:
+  synthetic: false
+  root: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene
+  pose_root: /mnt/disk1/lanboyang/Datasets/Airsim360/UE_Raw_sample_pts
+  scenes: ["DTW", "NYC"]
+  erp_resize_height: 518
+  erp_resize_width: 1036
+  clip_stride: 1
+  temporal_radius: 4
+  bidirectional_pairs: false
+  pair_sampling: random
+  pairs_per_sample: 6
+  depth_format: euclidean_range
+  depth_scale: 1.0
+  depth_invalid_value: 1000.0
+  pose_format: position_euler
+  pose_coordinate_system: ue_airsim
+  pose_translation_scale: 0.01
+  validation_split: tail
+  validation_fraction: 0.05
+  allow_fallback_mode: false
+  class_map:
+    sky_names: ["Sky", "sky"]
+    sky_ids: [3]
+    sky_colors: []
+
+Renderer:
+  backend: gsplat360
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+  soft_sigma_px: 1.25
+  soft_max_points: 4096
+
+TrainingRender:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Loss:
+  rgb_weight: 1.0
+  depth_weight: 0.05
+  alpha_weight: 0.01
+  scale_reg_weight: 0.001
+  offset_reg_weight: 0.001
+  depth_delta_reg_weight: 0.01
+  intermediate_weight: 0.25
+
+Optimizer:
+  lr: 2.0e-4
+  weight_decay: 0.05
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: panovggt_m3_sphere_omni360_gaussian_head
+  mode: online
+  log_every: 10
+  tags:
+    - panovggt-gaussian-head
+    - omni360-scene
+    - feedforward
+    - recurrent-refinement
+
+Visualization:
+  enabled: true
+  interval: 250
+  save_dir: visualizations
+  max_width: 256
+
+Validation:
+  enabled: false
+  batch_size: 1
+  num_workers: 0
+  max_batches: 1
