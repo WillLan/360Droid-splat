@@ -76,6 +76,7 @@ class PanoReSplatFrontend(nn.Module):
                 poses,
                 render_output,
                 context_depth=depths,
+                context_valid_mask=valid_mask,
             )
             state, metrics = self.update_block(state, feedback)
             states.append(state)

@@ -79,6 +79,7 @@ def _default_config() -> dict[str, Any]:
             "skip_dinov2_pretrain": False,
         },
         "Initializer": {
+            "position_mode": "compact",
             "latent_downsample": 1,
             "gaussians_per_cell": 2,
             "state_dim": 32,
@@ -88,6 +89,7 @@ def _default_config() -> dict[str, Any]:
             "max_scale": 0.12,
             "init_scale": 0.02,
             "use_world_points_as_base": True,
+            "use_local_offsets": True,
         },
         "Feedback": {"feedback_dim": 32, "hidden_dim": 64},
         "Refiner": {
@@ -143,7 +145,7 @@ def _default_config() -> dict[str, Any]:
             "dssim_weight": 0.1,
             "lpips_weight": 0.0,
             "depth_weight": 0.05,
-            "context_weight": 0.15,
+            "context_weight": 0.0,
             "opacity_reg_weight": 0.001,
             "alpha_coverage_weight": 0.01,
             "scale_reg_weight": 0.001,
@@ -361,6 +363,36 @@ def _save_checkpoint(path: Path, frontend: PanoReSplatFrontend, config: dict[str
     torch.save(_checkpoint_payload(frontend, config=config, step=step, stage=stage, metrics=metrics), path)
 
 
+def _select_optional_frames(values: Any, indices: torch.Tensor) -> torch.Tensor | None:
+    if not torch.is_tensor(values):
+        return None
+    return values.index_select(1, indices)
+
+
+def _as_5d_mask(mask: torch.Tensor, *, name: str) -> torch.Tensor:
+    if mask.ndim == 4:
+        mask = mask.unsqueeze(2)
+    if mask.ndim != 5 or int(mask.shape[2]) != 1:
+        raise ValueError(f"{name} must have shape BxVxHxW or BxVx1xHxW, got {tuple(mask.shape)}")
+    return mask.bool()
+
+
+def _compose_valid_mask(
+    *,
+    valid_depth: torch.Tensor | None,
+    sky_mask: torch.Tensor | None,
+    world_points: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    valid = None if valid_depth is None else _as_5d_mask(valid_depth, name="valid_depth")
+    if sky_mask is not None:
+        non_sky = ~_as_5d_mask(sky_mask, name="sky_mask")
+        valid = non_sky if valid is None else valid & non_sky
+    if world_points is not None:
+        finite_world = torch.isfinite(world_points).all(dim=-1).unsqueeze(2)
+        valid = finite_world if valid is None else valid & finite_world
+    return valid
+
+
 def _sample_window(
     sample: dict[str, Any],
     priors: dict[str, torch.Tensor],
@@ -374,11 +406,15 @@ def _sample_window(
     vc = min(max(1, int(tr.get("context_views", 3))), max(1, n - 1))
     vt = min(max(1, int(tr.get("target_views", 1))), max(1, n - vc))
     mode = str(tr.get("window_mode", "fixed")).lower()
-    if bool(tr.get("debug_overfit", False)) or mode == "fixed" or n <= vc + vt:
+    if bool(tr.get("debug_overfit", False)) or mode == "fixed" or (mode != "random_split" and n <= vc + vt):
         context_idx = torch.arange(vc, device=index_device)
         target_idx = torch.arange(vc, min(vc + vt, n), device=index_device)
         if target_idx.numel() < vt:
             target_idx = torch.full((vt,), n - 1, dtype=torch.long, device=index_device)
+    elif mode == "random_split":
+        order = torch.randperm(n, device=index_device)
+        context_idx = order[:vc]
+        target_idx = order[vc : vc + vt]
     else:
         max_start = max(0, n - vc - vt)
         start = int(torch.randint(0, max_start + 1, (1,)).item())
@@ -390,17 +426,33 @@ def _sample_window(
         "depths": priors["depth"].index_select(1, context_idx).float(),
         "poses_c2w": priors["poses_c2w"].index_select(1, context_idx).float(),
         "world_points": priors["world_points"].index_select(1, context_idx).float(),
+        "view_indices": context_idx,
     }
-    valid_depth = sample.get("valid_depth")
-    if torch.is_tensor(valid_depth):
-        context["valid_mask"] = valid_depth.index_select(1, context_idx)
+    context_sky = _select_optional_frames(sample.get("sky_mask"), context_idx)
+    if context_sky is not None:
+        context["sky_mask"] = context_sky
+    context_valid = _compose_valid_mask(
+        valid_depth=_select_optional_frames(sample.get("valid_depth"), context_idx),
+        sky_mask=context_sky,
+        world_points=context["world_points"],
+    )
+    if context_valid is not None:
+        context["valid_mask"] = context_valid
     target = {
         "images": sample["images"].index_select(1, target_idx).float(),
         "depths": priors["depth"].index_select(1, target_idx).float(),
         "poses_c2w": priors["poses_c2w"].index_select(1, target_idx).float(),
+        "view_indices": target_idx,
     }
-    if torch.is_tensor(valid_depth):
-        target["valid_mask"] = valid_depth.index_select(1, target_idx)
+    target_sky = _select_optional_frames(sample.get("sky_mask"), target_idx)
+    if target_sky is not None:
+        target["sky_mask"] = target_sky
+    target_valid = _compose_valid_mask(
+        valid_depth=_select_optional_frames(sample.get("valid_depth"), target_idx),
+        sky_mask=target_sky,
+    )
+    if target_valid is not None:
+        target["valid_mask"] = target_valid
     return context, target
 
 
@@ -432,6 +484,40 @@ def _render_views(
     )
 
 
+def _broadcast_mask(mask: torch.Tensor | None, values: torch.Tensor) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    out = _as_5d_mask(mask, name="loss_mask").to(device=values.device)
+    while out.ndim < values.ndim:
+        out = out.unsqueeze(-1)
+    if out.shape[-2:] != values.shape[-2:]:
+        flat = out.float().reshape(-1, 1, int(out.shape[-2]), int(out.shape[-1]))
+        flat = F.interpolate(flat, size=tuple(int(x) for x in values.shape[-2:]), mode="nearest")
+        out = flat.reshape(*out.shape[:-2], *values.shape[-2:]) > 0.5
+    return out.expand_as(values).bool()
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor | None, *, default: float = 0.0) -> torch.Tensor:
+    if mask is None:
+        return values.mean()
+    mask_b = _broadcast_mask(mask, values)
+    if mask_b is None or not bool(mask_b.any()):
+        return values.new_tensor(float(default))
+    return values[mask_b].mean()
+
+
+def _gaussian_masked_mean(values: torch.Tensor, mask: torch.Tensor | None, *, default: float = 0.0) -> torch.Tensor:
+    if mask is None:
+        return values.mean()
+    valid = mask.to(device=values.device, dtype=torch.bool)
+    while valid.ndim < values.ndim:
+        valid = valid.unsqueeze(-1)
+    valid = valid.expand_as(values)
+    if not bool(valid.any()):
+        return values.new_tensor(float(default))
+    return values[valid].mean()
+
+
 def _ssim_dssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_f = pred.reshape(-1, 3, pred.shape[-2], pred.shape[-1])
     target_f = target.reshape(-1, 3, target.shape[-2], target.shape[-1])
@@ -446,8 +532,18 @@ def _ssim_dssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return ((1.0 - ssim.clamp(-1.0, 1.0)) * 0.5).mean()
 
 
-def _psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    mse = (pred - target).square().mean().clamp_min(1.0e-8)
+def _masked_ssim_dssim(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return _ssim_dssim(pred, target)
+    mask_b = _broadcast_mask(mask, pred)
+    if mask_b is None or not bool(mask_b.any()):
+        return pred.new_tensor(0.0)
+    mask_f = mask_b.to(dtype=pred.dtype)
+    return _ssim_dssim(pred * mask_f, target * mask_f)
+
+
+def _psnr(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    mse = _masked_mean((pred - target).square(), mask).clamp_min(1.0e-8)
     return -10.0 * torch.log10(mse)
 
 
@@ -483,12 +579,18 @@ def _single_output_loss(
     loss_cfg = config.get("Loss", {})
     pred = target_render.color
     gt = target["images"].to(pred).clamp(0.0, 1.0)
-    rgb_l1 = (pred - gt).abs().mean()
-    dssim = _ssim_dssim(pred, gt)
+    target_mask = target.get("valid_mask") if torch.is_tensor(target.get("valid_mask")) else None
+    rgb_l1 = _masked_mean((pred - gt).abs(), target_mask)
+    dssim = _masked_ssim_dssim(pred, gt, target_mask)
     lpips_loss = pred.new_tensor(0.0)
     if lpips_model is not None:
+        lpips_mask = _broadcast_mask(target_mask, pred)
+        mask_f = 1.0 if lpips_mask is None else lpips_mask.to(dtype=pred.dtype)
         pred_f = pred.reshape(-1, 3, pred.shape[-2], pred.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
         gt_f = gt.reshape(-1, 3, gt.shape[-2], gt.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
+        if torch.is_tensor(mask_f):
+            pred_f = (pred * mask_f).reshape(-1, 3, pred.shape[-2], pred.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
+            gt_f = (gt * mask_f).reshape(-1, 3, gt.shape[-2], gt.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
         lpips_loss = lpips_model(pred_f, gt_f).mean()
     depth_loss = pred.new_tensor(0.0)
     if torch.is_tensor(target.get("depths")) and torch.is_tensor(target_render.depth):
@@ -502,29 +604,33 @@ def _single_output_loss(
     context_l1 = pred.new_tensor(0.0)
     if context_render is not None:
         context_gt = context["images"].to(pred).clamp(0.0, 1.0)
-        context_l1 = (context_render.color - context_gt).abs().mean()
+        context_mask = context.get("valid_mask") if torch.is_tensor(context.get("valid_mask")) else None
+        context_l1 = _masked_mean((context_render.color - context_gt).abs(), context_mask)
     scale = state.log_scales.exp()
     opacity = torch.sigmoid(state.opacity_logits)
-    alpha_coverage = target_render.alpha.mean()
-    opacity_reg = opacity.mean()
-    scale_reg = scale.mean()
-    anisotropy_reg = (scale.max(dim=-1).values / scale.min(dim=-1).values.clamp_min(1.0e-6) - 1.0).mean()
-    sh_reg = state.sh_coeffs.abs().mean()
+    alpha_coverage = _masked_mean(target_render.alpha, target_mask, default=1.0)
+    gaussian_valid = state.valid_mask
+    opacity_reg = _gaussian_masked_mean(opacity, gaussian_valid)
+    scale_reg = _gaussian_masked_mean(scale, gaussian_valid)
+    anisotropy_values = scale.max(dim=-1).values / scale.min(dim=-1).values.clamp_min(1.0e-6) - 1.0
+    anisotropy_reg = _gaussian_masked_mean(anisotropy_values, gaussian_valid)
+    sh_reg = _gaussian_masked_mean(state.sh_coeffs.abs(), gaussian_valid)
     delta_reg = pred.new_tensor(0.0)
     mean_step = pred.new_tensor(0.0)
     if prev_state is not None:
+        valid_delta = state.valid_mask & prev_state.valid_mask
         delta_reg = (
-            (state.log_scales - prev_state.log_scales).abs().mean()
-            + (state.opacity_logits - prev_state.opacity_logits).abs().mean()
-            + (state.sh_coeffs - prev_state.sh_coeffs).abs().mean()
+            _gaussian_masked_mean((state.log_scales - prev_state.log_scales).abs(), valid_delta)
+            + _gaussian_masked_mean((state.opacity_logits - prev_state.opacity_logits).abs(), valid_delta)
+            + _gaussian_masked_mean((state.sh_coeffs - prev_state.sh_coeffs).abs(), valid_delta)
         )
-        mean_step = (state.means - prev_state.means).norm(dim=-1).mean()
+        mean_step = _gaussian_masked_mean((state.means - prev_state.means).norm(dim=-1), valid_delta)
     loss = (
         float(loss_cfg.get("rgb_l1_weight", 1.0)) * rgb_l1
         + float(loss_cfg.get("dssim_weight", 0.1)) * dssim
         + float(loss_cfg.get("lpips_weight", 0.0)) * lpips_loss
         + float(loss_cfg.get("depth_weight", 0.05)) * depth_loss
-        + float(loss_cfg.get("context_weight", 0.15)) * context_l1
+        + float(loss_cfg.get("context_weight", 0.0)) * context_l1
         + float(loss_cfg.get("opacity_reg_weight", 0.001)) * opacity_reg
         + float(loss_cfg.get("alpha_coverage_weight", 0.01)) * (1.0 - alpha_coverage)
         + float(loss_cfg.get("scale_reg_weight", 0.001)) * scale_reg
@@ -546,8 +652,13 @@ def _single_output_loss(
         "delta_reg": delta_reg.detach(),
         "mean_step_reg": mean_step.detach(),
         "sh_reg": sh_reg.detach(),
-        "psnr": _psnr(pred.detach(), gt.detach()).detach(),
+        "psnr": _psnr(pred.detach(), gt.detach(), target_mask).detach(),
         "target_l1": rgb_l1.detach(),
+        "target_valid_ratio": (
+            target["valid_mask"].to(device=pred.device, dtype=pred.dtype).mean().detach()
+            if torch.is_tensor(target.get("valid_mask"))
+            else pred.new_tensor(1.0)
+        ),
     }
 
 
@@ -593,6 +704,7 @@ def _forward_train(
             context["poses_c2w"],
             context_render,
             context_depth=context.get("depths"),
+            context_valid_mask=context.get("valid_mask"),
         )
         state, metrics = frontend.update_block(state, feedback)
         states.append(state)
@@ -680,6 +792,14 @@ def _tensor_to_image(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
+def _mask_to_image(mask: torch.Tensor) -> Image.Image:
+    m = mask.detach().float().cpu()
+    if m.ndim == 3:
+        m = m[0]
+    arr = (m.clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(np.stack([arr, arr, arr], axis=-1), mode="RGB")
+
+
 def _save_visualization(output_dir: Path, step_name: str, target: dict[str, torch.Tensor], artifacts: dict[str, Any]) -> Path:
     render_dir = output_dir / "renders" / step_name
     render_dir.mkdir(parents=True, exist_ok=True)
@@ -687,7 +807,14 @@ def _save_visualization(output_dir: Path, step_name: str, target: dict[str, torc
     renders: list[PanoRenderOutput] = artifacts["target_renders"]
     final = renders[-1].color[0, 0] if renders[-1].color.ndim == 5 else renders[-1].color[0]
     initial = renders[0].color[0, 0] if renders[0].color.ndim == 5 else renders[0].color[0]
+    target_mask = None
+    if torch.is_tensor(target.get("valid_mask")):
+        target_mask = target["valid_mask"][0, 0].detach().float().cpu()
+        if target_mask.ndim == 3:
+            target_mask = target_mask[0]
     err = (final.detach().float().cpu() - target_rgb.detach().float().cpu()).abs().mean(dim=0)
+    if target_mask is not None:
+        err = err * target_mask
     err = err / err.max().clamp_min(1.0e-6)
     err_img = torch.stack([err, 1.0 - err, torch.zeros_like(err)], dim=0)
     panels = [
@@ -696,6 +823,12 @@ def _save_visualization(output_dir: Path, step_name: str, target: dict[str, torc
         ("rendered_target", _tensor_to_image(final)),
         ("error_map", _tensor_to_image(err_img)),
     ]
+    if target_mask is not None:
+        panels.insert(1, ("masked_target", _tensor_to_image(target_rgb.detach().float().cpu() * target_mask.unsqueeze(0))))
+        panels.append(("target_valid_mask", _mask_to_image(target_mask)))
+    if torch.is_tensor(target.get("sky_mask")):
+        sky = target["sky_mask"][0, 0].detach().float().cpu()
+        panels.append(("target_sky_mask", _mask_to_image(sky)))
     context = artifacts.get("context_render")
     if isinstance(context, PanoRenderOutput):
         ctx = context.color[0, 0] if context.color.ndim == 5 else context.color[0]

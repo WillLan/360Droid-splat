@@ -34,6 +34,7 @@ class PanoRenderFeedbackEncoder(nn.Module):
         context_poses_c2w: torch.Tensor,
         context_render_output: PanoRenderOutput | dict[str, Any],
         context_depth: torch.Tensor | None = None,
+        context_valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if context_images.ndim != 5 or int(context_images.shape[2]) != 3:
             raise ValueError(f"context_images must have shape BxVx3xHxW, got {tuple(context_images.shape)}")
@@ -55,6 +56,9 @@ class PanoRenderFeedbackEncoder(nn.Module):
             if context_depth.ndim != 5 or tuple(context_depth.shape[:2]) != (b, v):
                 raise ValueError(f"context_depth must have shape BxVx1xHxW, got {tuple(context_depth.shape)}")
             depth_target = torch.nan_to_num(context_depth.to(device=state.means.device, dtype=state.means.dtype), nan=0.0, posinf=0.0, neginf=0.0)
+        valid_maps = None
+        if context_valid_mask is not None:
+            valid_maps = self._normalize_context_mask(context_valid_mask, b, v, h, w).to(device=state.means.device, dtype=state.means.dtype)
 
         per_view = []
         weights = []
@@ -73,6 +77,10 @@ class PanoRenderFeedbackEncoder(nn.Module):
             abs_residual = self._sample_map(abs_maps[:, view_idx], grid).transpose(1, 2)
             alpha = self._sample_map(render_alpha[:, view_idx], grid).transpose(1, 2)
             depth_render = self._sample_map(render_depth[:, view_idx], grid).transpose(1, 2)
+            if valid_maps is None:
+                valid_sample = torch.ones_like(alpha[..., 0], dtype=torch.bool)
+            else:
+                valid_sample = self._sample_map(valid_maps[:, view_idx], grid).transpose(1, 2)[..., 0] > 0.5
             if depth_target is None:
                 depth_error = torch.zeros_like(depth_render)
             else:
@@ -80,7 +88,7 @@ class PanoRenderFeedbackEncoder(nn.Module):
                 depth_error = ((depth_render - depth_gt) / depth_gt.abs().clamp_min(1.0)).clamp(-1.0, 1.0)
             camera_center = context_poses_c2w[:, view_idx, :3, 3].to(device=state.means.device, dtype=state.means.dtype)
             view_dir = F.normalize(state.means - camera_center[:, None, :], dim=-1, eps=1.0e-6)
-            valid = projection.mask & state.valid_mask
+            valid = projection.mask & state.valid_mask & valid_sample
             weight = valid.unsqueeze(-1).to(dtype=state.means.dtype) * alpha.clamp(0.0, 1.0)
             feat = torch.cat(
                 [
@@ -116,6 +124,16 @@ class PanoRenderFeedbackEncoder(nn.Module):
     @staticmethod
     def _sample_map(values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         return F.grid_sample(values, grid, mode="bilinear", padding_mode="border", align_corners=True)[..., 0]
+
+    @staticmethod
+    def _normalize_context_mask(mask: torch.Tensor, b: int, v: int, h: int, w: int) -> torch.Tensor:
+        if mask.ndim == 4:
+            mask = mask.unsqueeze(2)
+        if mask.ndim != 5 or tuple(mask.shape[:2]) != (b, v) or int(mask.shape[2]) != 1:
+            raise ValueError(f"context_valid_mask must have shape BxVxHxW or BxVx1xHxW, got {tuple(mask.shape)}")
+        if tuple(mask.shape[-2:]) != (h, w):
+            mask = F.interpolate(mask.float(), size=(h, w), mode="nearest")
+        return mask.float()
 
     @staticmethod
     def _unpack_render_output(

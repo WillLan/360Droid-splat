@@ -19,6 +19,7 @@ from .resplat_types import PanoGaussianState
 
 @dataclass(frozen=True)
 class PanoCompactGaussianInitializerConfig:
+    position_mode: str = "compact"
     latent_downsample: int = 1
     gaussians_per_cell: int = 2
     state_dim: int = 64
@@ -28,6 +29,7 @@ class PanoCompactGaussianInitializerConfig:
     max_scale: float = 0.12
     init_scale: float = 0.02
     use_world_points_as_base: bool = False
+    use_local_offsets: bool = True
 
 
 def _as_config(
@@ -75,6 +77,7 @@ class PanoCompactGaussianInitializer(nn.Module):
         self,
         config: PanoCompactGaussianInitializerConfig | dict | None = None,
         *,
+        position_mode: str | None = None,
         latent_downsample: int | None = None,
         gaussians_per_cell: int | None = None,
         state_dim: int | None = None,
@@ -84,10 +87,12 @@ class PanoCompactGaussianInitializer(nn.Module):
         max_scale: float | None = None,
         init_scale: float | None = None,
         use_world_points_as_base: bool | None = None,
+        use_local_offsets: bool | None = None,
     ) -> None:
         super().__init__()
         cfg = _as_config(
             config,
+            position_mode=position_mode,
             latent_downsample=latent_downsample,
             gaussians_per_cell=gaussians_per_cell,
             state_dim=state_dim,
@@ -97,14 +102,24 @@ class PanoCompactGaussianInitializer(nn.Module):
             max_scale=max_scale,
             init_scale=init_scale,
             use_world_points_as_base=use_world_points_as_base,
+            use_local_offsets=use_local_offsets,
         )
+        position_mode_value = str(cfg.position_mode).lower()
+        if position_mode_value not in {"compact", "dense_world_points"}:
+            raise ValueError(f"Unsupported Initializer.position_mode={cfg.position_mode!r}.")
         if int(cfg.sh_degree) != 0:
             raise NotImplementedError("PanoCompactGaussianInitializer currently supports sh_degree=0 only.")
         if int(cfg.gaussians_per_cell) <= 0:
             raise ValueError("gaussians_per_cell must be positive.")
         if int(cfg.state_dim) <= 0:
             raise ValueError("state_dim must be positive.")
+        if position_mode_value == "dense_world_points":
+            if int(cfg.gaussians_per_cell) != 1:
+                raise ValueError("dense_world_points mode requires gaussians_per_cell=1.")
+            if bool(cfg.use_local_offsets):
+                raise NotImplementedError("dense_world_points mode currently requires use_local_offsets=false.")
         self.config = cfg
+        self.position_mode = position_mode_value
         self.latent_downsample = max(1, int(cfg.latent_downsample))
         self.gaussians_per_cell = int(cfg.gaussians_per_cell)
         self.state_dim = int(cfg.state_dim)
@@ -115,10 +130,15 @@ class PanoCompactGaussianInitializer(nn.Module):
         self.max_scale = max(float(cfg.max_scale), self.min_scale)
         self.init_scale = min(max(float(cfg.init_scale), self.min_scale), self.max_scale)
         self.use_world_points_as_base = bool(cfg.use_world_points_as_base)
+        self.use_local_offsets = bool(cfg.use_local_offsets)
 
         self.trunk = nn.Sequential(
             _ConvNormGELU(None, self.state_dim),
             _ConvNormGELU(self.state_dim, self.state_dim),
+        )
+        self.dense_feature_proj = nn.Sequential(
+            nn.LazyConv2d(self.state_dim, kernel_size=1),
+            nn.GELU(),
         )
         k = self.gaussians_per_cell
         self.latent_proj = nn.Conv2d(self.state_dim, self.state_dim, kernel_size=1)
@@ -167,6 +187,9 @@ class PanoCompactGaussianInitializer(nn.Module):
         """
 
         self._validate_inputs(images, features, depths, poses_c2w, valid_mask, world_points)
+        if self.position_mode == "dense_world_points":
+            return self._forward_dense_world_points(images, features, depths, poses_c2w, valid_mask, world_points=world_points)
+
         input_dtype = features.dtype
         device = features.device
         param_dtype = next(self.parameters()).dtype
@@ -235,7 +258,7 @@ class PanoCompactGaussianInitializer(nn.Module):
         basis = tangent_basis(base_bearing)
         tangent_u = basis[..., 0]
         tangent_v = basis[..., 1]
-        offset_step = torch.tanh(offsets) * float(self.max_scale)
+        offset_step = torch.tanh(offsets) * float(self.max_scale) if self.use_local_offsets else torch.zeros_like(offsets)
         mean_cam = (
             base_cam.unsqueeze(-2)
             + offset_step[..., 0:1] * base_bearing.unsqueeze(-2)
@@ -269,6 +292,87 @@ class PanoCompactGaussianInitializer(nn.Module):
         )
         return self._maybe_crop(state)
 
+    def _forward_dense_world_points(
+        self,
+        images: torch.Tensor,
+        features: torch.Tensor,
+        depths: torch.Tensor,
+        poses_c2w: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        *,
+        world_points: torch.Tensor | None,
+    ) -> PanoGaussianState:
+        if world_points is None:
+            raise ValueError("dense_world_points mode requires world_points with shape BxVxHxWx3.")
+        input_dtype = features.dtype
+        device = features.device
+        param_dtype = next(self.parameters()).dtype
+        b, v, c, hf, wf = [int(x) for x in features.shape]
+        h, w = int(images.shape[-2]), int(images.shape[-1])
+        flat_count = b * v
+        k = 1
+
+        feat = self.dense_feature_proj(
+            torch.nan_to_num(features.to(dtype=param_dtype), nan=0.0, posinf=0.0, neginf=0.0).reshape(flat_count, c, hf, wf)
+        )
+        feat = F.interpolate(feat, size=(h, w), mode="bilinear", align_corners=False)
+        rgb = torch.nan_to_num(
+            images.to(device=device, dtype=param_dtype),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0).reshape(flat_count, 3, h, w)
+        depth_raw = depths.to(device=device, dtype=param_dtype)
+        depth_valid = torch.isfinite(depth_raw) & (depth_raw > 1.0e-6)
+        valid = depth_valid if valid_mask is None else depth_valid & self._normalize_valid_mask(valid_mask, depths.shape).to(device=device)
+        depth_safe = torch.where(depth_valid, depth_raw, torch.ones_like(depth_raw)).reshape(flat_count, 1, h, w).clamp_min(1.0e-6)
+
+        uv_image = make_feature_grid((h, w), device=device, dtype=param_dtype)
+        bearing = erp_uv_to_bearing(uv_image, (h, w)).to(device=device, dtype=param_dtype)
+        bearing_map = bearing.permute(2, 0, 1).view(1, 3, h, w).expand(flat_count, -1, -1, -1)
+        uv_norm = torch.stack(
+            [
+                2.0 * uv_image[..., 0] / float(max(w - 1, 1)) - 1.0,
+                2.0 * uv_image[..., 1] / float(max(h - 1, 1)) - 1.0,
+            ],
+            dim=-1,
+        ).permute(2, 0, 1).view(1, 2, h, w).expand(flat_count, -1, -1, -1)
+
+        x = torch.cat([feat, rgb, depth_safe.log(), bearing_map, uv_norm], dim=1)
+        hidden = self.trunk(x)
+        latent_cell = self.latent_proj(hidden)
+        log_scales = self.scale_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
+        rotations = self.rotation_proj(hidden).view(b, v, k, 4, h, w).permute(0, 1, 4, 5, 2, 3)
+        opacity = self.opacity_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
+        sh_residual = self.sh0_residual_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
+        confidence_delta = self.confidence_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
+        latent = latent_cell.view(b, v, self.state_dim, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2)
+
+        means_world = world_points.to(device=device, dtype=param_dtype).unsqueeze(-2)
+        finite_world = torch.isfinite(means_world).all(dim=-1)
+        rgb_cell = rgb.view(b, v, 3, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2)
+        rgb_init = (rgb_cell + 0.25 * torch.tanh(sh_residual)).clamp(0.0, 1.0)
+        sh0 = ((rgb_init - 0.5) / SH_C0).unsqueeze(-1)
+        log_scales = log_scales.clamp(math.log(float(self.min_scale)), math.log(float(self.max_scale)))
+        valid_cells = valid.reshape(b, v, 1, h, w).permute(0, 1, 3, 4, 2).expand(-1, -1, -1, -1, k)
+        finite = finite_world & torch.isfinite(log_scales).all(dim=-1)
+        valid_flat = (valid_cells & finite).reshape(b, -1)
+        confidence = (valid_cells.unsqueeze(-1).to(dtype=param_dtype) * torch.sigmoid(opacity + confidence_delta)).reshape(b, -1, 1)
+
+        state = PanoGaussianState(
+            means=torch.nan_to_num(means_world.reshape(b, -1, 3).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            log_scales=torch.nan_to_num(log_scales.reshape(b, -1, 3).to(dtype=input_dtype), nan=math.log(float(self.init_scale)), posinf=math.log(float(self.max_scale)), neginf=math.log(float(self.min_scale))),
+            rotations_unnorm=torch.nan_to_num(rotations.reshape(b, -1, 4).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            opacity_logits=torch.nan_to_num(opacity.reshape(b, -1, 1).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            sh_coeffs=torch.nan_to_num(sh0.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            latent_features=torch.nan_to_num(latent.reshape(b, -1, self.state_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            source_view_ids=self._source_view_ids(b, v, h, w, k, device=device),
+            source_uv=self._source_uv(b, v, h, w, k, uv_image.to(dtype=input_dtype)),
+            valid_mask=valid_flat,
+            confidence=torch.nan_to_num(confidence.to(dtype=input_dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0),
+        )
+        return self._maybe_crop(state)
+
     def _validate_inputs(
         self,
         images: torch.Tensor,
@@ -294,9 +398,9 @@ class PanoCompactGaussianInitializer(nn.Module):
             raise ValueError("depths must match image H,W.")
         if valid_mask is not None:
             self._normalize_valid_mask(valid_mask, depths.shape)
-        if self.use_world_points_as_base:
+        if self.use_world_points_as_base or self.position_mode == "dense_world_points":
             if world_points is None:
-                raise ValueError("use_world_points_as_base=True requires world_points with shape BxVxHxWx3.")
+                raise ValueError("world point based initialization requires world_points with shape BxVxHxWx3.")
             if world_points.ndim != 5 or int(world_points.shape[-1]) != 3:
                 raise ValueError(f"world_points must have shape BxVxHxWx3, got {tuple(world_points.shape)}")
             if tuple(world_points.shape[:2]) != tuple(images.shape[:2]) or tuple(world_points.shape[2:4]) != tuple(images.shape[-2:]):

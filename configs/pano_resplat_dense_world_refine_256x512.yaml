@@ -1,0 +1,89 @@
+Training:
+  stage: refine
+  steps: 30000
+  batch_size: 1
+  frames_per_sample: 6
+  context_views: 4
+  target_views: 2
+  train_min_refine: 1
+  train_max_refine: 4
+  window_mode: random_split
+  num_workers: 2
+  output_dir: outputs/pano_resplat/dense_world_refine_256x512
+  save_every: 1000
+  eval_every: 500
+  vis_every: 500
+  log_every: 10
+Optimizer:
+  lr: 1.0e-4
+  refiner_lr: 1.0e-4
+  weight_decay: 0.01
+Model:
+  use_synthetic_features: false
+  panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
+  panovggt_config: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  feature_hook: aggregator
+  feature_dim: 2048
+  image_size: [256, 512]
+  patch_size: 14
+  patch_multiple: 14
+  amp: true
+  input_batch_dim: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+Initializer:
+  position_mode: dense_world_points
+  latent_downsample: 1
+  gaussians_per_cell: 1
+  state_dim: 64
+  sh_degree: 0
+  max_gaussians: 0
+  min_scale: 0.002
+  max_scale: 0.12
+  init_scale: 0.02
+  use_world_points_as_base: true
+  use_local_offsets: false
+Feedback:
+  feedback_dim: 64
+  hidden_dim: 128
+Refiner:
+  hidden_dim: 128
+  knn: 8
+  num_heads: 4
+  max_knn_points: 8192
+  chunk_size: 4096
+Dataset:
+  synthetic: false
+  root: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene
+  pose_root: /mnt/disk1/lanboyang/Datasets/Airsim360/UE_Raw_sample_pts
+  scenes: ["DTW", "NYC"]
+  erp_resize_height: 256
+  erp_resize_width: 512
+  clip_stride: 1
+  temporal_radius: 4
+  depth_format: euclidean_range
+  depth_scale: 1.0
+  depth_invalid_value: 1000.0
+  pose_coordinate_system: ue_airsim
+  pose_translation_scale: 0.01
+  validation_fraction: 0.05
+  class_map:
+    sky_names: ["Sky", "sky"]
+    sky_ids: [3]
+Renderer:
+  backend: gsplat360
+  allow_soft_splat_fallback: false
+  soft_max_points: 4096
+Loss:
+  context_weight: 0.0
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  project: 360Droid-splat
+  run_name: pano_resplat_dense_world_refine_256x512
+  tags: ["pano-resplat", "dense-world", "refine"]
+Validation:
+  enabled: true
+  max_batches: 2

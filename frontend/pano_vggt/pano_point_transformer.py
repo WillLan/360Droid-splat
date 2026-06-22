@@ -88,22 +88,32 @@ class PanoKNNTransformerBlock(nn.Module):
         b, n, _ = [int(v) for v in xyz.shape]
         k = min(self.knn, n)
         safe_xyz = torch.nan_to_num(xyz.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        ref_indices = None
+        search_xyz = safe_xyz
+        search_valid = valid
+        if self.max_knn_points > 0 and n > self.max_knn_points:
+            ref_indices = torch.linspace(0, n - 1, steps=int(self.max_knn_points), device=xyz.device).round().long()
+            search_xyz = safe_xyz.index_select(1, ref_indices)
+            search_valid = None if valid is None else valid.index_select(1, ref_indices)
+            k = min(k, int(search_xyz.shape[1]))
         chunk = self.chunk_size
-        if chunk is None and self.max_knn_points > 0 and n > self.max_knn_points:
-            chunk = self.max_knn_points
+        if chunk is None and n > 4096:
+            chunk = 4096
         if chunk is None or chunk >= n:
-            dist = torch.cdist(safe_xyz, safe_xyz)
-            if valid is not None:
-                dist = dist.masked_fill(~valid[:, None, :], float("inf"))
-            return torch.topk(dist, k=k, dim=-1, largest=False).indices
+            dist = torch.cdist(safe_xyz, search_xyz)
+            if search_valid is not None:
+                dist = dist.masked_fill(~search_valid[:, None, :], float("inf"))
+            idx = torch.topk(dist, k=k, dim=-1, largest=False).indices
+            return ref_indices[idx] if ref_indices is not None else idx
 
         parts = []
         for start in range(0, n, int(chunk)):
             stop = min(start + int(chunk), n)
-            dist = torch.cdist(safe_xyz[:, start:stop], safe_xyz)
-            if valid is not None:
-                dist = dist.masked_fill(~valid[:, None, :], float("inf"))
-            parts.append(torch.topk(dist, k=k, dim=-1, largest=False).indices)
+            dist = torch.cdist(safe_xyz[:, start:stop], search_xyz)
+            if search_valid is not None:
+                dist = dist.masked_fill(~search_valid[:, None, :], float("inf"))
+            idx = torch.topk(dist, k=k, dim=-1, largest=False).indices
+            parts.append(ref_indices[idx] if ref_indices is not None else idx)
         return torch.cat(parts, dim=1)
 
     @staticmethod
