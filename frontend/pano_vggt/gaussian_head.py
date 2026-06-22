@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any
 
 import torch
@@ -28,6 +29,10 @@ def _normalize_quaternion(raw: torch.Tensor) -> torch.Tensor:
     identity[..., 0] = 1.0
     norm = torch.linalg.norm(quat, dim=-1, keepdim=True)
     return torch.where(norm > 1.0e-6, quat / norm.clamp_min(1.0e-6), identity)
+
+
+def _clamped_log_scale(values: torch.Tensor, min_scale: float, max_scale: float) -> torch.Tensor:
+    return values.clamp(math.log(float(min_scale)), math.log(float(max_scale)))
 
 
 @dataclass
@@ -108,15 +113,15 @@ class AnchorGaussianPrediction:
     def current_anchor_xyz(self) -> torch.Tensor:
         depth_delta = self.log_depth_delta.clamp(-float(self.depth_delta_limit), float(self.depth_delta_limit))
         depth = self.base_depth.clamp_min(1.0e-6) * torch.exp(depth_delta)
-        cam = self.source_bearing * depth
-        return torch.einsum("bmij,bmj->bmi", self.source_rot, cam) + self.source_trans
+        cam = torch.nan_to_num(self.source_bearing, nan=0.0, posinf=0.0, neginf=0.0) * torch.nan_to_num(depth, nan=1.0, posinf=1.0, neginf=1.0)
+        return torch.einsum("bmij,bmj->bmi", torch.nan_to_num(self.source_rot, nan=0.0), cam) + torch.nan_to_num(self.source_trans, nan=0.0)
 
     def materialize(self, batch_index: int, *, config: dict[str, Any] | None = None) -> ExplicitGaussianSet:
         idx = int(batch_index)
         anchor_xyz = self.current_anchor_xyz()[idx]
         valid = self.anchor_valid[idx].bool()
         xyz = anchor_xyz[:, None, :] + self.local_offsets[idx]
-        scales = self.log_scales[idx].exp().clamp(float(self.min_scale), float(self.max_scale))
+        scales = _clamped_log_scale(self.log_scales[idx], self.min_scale, self.max_scale).exp()
         rotation = _normalize_quaternion(self.quat_raw[idx])
         opacity = torch.sigmoid(self.opacity_logit[idx]).clamp(0.0, 1.0)
         color = torch.sigmoid(self.color_logit[idx]).clamp(0.0, 1.0)
@@ -299,35 +304,50 @@ class PanoVGGTAnchorGaussianHead(nn.Module):
         device = features.device
         dtype = features.dtype
 
-        rgb_low = F.interpolate(images.reshape(b * s, 3, *image_hw).to(dtype), size=feature_hw, mode="bilinear", align_corners=False)
-        depth_low = F.interpolate(depth.reshape(b * s, 1, *image_hw).to(dtype), size=feature_hw, mode="bilinear", align_corners=False).clamp_min(1.0e-6)
+        features = torch.nan_to_num(features.to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)
+        images_safe = torch.nan_to_num(images.to(device=device, dtype=dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        depth_raw = depth.to(device=device, dtype=dtype)
+        depth_valid = torch.isfinite(depth_raw) & (depth_raw > 1.0e-6)
+        depth_safe = torch.where(depth_valid, depth_raw, torch.ones_like(depth_raw))
+
+        rgb_low = F.interpolate(images_safe.reshape(b * s, 3, *image_hw), size=feature_hw, mode="bilinear", align_corners=False)
+        depth_low = F.interpolate(depth_safe.reshape(b * s, 1, *image_hw), size=feature_hw, mode="bilinear", align_corners=False).clamp_min(1.0e-6)
+        depth_valid_low = F.interpolate(depth_valid.reshape(b * s, 1, *image_hw).float(), size=feature_hw, mode="nearest") > 0.5
         uv_feature = make_feature_grid(feature_hw, device=device, dtype=dtype)
         uv_image = feature_uv_to_image_uv(uv_feature, feature_hw, image_hw)
         bearing = erp_pixel_to_bearing(uv_image, *image_hw).to(device=device, dtype=dtype)
         bearing_map = bearing.permute(2, 0, 1).view(1, 3, hf, wf).expand(b * s, -1, -1, -1)
         anchor_depth_low = depth_low
         anchor_bearing_map = bearing_map
-        world_valid_low = torch.ones_like(depth_low, dtype=torch.bool)
+        world_valid_low = depth_valid_low
+        rot = poses_c2w[:, :, :3, :3].to(device=device, dtype=dtype)
+        trans = poses_c2w[:, :, :3, 3].to(device=device, dtype=dtype)
         if world_points is not None:
             if world_points.ndim != 5 or int(world_points.shape[-1]) != 3:
                 raise ValueError(f"world_points must have shape BxSxHxWx3, got {tuple(world_points.shape)}")
             if int(world_points.shape[0]) != b or int(world_points.shape[1]) != s:
                 raise ValueError("world_points batch/frame dimensions must match features.")
-            wp = world_points.to(device=device, dtype=dtype).permute(0, 1, 4, 2, 3).reshape(b * s, 3, int(world_points.shape[2]), int(world_points.shape[3]))
+            wp_raw = world_points.to(device=device, dtype=dtype).permute(0, 1, 4, 2, 3)
+            wp_finite = torch.isfinite(wp_raw).all(dim=2, keepdim=True)
+            wp = torch.nan_to_num(wp_raw, nan=0.0, posinf=0.0, neginf=0.0).reshape(b * s, 3, int(world_points.shape[2]), int(world_points.shape[3]))
+            wp_valid_low = F.interpolate(
+                wp_finite.reshape(b * s, 1, int(world_points.shape[2]), int(world_points.shape[3])).float(),
+                size=feature_hw,
+                mode="nearest",
+            ).view(b, s, 1, hf, wf) > 0.5
             wp_low = F.interpolate(wp, size=feature_hw, mode="bilinear", align_corners=False).view(b, s, 3, hf, wf)
-            rot = poses_c2w[:, :, :3, :3].to(device=device, dtype=dtype)
-            trans = poses_c2w[:, :, :3, 3].to(device=device, dtype=dtype)
-            cam = torch.einsum("bsij,bsihw->bsjhw", rot, wp_low - trans.view(b, s, 3, 1, 1))
+            rot_w2c = rot.transpose(-1, -2)
+            cam = torch.einsum("bsij,bsihw->bsjhw", rot_w2c, wp_low - trans.view(b, s, 3, 1, 1))
             depth_from_world = torch.linalg.norm(cam, dim=2, keepdim=True).clamp_min(1.0e-6)
             bearing_from_world = cam / depth_from_world
-            finite_world = torch.isfinite(wp_low).all(dim=2, keepdim=True) & torch.isfinite(depth_from_world)
+            finite_world = wp_valid_low & torch.isfinite(depth_from_world)
             anchor_depth_low = torch.where(finite_world.reshape(b * s, 1, hf, wf), depth_from_world.reshape(b * s, 1, hf, wf), depth_low)
             anchor_bearing_map = torch.where(
                 finite_world.reshape(b * s, 1, hf, wf),
                 bearing_from_world.reshape(b * s, 3, hf, wf),
                 bearing_map,
             )
-            world_valid_low = finite_world.reshape(b * s, 1, hf, wf)
+            world_valid_low = finite_world.reshape(b * s, 1, hf, wf) | depth_valid_low
         yy = torch.linspace(-1.0, 1.0, steps=hf, device=device, dtype=dtype).view(1, 1, hf, 1).expand(b * s, 1, hf, wf)
         xx = torch.linspace(-1.0, 1.0, steps=wf, device=device, dtype=dtype).view(1, 1, 1, wf).expand(b * s, 1, hf, wf)
         uv_embed = torch.cat(
@@ -380,7 +400,7 @@ class PanoVGGTAnchorGaussianHead(nn.Module):
         flat_anchor_feat = anchor_feat.view(b, s, self.anchor_feat_dim, hf, wf).permute(0, 1, 3, 4, 2).reshape(b, s * hf * wf, self.anchor_feat_dim)
         flat_delta = depth_delta.view(b, s, 1, hf, wf).permute(0, 1, 3, 4, 2).reshape(b, s * hf * wf, 1)
         flat_offsets = offsets.view(b, s, self.k_offsets, 3, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 3)
-        flat_scales = scales.view(b, s, self.k_offsets, 3, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 3)
+        flat_scales = _clamped_log_scale(scales, self.min_scale, self.max_scale).view(b, s, self.k_offsets, 3, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 3)
         flat_rot = rotations.view(b, s, self.k_offsets, 4, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 4)
         flat_opacity = opacity.view(b, s, self.k_offsets, 1, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 1)
         flat_color_delta = color_delta.view(b, s, self.k_offsets, 3, hf, wf).permute(0, 1, 4, 5, 2, 3).reshape(b, s * hf * wf, self.k_offsets, 3)
@@ -397,8 +417,6 @@ class PanoVGGTAnchorGaussianHead(nn.Module):
         gather_k1 = indices.view(b, -1, 1, 1).expand(-1, -1, self.k_offsets, 1)
 
         source_index = torch.gather(src_frame, 1, indices)
-        rot = poses_c2w[:, :, :3, :3].to(device=device, dtype=dtype)
-        trans = poses_c2w[:, :, :3, 3].to(device=device, dtype=dtype)
         gather_rot = source_index.view(b, -1, 1, 1).expand(-1, -1, 3, 3)
         gather_trans = source_index.unsqueeze(-1).expand(-1, -1, 3)
         anchor_rgb = torch.gather(flat_rgb, 1, gather_3).clamp(0.0, 1.0)
@@ -413,7 +431,7 @@ class PanoVGGTAnchorGaussianHead(nn.Module):
             anchor_valid=torch.gather(flat_valid, 1, indices).bool(),
             anchor_feature=torch.gather(flat_anchor_feat, 1, gather_feat),
             log_depth_delta=torch.gather(flat_delta, 1, gather_1),
-            local_offsets=torch.gather(flat_offsets, 1, gather_k3) * self.init_scale,
+            local_offsets=(torch.gather(flat_offsets, 1, gather_k3) * self.init_scale).clamp(-self.max_scale, self.max_scale),
             log_scales=torch.gather(flat_scales, 1, gather_k3),
             quat_raw=torch.gather(flat_rot, 1, gather_k4),
             opacity_logit=torch.gather(flat_opacity, 1, gather_k1),
@@ -493,16 +511,17 @@ class IterativeGaussianRefiner(nn.Module):
             nn.init.zeros_(last.bias)
 
     def forward(self, pred: AnchorGaussianPrediction, feedback: dict[str, torch.Tensor]) -> AnchorGaussianPrediction:
-        rgb_error = feedback["rgb_error"].to(pred.anchor_feature)
-        depth_error = feedback["depth_error"].to(pred.anchor_feature)
-        alpha = feedback["alpha"].to(pred.anchor_feature)
-        view_dir = feedback["view_dir"].to(pred.anchor_feature)
+        rgb_error = torch.nan_to_num(feedback["rgb_error"].to(pred.anchor_feature), nan=0.0, posinf=0.0, neginf=0.0)
+        depth_error = torch.nan_to_num(feedback["depth_error"].to(pred.anchor_feature), nan=0.0, posinf=0.0, neginf=0.0)
+        alpha = torch.nan_to_num(feedback["alpha"].to(pred.anchor_feature), nan=0.0, posinf=1.0, neginf=0.0)
+        view_dir = torch.nan_to_num(feedback["view_dir"].to(pred.anchor_feature), nan=0.0, posinf=0.0, neginf=0.0)
         opacity_mean = torch.sigmoid(pred.opacity_logit).mean(dim=2)
-        scale_mean = pred.log_scales.exp().mean(dim=(2, 3), keepdim=False).unsqueeze(-1)
+        safe_log_scales = _clamped_log_scale(pred.log_scales, pred.min_scale, pred.max_scale)
+        scale_mean = safe_log_scales.exp().mean(dim=(2, 3), keepdim=False).unsqueeze(-1)
         color_mean = torch.sigmoid(pred.color_logit).mean(dim=2)
         x = torch.cat(
             [
-                pred.anchor_feature,
+                torch.nan_to_num(pred.anchor_feature, nan=0.0, posinf=0.0, neginf=0.0),
                 rgb_error,
                 depth_error,
                 alpha,
@@ -514,8 +533,10 @@ class IterativeGaussianRefiner(nn.Module):
             dim=-1,
         )
         b, m, _ = x.shape
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         update_input = self.input_proj(x.reshape(b * m, -1))
-        hidden = self.gru(update_input, pred.anchor_feature.reshape(b * m, -1)).view(b, m, -1)
+        hidden_prev = torch.nan_to_num(pred.anchor_feature.reshape(b * m, -1), nan=0.0, posinf=0.0, neginf=0.0)
+        hidden = self.gru(update_input, hidden_prev).view(b, m, -1)
         raw = self.delta(hidden).view(b, m, -1)
         cursor = 0
         depth_step = torch.tanh(raw[..., cursor : cursor + 1]) * self.max_depth_step
@@ -531,10 +552,10 @@ class IterativeGaussianRefiner(nn.Module):
         color_step = torch.tanh(raw[..., cursor : cursor + self.k_offsets * 3]).view(b, m, self.k_offsets, 3) * self.max_color_step
         return replace(
             pred,
-            anchor_feature=hidden,
+            anchor_feature=torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0),
             log_depth_delta=(pred.log_depth_delta + depth_step).clamp(-pred.depth_delta_limit, pred.depth_delta_limit),
-            local_offsets=pred.local_offsets + offset_step,
-            log_scales=pred.log_scales + scale_step,
+            local_offsets=(pred.local_offsets + offset_step).clamp(-pred.max_scale, pred.max_scale),
+            log_scales=_clamped_log_scale(pred.log_scales + scale_step, pred.min_scale, pred.max_scale),
             quat_raw=pred.quat_raw + rot_step,
             opacity_logit=pred.opacity_logit + opacity_step,
             color_logit=pred.color_logit + color_step,
@@ -558,18 +579,19 @@ def sample_render_feedback(
     anchor_xyz = pred.current_anchor_xyz()[idx]
     device = anchor_xyz.device
     dtype = anchor_xyz.dtype
-    target = target_rgb.to(device=device, dtype=dtype)
-    rgb_err_map = (target - render_rgb.to(device=device, dtype=dtype)).unsqueeze(0)
+    target = torch.nan_to_num(target_rgb.to(device=device, dtype=dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    rendered = torch.nan_to_num(render_rgb.to(device=device, dtype=dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    rgb_err_map = (target - rendered).unsqueeze(0)
     if render_depth is None or target_depth is None:
         depth_err_map = torch.zeros(1, 1, target.shape[-2], target.shape[-1], device=device, dtype=dtype)
     else:
-        rd = render_depth.to(device=device, dtype=dtype)
-        td = target_depth.to(device=device, dtype=dtype)
+        rd = torch.nan_to_num(render_depth.to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)
+        td = torch.nan_to_num(target_depth.to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)
         depth_err_map = ((td - rd) / td.abs().clamp_min(1.0)).clamp(-1.0, 1.0).unsqueeze(0)
     if render_alpha is None:
         alpha_map = torch.zeros(1, 1, target.shape[-2], target.shape[-1], device=device, dtype=dtype)
     else:
-        alpha_map = render_alpha.to(device=device, dtype=dtype).unsqueeze(0)
+        alpha_map = torch.nan_to_num(render_alpha.to(device=device, dtype=dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0).unsqueeze(0)
 
     c2w = target_pose_c2w.to(device=device, dtype=dtype)
     w2c = torch.linalg.inv(c2w)

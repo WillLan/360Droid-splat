@@ -161,6 +161,10 @@ def _image_hw(images: torch.Tensor) -> tuple[int, int]:
     return int(images.shape[-2]), int(images.shape[-1])
 
 
+def _safe_log_scales(pred: AnchorGaussianPrediction) -> torch.Tensor:
+    return pred.log_scales.clamp(math.log(float(pred.min_scale)), math.log(float(pred.max_scale)))
+
+
 def _world_points_from_depth(depth: torch.Tensor, poses_c2w: torch.Tensor) -> torch.Tensor:
     """Build world points with shape ``B x N x H x W x 3`` from ERP range depth."""
 
@@ -270,8 +274,8 @@ class ExternalPanoVGGTGaussianPriorExtractor(nn.Module):
                     feat = feat[0]
                 if feat.ndim != 4:
                     raise ValueError(f"Expected feature as NxCxHfxWf, got {tuple(feat.shape)}")
-                features.append(feat.float())
-                depths.append(pred.depth.detach().float())
+                features.append(torch.nan_to_num(feat.detach().float(), nan=0.0, posinf=0.0, neginf=0.0))
+                depths.append(torch.nan_to_num(pred.depth.detach().float(), nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0e-6))
                 poses.append(pred.poses_c2w.detach().float())
                 worlds.append(pred.chunk_world_points.detach().float())
         return {
@@ -457,33 +461,34 @@ def _loss_for_renders(
     psnrs = []
     alpha_means = []
     for batch_idx, pkg in enumerate(renders):
-        render = pkg["render"]
-        target = target_rgb[batch_idx].to(render)
+        render = torch.nan_to_num(pkg["render"], nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        target = torch.nan_to_num(target_rgb[batch_idx].to(render), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         rgb = (render - target).abs().mean()
         depth_loss = render.sum() * 0.0
         if target_depth is not None and torch.is_tensor(pkg.get("depth")):
-            td = target_depth[batch_idx].to(render)
-            rd = pkg["depth"].to(render)
+            td = torch.nan_to_num(target_depth[batch_idx].to(render), nan=0.0, posinf=0.0, neginf=0.0)
+            rd = torch.nan_to_num(pkg["depth"].to(render), nan=0.0, posinf=0.0, neginf=0.0)
             alpha = pkg.get("alpha")
             mask = torch.isfinite(td) & (td > 0.0)
             if torch.is_tensor(alpha):
-                mask = mask & (alpha.to(render) > 0.01)
+                mask = mask & (torch.nan_to_num(alpha.to(render), nan=0.0, posinf=1.0, neginf=0.0) > 0.01)
             if bool(mask.any()):
                 depth_loss = (((rd - td).abs() / td.abs().clamp_min(1.0))[mask]).mean()
         mse = (render - target).square().mean().clamp_min(1.0e-8)
         psnr = -10.0 * torch.log10(mse)
         alpha = pkg.get("alpha")
-        alpha_mean = render.new_tensor(0.0) if not torch.is_tensor(alpha) else alpha.to(render).mean()
+        alpha_mean = render.new_tensor(0.0) if not torch.is_tensor(alpha) else torch.nan_to_num(alpha.to(render), nan=0.0, posinf=1.0, neginf=0.0).mean()
         losses.append(float(weights.get("rgb_weight", 1.0)) * rgb + float(weights.get("depth_weight", 0.05)) * depth_loss)
         rgb_losses.append(rgb.detach())
         depth_losses.append(depth_loss.detach())
         psnrs.append(psnr.detach())
         alpha_means.append(alpha_mean.detach())
     base = torch.stack(losses).mean()
-    scale_reg = pred.log_scales.exp().mean()
-    offset_reg = (pred.local_offsets.square().sum(dim=-1) + 1.0e-12).sqrt().mean()
-    depth_reg = pred.log_depth_delta.abs().mean()
-    opacity_reg = torch.sigmoid(pred.opacity_logit).mean()
+    scale_reg = _safe_log_scales(pred).exp().mean()
+    safe_offsets = torch.nan_to_num(pred.local_offsets, nan=0.0, posinf=float(pred.max_scale), neginf=-float(pred.max_scale))
+    offset_reg = (safe_offsets.square().sum(dim=-1) + 1.0e-12).sqrt().mean()
+    depth_reg = torch.nan_to_num(pred.log_depth_delta, nan=0.0, posinf=float(pred.depth_delta_limit), neginf=-float(pred.depth_delta_limit)).abs().mean()
+    opacity_reg = torch.sigmoid(torch.nan_to_num(pred.opacity_logit, nan=0.0, posinf=0.0, neginf=0.0)).mean()
     loss = (
         base
         + float(weights.get("scale_reg_weight", 0.001)) * scale_reg
@@ -571,11 +576,11 @@ def _run_model_iteration(
             metrics[f"iter{iter_idx}/loss_delta_from_prev"] = (losses[iter_idx - 1] - loss_i).detach()
             prev_state = states[iter_idx - 1]
             cur_state = states[iter_idx]
-            metrics[f"iter{iter_idx}/update_depth_delta_abs"] = (cur_state.log_depth_delta - prev_state.log_depth_delta).abs().mean().detach()
-            metrics[f"iter{iter_idx}/update_offset_abs"] = (cur_state.local_offsets - prev_state.local_offsets).abs().mean().detach()
-            metrics[f"iter{iter_idx}/update_log_scale_abs"] = (cur_state.log_scales - prev_state.log_scales).abs().mean().detach()
-            metrics[f"iter{iter_idx}/update_opacity_logit_abs"] = (cur_state.opacity_logit - prev_state.opacity_logit).abs().mean().detach()
-            metrics[f"iter{iter_idx}/update_color_logit_abs"] = (cur_state.color_logit - prev_state.color_logit).abs().mean().detach()
+            metrics[f"iter{iter_idx}/update_depth_delta_abs"] = torch.nan_to_num(cur_state.log_depth_delta - prev_state.log_depth_delta, nan=0.0).abs().mean().detach()
+            metrics[f"iter{iter_idx}/update_offset_abs"] = torch.nan_to_num(cur_state.local_offsets - prev_state.local_offsets, nan=0.0).abs().mean().detach()
+            metrics[f"iter{iter_idx}/update_log_scale_abs"] = torch.nan_to_num(cur_state.log_scales - prev_state.log_scales, nan=0.0).abs().mean().detach()
+            metrics[f"iter{iter_idx}/update_opacity_logit_abs"] = torch.nan_to_num(cur_state.opacity_logit - prev_state.opacity_logit, nan=0.0).abs().mean().detach()
+            metrics[f"iter{iter_idx}/update_color_logit_abs"] = torch.nan_to_num(cur_state.color_logit - prev_state.color_logit, nan=0.0).abs().mean().detach()
     metrics.update({f"final/{key}": value for key, value in metrics_by_iter[-1].items()})
     metrics["loss_initial"] = losses[0].detach()
     metrics["loss_final_raw"] = losses[-1].detach()
@@ -609,6 +614,20 @@ def _select_source_target(priors: dict[str, torch.Tensor], sample: dict[str, Any
         "target_depth": priors["depth"][:, target_idx],
         "target_poses": priors["poses_c2w"][:, target_idx],
     }
+
+
+def _batch_has_finite_camera_state(batch: dict[str, torch.Tensor]) -> bool:
+    pose_keys = ("source_poses", "target_poses")
+    depth_keys = ("source_depth", "target_depth")
+    for key in pose_keys:
+        value = batch.get(key)
+        if not torch.is_tensor(value) or not bool(torch.isfinite(value).all()):
+            return False
+    for key in depth_keys:
+        value = batch.get(key)
+        if torch.is_tensor(value) and not bool((torch.isfinite(value) & (value > 0.0)).any()):
+            return False
+    return True
 
 
 def _tensor_to_image(tensor: torch.Tensor) -> Image.Image:
@@ -736,6 +755,9 @@ def train_gaussian_head(config: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError(f"Configured feature_dim={feature_dim} does not match extracted dim={int(batch['features'].shape[2])}.")
                 model, optimizer = _build_model(config, feature_dim, device=device)
                 model.train()
+            if not _batch_has_finite_camera_state(batch):
+                print(yaml.safe_dump({"skipped_batch": "nonfinite_camera_state", "step": step}, sort_keys=False).strip())
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss, metrics_t, render_history, _states = _run_model_iteration(
                 model,
@@ -750,11 +772,21 @@ def train_gaussian_head(config: dict[str, Any]) -> dict[str, Any]:
                 renderer=renderer,
                 config=config,
             )
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
+                print(yaml.safe_dump({"skipped_batch": "nonfinite_loss", "step": step, "metrics": latest_metrics}, sort_keys=False).strip())
+                continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr_cfg.get("grad_clip", 1.0)))
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(tr_cfg.get("grad_clip", 1.0)), error_if_nonfinite=False)
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t, "grad_norm": grad_norm.detach()})
+                print(yaml.safe_dump({"skipped_batch": "nonfinite_grad", "step": step, "metrics": latest_metrics}, sort_keys=False).strip())
+                continue
             optimizer.step()
             step += 1
-            latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
+            latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t, "grad_norm": grad_norm.detach()})
             if wandb_run is not None and (step == 1 or step % wb_log_every == 0):
                 wandb_run.log({f"train/{key}": value for key, value in latest_metrics.items()}, step=step)
             if step == 1 or step % log_interval == 0:

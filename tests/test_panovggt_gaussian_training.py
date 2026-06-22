@@ -90,6 +90,36 @@ def test_anchor_gaussian_head_materializes_renderer_compatible_gaussians():
     assert pkg["depth"].shape == (1, h, w)
 
 
+def test_anchor_gaussian_head_sanitizes_nonfinite_priors():
+    b, n, h, w = 1, 2, 12, 24
+    feature_dim = 8
+    images = torch.rand(b, n, 3, h, w)
+    depth = torch.full((b, n, 1, h, w), 2.0)
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(b, n, 1, 1)
+    features = torch.rand(b, n, feature_dim, h // 4, w // 4)
+    world = _world_points_from_depth(depth, poses)
+    features[:, :, :, 0, 0] = float("nan")
+    depth[:, :, :, 0, 0] = float("nan")
+    world[:, :, 0, 0] = float("nan")
+    head = PanoVGGTAnchorGaussianHead(
+        feature_dim,
+        hidden_dim=8,
+        anchor_feat_dim=8,
+        k_offsets=2,
+        num_conv_blocks=1,
+        max_anchors=16,
+    )
+
+    pred = head(features, images, depth, poses, world_points=world)
+    gaussians = pred.materialize(0)
+
+    assert torch.isfinite(pred.base_depth).all()
+    assert torch.isfinite(pred.log_scales).all()
+    assert torch.isfinite(pred.local_offsets).all()
+    assert torch.isfinite(gaussians.get_xyz).all()
+    assert torch.isfinite(gaussians.get_scaling).all()
+
+
 def test_gaussian_head_smoke_training_saves_checkpoint_and_visualization(tmp_path: Path):
     cfg = _config(tmp_path)
 

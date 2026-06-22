@@ -1,0 +1,53 @@
+Training:
+  stage: overfit
+  steps: 300
+  batch_size: 1
+  frames_per_sample: 4
+  context_views: 3
+  target_views: 1
+  train_min_refine: 0
+  train_max_refine: 0
+  window_mode: fixed
+  num_workers: 0
+  output_dir: outputs/pano_resplat/overfit_init
+  save_every: 50
+  eval_every: 50
+  vis_every: 50
+  log_every: 10
+  debug_overfit: true
+Model:
+  use_synthetic_features: true
+  feature_dim: 16
+  feature_stride: 4
+Initializer:
+  latent_downsample: 1
+  gaussians_per_cell: 2
+  state_dim: 32
+  sh_degree: 0
+  max_gaussians: 256
+  use_world_points_as_base: true
+Feedback:
+  feedback_dim: 32
+  hidden_dim: 64
+Refiner:
+  hidden_dim: 64
+  knn: 8
+  num_heads: 4
+  max_knn_points: 512
+Dataset:
+  synthetic: true
+  synthetic_length: 1
+  height: 32
+  width: 64
+Renderer:
+  backend: soft_splat
+  allow_soft_splat_fallback: true
+  soft_max_points: 4096
+WeightsAndBiases:
+  enabled: false
+  mode: disabled
+Validation:
+  enabled: false
+Checks:
+  target_leakage_check: true
+  renderer_gradient_check: true
