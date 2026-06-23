@@ -625,10 +625,12 @@ def train_panovggt_geometry(config: dict[str, Any], *, command: list[str] | None
                 save_geometry_checkpoint(output_dir / "best_geometry.pt", model=model, config=config, step=step, metrics={**metrics, **val_metrics})
             if step % save_every == 0:
                 save_geometry_checkpoint(output_dir / f"checkpoint_{step:06d}.pt", model=model, config=config, step=step, metrics={**metrics, **val_metrics})
-            save_geometry_checkpoint(output_dir / "last_geometry.pt", model=model, config=config, step=step, metrics={**metrics, **val_metrics})
+                save_geometry_checkpoint(output_dir / "last_geometry.pt", model=model, config=config, step=step, metrics={**metrics, **val_metrics})
             if step >= max_steps:
                 break
     elapsed = time.time() - start
+    if step > 0:
+        save_geometry_checkpoint(output_dir / "last_geometry.pt", model=model, config=config, step=step, metrics=last_metrics)
     result = {
         "output_dir": str(output_dir),
         "steps": step,
