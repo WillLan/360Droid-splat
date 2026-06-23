@@ -42,6 +42,7 @@ def _default_config() -> dict[str, Any]:
             "stage": "overfit",
             "steps": 5,
             "batch_size": 1,
+            "gradient_accumulation_steps": 1,
             "num_workers": 0,
             "frames_per_sample": 4,
             "context_views": 3,
@@ -1273,6 +1274,7 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
 
     wandb_run = _init_wandb(config, output_dir)
     max_steps = int(tr.get("steps", 1))
+    accum = max(1, int(tr.get("gradient_accumulation_steps", 1)))
     save_every = max(1, int(tr.get("save_every", 100)))
     vis_every = max(1, int(tr.get("vis_every", 100)))
     eval_every = max(1, int(tr.get("eval_every", 100)))
@@ -1284,7 +1286,9 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     first_target: dict[str, torch.Tensor] | None = None
     checked = False
     step = 0
+    micro_step = 0
     start = time.time()
+    optimizer.zero_grad(set_to_none=True)
     while step < max_steps:
         for raw_batch in loader:
             sample = _to_device_batch(raw_batch, device)
@@ -1304,7 +1308,6 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                 if bool(config.get("Checks", {}).get("renderer_gradient_check", True)):
                     _renderer_gradient_check(frontend, context, target, stage=stage, config=config, lpips_model=lpips_model)
                 checked = True
-            optimizer.zero_grad(set_to_none=True)
             num_refine = _num_refine_for_step(config, stage)
             loss, metrics_t, artifacts = _forward_train(
                 frontend,
@@ -1317,12 +1320,16 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
             )
             _check_finite(metrics_t, artifacts)
             if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite loss at step {step}: {loss}")
-            loss.backward()
+                raise RuntimeError(f"Non-finite loss at optimizer step {step}: {loss}")
+            (loss / float(accum)).backward()
+            micro_step += 1
+            if micro_step % accum != 0:
+                continue
             grad_norm = torch.nn.utils.clip_grad_norm_(frontend.parameters(), float(tr.get("grad_clip", 1.0)), error_if_nonfinite=False)
             if not torch.isfinite(grad_norm):
-                raise RuntimeError(f"Non-finite grad norm at step {step}: {grad_norm}")
+                raise RuntimeError(f"Non-finite grad norm at optimizer step {step}: {grad_norm}")
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             step += 1
             metrics = _float_metrics({"step": float(step), **metrics_t, "grad_norm": grad_norm.detach()})
             last_metrics = metrics
