@@ -47,6 +47,9 @@ def _default_config() -> dict[str, Any]:
             "context_views": 3,
             "target_views": 1,
             "window_mode": "fixed",
+            "view_mode": "split",
+            "render_height": None,
+            "render_width": None,
             "train_min_refine": 0,
             "train_max_refine": 0,
             "eval_refine": 0,
@@ -90,6 +93,8 @@ def _default_config() -> dict[str, Any]:
             "init_scale": 0.02,
             "use_world_points_as_base": True,
             "use_local_offsets": True,
+            "max_offset_abs": 0.05,
+            "max_offset_depth_ratio": 0.02,
         },
         "Feedback": {"feedback_dim": 32, "hidden_dim": 64},
         "Refiner": {
@@ -391,6 +396,97 @@ def _compose_valid_mask(
         finite_world = torch.isfinite(world_points).all(dim=-1).unsqueeze(2)
         valid = finite_world if valid is None else valid & finite_world
     return valid
+
+
+def _is_input_reconstruction(config: dict[str, Any]) -> bool:
+    tr = config.get("Training", {})
+    init_cfg = config.get("Initializer", {})
+    mode = str(tr.get("view_mode", "split")).lower()
+    position_mode = str(init_cfg.get("position_mode", "")).lower()
+    init_type = str(init_cfg.get("type", "")).lower()
+    return mode in {"input_reconstruction", "all_views", "input_views"} or position_mode == "panovggt_aligned" or init_type in {"panovggt_aligned", "pano_vggt_aligned"}
+
+
+def _render_hw(config: dict[str, Any], fallback_hw: tuple[int, int]) -> tuple[int, int]:
+    tr = config.get("Training", {})
+    height = tr.get("render_height")
+    width = tr.get("render_width")
+    if height is None or width is None:
+        renderer = config.get("Renderer", {})
+        height = renderer.get("render_height", height)
+        width = renderer.get("render_width", width)
+    if height is None or width is None:
+        return int(fallback_hw[0]), int(fallback_hw[1])
+    return int(height), int(width)
+
+
+def _resize_5d(values: torch.Tensor | None, image_hw: tuple[int, int], *, mode: str, is_mask: bool = False) -> torch.Tensor | None:
+    if not torch.is_tensor(values):
+        return None
+    tensor = values
+    squeeze_channel = False
+    if tensor.ndim == 4:
+        tensor = tensor.unsqueeze(2)
+        squeeze_channel = True
+    if tensor.ndim != 5:
+        raise ValueError(f"Expected BxVxCxHxW or BxVxHxW tensor, got {tuple(values.shape)}")
+    if tuple(int(x) for x in tensor.shape[-2:]) == tuple(int(x) for x in image_hw):
+        return values
+    b, v, c, h, w = [int(x) for x in tensor.shape]
+    flat = tensor.reshape(b * v, c, h, w)
+    if is_mask:
+        resized = F.interpolate(flat.float(), size=image_hw, mode="nearest") > 0.5
+    else:
+        kwargs = {} if mode == "nearest" else {"align_corners": False}
+        resized = F.interpolate(flat.float(), size=image_hw, mode=mode, **kwargs).to(dtype=values.dtype)
+    resized = resized.reshape(b, v, c, int(image_hw[0]), int(image_hw[1]))
+    if squeeze_channel:
+        resized = resized.squeeze(2)
+    return resized
+
+
+def _sample_input_reconstruction(
+    sample: dict[str, Any],
+    priors: dict[str, torch.Tensor],
+    config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Use every input frame as both Gaussian source and supervised render view."""
+
+    n = int(sample["images"].shape[1])
+    device = sample["images"].device
+    view_idx = torch.arange(n, device=device)
+    context_valid = _compose_valid_mask(
+        valid_depth=sample.get("valid_depth"),
+        sky_mask=sample.get("sky_mask"),
+        world_points=priors.get("world_points"),
+    )
+    context = {
+        "images": sample["images"].float(),
+        "features": priors["features"].float(),
+        "depths": priors["depth"].float(),
+        "poses_c2w": priors["poses_c2w"].float(),
+        "world_points": priors["world_points"].float(),
+        "view_indices": view_idx,
+    }
+    if torch.is_tensor(sample.get("sky_mask")):
+        context["sky_mask"] = sample["sky_mask"]
+    if context_valid is not None:
+        context["valid_mask"] = context_valid
+
+    render_hw = _render_hw(config, tuple(int(x) for x in sample["images"].shape[-2:]))
+    target_valid = _resize_5d(context_valid, render_hw, mode="nearest", is_mask=True) if context_valid is not None else None
+    target = {
+        "images": _resize_5d(sample["images"].float(), render_hw, mode="bilinear"),
+        "depths": _resize_5d(priors["depth"].float(), render_hw, mode="bilinear"),
+        "poses_c2w": priors["poses_c2w"].float(),
+        "view_indices": view_idx,
+    }
+    target_sky = _resize_5d(sample.get("sky_mask"), render_hw, mode="nearest", is_mask=True)
+    if target_sky is not None:
+        target["sky_mask"] = target_sky
+    if target_valid is not None:
+        target["valid_mask"] = target_valid
+    return context, target
 
 
 def _sample_window(
@@ -849,6 +945,67 @@ def _save_visualization(output_dir: Path, step_name: str, target: dict[str, torc
     return panel_path
 
 
+def _depth_to_image(depth: torch.Tensor, mask: torch.Tensor | None = None) -> Image.Image:
+    d = depth.detach().float().cpu()
+    if d.ndim == 3:
+        d = d[0]
+    valid = torch.isfinite(d) & (d > 0.0)
+    if mask is not None:
+        m = mask.detach().float().cpu()
+        if m.ndim == 3:
+            m = m[0]
+        valid = valid & (m > 0.5)
+    if bool(valid.any()):
+        vals = d[valid]
+        lo = torch.quantile(vals, 0.02)
+        hi = torch.quantile(vals, 0.98).clamp_min(lo + 1.0e-6)
+        norm = ((d - lo) / (hi - lo)).clamp(0.0, 1.0)
+    else:
+        norm = torch.zeros_like(d)
+    if mask is not None:
+        norm = norm * valid.float()
+    arr = (norm.numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(np.stack([arr, arr, arr], axis=-1), mode="RGB")
+
+
+def _save_aligned_visualization(output_dir: Path, step_name: str, target: dict[str, torch.Tensor], artifacts: dict[str, Any]) -> Path:
+    render_dir = output_dir / "renders" / step_name
+    render_dir.mkdir(parents=True, exist_ok=True)
+    renders: list[PanoRenderOutput] = artifacts["target_renders"]
+    final = renders[-1].color
+    if final.ndim != 5:
+        final = final.unsqueeze(1)
+    gt = target["images"]
+    depth = target.get("depths")
+    mask = target.get("valid_mask")
+    views = min(4, int(gt.shape[1]), int(final.shape[1]))
+    gt_images = [_tensor_to_image(gt[0, idx]) for idx in range(views)]
+    depth_images = []
+    render_images = [_tensor_to_image(final[0, idx]) for idx in range(views)]
+    for idx in range(views):
+        depth_i = depth[0, idx] if torch.is_tensor(depth) else torch.zeros(1, *gt.shape[-2:], device=gt.device, dtype=gt.dtype)
+        mask_i = mask[0, idx] if torch.is_tensor(mask) else None
+        depth_images.append(_depth_to_image(depth_i, mask_i))
+    for idx, image in enumerate(gt_images):
+        image.save(render_dir / f"gt_view_{idx}.png")
+    for idx, image in enumerate(depth_images):
+        image.save(render_dir / f"depth_view_{idx}.png")
+    for idx, image in enumerate(render_images):
+        image.save(render_dir / f"render_view_{idx}.png")
+    rows = [gt_images, depth_images, render_images]
+    tile_w = max(img.width for row in rows for img in row)
+    tile_h = max(img.height for row in rows for img in row)
+    canvas = Image.new("RGB", (tile_w * views, tile_h * 3), (0, 0, 0))
+    for row_idx, row in enumerate(rows):
+        for col_idx, image in enumerate(row):
+            if image.size != (tile_w, tile_h):
+                image = image.resize((tile_w, tile_h), Image.BILINEAR)
+            canvas.paste(image, (col_idx * tile_w, row_idx * tile_h))
+    panel_path = render_dir / "panel.png"
+    canvas.save(panel_path)
+    return panel_path
+
+
 def _log_wandb_image(wandb_run: Any, key: str, path: Path, *, step: int, logger: _Logger) -> None:
     if wandb_run is None:
         return
@@ -972,6 +1129,105 @@ def _renderer_gradient_check(
         raise RuntimeError("Renderer gradient check failed: no nonzero gradients on trainable parameters.")
 
 
+def _validation_loader(config: dict[str, Any], *, logger: _Logger) -> DataLoader | None:
+    if not bool(config.get("Validation", {}).get("enabled", False)):
+        return None
+    try:
+        dataset = build_matching_dataset_from_config(config, split="val")
+    except Exception as exc:
+        logger.error(f"Validation dataset unavailable: {exc}")
+        return None
+    try:
+        length = len(dataset)  # type: ignore[arg-type]
+    except Exception:
+        length = 1
+    if int(length) <= 0:
+        logger.error("Validation dataset is empty; disabling validation.")
+        return None
+    return DataLoader(
+        dataset,
+        batch_size=int(config.get("Training", {}).get("batch_size", 1)),
+        shuffle=False,
+        num_workers=int(config.get("Training", {}).get("num_workers", 0)),
+        collate_fn=matching_collate,
+        drop_last=False,
+    )
+
+
+def _run_validation(
+    frontend: PanoReSplatFrontend,
+    prior_extractor: nn.Module,
+    loader: DataLoader,
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    stage: str,
+    step: int,
+    output_dir: Path,
+    wandb_run: Any,
+    logger: _Logger,
+    lpips_model: nn.Module | None = None,
+) -> dict[str, float]:
+    was_training = frontend.training
+    frontend.eval()
+    prior_extractor.eval()
+    max_batches = max(1, int(config.get("Validation", {}).get("max_batches", 1)))
+    input_reconstruction = _is_input_reconstruction(config)
+    rows: list[dict[str, float]] = []
+    first_panel: Path | None = None
+    with torch.no_grad():
+        for batch_idx, raw_batch in enumerate(loader):
+            if batch_idx >= max_batches:
+                break
+            sample = _to_device_batch(raw_batch, device)
+            validate_training_sample(sample, "matching_only", allow_fallback_mode=bool(config.get("Dataset", {}).get("allow_fallback_mode", False)))
+            priors = prior_extractor(sample)
+            if input_reconstruction:
+                context, target = _sample_input_reconstruction(sample, priors, config)
+            else:
+                context, target = _sample_window(sample, priors, config, step=step)
+            loss, metrics_t, artifacts = _forward_train(
+                frontend,
+                context,
+                target,
+                num_refine=max(0, int(config.get("Training", {}).get("eval_refine", 0))),
+                stage=stage,
+                config=config,
+                lpips_model=lpips_model,
+            )
+            metrics = _float_metrics({"total_loss": loss.detach(), **metrics_t})
+            rows.append(metrics)
+            if first_panel is None:
+                tag = f"val_step_{step:06d}"
+                if input_reconstruction:
+                    first_panel = _save_aligned_visualization(output_dir, tag, target, artifacts)
+                else:
+                    first_panel = _save_visualization(output_dir, tag, target, artifacts)
+    if was_training:
+        frontend.train()
+    if not rows:
+        return {}
+    keys = sorted({key for row in rows for key in row})
+    averaged = {"step": float(step)}
+    for key in keys:
+        vals = [row[key] for row in rows if key in row]
+        if vals:
+            averaged[key] = float(sum(vals) / len(vals))
+    _write_csv(output_dir / "val_metrics.csv", averaged)
+    if wandb_run is not None:
+        wandb_run.log({f"val/{k}": v for k, v in averaged.items()}, step=step)
+    if first_panel is not None:
+        _log_wandb_image(
+            wandb_run,
+            "renders/val_panel" if input_reconstruction else f"renders/val_step_{step:06d}",
+            first_panel,
+            step=step,
+            logger=logger,
+        )
+    logger.log(yaml.safe_dump({"step": step, "validation": averaged}, sort_keys=False).strip())
+    return averaged
+
+
 def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None = None, checkpoint: str | None = None, resume: str | None = None) -> dict[str, Any]:
     tr = config.get("Training", {})
     stage = str(tr.get("stage", "overfit")).lower()
@@ -983,6 +1239,7 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     _save_run_metadata(output_dir, config, command or sys.argv)
     logger = _Logger(output_dir)
     logger.log(yaml.safe_dump({"stage": stage, "device": str(device), "renderer": config.get("Renderer", {}).get("backend")}, sort_keys=False).strip())
+    input_reconstruction = _is_input_reconstruction(config)
 
     dataset = build_matching_dataset_from_config(config, split="train")
     if bool(tr.get("debug_overfit", False)) or stage == "overfit":
@@ -995,6 +1252,7 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
         collate_fn=matching_collate,
         drop_last=False,
     )
+    val_loader = _validation_loader(config, logger=logger)
     prior_extractor = _build_prior_extractor(config, device=device)
     prior_extractor.eval()
     for p in prior_extractor.parameters():
@@ -1017,6 +1275,7 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     max_steps = int(tr.get("steps", 1))
     save_every = max(1, int(tr.get("save_every", 100)))
     vis_every = max(1, int(tr.get("vis_every", 100)))
+    eval_every = max(1, int(tr.get("eval_every", 100)))
     log_every = max(1, int(tr.get("log_every", 1)))
     best = float("inf")
     first_metrics: dict[str, float] = {}
@@ -1032,10 +1291,16 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
             validate_training_sample(sample, "matching_only", allow_fallback_mode=bool(config.get("Dataset", {}).get("allow_fallback_mode", False)))
             with torch.no_grad():
                 priors = prior_extractor(sample)
-            context, target = _sample_window(sample, priors, config, step=step)
+            if input_reconstruction:
+                context, target = _sample_input_reconstruction(sample, priors, config)
+            else:
+                context, target = _sample_window(sample, priors, config, step=step)
             if not checked:
                 if bool(config.get("Checks", {}).get("target_leakage_check", True)):
-                    _target_leakage_check(frontend, context)
+                    if input_reconstruction and _num_refine_for_step(config, stage) <= 0:
+                        logger.log("Skipping target leakage check for init-only input reconstruction training.")
+                    else:
+                        _target_leakage_check(frontend, context)
                 if bool(config.get("Checks", {}).get("renderer_gradient_check", True)):
                     _renderer_gradient_check(frontend, context, target, stage=stage, config=config, lpips_model=lpips_model)
                 checked = True
@@ -1065,8 +1330,12 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                 first_metrics = dict(metrics)
                 first_artifacts = artifacts
                 first_target = target
-                panel = _save_visualization(output_dir, "step_000000", target, artifacts)
-                _log_wandb_image(wandb_run, "renders/step_000000", panel, step=step, logger=logger)
+                if input_reconstruction:
+                    panel = _save_aligned_visualization(output_dir, "step_000000", target, artifacts)
+                    _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
+                else:
+                    panel = _save_visualization(output_dir, "step_000000", target, artifacts)
+                    _log_wandb_image(wandb_run, "renders/step_000000", panel, step=step, logger=logger)
             _write_csv(output_dir / "train_metrics.csv", metrics)
             if wandb_run is not None:
                 wandb_run.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
@@ -1074,8 +1343,26 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                 logger.log(yaml.safe_dump({"step": step, "metrics": metrics}, sort_keys=False).strip())
             if step % vis_every == 0 or step == max_steps:
                 tag = f"step_{step:06d}"
-                panel = _save_visualization(output_dir, tag, target, artifacts)
-                _log_wandb_image(wandb_run, f"renders/{tag}", panel, step=step, logger=logger)
+                if input_reconstruction:
+                    panel = _save_aligned_visualization(output_dir, tag, target, artifacts)
+                    _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
+                else:
+                    panel = _save_visualization(output_dir, tag, target, artifacts)
+                    _log_wandb_image(wandb_run, f"renders/{tag}", panel, step=step, logger=logger)
+            if val_loader is not None and (step % eval_every == 0 or step == max_steps):
+                _run_validation(
+                    frontend,
+                    prior_extractor,
+                    val_loader,
+                    config,
+                    device=device,
+                    stage=stage,
+                    step=step,
+                    output_dir=output_dir,
+                    wandb_run=wandb_run,
+                    logger=logger,
+                    lpips_model=lpips_model,
+                )
             if metrics["total_loss"] < best:
                 best = metrics["total_loss"]
                 _save_checkpoint(output_dir / _stage_best_name(stage), frontend, config, step, stage, metrics)
@@ -1085,8 +1372,12 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
             if step >= max_steps:
                 break
     if first_artifacts is not None and first_target is not None:
-        panel = _save_visualization(output_dir, "final", first_target if step == 0 else target, artifacts)
-        _log_wandb_image(wandb_run, "renders/final", panel, step=step, logger=logger)
+        if input_reconstruction:
+            panel = _save_aligned_visualization(output_dir, "final", first_target if step == 0 else target, artifacts)
+            _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
+        else:
+            panel = _save_visualization(output_dir, "final", first_target if step == 0 else target, artifacts)
+            _log_wandb_image(wandb_run, "renders/final", panel, step=step, logger=logger)
     _save_checkpoint(output_dir / "latest.pt", frontend, config, step, stage, last_metrics)
     metrics_json = {
         "steps": step,

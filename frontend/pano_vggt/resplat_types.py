@@ -155,7 +155,7 @@ def state_to_explicit_gaussian_set(
     config: dict[str, Any] | None = None,
     min_scale: float = 1.0e-5,
     max_scale: float | None = None,
-    active_sh_degree: int = 0,
+    active_sh_degree: int | None = None,
 ) -> ExplicitGaussianSet:
     """Materialize one batch item as a renderer-compatible explicit Gaussian set."""
 
@@ -172,9 +172,11 @@ def state_to_explicit_gaussian_set(
     keep = valid & finite
     device = state.means.device
     dtype = state.means.dtype
+    sh_dim = max(1, state.sh_dim)
+    max_sh_degree = max(0, int(round(math.sqrt(sh_dim) - 1)))
+    active_degree = max_sh_degree if active_sh_degree is None else int(active_sh_degree)
     if not bool(keep.any()):
         empty = torch.zeros(0, device=device, dtype=dtype)
-        sh_dim = max(1, state.sh_dim)
         return ExplicitSHGaussianSet(
             xyz=empty.view(0, 3),
             scaling=empty.view(0, 3),
@@ -182,8 +184,8 @@ def state_to_explicit_gaussian_set(
             opacity=empty.view(0, 1),
             features=empty.view(0, 3),
             config=config,
-            active_sh_degree=int(active_sh_degree),
-            max_sh_degree=max(0, int(round(math.sqrt(sh_dim) - 1))),
+            active_sh_degree=active_degree,
+            max_sh_degree=max_sh_degree,
             sh_coefficients=empty.view(0, 3, sh_dim),
         )
 
@@ -201,7 +203,7 @@ def state_to_explicit_gaussian_set(
         opacity=torch.sigmoid(torch.nan_to_num(state.opacity_logits[idx][keep].to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)).clamp(0.0, 1.0),
         features=dc_rgb,
         config=config,
-        active_sh_degree=int(active_sh_degree),
-        max_sh_degree=max(0, int(round(math.sqrt(state.sh_dim) - 1))),
+        active_sh_degree=active_degree,
+        max_sh_degree=max_sh_degree,
         sh_coefficients=sh_coeffs,
     )

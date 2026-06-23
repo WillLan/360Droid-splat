@@ -19,6 +19,7 @@ from .resplat_types import PanoGaussianState
 
 @dataclass(frozen=True)
 class PanoCompactGaussianInitializerConfig:
+    type: str | None = None
     position_mode: str = "compact"
     latent_downsample: int = 1
     gaussians_per_cell: int = 2
@@ -30,6 +31,8 @@ class PanoCompactGaussianInitializerConfig:
     init_scale: float = 0.02
     use_world_points_as_base: bool = False
     use_local_offsets: bool = True
+    max_offset_abs: float = 0.05
+    max_offset_depth_ratio: float = 0.02
 
 
 def _as_config(
@@ -88,6 +91,8 @@ class PanoCompactGaussianInitializer(nn.Module):
         init_scale: float | None = None,
         use_world_points_as_base: bool | None = None,
         use_local_offsets: bool | None = None,
+        max_offset_abs: float | None = None,
+        max_offset_depth_ratio: float | None = None,
     ) -> None:
         super().__init__()
         cfg = _as_config(
@@ -103,12 +108,17 @@ class PanoCompactGaussianInitializer(nn.Module):
             init_scale=init_scale,
             use_world_points_as_base=use_world_points_as_base,
             use_local_offsets=use_local_offsets,
+            max_offset_abs=max_offset_abs,
+            max_offset_depth_ratio=max_offset_depth_ratio,
         )
         position_mode_value = str(cfg.position_mode).lower()
-        if position_mode_value not in {"compact", "dense_world_points"}:
+        type_value = str(cfg.type).lower() if cfg.type is not None else ""
+        if type_value in {"panovggt_aligned", "pano_vggt_aligned"}:
+            position_mode_value = "panovggt_aligned"
+        if position_mode_value not in {"compact", "dense_world_points", "panovggt_aligned"}:
             raise ValueError(f"Unsupported Initializer.position_mode={cfg.position_mode!r}.")
-        if int(cfg.sh_degree) != 0:
-            raise NotImplementedError("PanoCompactGaussianInitializer currently supports sh_degree=0 only.")
+        if int(cfg.sh_degree) < 0:
+            raise ValueError("sh_degree must be non-negative.")
         if int(cfg.gaussians_per_cell) <= 0:
             raise ValueError("gaussians_per_cell must be positive.")
         if int(cfg.state_dim) <= 0:
@@ -118,6 +128,8 @@ class PanoCompactGaussianInitializer(nn.Module):
                 raise ValueError("dense_world_points mode requires gaussians_per_cell=1.")
             if bool(cfg.use_local_offsets):
                 raise NotImplementedError("dense_world_points mode currently requires use_local_offsets=false.")
+        if position_mode_value == "panovggt_aligned" and int(cfg.gaussians_per_cell) != 1:
+            raise ValueError("panovggt_aligned mode currently requires gaussians_per_cell=1.")
         self.config = cfg
         self.position_mode = position_mode_value
         self.latent_downsample = max(1, int(cfg.latent_downsample))
@@ -131,6 +143,8 @@ class PanoCompactGaussianInitializer(nn.Module):
         self.init_scale = min(max(float(cfg.init_scale), self.min_scale), self.max_scale)
         self.use_world_points_as_base = bool(cfg.use_world_points_as_base)
         self.use_local_offsets = bool(cfg.use_local_offsets)
+        self.max_offset_abs = max(0.0, float(cfg.max_offset_abs))
+        self.max_offset_depth_ratio = max(0.0, float(cfg.max_offset_depth_ratio))
 
         self.trunk = nn.Sequential(
             _ConvNormGELU(None, self.state_dim),
@@ -146,7 +160,7 @@ class PanoCompactGaussianInitializer(nn.Module):
         self.scale_proj = nn.Conv2d(self.state_dim, k * 3, kernel_size=1)
         self.rotation_proj = nn.Conv2d(self.state_dim, k * 4, kernel_size=1)
         self.opacity_proj = nn.Conv2d(self.state_dim, k, kernel_size=1)
-        self.sh0_residual_proj = nn.Conv2d(self.state_dim, k * 3, kernel_size=1)
+        self.sh0_residual_proj = nn.Conv2d(self.state_dim, k * 3 * self.sh_dim, kernel_size=1)
         self.confidence_proj = nn.Conv2d(self.state_dim, k, kernel_size=1)
         self._init_predictions()
 
@@ -189,6 +203,8 @@ class PanoCompactGaussianInitializer(nn.Module):
         self._validate_inputs(images, features, depths, poses_c2w, valid_mask, world_points)
         if self.position_mode == "dense_world_points":
             return self._forward_dense_world_points(images, features, depths, poses_c2w, valid_mask, world_points=world_points)
+        if self.position_mode == "panovggt_aligned":
+            return self._forward_panovggt_aligned(images, features, depths, poses_c2w, valid_mask, world_points=world_points)
 
         input_dtype = features.dtype
         device = features.device
@@ -241,7 +257,7 @@ class PanoCompactGaussianInitializer(nn.Module):
         log_scales = self.scale_proj(hidden).view(b, v, k, 3, lh, lw).permute(0, 1, 4, 5, 2, 3)
         rotations = self.rotation_proj(hidden).view(b, v, k, 4, lh, lw).permute(0, 1, 4, 5, 2, 3)
         opacity = self.opacity_proj(hidden).view(b, v, k, 1, lh, lw).permute(0, 1, 4, 5, 2, 3)
-        sh_residual = self.sh0_residual_proj(hidden).view(b, v, k, 3, lh, lw).permute(0, 1, 4, 5, 2, 3)
+        sh_raw = self._reshape_sh(self.sh0_residual_proj(hidden), b, v, k, lh, lw)
         confidence_delta = self.confidence_proj(hidden).view(b, v, k, 1, lh, lw).permute(0, 1, 4, 5, 2, 3)
         latent = latent_cell.view(b, v, self.state_dim, lh, lw).permute(0, 1, 3, 4, 2)
         latent = latent.unsqueeze(-2).expand(-1, -1, -1, -1, k, -1)
@@ -270,11 +286,10 @@ class PanoCompactGaussianInitializer(nn.Module):
         means_world = torch.einsum("bvij,bvxykj->bvxyki", rot, mean_cam) + trans.view(b, v, 1, 1, 1, 3)
 
         rgb_cell = rgb.view(b, v, 3, lh, lw).permute(0, 1, 3, 4, 2).unsqueeze(-2).expand(-1, -1, -1, -1, k, -1)
-        rgb_init = (rgb_cell + 0.25 * torch.tanh(sh_residual)).clamp(0.0, 1.0)
-        sh0 = ((rgb_init - 0.5) / SH_C0).unsqueeze(-1)
+        sh_coeffs = self._build_sh_coeffs(rgb_cell, sh_raw)
         log_scales = log_scales.clamp(math.log(float(self.min_scale)), math.log(float(self.max_scale)))
         valid_cells = cell_valid.squeeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, k)
-        finite = torch.isfinite(means_world).all(dim=-1) & torch.isfinite(log_scales).all(dim=-1)
+        finite = torch.isfinite(means_world).all(dim=-1) & torch.isfinite(log_scales).all(dim=-1) & torch.isfinite(sh_coeffs).all(dim=(-1, -2))
         valid_flat = (valid_cells & finite).reshape(b, -1)
         confidence = (valid_cells.unsqueeze(-1).to(dtype=param_dtype) * torch.sigmoid(opacity + confidence_delta)).reshape(b, -1, 1)
 
@@ -283,7 +298,7 @@ class PanoCompactGaussianInitializer(nn.Module):
             log_scales=torch.nan_to_num(log_scales.reshape(b, -1, 3).to(dtype=input_dtype), nan=math.log(float(self.init_scale)), posinf=math.log(float(self.max_scale)), neginf=math.log(float(self.min_scale))),
             rotations_unnorm=torch.nan_to_num(rotations.reshape(b, -1, 4).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             opacity_logits=torch.nan_to_num(opacity.reshape(b, -1, 1).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
-            sh_coeffs=torch.nan_to_num(sh0.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            sh_coeffs=torch.nan_to_num(sh_coeffs.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             latent_features=torch.nan_to_num(latent.reshape(b, -1, self.state_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             source_view_ids=self._source_view_ids(b, v, lh, lw, k, device=device),
             source_uv=self._source_uv(b, v, lh, lw, k, uv_image.to(dtype=input_dtype)),
@@ -344,18 +359,17 @@ class PanoCompactGaussianInitializer(nn.Module):
         log_scales = self.scale_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
         rotations = self.rotation_proj(hidden).view(b, v, k, 4, h, w).permute(0, 1, 4, 5, 2, 3)
         opacity = self.opacity_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
-        sh_residual = self.sh0_residual_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
+        sh_raw = self._reshape_sh(self.sh0_residual_proj(hidden), b, v, k, h, w)
         confidence_delta = self.confidence_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
         latent = latent_cell.view(b, v, self.state_dim, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2)
 
         means_world = world_points.to(device=device, dtype=param_dtype).unsqueeze(-2)
         finite_world = torch.isfinite(means_world).all(dim=-1)
         rgb_cell = rgb.view(b, v, 3, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2)
-        rgb_init = (rgb_cell + 0.25 * torch.tanh(sh_residual)).clamp(0.0, 1.0)
-        sh0 = ((rgb_init - 0.5) / SH_C0).unsqueeze(-1)
+        sh_coeffs = self._build_sh_coeffs(rgb_cell, sh_raw)
         log_scales = log_scales.clamp(math.log(float(self.min_scale)), math.log(float(self.max_scale)))
         valid_cells = valid.reshape(b, v, 1, h, w).permute(0, 1, 3, 4, 2).expand(-1, -1, -1, -1, k)
-        finite = finite_world & torch.isfinite(log_scales).all(dim=-1)
+        finite = finite_world & torch.isfinite(log_scales).all(dim=-1) & torch.isfinite(sh_coeffs).all(dim=(-1, -2))
         valid_flat = (valid_cells & finite).reshape(b, -1)
         confidence = (valid_cells.unsqueeze(-1).to(dtype=param_dtype) * torch.sigmoid(opacity + confidence_delta)).reshape(b, -1, 1)
 
@@ -364,7 +378,124 @@ class PanoCompactGaussianInitializer(nn.Module):
             log_scales=torch.nan_to_num(log_scales.reshape(b, -1, 3).to(dtype=input_dtype), nan=math.log(float(self.init_scale)), posinf=math.log(float(self.max_scale)), neginf=math.log(float(self.min_scale))),
             rotations_unnorm=torch.nan_to_num(rotations.reshape(b, -1, 4).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             opacity_logits=torch.nan_to_num(opacity.reshape(b, -1, 1).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
-            sh_coeffs=torch.nan_to_num(sh0.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            sh_coeffs=torch.nan_to_num(sh_coeffs.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            latent_features=torch.nan_to_num(latent.reshape(b, -1, self.state_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            source_view_ids=self._source_view_ids(b, v, h, w, k, device=device),
+            source_uv=self._source_uv(b, v, h, w, k, uv_image.to(dtype=input_dtype)),
+            valid_mask=valid_flat,
+            confidence=torch.nan_to_num(confidence.to(dtype=input_dtype), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0),
+        )
+        return self._maybe_crop(state)
+
+    def _forward_panovggt_aligned(
+        self,
+        images: torch.Tensor,
+        features: torch.Tensor,
+        depths: torch.Tensor,
+        poses_c2w: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+        *,
+        world_points: torch.Tensor | None,
+    ) -> PanoGaussianState:
+        if world_points is None:
+            raise ValueError("panovggt_aligned mode requires world_points with shape BxVxHxWx3.")
+        input_dtype = features.dtype
+        device = features.device
+        param_dtype = next(self.parameters()).dtype
+        b, v, c, hf, wf = [int(x) for x in features.shape]
+        h, w = int(images.shape[-2]), int(images.shape[-1])
+        flat_count = b * v
+        k = self.gaussians_per_cell
+
+        feat = self.dense_feature_proj(
+            torch.nan_to_num(features.to(dtype=param_dtype), nan=0.0, posinf=0.0, neginf=0.0).reshape(flat_count, c, hf, wf)
+        )
+        feat = F.interpolate(feat, size=(h, w), mode="bilinear", align_corners=False)
+        rgb = torch.nan_to_num(
+            images.to(device=device, dtype=param_dtype),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0).reshape(flat_count, 3, h, w)
+        depth_raw = depths.to(device=device, dtype=param_dtype)
+        depth_valid = torch.isfinite(depth_raw) & (depth_raw > 1.0e-6)
+        valid = depth_valid if valid_mask is None else depth_valid & self._normalize_valid_mask(valid_mask, depths.shape).to(device=device)
+        depth_safe = torch.where(depth_valid, depth_raw, torch.ones_like(depth_raw)).reshape(flat_count, 1, h, w).clamp_min(1.0e-6)
+
+        uv_image = make_feature_grid((h, w), device=device, dtype=param_dtype)
+        bearing = erp_uv_to_bearing(uv_image, (h, w)).to(device=device, dtype=param_dtype)
+        bearing_map = bearing.permute(2, 0, 1).view(1, 3, h, w).expand(flat_count, -1, -1, -1)
+        uv_norm = torch.stack(
+            [
+                2.0 * uv_image[..., 0] / float(max(w - 1, 1)) - 1.0,
+                2.0 * uv_image[..., 1] / float(max(h - 1, 1)) - 1.0,
+            ],
+            dim=-1,
+        ).permute(2, 0, 1).view(1, 2, h, w).expand(flat_count, -1, -1, -1)
+
+        base_world = world_points.to(device=device, dtype=param_dtype)
+        base_cam = world_to_camera(base_world, poses_c2w.to(device=device, dtype=param_dtype))
+        base_depth = torch.linalg.norm(base_cam, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        base_bearing = F.normalize(torch.nan_to_num(base_cam, nan=0.0, posinf=0.0, neginf=0.0), dim=-1, eps=1.0e-6)
+
+        world_chw = torch.nan_to_num(base_world, nan=0.0, posinf=0.0, neginf=0.0).permute(0, 1, 4, 2, 3).reshape(flat_count, 3, h, w)
+        x = torch.cat([feat, rgb, depth_safe.log(), world_chw, bearing_map, uv_norm], dim=1)
+        hidden = self.trunk(x)
+        latent_cell = self.latent_proj(hidden)
+        offsets = self.offset_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
+        log_scales = self.scale_proj(hidden).view(b, v, k, 3, h, w).permute(0, 1, 4, 5, 2, 3)
+        rotations = self.rotation_proj(hidden).view(b, v, k, 4, h, w).permute(0, 1, 4, 5, 2, 3)
+        opacity = self.opacity_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
+        sh_raw = self._reshape_sh(self.sh0_residual_proj(hidden), b, v, k, h, w)
+        confidence_delta = self.confidence_proj(hidden).view(b, v, k, 1, h, w).permute(0, 1, 4, 5, 2, 3)
+        latent = latent_cell.view(b, v, self.state_dim, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2)
+
+        if self.use_local_offsets:
+            basis = tangent_basis(base_bearing)
+            tangent_u = basis[..., 0]
+            tangent_v = basis[..., 1]
+            depth_bound = base_depth * float(self.max_offset_depth_ratio)
+            if self.max_offset_abs > 0.0:
+                abs_bound = torch.full_like(depth_bound, float(self.max_offset_abs))
+                depth_bound = torch.minimum(depth_bound, abs_bound)
+            offset_step = torch.tanh(offsets) * depth_bound.unsqueeze(-2)
+        else:
+            tangent_u = torch.zeros_like(base_bearing)
+            tangent_v = torch.zeros_like(base_bearing)
+            offset_step = torch.zeros_like(offsets)
+
+        mean_cam = (
+            base_cam.unsqueeze(-2)
+            + offset_step[..., 0:1] * base_bearing.unsqueeze(-2)
+            + offset_step[..., 1:2] * tangent_u.unsqueeze(-2)
+            + offset_step[..., 2:3] * tangent_v.unsqueeze(-2)
+        )
+        pose = poses_c2w.to(device=device, dtype=param_dtype)
+        rot = pose[..., :3, :3]
+        trans = pose[..., :3, 3]
+        means_world = torch.einsum("bvij,bvxykj->bvxyki", rot, mean_cam) + trans.view(b, v, 1, 1, 1, 3)
+
+        rgb_cell = rgb.view(b, v, 3, h, w).permute(0, 1, 3, 4, 2).unsqueeze(-2).expand(-1, -1, -1, -1, k, -1)
+        sh_coeffs = self._build_sh_coeffs(rgb_cell, sh_raw)
+        log_scales = log_scales.clamp(math.log(float(self.min_scale)), math.log(float(self.max_scale)))
+        valid_cells = valid.reshape(b, v, 1, h, w).permute(0, 1, 3, 4, 2).expand(-1, -1, -1, -1, k)
+        finite_world = torch.isfinite(base_world).all(dim=-1).unsqueeze(-1).expand_as(valid_cells)
+        finite = (
+            finite_world
+            & torch.isfinite(means_world).all(dim=-1)
+            & torch.isfinite(log_scales).all(dim=-1)
+            & torch.isfinite(sh_coeffs).all(dim=(-1, -2))
+            & torch.isfinite(base_depth).squeeze(-1).unsqueeze(-1).expand_as(valid_cells)
+        )
+        valid_flat = (valid_cells & finite).reshape(b, -1)
+        confidence = (valid_cells.unsqueeze(-1).to(dtype=param_dtype) * torch.sigmoid(opacity + confidence_delta)).reshape(b, -1, 1)
+
+        state = PanoGaussianState(
+            means=torch.nan_to_num(means_world.reshape(b, -1, 3).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            log_scales=torch.nan_to_num(log_scales.reshape(b, -1, 3).to(dtype=input_dtype), nan=math.log(float(self.init_scale)), posinf=math.log(float(self.max_scale)), neginf=math.log(float(self.min_scale))),
+            rotations_unnorm=torch.nan_to_num(rotations.reshape(b, -1, 4).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            opacity_logits=torch.nan_to_num(opacity.reshape(b, -1, 1).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
+            sh_coeffs=torch.nan_to_num(sh_coeffs.reshape(b, -1, 3, self.sh_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             latent_features=torch.nan_to_num(latent.reshape(b, -1, self.state_dim).to(dtype=input_dtype), nan=0.0, posinf=0.0, neginf=0.0),
             source_view_ids=self._source_view_ids(b, v, h, w, k, device=device),
             source_uv=self._source_uv(b, v, h, w, k, uv_image.to(dtype=input_dtype)),
@@ -398,7 +529,7 @@ class PanoCompactGaussianInitializer(nn.Module):
             raise ValueError("depths must match image H,W.")
         if valid_mask is not None:
             self._normalize_valid_mask(valid_mask, depths.shape)
-        if self.use_world_points_as_base or self.position_mode == "dense_world_points":
+        if self.use_world_points_as_base or self.position_mode in {"dense_world_points", "panovggt_aligned"}:
             if world_points is None:
                 raise ValueError("world point based initialization requires world_points with shape BxVxHxWx3.")
             if world_points.ndim != 5 or int(world_points.shape[-1]) != 3:
@@ -417,6 +548,24 @@ class PanoCompactGaussianInitializer(nn.Module):
         if tuple(valid.shape) != tuple(depth_shape):
             raise ValueError(f"valid_mask shape {tuple(valid.shape)} must match depths shape {tuple(depth_shape)}")
         return valid.bool()
+
+    def _reshape_sh(self, raw: torch.Tensor, b: int, v: int, k: int, h: int, w: int) -> torch.Tensor:
+        return raw.view(b, v, k, 3, self.sh_dim, h, w).permute(0, 1, 5, 6, 2, 3, 4)
+
+    def _build_sh_coeffs(self, rgb_cell: torch.Tensor, sh_raw: torch.Tensor) -> torch.Tensor:
+        """Build SH coefficients from source RGB plus learned residuals.
+
+        ``rgb_cell`` has shape ``B x V x H x W x K x 3`` and ``sh_raw`` has
+        shape ``B x V x H x W x K x 3 x SH_DIM``.
+        """
+
+        sh_delta = torch.tanh(sh_raw)
+        sh_coeffs = torch.zeros_like(sh_delta)
+        rgb_init = (rgb_cell + 0.25 * sh_delta[..., 0]).clamp(0.0, 1.0)
+        sh_coeffs[..., 0] = (rgb_init - 0.5) / SH_C0
+        if self.sh_dim > 1:
+            sh_coeffs[..., 1:] = 0.05 * sh_delta[..., 1:]
+        return sh_coeffs
 
     def _latent_hw(self, hf: int, wf: int) -> tuple[int, int]:
         return (

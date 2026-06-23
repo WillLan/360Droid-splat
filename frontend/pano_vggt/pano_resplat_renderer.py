@@ -43,7 +43,7 @@ def _soft_splat_render(
     c2w = camera.c2w.to(device=device, dtype=dtype)
     ones = torch.ones(xyz.shape[0], 1, device=device, dtype=dtype)
     cam = (torch.linalg.inv(c2w) @ torch.cat([xyz, ones], dim=-1).T).T[:, :3]
-    uv, depth, valid, _bearing = camera_to_erp_uv(cam, (height, width), require_forward=True)
+    uv, depth, valid, _bearing = camera_to_erp_uv(cam, (height, width), require_forward=False)
     if not bool(valid.any()):
         render = torch.zeros(3, height, width, device=device, dtype=dtype)
         alpha = torch.zeros(1, height, width, device=device, dtype=dtype)
