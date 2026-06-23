@@ -619,8 +619,8 @@ def train_panovggt_geometry(config: dict[str, Any], *, command: list[str] | None
                 print(yaml.safe_dump({"validation": val_metrics}, sort_keys=False).strip(), flush=True)
                 if wandb_run is not None:
                     wandb_run.log(val_metrics, step=step)
-            score = val_metrics.get("val/total_loss", metrics.get("total_loss", float("inf")))
-            if score < best:
+            score = val_metrics.get("val/total_loss") if val_loader is not None else metrics.get("total_loss")
+            if score is not None and score < best:
                 best = score
                 save_geometry_checkpoint(output_dir / "best_geometry.pt", model=model, config=config, step=step, metrics={**metrics, **val_metrics})
             if step % save_every == 0:
