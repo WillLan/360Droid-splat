@@ -13,6 +13,20 @@ from .pano_point_transformer import PanoKNNTransformerBlock
 from .resplat_types import PanoGaussianState
 
 
+class _FiniteGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value: torch.Tensor) -> torch.Tensor:  # noqa: D401
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:  # noqa: D401
+        return (torch.nan_to_num(grad_output, nan=0.0, posinf=0.0, neginf=0.0),)
+
+
+def _finite_gradient(value: torch.Tensor) -> torch.Tensor:
+    return _FiniteGradient.apply(value)
+
+
 @dataclass(frozen=True)
 class PanoGaussianUpdateLimits:
     mean: float = 0.02
@@ -150,7 +164,7 @@ class PanoGaussianUpdateBlock(nn.Module):
                 feat = block(means_prev, feat, state.valid_mask, knn_cache=knn_cache)
             else:
                 feat = block(means_prev, feat, state.valid_mask)
-        raw = self.delta(feat)
+        raw = _finite_gradient(self.delta(feat))
         cursor = 0
         mean_delta = torch.tanh(raw[..., cursor : cursor + 3]) * float(self.limits.mean)
         cursor += 3
