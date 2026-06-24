@@ -99,6 +99,42 @@ class PanoKNNTransformerBlock(nn.Module):
         out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return (out, cache) if return_knn_cache else out
 
+    @torch.no_grad()
+    def compute_knn_cache(self, xyz: torch.Tensor, valid_mask: torch.Tensor | None = None) -> Any:
+        if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
+            raise ValueError(f"xyz must have shape BxNx3, got {tuple(xyz.shape)}")
+        b, n, _ = [int(v) for v in xyz.shape]
+        valid = None if valid_mask is None else valid_mask.to(device=xyz.device, dtype=torch.bool)
+        if valid is not None and tuple(valid.shape) != (b, n):
+            raise ValueError(f"valid_mask must have shape {(b, n)}, got {tuple(valid.shape)}")
+        if self.knn_backend != "pointops":
+            return self._cdist_knn_indices(xyz, valid)
+
+        pointops = _load_pointops(strict=self.strict_knn_backend)
+        if pointops is None or not xyz.is_cuda:
+            if self.strict_knn_backend:
+                raise RuntimeError("pointops KNN is only supported for CUDA tensors in strict mode.")
+            cache = self._cdist_knn_indices(xyz, valid)
+            return [cache[i] for i in range(int(cache.shape[0]))]
+
+        caches: list[torch.Tensor | None] = []
+        for batch_idx in range(b):
+            valid_idx = (
+                torch.arange(n, device=xyz.device)
+                if valid is None
+                else torch.nonzero(valid[batch_idx], as_tuple=False).flatten()
+            )
+            m = int(valid_idx.numel())
+            if m == 0:
+                caches.append(None)
+                continue
+            p = torch.nan_to_num(xyz[batch_idx].index_select(0, valid_idx).detach(), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+            offset = torch.tensor([m], device=xyz.device, dtype=torch.int32)
+            k_count = min(self.knn, m)
+            knn_idx, _ = pointops.knn_query(k_count, p, offset, p, offset)
+            caches.append(knn_idx.detach())
+        return caches
+
     def _forward_cdist(
         self,
         xyz: torch.Tensor,

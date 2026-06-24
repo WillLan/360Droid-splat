@@ -7,6 +7,7 @@ import math
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .pano_point_transformer import PanoKNNTransformerBlock
 from .resplat_types import PanoGaussianState
@@ -46,6 +47,7 @@ class PanoGaussianUpdateBlock(nn.Module):
         strict_knn_backend: bool = False,
         cache_knn: bool = False,
         detach_feedback: bool = True,
+        gradient_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.feedback_dim = int(feedback_dim)
@@ -55,6 +57,7 @@ class PanoGaussianUpdateBlock(nn.Module):
         self.limits = limits or PanoGaussianUpdateLimits()
         self.cache_knn = bool(cache_knn)
         self.detach_feedback = bool(detach_feedback)
+        self.gradient_checkpoint = bool(gradient_checkpoint)
         self.num_basic_refine_blocks = max(1, int(num_basic_refine_blocks))
         input_dim = 3 + 3 + 4 + 1 + 3 * self.sh_dim + self.latent_dim + self.feedback_dim + 1
         self.input_proj = nn.Sequential(
@@ -136,16 +139,15 @@ class PanoGaussianUpdateBlock(nn.Module):
             dim=-1,
         )
         feat = self.input_proj(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
-        knn_cache = None
+        knn_cache = self.transformers[0].compute_knn_cache(means_prev, state.valid_mask) if self.cache_knn else None
         for block in self.transformers:
-            if self.cache_knn:
-                feat, knn_cache = block(
-                    means_prev,
-                    feat,
-                    state.valid_mask,
-                    knn_cache=knn_cache,
-                    return_knn_cache=True,
-                )
+            if self.gradient_checkpoint and self.training and torch.is_grad_enabled():
+                def _run_block(feat_in: torch.Tensor, *, current_block: PanoKNNTransformerBlock = block) -> torch.Tensor:
+                    return current_block(means_prev, feat_in, state.valid_mask, knn_cache=knn_cache)
+
+                feat = checkpoint(_run_block, feat, use_reentrant=False)
+            elif self.cache_knn:
+                feat = block(means_prev, feat, state.valid_mask, knn_cache=knn_cache)
             else:
                 feat = block(means_prev, feat, state.valid_mask)
         raw = self.delta(feat)

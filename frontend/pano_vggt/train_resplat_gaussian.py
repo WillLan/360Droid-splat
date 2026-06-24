@@ -114,6 +114,7 @@ def _default_config() -> dict[str, Any]:
             "strict_knn_backend": False,
             "cache_knn": False,
             "detach_feedback": True,
+            "gradient_checkpoint": False,
             "max_knn_points": 1024,
             "chunk_size": None,
             "limits": {
@@ -376,6 +377,7 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
         strict_knn_backend=bool(ref_cfg.get("strict_knn_backend", False)),
         cache_knn=bool(ref_cfg.get("cache_knn", False)),
         detach_feedback=bool(ref_cfg.get("detach_feedback", True)),
+        gradient_checkpoint=bool(ref_cfg.get("gradient_checkpoint", False)),
     )
     render_cfg = config.get("Renderer", {})
     render_config = {"Training": dict(config.get("TrainingRender", {})), "Renderer": dict(render_cfg)}

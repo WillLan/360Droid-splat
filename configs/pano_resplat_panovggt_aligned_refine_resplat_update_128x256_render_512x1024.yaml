@@ -68,6 +68,7 @@ Refiner:
   strict_knn_backend: true
   cache_knn: true
   detach_feedback: false
+  gradient_checkpoint: true
   max_knn_points: 0
   chunk_size: null
 
