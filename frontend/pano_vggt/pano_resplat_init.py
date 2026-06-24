@@ -95,6 +95,11 @@ class PanoCompactGaussianInitializer(nn.Module):
         max_offset_depth_ratio: float | None = None,
     ) -> None:
         super().__init__()
+        raise RuntimeError(
+            "PanoCompactGaussianInitializer has been retired. "
+            "Use PanoVGGTPointDecoderGaussianInitializer from "
+            "frontend.pano_vggt.pano_resplat_point_decoder_init."
+        )
         cfg = _as_config(
             config,
             position_mode=position_mode,

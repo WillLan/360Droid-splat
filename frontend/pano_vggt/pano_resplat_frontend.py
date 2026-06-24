@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from .pano_resplat_feedback import PanoRenderFeedbackEncoder
-from .pano_resplat_init import PanoCompactGaussianInitializer
+from .pano_resplat_point_decoder_init import PanoVGGTPointDecoderGaussianInitializer
 from .pano_resplat_refiner import PanoGaussianUpdateBlock
 from .pano_resplat_renderer import PanoGaussianRendererAdapter
 from .resplat_types import PanoGaussianState, PanoRenderOutput
@@ -20,14 +20,14 @@ class PanoReSplatFrontend(nn.Module):
     def __init__(
         self,
         *,
-        initializer: PanoCompactGaussianInitializer | None = None,
+        initializer: PanoVGGTPointDecoderGaussianInitializer | None = None,
         feedback_encoder: PanoRenderFeedbackEncoder | None = None,
         update_block: PanoGaussianUpdateBlock | None = None,
         renderer: PanoGaussianRendererAdapter | None = None,
         renderer_backend: str = "soft_splat",
     ) -> None:
         super().__init__()
-        self.initializer = initializer or PanoCompactGaussianInitializer()
+        self.initializer = initializer or PanoVGGTPointDecoderGaussianInitializer()
         self.feedback_encoder = feedback_encoder or PanoRenderFeedbackEncoder()
         latent_dim = int(getattr(self.initializer, "state_dim", 64))
         sh_dim = int(getattr(self.initializer, "sh_dim", 1))
@@ -62,6 +62,8 @@ class PanoReSplatFrontend(nn.Module):
             poses,
             valid_mask,
             world_points=world_points,
+            tokens=context.get("tokens"),
+            token_hw=context.get("token_hw"),
         )
         states: list[PanoGaussianState] = [state]
         context_renders: list[PanoRenderOutput] = []

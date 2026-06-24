@@ -163,9 +163,11 @@ def state_to_explicit_gaussian_set(
     if idx < 0 or idx >= state.batch_size:
         raise IndexError(f"batch_index={idx} out of range for batch size {state.batch_size}")
     valid = state.valid_mask[idx].bool()
+    scale_values = torch.exp(state.log_scales[idx])
     finite = (
         torch.isfinite(state.means[idx]).all(dim=-1)
         & torch.isfinite(state.log_scales[idx]).all(dim=-1)
+        & torch.isfinite(scale_values).all(dim=-1)
         & torch.isfinite(state.opacity_logits[idx]).all(dim=-1)
         & torch.isfinite(state.sh_coeffs[idx]).all(dim=(-1, -2))
     )
@@ -189,16 +191,12 @@ def state_to_explicit_gaussian_set(
             sh_coefficients=empty.view(0, 3, sh_dim),
         )
 
-    log_scales = state.log_scales[idx][keep]
-    if max_scale is not None:
-        log_scales = log_scales.clamp(math.log(float(min_scale)), math.log(float(max_scale)))
-    else:
-        log_scales = log_scales.clamp_min(math.log(float(min_scale)))
+    scaling = scale_values[keep]
     sh_coeffs = torch.nan_to_num(state.sh_coeffs[idx][keep].to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)
     dc_rgb = (sh_coeffs[..., 0] * SH_C0 + 0.5).clamp(0.0, 1.0)
     return ExplicitSHGaussianSet(
         xyz=torch.nan_to_num(state.means[idx][keep].to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0),
-        scaling=torch.nan_to_num(log_scales.exp(), nan=float(min_scale), posinf=float(max_scale or 1.0e6), neginf=float(min_scale)),
+        scaling=torch.nan_to_num(scaling.to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0),
         rotation=normalize_quaternion(state.rotations_unnorm[idx][keep].to(device=device, dtype=dtype)),
         opacity=torch.sigmoid(torch.nan_to_num(state.opacity_logits[idx][keep].to(device=device, dtype=dtype), nan=0.0, posinf=0.0, neginf=0.0)).clamp(0.0, 1.0),
         features=dc_rgb,

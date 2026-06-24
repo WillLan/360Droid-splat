@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock
 
 
@@ -15,18 +15,25 @@ def _context():
     depths = torch.full((b, v, 1, h, w), 2.0)
     poses = torch.eye(4).view(1, 1, 4, 4).repeat(b, v, 1, 1)
     valid = torch.ones(b, v, 1, h, w, dtype=torch.bool)
-    return images, features, depths, poses, valid
+    world = torch.zeros(b, v, h, w, 3)
+    world[..., 2] = 2.0
+    return images, features, depths, poses, valid, world
 
 
 def test_zero_init_refiner_delta_is_identity():
-    images, features, depths, poses, valid = _context()
-    initializer = PanoCompactGaussianInitializer(
-        latent_downsample=1,
-        gaussians_per_cell=2,
-        state_dim=16,
-        max_gaussians=16,
+    images, features, depths, poses, valid, world = _context()
+    initializer = PanoVGGTPointDecoderGaussianInitializer(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 16,
+            "sh_degree": 0,
+            "patch_size": 4,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+        }
     )
-    state = initializer(images, features, depths, poses, valid)
+    state = initializer(images, features, depths, poses, valid, world_points=world)
     block = PanoGaussianUpdateBlock(feedback_dim=12, latent_dim=state.latent_dim, sh_dim=state.sh_dim, hidden_dim=16)
     feedback = torch.randn(state.batch_size, state.num_gaussians, 12)
 

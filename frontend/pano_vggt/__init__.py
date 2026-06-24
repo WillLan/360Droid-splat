@@ -11,6 +11,7 @@ from .keyframe_memory import KeyframeCorrespondenceEdge, KeyframeCorrespondenceG
 from .matching_dataset import Omni360SceneTrainingDataset, SyntheticOmni360TrainingDataset
 from .matching_head import PanoVGGTMatchingHead, PanoVGGTMatchingSkyHead, PanoVGGTSkyMaskHead
 from .matching_losses import PanoVGGTMatchingLossWeights, PanoVGGTMatchingSkyLoss
+from .pano_resplat_point_decoder_init import PanoVGGTPointDecoderGaussianInitializer
 from .spherical_dense_ba import SphericalTangentDenseBA, SphericalTangentDenseBAOutput
 from .tracker import PanoVGGTAlignmentError, PanoVGGTLongTracker, build_panovggt_frontend_from_config
 from .types import PanoVGGTLocalPrediction
@@ -41,6 +42,7 @@ __all__ = [
     "PanoVGGTMatchingLossWeights",
     "PanoVGGTMatchingSkyHead",
     "PanoVGGTMatchingSkyLoss",
+    "PanoVGGTPointDecoderGaussianInitializer",
     "PanoVGGTSkyMaskHead",
     "PoseGuidedDenseMatcher",
     "SimilarityTransform",

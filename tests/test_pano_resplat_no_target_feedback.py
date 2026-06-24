@@ -6,17 +6,22 @@ import torch
 
 from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
-from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_resplat_renderer import PanoGaussianRendererAdapter
 
 
 def _frontend() -> PanoReSplatFrontend:
-    initializer = PanoCompactGaussianInitializer(
-        latent_downsample=1,
-        gaussians_per_cell=2,
-        state_dim=16,
-        max_gaussians=18,
-        init_scale=0.02,
+    initializer = PanoVGGTPointDecoderGaussianInitializer(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 16,
+            "sh_degree": 0,
+            "patch_size": 4,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+            "init_scale": 0.02,
+        }
     )
     return PanoReSplatFrontend(
         initializer=initializer,
@@ -36,12 +41,15 @@ def _context(image_shift: float = 0.0) -> dict[str, torch.Tensor]:
     poses = torch.eye(4).view(1, 1, 4, 4).repeat(b, v, 1, 1)
     poses[:, 1, 0, 3] = 0.1
     valid = torch.ones(b, v, 1, h, w, dtype=torch.bool)
+    world = torch.zeros(b, v, h, w, 3)
+    world[..., 2] = 2.0
     return {
         "images": images,
         "features": features,
         "depths": depths,
         "poses_c2w": poses,
         "valid_mask": valid,
+        "world_points": world,
     }
 
 
@@ -87,9 +95,9 @@ def test_num_refine_shapes_and_finite_outputs():
     for num_refine in (0, 1, 2):
         out = frontend(context, target=_target(0.2), num_refine=num_refine)
         state = out["final_state"]
-        assert state.means.shape == (1, 18, 3)
-        assert state.log_scales.shape == (1, 18, 3)
-        assert state.sh_coeffs.shape == (1, 18, 3, 1)
+        assert state.means.shape == (1, 2 * 12 * 24, 3)
+        assert state.log_scales.shape == (1, 2 * 12 * 24, 3)
+        assert state.sh_coeffs.shape == (1, 2 * 12 * 24, 3, 1)
         assert len(out["states"]) == num_refine + 1
         assert torch.isfinite(state.means).all()
         assert torch.isfinite(state.log_scales).all()

@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 import time
 
+import pytest
 import torch
 
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE
 from frontend.pano_vggt.train_resplat_gaussian import _sample_input_reconstruction, _sample_window, load_resplat_train_config, train_resplat_gaussian
 
 
@@ -31,7 +33,17 @@ def _config(tmp_path: Path) -> dict:
     )
     cfg["Dataset"].update({"synthetic": True, "synthetic_length": 1, "height": 12, "width": 24})
     cfg["Model"].update({"use_synthetic_features": True, "feature_dim": 8, "feature_stride": 4})
-    cfg["Initializer"].update({"state_dim": 8, "max_gaussians": 24, "gaussians_per_cell": 2})
+    cfg["Initializer"].update(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 8,
+            "sh_degree": 0,
+            "patch_size": 4,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+        }
+    )
     cfg["Feedback"].update({"feedback_dim": 8, "hidden_dim": 8})
     cfg["Refiner"].update({"hidden_dim": 8, "knn": 4, "num_heads": 2, "max_knn_points": 64})
     cfg["Renderer"].update({"backend": "soft_splat", "soft_max_points": 64})
@@ -104,3 +116,21 @@ def test_input_reconstruction_uses_high_resolution_supervision_target():
     assert torch.allclose(target["images"], high_images)
     assert torch.allclose(target["depths"], torch.full((1, 4, 1, 16, 32), 3.0))
     assert tuple(target["valid_mask"].shape[-2:]) == (16, 32)
+
+
+def test_render_resolution_requires_native_supervision_gt():
+    cfg = load_resplat_train_config(None)
+    cfg["Training"].update({"render_height": 16, "render_width": 32})
+    sample = {
+        "images": torch.zeros(1, 4, 3, 8, 16),
+        "valid_depth": torch.ones(1, 4, 1, 8, 16, dtype=torch.bool),
+    }
+    priors = {
+        "features": torch.rand(1, 4, 4, 2, 4),
+        "depth": torch.ones(1, 4, 1, 8, 16),
+        "poses_c2w": torch.eye(4).view(1, 1, 4, 4).expand(1, 4, 4, 4),
+        "world_points": torch.rand(1, 4, 8, 16, 3),
+    }
+
+    with pytest.raises(ValueError, match="supervision_images"):
+        _sample_input_reconstruction(sample, priors, cfg)

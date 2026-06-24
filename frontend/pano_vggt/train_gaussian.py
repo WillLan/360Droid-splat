@@ -192,8 +192,12 @@ class SyntheticGaussianPriorExtractor(nn.Module):
         depth = sample["depths"].float()
         poses = sample["poses_c2w"].float()
         world = _world_points_from_depth(depth, poses)
+        b, v, c, hf, wf = [int(x) for x in features.shape]
+        tokens = features.permute(0, 1, 3, 4, 2).reshape(b, v, hf * wf, c).contiguous()
         return {
             "features": features,
+            "tokens": tokens,
+            "token_hw": torch.tensor([hf, wf], device=features.device, dtype=torch.long),
             "depth": depth,
             "poses_c2w": poses,
             "world_points": world,
@@ -278,8 +282,13 @@ class ExternalPanoVGGTGaussianPriorExtractor(nn.Module):
                 depths.append(torch.nan_to_num(pred.depth.detach().float(), nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0e-6))
                 poses.append(pred.poses_c2w.detach().float())
                 worlds.append(pred.chunk_world_points.detach().float())
+        feature_batch = torch.stack(features, dim=0)
+        b, v, c, hf, wf = [int(x) for x in feature_batch.shape]
+        tokens = feature_batch.permute(0, 1, 3, 4, 2).reshape(b, v, hf * wf, c).contiguous()
         return {
-            "features": torch.stack(features, dim=0),
+            "features": feature_batch,
+            "tokens": tokens,
+            "token_hw": torch.tensor([hf, wf], device=feature_batch.device, dtype=torch.long),
             "depth": torch.stack(depths, dim=0),
             "poses_c2w": torch.stack(poses, dim=0),
             "world_points": torch.stack(worlds, dim=0),

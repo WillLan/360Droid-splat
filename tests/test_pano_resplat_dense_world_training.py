@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_resplat_renderer import PanoGaussianRendererAdapter
 from frontend.pano_vggt.resplat_types import PanoRenderOutput, PanoGaussianState, state_to_explicit_gaussian_set
 from frontend.pano_vggt.train_resplat_gaussian import _sample_window, _single_output_loss, load_resplat_train_config
@@ -28,20 +28,22 @@ def _dense_batch(b: int = 1, v: int = 4, h: int = 6, w: int = 10):
     return images, features, depths, poses, valid, sky, world
 
 
-def _dense_initializer() -> PanoCompactGaussianInitializer:
-    return PanoCompactGaussianInitializer(
-        position_mode="dense_world_points",
-        latent_downsample=1,
-        gaussians_per_cell=1,
-        state_dim=8,
-        sh_degree=0,
-        max_gaussians=0,
-        use_world_points_as_base=True,
-        use_local_offsets=False,
+def _dense_initializer() -> PanoVGGTPointDecoderGaussianInitializer:
+    return PanoVGGTPointDecoderGaussianInitializer(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 8,
+            "sh_degree": 0,
+            "patch_size": 2,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+            "use_local_offsets": False,
+        }
     )
 
 
-def test_dense_world_initializer_keeps_all_world_points_and_masks_sky():
+def test_point_decoder_initializer_keeps_all_world_points_and_masks_sky():
     images, features, depths, poses, valid, _sky, world = _dense_batch()
     model = _dense_initializer()
 
@@ -55,7 +57,7 @@ def test_dense_world_initializer_keeps_all_world_points_and_masks_sky():
     assert state.confidence is not None and state.confidence.shape == (1, state.num_gaussians, 1)
 
 
-def test_dense_world_initializer_means_follow_world_points_exactly():
+def test_point_decoder_initializer_means_follow_world_points_exactly():
     images, features, depths, poses, valid, _sky, world = _dense_batch()
     model = _dense_initializer()
 
@@ -65,7 +67,7 @@ def test_dense_world_initializer_means_follow_world_points_exactly():
     assert torch.allclose(state_b.means - state_a.means, torch.full_like(state_a.means, 3.0), atol=1.0e-6)
 
 
-def test_dense_world_state_soft_splat_smoke_renders():
+def test_point_decoder_state_soft_splat_smoke_renders():
     images, features, depths, poses, valid, _sky, world = _dense_batch(h=4, w=8)
     model = _dense_initializer()
     state = model(images, features, depths, poses, valid, world_points=world)

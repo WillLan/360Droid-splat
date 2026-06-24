@@ -10,7 +10,7 @@ import torch
 
 from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
-from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_point_transformer import PanoKNNTransformerBlock
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock
 from frontend.pano_vggt.resplat_types import PanoGaussianState
@@ -129,7 +129,17 @@ def test_invalid_points_are_not_updated_when_delta_head_is_nonzero():
 
 
 def test_checkpoint_load_skips_incompatible_refiner_shapes():
-    initializer = PanoCompactGaussianInitializer(state_dim=8, sh_degree=3, max_gaussians=8)
+    initializer = PanoVGGTPointDecoderGaussianInitializer(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 8,
+            "sh_degree": 3,
+            "patch_size": 4,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+        }
+    )
     feedback = PanoRenderFeedbackEncoder(feedback_dim=5, hidden_dim=8)
     old_update = PanoGaussianUpdateBlock(feedback_dim=5, latent_dim=8, sh_dim=16, hidden_dim=8)
     with torch.no_grad():
@@ -153,6 +163,10 @@ def test_checkpoint_load_skips_incompatible_refiner_shapes():
     path = output_dir / "old_init.pt"
     torch.save(
         {
+            "initializer_type": INITIALIZER_TYPE,
+            "state_dim": 8,
+            "sh_degree": 3,
+            "sh_dim": 16,
             "initializer": initializer.state_dict(),
             "feedback_encoder": feedback.state_dict(),
             "update_block": old_update.state_dict(),

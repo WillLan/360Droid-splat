@@ -33,7 +33,7 @@ if __package__ in {None, ""}:
 from frontend.pano_vggt.matching_dataset import build_matching_dataset_from_config, validate_training_sample
 from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
-from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
+from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock, PanoGaussianUpdateLimits
 from frontend.pano_vggt.pano_resplat_renderer import PanoGaussianRendererAdapter
 from frontend.pano_vggt.resplat_types import PanoGaussianState, PanoRenderOutput, state_to_explicit_gaussian_set
@@ -88,16 +88,15 @@ def _default_config() -> dict[str, Any]:
             "skip_dinov2_pretrain": False,
         },
         "Initializer": {
-            "position_mode": "compact",
-            "latent_downsample": 1,
-            "gaussians_per_cell": 2,
+            "type": INITIALIZER_TYPE,
             "state_dim": 32,
             "sh_degree": 0,
-            "max_gaussians": 256,
-            "min_scale": 0.002,
-            "max_scale": 0.12,
+            "patch_size": 14,
+            "decoder_embed_dim": 64,
+            "decoder_depth": 2,
+            "decoder_num_heads": 4,
+            "decoder_mlp_ratio": 4.0,
             "init_scale": 0.02,
-            "use_world_points_as_base": True,
             "use_local_offsets": True,
             "max_offset_abs": 0.05,
             "max_offset_depth_ratio": 0.02,
@@ -352,7 +351,7 @@ def _wrap_trainable_modules_for_ddp(frontend: PanoReSplatFrontend, state: dict[s
 
 def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSplatFrontend:
     init_cfg = dict(config.get("Initializer", {}))
-    initializer = PanoCompactGaussianInitializer(init_cfg)
+    initializer = PanoVGGTPointDecoderGaussianInitializer(init_cfg)
     feedback_cfg = config.get("Feedback", {})
     feedback = PanoRenderFeedbackEncoder(
         feedback_dim=int(feedback_cfg.get("feedback_dim", 32)),
@@ -479,6 +478,17 @@ def _load_checkpoint(frontend: PanoReSplatFrontend, path: str | None) -> dict[st
         return {}
     payload = _torch_load_checkpoint(path)
     frontend = _unwrap_frontend(frontend)
+    expected_type = getattr(_unwrap_module(frontend.initializer), "initializer_type", INITIALIZER_TYPE)
+    found_type = payload.get("initializer_type")
+    if found_type != expected_type:
+        raise ValueError(
+            f"Checkpoint {path} has initializer_type={found_type!r}; expected {expected_type!r}. "
+            "Old lightweight initializer checkpoints are intentionally incompatible."
+        )
+    if int(payload.get("state_dim", getattr(frontend.initializer, "state_dim", -1))) != int(getattr(frontend.initializer, "state_dim", -2)):
+        raise ValueError("Checkpoint state_dim does not match current Initializer.state_dim.")
+    if int(payload.get("sh_degree", getattr(frontend.initializer, "sh_degree", -1))) != int(getattr(frontend.initializer, "sh_degree", -2)):
+        raise ValueError("Checkpoint sh_degree does not match current Initializer.sh_degree.")
     skipped: dict[str, list[str]] = {}
     if "initializer" in payload:
         skipped["initializer"] = _load_compatible_state(_unwrap_module(frontend.initializer), payload["initializer"], strict=False)
@@ -504,11 +514,18 @@ def _checkpoint_payload(
     metrics: dict[str, float],
 ) -> dict[str, Any]:
     frontend = _unwrap_frontend(frontend)
+    initializer = _unwrap_module(frontend.initializer)
     return {
         "format": "pano_resplat_gaussian_v1",
+        "initializer_type": getattr(initializer, "initializer_type", INITIALIZER_TYPE),
+        "initializer_config": getattr(initializer, "initializer_config", dict(config.get("Initializer", {}))),
+        "panovggt_checkpoint": config.get("Model", {}).get("panovggt_checkpoint"),
+        "state_dim": int(getattr(initializer, "state_dim", config.get("Initializer", {}).get("state_dim", 0))),
+        "sh_degree": int(getattr(initializer, "sh_degree", config.get("Initializer", {}).get("sh_degree", 0))),
+        "sh_dim": int(getattr(initializer, "sh_dim", (int(config.get("Initializer", {}).get("sh_degree", 0)) + 1) ** 2)),
         "stage": stage,
         "step": int(step),
-        "initializer": _unwrap_module(frontend.initializer).state_dict(),
+        "initializer": initializer.state_dict(),
         "feedback_encoder": _unwrap_module(frontend.feedback_encoder).state_dict(),
         "update_block": _unwrap_module(frontend.update_block).state_dict(),
         "config": config,
@@ -542,9 +559,23 @@ def _target_supervision(
     indices: torch.Tensor | None,
     render_hw: tuple[int, int],
 ) -> dict[str, torch.Tensor]:
-    images = _supervision_tensor(sample, "supervision_images", "images")
+    images = sample.get("supervision_images")
+    has_native_supervision = torch.is_tensor(images)
+    if not has_native_supervision:
+        images = sample.get("images")
     if images is None:
         raise ValueError("Training target requires sample images.")
+    input_images = sample.get("images")
+    if (
+        not has_native_supervision
+        and torch.is_tensor(input_images)
+        and tuple(int(x) for x in input_images.shape[-2:]) != tuple(int(x) for x in render_hw)
+    ):
+        raise ValueError(
+            "render_hw differs from input image size but sample['supervision_images'] is missing. "
+            "Enable Dataset.use_native_supervision_gt with supervision_resize_height/width so loss is "
+            "computed against native high-resolution GT instead of upsampled model input."
+        )
     depths = _supervision_tensor(sample, "supervision_depths", "depths")
     valid_depth = _supervision_tensor(sample, "supervision_valid_depth", "valid_depth")
     sky_mask = _supervision_tensor(sample, "supervision_sky_mask", "sky_mask")
@@ -604,7 +635,11 @@ def _is_input_reconstruction(config: dict[str, Any]) -> bool:
     mode = str(tr.get("view_mode", "split")).lower()
     position_mode = str(init_cfg.get("position_mode", "")).lower()
     init_type = str(init_cfg.get("type", "")).lower()
-    return mode in {"input_reconstruction", "all_views", "input_views"} or position_mode == "panovggt_aligned" or init_type in {"panovggt_aligned", "pano_vggt_aligned"}
+    return (
+        mode in {"input_reconstruction", "all_views", "input_views"}
+        or position_mode == "panovggt_aligned"
+        or init_type in {"panovggt_aligned", "pano_vggt_aligned", INITIALIZER_TYPE}
+    )
 
 
 def _render_hw(config: dict[str, Any], fallback_hw: tuple[int, int]) -> tuple[int, int]:
@@ -668,6 +703,10 @@ def _sample_input_reconstruction(
         "world_points": priors["world_points"].float(),
         "view_indices": view_idx,
     }
+    if torch.is_tensor(priors.get("tokens")):
+        context["tokens"] = priors["tokens"].float()
+    if torch.is_tensor(priors.get("token_hw")):
+        context["token_hw"] = priors["token_hw"]
     if torch.is_tensor(sample.get("sky_mask")):
         context["sky_mask"] = sample["sky_mask"]
     if context_valid is not None:
@@ -714,6 +753,10 @@ def _sample_window(
         "world_points": priors["world_points"].index_select(1, context_idx).float(),
         "view_indices": context_idx,
     }
+    if torch.is_tensor(priors.get("tokens")):
+        context["tokens"] = priors["tokens"].index_select(1, context_idx).float()
+    if torch.is_tensor(priors.get("token_hw")):
+        context["token_hw"] = priors["token_hw"]
     context_sky = _select_optional_frames(sample.get("sky_mask"), context_idx)
     if context_sky is not None:
         context["sky_mask"] = context_sky
@@ -956,6 +999,8 @@ def _forward_train(
                 context["poses_c2w"],
                 context.get("valid_mask"),
                 world_points=context.get("world_points"),
+                tokens=context.get("tokens"),
+                token_hw=context.get("token_hw"),
             )
     else:
         state = frontend.initializer(
@@ -965,6 +1010,8 @@ def _forward_train(
             context["poses_c2w"],
             context.get("valid_mask"),
             world_points=context.get("world_points"),
+            tokens=context.get("tokens"),
+            token_hw=context.get("token_hw"),
         )
     states = [state]
     context_renders: list[PanoRenderOutput | None] = []
