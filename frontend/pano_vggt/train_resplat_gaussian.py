@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import json
 import math
@@ -1217,6 +1218,23 @@ def _num_refine_for_step(config: dict[str, Any], stage: str) -> int:
     return int(torch.randint(lo, hi + 1, (1,)).item())
 
 
+def _amp_enabled(config: dict[str, Any], device: torch.device) -> bool:
+    return bool(config.get("Training", {}).get("amp", False)) and device.type == "cuda"
+
+
+def _autocast_context(config: dict[str, Any], device: torch.device):
+    if not _amp_enabled(config, device):
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.float16)
+
+
+def _grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def _target_leakage_check(frontend: PanoReSplatFrontend, context: dict[str, torch.Tensor]) -> None:
     target_a = {"images": torch.zeros_like(context["images"][:, :1]), "poses_c2w": context["poses_c2w"][:, :1]}
     target_b = {"images": torch.ones_like(context["images"][:, :1]), "poses_c2w": context["poses_c2w"][:, :1]}
@@ -1239,15 +1257,17 @@ def _renderer_gradient_check(
     lpips_model: nn.Module | None = None,
 ) -> None:
     frontend.zero_grad(set_to_none=True)
-    loss, _metrics, _artifacts = _forward_train(
-        frontend,
-        context,
-        target,
-        num_refine=_num_refine_for_step(config, stage),
-        stage=stage,
-        config=config,
-        lpips_model=lpips_model,
-    )
+    device = target["images"].device
+    with _autocast_context(config, device):
+        loss, _metrics, _artifacts = _forward_train(
+            frontend,
+            context,
+            target,
+            num_refine=_num_refine_for_step(config, stage),
+            stage=stage,
+            config=config,
+            lpips_model=lpips_model,
+        )
     loss.backward()
     total_grad = 0.0
     for param in frontend.parameters():
@@ -1316,15 +1336,16 @@ def _run_validation(
                 context, target = _sample_input_reconstruction(sample, priors, config)
             else:
                 context, target = _sample_window(sample, priors, config, step=step)
-            loss, metrics_t, artifacts = _forward_train(
-                frontend,
-                context,
-                target,
-                num_refine=max(0, int(config.get("Training", {}).get("eval_refine", 0))),
-                stage=stage,
-                config=config,
-                lpips_model=lpips_model,
-            )
+            with _autocast_context(config, device):
+                loss, metrics_t, artifacts = _forward_train(
+                    frontend,
+                    context,
+                    target,
+                    num_refine=max(0, int(config.get("Training", {}).get("eval_refine", 0))),
+                    stage=stage,
+                    config=config,
+                    lpips_model=lpips_model,
+                )
             metrics = _float_metrics({"total_loss": loss.detach(), **metrics_t})
             rows.append(metrics)
             if write_outputs and first_panel is None:
@@ -1437,6 +1458,8 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     wandb_run = _init_wandb(config, output_dir) if is_main else None
     max_steps = int(tr.get("steps", 1))
     accum = max(1, int(tr.get("gradient_accumulation_steps", 1)))
+    amp_enabled = _amp_enabled(config, device)
+    scaler = _grad_scaler(amp_enabled)
     save_every = max(1, int(tr.get("save_every", 100)))
     vis_every = max(1, int(tr.get("vis_every", 100)))
     eval_every = max(1, int(tr.get("eval_every", 100)))
@@ -1475,26 +1498,29 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                     _renderer_gradient_check(frontend, context, target, stage=stage, config=config, lpips_model=lpips_model)
                 checked = True
             num_refine = _num_refine_for_step(config, stage)
-            loss, metrics_t, artifacts = _forward_train(
-                frontend,
-                context,
-                target,
-                num_refine=num_refine,
-                stage=stage,
-                config=config,
-                lpips_model=lpips_model,
-            )
+            with _autocast_context(config, device):
+                loss, metrics_t, artifacts = _forward_train(
+                    frontend,
+                    context,
+                    target,
+                    num_refine=num_refine,
+                    stage=stage,
+                    config=config,
+                    lpips_model=lpips_model,
+                )
             _check_finite(metrics_t, artifacts)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss at optimizer step {step}: {loss}")
-            (loss / float(accum)).backward()
+            scaler.scale(loss / float(accum)).backward()
             micro_step += 1
             if micro_step % accum != 0:
                 continue
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(frontend.parameters(), float(tr.get("grad_clip", 1.0)), error_if_nonfinite=False)
             if not torch.isfinite(grad_norm):
                 raise RuntimeError(f"Non-finite grad norm at optimizer step {step}: {grad_norm}")
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             step += 1
             metrics = _float_metrics({"step": float(step), **metrics_t, "grad_norm": grad_norm.detach()})
