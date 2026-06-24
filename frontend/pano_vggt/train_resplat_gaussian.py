@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,10 +17,13 @@ import warnings
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.parameter import UninitializedParameter
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 import yaml
 
 if __package__ in {None, ""}:
@@ -102,6 +106,13 @@ def _default_config() -> dict[str, Any]:
             "hidden_dim": 64,
             "knn": 8,
             "num_heads": 4,
+            "attn_proj_channels": None,
+            "mlp_ratio": 2.0,
+            "num_basic_refine_blocks": 1,
+            "knn_backend": "cdist",
+            "strict_knn_backend": False,
+            "cache_knn": False,
+            "detach_feedback": True,
             "max_knn_points": 1024,
             "chunk_size": None,
             "limits": {
@@ -195,19 +206,27 @@ def load_resplat_train_config(path: str | None) -> dict[str, Any]:
 
 
 class _Logger:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, *, enabled: bool = True, rank: int = 0) -> None:
+        self.enabled = bool(enabled)
+        self.rank = int(rank)
         self.stdout_path = output_dir / "logs" / "stdout.log"
         self.stderr_path = output_dir / "logs" / "stderr.log"
+        if not self.enabled:
+            return
         self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
         self.stdout_path.write_text("", encoding="utf-8")
         self.stderr_path.write_text("", encoding="utf-8")
 
     def log(self, message: str) -> None:
+        if not self.enabled:
+            return
         print(message, flush=True)
         with self.stdout_path.open("a", encoding="utf-8") as handle:
             handle.write(message + "\n")
 
     def error(self, message: str) -> None:
+        if not self.enabled:
+            return
         print(message, file=sys.stderr, flush=True)
         with self.stderr_path.open("a", encoding="utf-8") as handle:
             handle.write(message + "\n")
@@ -261,6 +280,74 @@ def _device_from_arg(value: str | None) -> torch.device:
     return torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
 
 
+def _distributed_state() -> dict[str, int | bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    return {
+        "distributed": distributed,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "is_main": rank == 0,
+    }
+
+
+def _init_distributed_if_needed(state: dict[str, int | bool]) -> None:
+    if not bool(state["distributed"]):
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(state["local_rank"]))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+
+
+def _cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _barrier_if_distributed(state: dict[str, int | bool]) -> None:
+    if bool(state["distributed"]) and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _unwrap_module(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def _unwrap_frontend(frontend: PanoReSplatFrontend) -> PanoReSplatFrontend:
+    if isinstance(frontend, DistributedDataParallel):
+        module = frontend.module
+    else:
+        module = frontend
+    if not isinstance(module, PanoReSplatFrontend):
+        raise TypeError(f"Expected PanoReSplatFrontend, got {type(module)!r}")
+    return module
+
+
+def _wrap_trainable_modules_for_ddp(frontend: PanoReSplatFrontend, state: dict[str, int | bool]) -> PanoReSplatFrontend:
+    if not bool(state["distributed"]):
+        return frontend
+    device_ids = [int(state["local_rank"])] if torch.cuda.is_available() else None
+    for name in ("initializer", "feedback_encoder", "update_block"):
+        module = getattr(frontend, name)
+        has_trainable = any(param.requires_grad for param in module.parameters())
+        if has_trainable:
+            setattr(
+                frontend,
+                name,
+                DistributedDataParallel(
+                    module,
+                    device_ids=device_ids,
+                    output_device=int(state["local_rank"]) if torch.cuda.is_available() else None,
+                    find_unused_parameters=False,
+                ),
+            )
+    return frontend
+
+
 def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSplatFrontend:
     init_cfg = dict(config.get("Initializer", {}))
     initializer = PanoCompactGaussianInitializer(init_cfg)
@@ -281,6 +368,13 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
         limits=limits,
         max_knn_points=int(ref_cfg.get("max_knn_points", 1024)),
         chunk_size=ref_cfg.get("chunk_size"),
+        attn_proj_channels=ref_cfg.get("attn_proj_channels"),
+        mlp_ratio=float(ref_cfg.get("mlp_ratio", 2.0)),
+        num_basic_refine_blocks=int(ref_cfg.get("num_basic_refine_blocks", 1)),
+        knn_backend=str(ref_cfg.get("knn_backend", "cdist")),
+        strict_knn_backend=bool(ref_cfg.get("strict_knn_backend", False)),
+        cache_knn=bool(ref_cfg.get("cache_knn", False)),
+        detach_feedback=bool(ref_cfg.get("detach_feedback", True)),
     )
     render_cfg = config.get("Renderer", {})
     render_config = {"Training": dict(config.get("TrainingRender", {})), "Renderer": dict(render_cfg)}
@@ -335,12 +429,13 @@ def _load_checkpoint(frontend: PanoReSplatFrontend, path: str | None) -> dict[st
     if not path:
         return {}
     payload = torch.load(path, map_location="cpu")
+    frontend = _unwrap_frontend(frontend)
     if "initializer" in payload:
-        frontend.initializer.load_state_dict(payload["initializer"], strict=False)
+        _unwrap_module(frontend.initializer).load_state_dict(payload["initializer"], strict=False)
     if "feedback_encoder" in payload:
-        frontend.feedback_encoder.load_state_dict(payload["feedback_encoder"], strict=False)
+        _unwrap_module(frontend.feedback_encoder).load_state_dict(payload["feedback_encoder"], strict=False)
     if "update_block" in payload:
-        frontend.update_block.load_state_dict(payload["update_block"], strict=False)
+        _unwrap_module(frontend.update_block).load_state_dict(payload["update_block"], strict=False)
     return payload
 
 
@@ -352,13 +447,14 @@ def _checkpoint_payload(
     stage: str,
     metrics: dict[str, float],
 ) -> dict[str, Any]:
+    frontend = _unwrap_frontend(frontend)
     return {
         "format": "pano_resplat_gaussian_v1",
         "stage": stage,
         "step": int(step),
-        "initializer": frontend.initializer.state_dict(),
-        "feedback_encoder": frontend.feedback_encoder.state_dict(),
-        "update_block": frontend.update_block.state_dict(),
+        "initializer": _unwrap_module(frontend.initializer).state_dict(),
+        "feedback_encoder": _unwrap_module(frontend.feedback_encoder).state_dict(),
+        "update_block": _unwrap_module(frontend.update_block).state_dict(),
         "config": config,
         "metrics": metrics,
     }
@@ -1168,6 +1264,7 @@ def _run_validation(
     wandb_run: Any,
     logger: _Logger,
     lpips_model: nn.Module | None = None,
+    write_outputs: bool = True,
 ) -> dict[str, float]:
     was_training = frontend.training
     frontend.eval()
@@ -1198,7 +1295,7 @@ def _run_validation(
             )
             metrics = _float_metrics({"total_loss": loss.detach(), **metrics_t})
             rows.append(metrics)
-            if first_panel is None:
+            if write_outputs and first_panel is None:
                 tag = f"val_step_{step:06d}"
                 if input_reconstruction:
                     first_panel = _save_aligned_visualization(output_dir, tag, target, artifacts)
@@ -1214,41 +1311,73 @@ def _run_validation(
         vals = [row[key] for row in rows if key in row]
         if vals:
             averaged[key] = float(sum(vals) / len(vals))
-    _write_csv(output_dir / "val_metrics.csv", averaged)
-    if wandb_run is not None:
-        wandb_run.log({f"val/{k}": v for k, v in averaged.items()}, step=step)
-    if first_panel is not None:
-        _log_wandb_image(
-            wandb_run,
-            "renders/val_panel" if input_reconstruction else f"renders/val_step_{step:06d}",
-            first_panel,
-            step=step,
-            logger=logger,
-        )
-    logger.log(yaml.safe_dump({"step": step, "validation": averaged}, sort_keys=False).strip())
+    if write_outputs:
+        _write_csv(output_dir / "val_metrics.csv", averaged)
+        if wandb_run is not None:
+            wandb_run.log({f"val/{k}": v for k, v in averaged.items()}, step=step)
+        if first_panel is not None:
+            _log_wandb_image(
+                wandb_run,
+                "renders/val_panel" if input_reconstruction else f"renders/val_step_{step:06d}",
+                first_panel,
+                step=step,
+                logger=logger,
+            )
+        logger.log(yaml.safe_dump({"step": step, "validation": averaged}, sort_keys=False).strip())
     return averaged
 
 
 def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None = None, checkpoint: str | None = None, resume: str | None = None) -> dict[str, Any]:
+    ddp_state = _distributed_state()
+    _init_distributed_if_needed(ddp_state)
+    is_main = bool(ddp_state["is_main"])
     tr = config.get("Training", {})
     stage = str(tr.get("stage", "overfit")).lower()
     if stage not in {"overfit", "init", "refine", "joint"}:
         raise ValueError(f"Unsupported stage: {stage}")
-    torch.manual_seed(int(tr.get("seed", 1234)))
-    device = _device_from_arg(tr.get("device"))
+    torch.manual_seed(int(tr.get("seed", 1234)) + int(ddp_state["rank"]))
+    if bool(ddp_state["distributed"]):
+        device = torch.device("cuda", int(ddp_state["local_rank"])) if torch.cuda.is_available() else torch.device("cpu")
+    else:
+        device = _device_from_arg(tr.get("device"))
     output_dir = Path(tr.get("output_dir", "outputs/pano_resplat/run"))
-    _save_run_metadata(output_dir, config, command or sys.argv)
-    logger = _Logger(output_dir)
-    logger.log(yaml.safe_dump({"stage": stage, "device": str(device), "renderer": config.get("Renderer", {}).get("backend")}, sort_keys=False).strip())
+    if is_main:
+        _save_run_metadata(output_dir, config, command or sys.argv)
+    _barrier_if_distributed(ddp_state)
+    logger = _Logger(output_dir, enabled=is_main, rank=int(ddp_state["rank"]))
+    logger.log(
+        yaml.safe_dump(
+            {
+                "stage": stage,
+                "device": str(device),
+                "renderer": config.get("Renderer", {}).get("backend"),
+                "distributed": bool(ddp_state["distributed"]),
+                "world_size": int(ddp_state["world_size"]),
+            },
+            sort_keys=False,
+        ).strip()
+    )
     input_reconstruction = _is_input_reconstruction(config)
 
     dataset = build_matching_dataset_from_config(config, split="train")
     if bool(tr.get("debug_overfit", False)) or stage == "overfit":
         dataset = Subset(dataset, [0])
+    train_sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=int(ddp_state["world_size"]),
+            rank=int(ddp_state["rank"]),
+            shuffle=not (bool(tr.get("debug_overfit", False)) or stage == "overfit"),
+            drop_last=False,
+        )
+        if bool(ddp_state["distributed"])
+        else None
+    )
     loader = DataLoader(
         dataset,
         batch_size=int(tr.get("batch_size", 1)),
-        shuffle=not (bool(tr.get("debug_overfit", False)) or stage == "overfit"),
+        shuffle=train_sampler is None and not (bool(tr.get("debug_overfit", False)) or stage == "overfit"),
+        sampler=train_sampler,
         num_workers=int(tr.get("num_workers", 0)),
         collate_fn=matching_collate,
         drop_last=False,
@@ -1268,11 +1397,12 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     _set_stage_trainability(frontend, stage, overfit_trains_refiner=overfit_trains_refiner)
     if stage == "refine":
         _set_requires_grad(frontend.initializer, False)
+    frontend = _wrap_trainable_modules_for_ddp(frontend, ddp_state)
     optimizer = _optimizer(frontend, config, stage)
     trainable, frozen = _count_params(frontend)
     logger.log(yaml.safe_dump({"trainable_params": trainable, "frozen_params": frozen}, sort_keys=False).strip())
 
-    wandb_run = _init_wandb(config, output_dir)
+    wandb_run = _init_wandb(config, output_dir) if is_main else None
     max_steps = int(tr.get("steps", 1))
     accum = max(1, int(tr.get("gradient_accumulation_steps", 1)))
     save_every = max(1, int(tr.get("save_every", 100)))
@@ -1287,9 +1417,13 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
     checked = False
     step = 0
     micro_step = 0
+    epoch = 0
     start = time.time()
     optimizer.zero_grad(set_to_none=True)
     while step < max_steps:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        epoch += 1
         for raw_batch in loader:
             sample = _to_device_batch(raw_batch, device)
             validate_training_sample(sample, "matching_only", allow_fallback_mode=bool(config.get("Dataset", {}).get("allow_fallback_mode", False)))
@@ -1337,18 +1471,20 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                 first_metrics = dict(metrics)
                 first_artifacts = artifacts
                 first_target = target
-                if input_reconstruction:
-                    panel = _save_aligned_visualization(output_dir, "step_000000", target, artifacts)
-                    _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
-                else:
-                    panel = _save_visualization(output_dir, "step_000000", target, artifacts)
-                    _log_wandb_image(wandb_run, "renders/step_000000", panel, step=step, logger=logger)
-            _write_csv(output_dir / "train_metrics.csv", metrics)
+                if is_main:
+                    if input_reconstruction:
+                        panel = _save_aligned_visualization(output_dir, "step_000000", target, artifacts)
+                        _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
+                    else:
+                        panel = _save_visualization(output_dir, "step_000000", target, artifacts)
+                        _log_wandb_image(wandb_run, "renders/step_000000", panel, step=step, logger=logger)
+            if is_main:
+                _write_csv(output_dir / "train_metrics.csv", metrics)
             if wandb_run is not None:
                 wandb_run.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
             if step == 1 or step % log_every == 0:
                 logger.log(yaml.safe_dump({"step": step, "metrics": metrics}, sort_keys=False).strip())
-            if step % vis_every == 0 or step == max_steps:
+            if is_main and (step % vis_every == 0 or step == max_steps):
                 tag = f"step_{step:06d}"
                 if input_reconstruction:
                     panel = _save_aligned_visualization(output_dir, tag, target, artifacts)
@@ -1369,23 +1505,23 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
                     wandb_run=wandb_run,
                     logger=logger,
                     lpips_model=lpips_model,
+                    write_outputs=is_main,
                 )
-            if metrics["total_loss"] < best:
+            if is_main and metrics["total_loss"] < best:
                 best = metrics["total_loss"]
                 _save_checkpoint(output_dir / _stage_best_name(stage), frontend, config, step, stage, metrics)
                 _save_checkpoint(output_dir / "best.pt", frontend, config, step, stage, metrics)
-            if step % save_every == 0 or step == max_steps:
+            if is_main and (step % save_every == 0 or step == max_steps):
                 _save_checkpoint(output_dir / "latest.pt", frontend, config, step, stage, metrics)
             if step >= max_steps:
                 break
-    if first_artifacts is not None and first_target is not None:
+    if is_main and first_artifacts is not None and first_target is not None:
         if input_reconstruction:
             panel = _save_aligned_visualization(output_dir, "final", first_target if step == 0 else target, artifacts)
             _log_wandb_image(wandb_run, "renders/train_panel", panel, step=step, logger=logger)
         else:
             panel = _save_visualization(output_dir, "final", first_target if step == 0 else target, artifacts)
             _log_wandb_image(wandb_run, "renders/final", panel, step=step, logger=logger)
-    _save_checkpoint(output_dir / "latest.pt", frontend, config, step, stage, last_metrics)
     metrics_json = {
         "steps": step,
         "best_loss": best,
@@ -1394,22 +1530,26 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
         "elapsed_sec": time.time() - start,
         "checkpoint": str(output_dir / "latest.pt"),
     }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics_json, indent=2), encoding="utf-8")
-    if not (output_dir / "val_metrics.csv").exists():
-        (output_dir / "val_metrics.csv").write_text("step,total_loss,psnr,rgb_l1\n", encoding="utf-8")
-    _write_report(
-        output_dir,
-        command=command or sys.argv,
-        renderer=str(config.get("Renderer", {}).get("backend", "soft_splat")),
-        stage=stage,
-        trainable=trainable,
-        frozen=frozen,
-        first_metrics=first_metrics,
-        last_metrics=last_metrics,
-        passed=math.isfinite(last_metrics.get("total_loss", float("nan"))),
-    )
+    if is_main:
+        _save_checkpoint(output_dir / "latest.pt", frontend, config, step, stage, last_metrics)
+        (output_dir / "metrics.json").write_text(json.dumps(metrics_json, indent=2), encoding="utf-8")
+        if not (output_dir / "val_metrics.csv").exists():
+            (output_dir / "val_metrics.csv").write_text("step,total_loss,psnr,rgb_l1\n", encoding="utf-8")
+        _write_report(
+            output_dir,
+            command=command or sys.argv,
+            renderer=str(config.get("Renderer", {}).get("backend", "soft_splat")),
+            stage=stage,
+            trainable=trainable,
+            frozen=frozen,
+            first_metrics=first_metrics,
+            last_metrics=last_metrics,
+            passed=math.isfinite(last_metrics.get("total_loss", float("nan"))),
+        )
     if wandb_run is not None:
         wandb_run.finish()
+    _barrier_if_distributed(ddp_state)
+    _cleanup_distributed()
     return metrics_json
 
 

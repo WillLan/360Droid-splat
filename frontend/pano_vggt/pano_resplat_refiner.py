@@ -39,6 +39,13 @@ class PanoGaussianUpdateBlock(nn.Module):
         limits: PanoGaussianUpdateLimits | None = None,
         max_knn_points: int = 2048,
         chunk_size: int | None = None,
+        attn_proj_channels: int | None = None,
+        mlp_ratio: float = 2.0,
+        num_basic_refine_blocks: int = 1,
+        knn_backend: str = "cdist",
+        strict_knn_backend: bool = False,
+        cache_knn: bool = False,
+        detach_feedback: bool = True,
     ) -> None:
         super().__init__()
         self.feedback_dim = int(feedback_dim)
@@ -46,18 +53,30 @@ class PanoGaussianUpdateBlock(nn.Module):
         self.sh_dim = int(sh_dim)
         self.hidden_dim = int(hidden_dim)
         self.limits = limits or PanoGaussianUpdateLimits()
+        self.cache_knn = bool(cache_knn)
+        self.detach_feedback = bool(detach_feedback)
+        self.num_basic_refine_blocks = max(1, int(num_basic_refine_blocks))
         input_dim = 3 + 3 + 4 + 1 + 3 * self.sh_dim + self.latent_dim + self.feedback_dim + 1
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.GELU(),
         )
-        self.transformer = PanoKNNTransformerBlock(
-            self.hidden_dim,
-            num_heads=num_heads,
-            knn=knn,
-            max_knn_points=max_knn_points,
-            chunk_size=chunk_size,
+        self.transformers = nn.ModuleList(
+            [
+                PanoKNNTransformerBlock(
+                    self.hidden_dim,
+                    num_heads=num_heads,
+                    knn=knn,
+                    mlp_ratio=mlp_ratio,
+                    max_knn_points=max_knn_points,
+                    chunk_size=chunk_size,
+                    attn_proj_channels=attn_proj_channels,
+                    knn_backend=knn_backend,
+                    strict_knn_backend=strict_knn_backend,
+                )
+                for _ in range(self.num_basic_refine_blocks)
+            ]
         )
         self.delta = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
@@ -66,6 +85,10 @@ class PanoGaussianUpdateBlock(nn.Module):
             nn.Linear(self.hidden_dim, 3 + 3 + 4 + 1 + 3 * self.sh_dim + self.latent_dim),
         )
         self._zero_init_delta()
+
+    @property
+    def transformer(self) -> PanoKNNTransformerBlock:
+        return self.transformers[0]
 
     def _zero_init_delta(self) -> None:
         last = self.delta[-1]
@@ -93,7 +116,7 @@ class PanoGaussianUpdateBlock(nn.Module):
         opacity_prev = state.opacity_logits.detach()
         sh_prev = state.sh_coeffs.detach()
         latent_prev = state.latent_features.detach()
-        feedback_prev = feedback.detach()
+        feedback_prev = feedback.detach() if self.detach_feedback else feedback
         confidence = (
             torch.ones_like(opacity_prev)
             if state.confidence is None
@@ -113,7 +136,18 @@ class PanoGaussianUpdateBlock(nn.Module):
             dim=-1,
         )
         feat = self.input_proj(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
-        feat = self.transformer(means_prev, feat, state.valid_mask)
+        knn_cache = None
+        for block in self.transformers:
+            if self.cache_knn:
+                feat, knn_cache = block(
+                    means_prev,
+                    feat,
+                    state.valid_mask,
+                    knn_cache=knn_cache,
+                    return_knn_cache=True,
+                )
+            else:
+                feat = block(means_prev, feat, state.valid_mask)
         raw = self.delta(feat)
         cursor = 0
         mean_delta = torch.tanh(raw[..., cursor : cursor + 3]) * float(self.limits.mean)
