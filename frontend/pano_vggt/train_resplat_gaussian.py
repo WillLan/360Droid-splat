@@ -425,17 +425,49 @@ def _optimizer(frontend: PanoReSplatFrontend, config: dict[str, Any], stage: str
     return torch.optim.AdamW(params, lr=float(opt_cfg.get("lr", 2.0e-4)), weight_decay=wd)
 
 
+def _load_compatible_state(module: nn.Module, state: dict[str, Any], *, strict: bool = False) -> list[str]:
+    current = module.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state.items():
+        key_str = str(key).removeprefix("module.")
+        if key_str not in current:
+            skipped.append(key_str)
+            continue
+        if isinstance(value, UninitializedParameter) or isinstance(current[key_str], UninitializedParameter):
+            skipped.append(key_str)
+            continue
+        if torch.is_tensor(value) and torch.is_tensor(current[key_str]) and tuple(value.shape) != tuple(current[key_str].shape):
+            skipped.append(key_str)
+            continue
+        compatible[key_str] = value
+    module.load_state_dict(compatible, strict=strict)
+    return skipped
+
+
+def _torch_load_checkpoint(path: str) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unsupported checkpoint payload in {path}")
+    return payload
+
+
 def _load_checkpoint(frontend: PanoReSplatFrontend, path: str | None) -> dict[str, Any]:
     if not path:
         return {}
-    payload = torch.load(path, map_location="cpu")
+    payload = _torch_load_checkpoint(path)
     frontend = _unwrap_frontend(frontend)
+    skipped: dict[str, list[str]] = {}
     if "initializer" in payload:
-        _unwrap_module(frontend.initializer).load_state_dict(payload["initializer"], strict=False)
+        skipped["initializer"] = _load_compatible_state(_unwrap_module(frontend.initializer), payload["initializer"], strict=False)
     if "feedback_encoder" in payload:
-        _unwrap_module(frontend.feedback_encoder).load_state_dict(payload["feedback_encoder"], strict=False)
+        skipped["feedback_encoder"] = _load_compatible_state(_unwrap_module(frontend.feedback_encoder), payload["feedback_encoder"], strict=False)
     if "update_block" in payload:
-        _unwrap_module(frontend.update_block).load_state_dict(payload["update_block"], strict=False)
+        skipped["update_block"] = _load_compatible_state(_unwrap_module(frontend.update_block), payload["update_block"], strict=False)
+    payload["_skipped_incompatible_keys"] = {key: value for key, value in skipped.items() if value}
     return payload
 
 

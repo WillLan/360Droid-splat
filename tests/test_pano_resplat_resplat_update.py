@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import time
 import types
 
 import pytest
 import torch
 
+from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
+from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
+from frontend.pano_vggt.pano_resplat_init import PanoCompactGaussianInitializer
 from frontend.pano_vggt.pano_point_transformer import PanoKNNTransformerBlock
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock
 from frontend.pano_vggt.resplat_types import PanoGaussianState
+from frontend.pano_vggt.train_resplat_gaussian import _load_checkpoint
 
 
 def _state(batch: int = 1, points: int = 12, latent_dim: int = 8, sh_dim: int = 16) -> PanoGaussianState:
@@ -119,3 +126,40 @@ def test_invalid_points_are_not_updated_when_delta_head_is_nonzero():
     assert torch.allclose(updated.means[invalid], state.means[invalid])
     assert torch.allclose(updated.log_scales[invalid], state.log_scales[invalid])
     assert not torch.allclose(updated.means[valid], state.means[valid])
+
+
+def test_checkpoint_load_skips_incompatible_refiner_shapes():
+    initializer = PanoCompactGaussianInitializer(state_dim=8, sh_degree=3, max_gaussians=8)
+    feedback = PanoRenderFeedbackEncoder(feedback_dim=5, hidden_dim=8)
+    old_update = PanoGaussianUpdateBlock(feedback_dim=5, latent_dim=8, sh_dim=16, hidden_dim=8)
+    new_update = PanoGaussianUpdateBlock(
+        feedback_dim=5,
+        latent_dim=8,
+        sh_dim=16,
+        hidden_dim=16,
+        num_heads=1,
+        attn_proj_channels=8,
+        num_basic_refine_blocks=2,
+    )
+    frontend = PanoReSplatFrontend(
+        initializer=initializer,
+        feedback_encoder=feedback,
+        update_block=new_update,
+    )
+    output_dir = Path("outputs/pano_resplat/test_checkpoint_load") / f"run_{os.getpid()}_{time.time_ns()}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "old_init.pt"
+    torch.save(
+        {
+            "initializer": initializer.state_dict(),
+            "feedback_encoder": feedback.state_dict(),
+            "update_block": old_update.state_dict(),
+        },
+        path,
+    )
+
+    payload = _load_checkpoint(frontend, str(path))
+
+    skipped = payload["_skipped_incompatible_keys"]["update_block"]
+    assert any(key.startswith("input_proj.0.weight") for key in skipped)
+    assert any(key.startswith("delta.1.weight") for key in skipped)
