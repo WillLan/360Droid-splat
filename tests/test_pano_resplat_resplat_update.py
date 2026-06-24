@@ -132,6 +132,8 @@ def test_checkpoint_load_skips_incompatible_refiner_shapes():
     initializer = PanoCompactGaussianInitializer(state_dim=8, sh_degree=3, max_gaussians=8)
     feedback = PanoRenderFeedbackEncoder(feedback_dim=5, hidden_dim=8)
     old_update = PanoGaussianUpdateBlock(feedback_dim=5, latent_dim=8, sh_dim=16, hidden_dim=8)
+    with torch.no_grad():
+        old_update.delta[-1].bias.fill_(0.5)
     new_update = PanoGaussianUpdateBlock(
         feedback_dim=5,
         latent_dim=8,
@@ -163,3 +165,4 @@ def test_checkpoint_load_skips_incompatible_refiner_shapes():
     skipped = payload["_skipped_incompatible_keys"]["update_block"]
     assert any(key.startswith("input_proj.0.weight") for key in skipped)
     assert any(key.startswith("delta.1.weight") for key in skipped)
+    assert torch.allclose(frontend.update_block.delta[-1].bias, torch.zeros_like(frontend.update_block.delta[-1].bias))

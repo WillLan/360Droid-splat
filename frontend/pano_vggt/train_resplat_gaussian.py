@@ -448,6 +448,22 @@ def _load_compatible_state(module: nn.Module, state: dict[str, Any], *, strict: 
     return skipped
 
 
+def _incompatible_state_keys(module: nn.Module, state: dict[str, Any]) -> list[str]:
+    current = module.state_dict()
+    skipped = []
+    for key, value in state.items():
+        key_str = str(key).removeprefix("module.")
+        if key_str not in current:
+            skipped.append(key_str)
+            continue
+        if isinstance(value, UninitializedParameter) or isinstance(current[key_str], UninitializedParameter):
+            skipped.append(key_str)
+            continue
+        if torch.is_tensor(value) and torch.is_tensor(current[key_str]) and tuple(value.shape) != tuple(current[key_str].shape):
+            skipped.append(key_str)
+    return skipped
+
+
 def _torch_load_checkpoint(path: str) -> dict[str, Any]:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -469,7 +485,12 @@ def _load_checkpoint(frontend: PanoReSplatFrontend, path: str | None) -> dict[st
     if "feedback_encoder" in payload:
         skipped["feedback_encoder"] = _load_compatible_state(_unwrap_module(frontend.feedback_encoder), payload["feedback_encoder"], strict=False)
     if "update_block" in payload:
-        skipped["update_block"] = _load_compatible_state(_unwrap_module(frontend.update_block), payload["update_block"], strict=False)
+        update_block = _unwrap_module(frontend.update_block)
+        incompatible = _incompatible_state_keys(update_block, payload["update_block"])
+        if incompatible:
+            skipped["update_block"] = sorted({str(key).removeprefix("module.") for key in payload["update_block"].keys()})
+        else:
+            skipped["update_block"] = _load_compatible_state(update_block, payload["update_block"], strict=False)
     payload["_skipped_incompatible_keys"] = {key: value for key, value in skipped.items() if value}
     return payload
 
