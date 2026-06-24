@@ -527,6 +527,53 @@ def _select_optional_frames(values: Any, indices: torch.Tensor) -> torch.Tensor 
     return values.index_select(1, indices)
 
 
+def _supervision_tensor(sample: dict[str, Any], supervision_key: str, fallback_key: str) -> torch.Tensor | None:
+    value = sample.get(supervision_key)
+    if torch.is_tensor(value):
+        return value
+    fallback = sample.get(fallback_key)
+    return fallback if torch.is_tensor(fallback) else None
+
+
+def _target_supervision(
+    sample: dict[str, Any],
+    priors: dict[str, torch.Tensor],
+    *,
+    indices: torch.Tensor | None,
+    render_hw: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    images = _supervision_tensor(sample, "supervision_images", "images")
+    if images is None:
+        raise ValueError("Training target requires sample images.")
+    depths = _supervision_tensor(sample, "supervision_depths", "depths")
+    valid_depth = _supervision_tensor(sample, "supervision_valid_depth", "valid_depth")
+    sky_mask = _supervision_tensor(sample, "supervision_sky_mask", "sky_mask")
+    poses = priors["poses_c2w"]
+    if indices is not None:
+        images = images.index_select(1, indices)
+        depths = _select_optional_frames(depths, indices)
+        valid_depth = _select_optional_frames(valid_depth, indices)
+        sky_mask = _select_optional_frames(sky_mask, indices)
+        poses = poses.index_select(1, indices)
+    if depths is None:
+        depths = priors["depth"] if indices is None else priors["depth"].index_select(1, indices)
+    target: dict[str, torch.Tensor] = {
+        "images": _resize_5d(images.float(), render_hw, mode="bilinear"),
+        "poses_c2w": poses.float(),
+    }
+    target_depths = _resize_5d(depths.float(), render_hw, mode="nearest") if depths is not None else None
+    if target_depths is not None:
+        target["depths"] = target_depths
+    target_sky = _resize_5d(sky_mask, render_hw, mode="nearest", is_mask=True)
+    target_valid = _compose_valid_mask(valid_depth=valid_depth, sky_mask=sky_mask)
+    target_valid = _resize_5d(target_valid, render_hw, mode="nearest", is_mask=True) if target_valid is not None else None
+    if target_sky is not None:
+        target["sky_mask"] = target_sky
+    if target_valid is not None:
+        target["valid_mask"] = target_valid
+    return target
+
+
 def _as_5d_mask(mask: torch.Tensor, *, name: str) -> torch.Tensor:
     if mask.ndim == 4:
         mask = mask.unsqueeze(2)
@@ -627,18 +674,8 @@ def _sample_input_reconstruction(
         context["valid_mask"] = context_valid
 
     render_hw = _render_hw(config, tuple(int(x) for x in sample["images"].shape[-2:]))
-    target_valid = _resize_5d(context_valid, render_hw, mode="nearest", is_mask=True) if context_valid is not None else None
-    target = {
-        "images": _resize_5d(sample["images"].float(), render_hw, mode="bilinear"),
-        "depths": _resize_5d(priors["depth"].float(), render_hw, mode="bilinear"),
-        "poses_c2w": priors["poses_c2w"].float(),
-        "view_indices": view_idx,
-    }
-    target_sky = _resize_5d(sample.get("sky_mask"), render_hw, mode="nearest", is_mask=True)
-    if target_sky is not None:
-        target["sky_mask"] = target_sky
-    if target_valid is not None:
-        target["valid_mask"] = target_valid
+    target = _target_supervision(sample, priors, indices=None, render_hw=render_hw)
+    target["view_indices"] = view_idx
     return context, target
 
 
@@ -687,21 +724,9 @@ def _sample_window(
     )
     if context_valid is not None:
         context["valid_mask"] = context_valid
-    target = {
-        "images": sample["images"].index_select(1, target_idx).float(),
-        "depths": priors["depth"].index_select(1, target_idx).float(),
-        "poses_c2w": priors["poses_c2w"].index_select(1, target_idx).float(),
-        "view_indices": target_idx,
-    }
-    target_sky = _select_optional_frames(sample.get("sky_mask"), target_idx)
-    if target_sky is not None:
-        target["sky_mask"] = target_sky
-    target_valid = _compose_valid_mask(
-        valid_depth=_select_optional_frames(sample.get("valid_depth"), target_idx),
-        sky_mask=target_sky,
-    )
-    if target_valid is not None:
-        target["valid_mask"] = target_valid
+    render_hw = _render_hw(config, tuple(int(x) for x in sample["images"].shape[-2:]))
+    target = _target_supervision(sample, priors, indices=target_idx, render_hw=render_hw)
+    target["view_indices"] = target_idx
     return context, target
 
 

@@ -6,7 +6,7 @@ import time
 
 import torch
 
-from frontend.pano_vggt.train_resplat_gaussian import _sample_window, load_resplat_train_config, train_resplat_gaussian
+from frontend.pano_vggt.train_resplat_gaussian import _sample_input_reconstruction, _sample_window, load_resplat_train_config, train_resplat_gaussian
 
 
 def _config(tmp_path: Path) -> dict:
@@ -74,3 +74,33 @@ def test_sample_window_uses_batch_device_for_indices():
 
     assert context["images"].device == device
     assert target["images"].device == device
+
+
+def test_input_reconstruction_uses_high_resolution_supervision_target():
+    cfg = load_resplat_train_config(None)
+    cfg["Training"].update({"render_height": 16, "render_width": 32})
+    low_images = torch.zeros(1, 4, 3, 8, 16)
+    high_images = torch.ones(1, 4, 3, 16, 32)
+    sample = {
+        "images": low_images,
+        "valid_depth": torch.ones(1, 4, 1, 8, 16, dtype=torch.bool),
+        "sky_mask": torch.zeros(1, 4, 1, 8, 16, dtype=torch.bool),
+        "supervision_images": high_images,
+        "supervision_depths": torch.full((1, 4, 1, 16, 32), 3.0),
+        "supervision_valid_depth": torch.ones(1, 4, 1, 16, 32, dtype=torch.bool),
+        "supervision_sky_mask": torch.zeros(1, 4, 1, 16, 32, dtype=torch.bool),
+    }
+    priors = {
+        "features": torch.rand(1, 4, 4, 2, 4),
+        "depth": torch.ones(1, 4, 1, 8, 16),
+        "poses_c2w": torch.eye(4).view(1, 1, 4, 4).expand(1, 4, 4, 4),
+        "world_points": torch.rand(1, 4, 8, 16, 3),
+    }
+
+    context, target = _sample_input_reconstruction(sample, priors, cfg)
+
+    assert tuple(context["images"].shape[-2:]) == (8, 16)
+    assert tuple(target["images"].shape[-2:]) == (16, 32)
+    assert torch.allclose(target["images"], high_images)
+    assert torch.allclose(target["depths"], torch.full((1, 4, 1, 16, 32), 3.0))
+    assert tuple(target["valid_mask"].shape[-2:]) == (16, 32)

@@ -458,6 +458,8 @@ class Omni360SceneTrainingDataset(Dataset):
         temporal_radius: int = 1,
         bidirectional_pairs: bool = False,
         resize: tuple[int, int] | None = None,
+        supervision_resize: tuple[int, int] | None = None,
+        include_supervision: bool = False,
         depth_format: str = "euclidean_range",
         depth_scale: float = 1.0,
         depth_invalid_value: float | None = 1000.0,
@@ -484,6 +486,8 @@ class Omni360SceneTrainingDataset(Dataset):
         self.temporal_radius = max(1, int(temporal_radius))
         self.bidirectional_pairs = bool(bidirectional_pairs)
         self.resize = resize
+        self.supervision_resize = supervision_resize
+        self.include_supervision = bool(include_supervision)
         self.depth_format = _normalize_depth_format(depth_format)
         self.depth_scale = float(depth_scale)
         self.depth_invalid_value = depth_invalid_value
@@ -647,8 +651,71 @@ class Omni360SceneTrainingDataset(Dataset):
             "has_pose": poses is not None,
             "has_sky": sky_mask is not None,
         }
+        if self.include_supervision:
+            supervision = self._load_supervision(selected, images, depths, valid_depth, sky_mask)
+            sample.update(supervision)
         validate_training_sample(sample, self.mode, allow_fallback_mode=self.allow_fallback_mode)
         return sample
+
+    def _load_supervision(
+        self,
+        selected: list[Omni360Frame],
+        images: torch.Tensor,
+        depths: torch.Tensor | None,
+        valid_depth: torch.Tensor | None,
+        sky_mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor | None]:
+        if self.supervision_resize == self.resize:
+            return {
+                "supervision_images": images,
+                "supervision_depths": depths,
+                "supervision_valid_depth": valid_depth,
+                "supervision_sky_mask": sky_mask,
+            }
+
+        supervision_images = torch.stack(
+            [load_erp_image(str(frame.image_path), self.supervision_resize) for frame in selected],
+            dim=0,
+        )
+        supervision_depths: torch.Tensor | None = None
+        supervision_valid_depth: torch.Tensor | None = None
+        if all(frame.depth_path is not None for frame in selected):
+            depth_list = []
+            depth_format_valid_list = []
+            for frame in selected:
+                depth = _read_h5_depth(frame.depth_path) * self.depth_scale  # type: ignore[arg-type]
+                if self.supervision_resize is not None:
+                    depth = torch.nn.functional.interpolate(
+                        depth.unsqueeze(0),
+                        size=self.supervision_resize,
+                        mode="nearest",
+                    ).squeeze(0)
+                depth, format_valid = _convert_depth_to_euclidean_range(depth, self.depth_format)
+                depth_list.append(depth)
+                depth_format_valid_list.append(format_valid)
+            supervision_depths = torch.stack(depth_list, dim=0)
+            depth_format_valid = torch.stack(depth_format_valid_list, dim=0)
+            supervision_valid_depth = torch.isfinite(supervision_depths) & (supervision_depths > 0.0) & depth_format_valid
+            if self.depth_invalid_value is not None:
+                supervision_valid_depth &= supervision_depths < float(self.depth_invalid_value)
+                supervision_depths = torch.where(supervision_valid_depth, supervision_depths, torch.zeros_like(supervision_depths))
+
+        sky_list: list[torch.Tensor] = []
+        for frame in selected:
+            if frame.semantic_path is None:
+                continue
+            labels, rgb = _load_semantic(frame.semantic_path, self.supervision_resize)
+            try:
+                sky_list.append(sky_mask_from_semantic(labels, rgb, self.class_map))
+            except ValueError:
+                pass
+        supervision_sky_mask = torch.stack(sky_list, dim=0) if len(sky_list) == len(selected) else None
+        return {
+            "supervision_images": supervision_images,
+            "supervision_depths": supervision_depths,
+            "supervision_valid_depth": supervision_valid_depth,
+            "supervision_sky_mask": supervision_sky_mask,
+        }
 
 
 class SyntheticOmni360TrainingDataset(Dataset):
@@ -744,6 +811,12 @@ def build_matching_dataset_from_config(config: dict[str, Any], *, split: Trainin
     w = ds_cfg.get("erp_resize_width")
     if h is not None and w is not None:
         resize = (int(h), int(w))
+    supervision_resize = None
+    sh = ds_cfg.get("supervision_resize_height")
+    sw = ds_cfg.get("supervision_resize_width")
+    if sh is not None and sw is not None:
+        supervision_resize = (int(sh), int(sw))
+    include_supervision = bool(ds_cfg.get("use_native_supervision_gt", False) or ds_cfg.get("include_supervision", False))
     root = ds_cfg.get("root") or ds_cfg.get("dataset_path")
     if root is None:
         raise ValueError("Dataset.root is required unless Dataset.synthetic=true.")
@@ -757,6 +830,8 @@ def build_matching_dataset_from_config(config: dict[str, Any], *, split: Trainin
         temporal_radius=int(ds_cfg.get("temporal_radius", ds_cfg.get("pair_radius", 1))),
         bidirectional_pairs=bool(ds_cfg.get("bidirectional_pairs", False)),
         resize=resize,
+        supervision_resize=supervision_resize,
+        include_supervision=include_supervision,
         depth_format=str(ds_cfg.get("depth_format", "euclidean_range")),
         depth_scale=float(ds_cfg.get("depth_scale", 1.0)),
         depth_invalid_value=ds_cfg.get("depth_invalid_value", 1000.0),

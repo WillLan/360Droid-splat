@@ -25,7 +25,7 @@ Model:
   use_synthetic_features: false
   panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
   panovggt_config: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
-  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_geometry/finetune_omni360_256x512/best_geometry.pt
+  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_geometry/finetune_omni360_256x512_20260623_191432/last_geometry.pt
   class_path: panovggt.models.panovggt_model.PanoVGGTModel
   feature_hook: aggregator
   feature_dim: 2048
@@ -79,6 +79,9 @@ Dataset:
   scenes: ["DTW", "NYC"]
   erp_resize_height: 128
   erp_resize_width: 256
+  use_native_supervision_gt: true
+  supervision_resize_height: 512
+  supervision_resize_width: 1024
   clip_stride: 1
   temporal_radius: 4
   depth_format: euclidean_range
@@ -126,7 +129,7 @@ WeightsAndBiases:
 Validation:
   enabled: true
   fraction: 0.05
-  max_batches: 2
+  max_batches: 32
 
 Checks:
   target_leakage_check: true
