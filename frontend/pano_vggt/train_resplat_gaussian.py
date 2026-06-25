@@ -1397,6 +1397,26 @@ def _count_params(module: nn.Module) -> tuple[int, int]:
     return int(trainable), int(frozen)
 
 
+def _nonfinite_grad_report(module: nn.Module, *, limit: int = 16) -> str:
+    rows: list[str] = []
+    for name, param in module.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        finite = torch.isfinite(grad)
+        if bool(finite.all()):
+            continue
+        bad = (~finite).float().mean().item()
+        nan = torch.isnan(grad).float().mean().item()
+        inf = torch.isinf(grad).float().mean().item()
+        finite_abs = grad[finite].abs()
+        finite_max = finite_abs.max().item() if finite_abs.numel() else float("nan")
+        rows.append(f"{name}: bad={bad:.6f} nan={nan:.6f} inf={inf:.6f} finite_abs_max={finite_max:.6g}")
+        if len(rows) >= limit:
+            break
+    return "; ".join(rows) if rows else "no non-finite parameter gradients found"
+
+
 def _write_report(
     output_dir: Path,
     *,
@@ -1745,7 +1765,8 @@ def train_resplat_gaussian(config: dict[str, Any], *, command: list[str] | None 
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(frontend.parameters(), float(tr.get("grad_clip", 1.0)), error_if_nonfinite=False)
             if not torch.isfinite(grad_norm):
-                raise RuntimeError(f"Non-finite grad norm at optimizer step {step}: {grad_norm}")
+                report = _nonfinite_grad_report(frontend)
+                raise RuntimeError(f"Non-finite grad norm at optimizer step {step}: {grad_norm}; {report}")
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
