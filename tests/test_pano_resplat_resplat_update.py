@@ -8,7 +8,7 @@ import types
 import pytest
 import torch
 
-from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
+from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder, _axis_angle_to_matrix
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
 from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_point_transformer import PanoKNNTransformerBlock
@@ -214,6 +214,16 @@ def test_resplat_pano_error_decoder_feedback_and_group_metrics_are_finite():
     assert torch.isfinite(corrected.means).all()
     assert debug["projected_valid_ratio"] > 0.0
     assert "group_rot_deg_abs" in debug
+
+
+def test_axis_angle_to_matrix_has_finite_zero_gradient():
+    rotvec = torch.zeros(2, 3, requires_grad=True)
+    rot = _axis_angle_to_matrix(rotvec)
+    loss = rot.sum()
+    loss.backward()
+
+    assert torch.isfinite(rot).all()
+    assert torch.isfinite(rotvec.grad).all()
 
 
 def test_latitude_weighted_image_l1_downweights_poles():

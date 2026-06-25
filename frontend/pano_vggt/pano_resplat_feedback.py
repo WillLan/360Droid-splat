@@ -40,9 +40,7 @@ def _sample_wrap(values: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
 def _axis_angle_to_matrix(rotvec: torch.Tensor) -> torch.Tensor:
     """Convert an axis-angle vector to a rotation matrix."""
 
-    theta = torch.linalg.norm(rotvec, dim=-1, keepdim=True)
-    axis = rotvec / theta.clamp_min(1.0e-8)
-    x, y, z = axis.unbind(dim=-1)
+    x, y, z = rotvec.unbind(dim=-1)
     zero = torch.zeros_like(x)
     k = torch.stack(
         [
@@ -59,11 +57,16 @@ def _axis_angle_to_matrix(rotvec: torch.Tensor) -> torch.Tensor:
         dim=-1,
     ).view(*rotvec.shape[:-1], 3, 3)
     eye = torch.eye(3, device=rotvec.device, dtype=rotvec.dtype).expand_as(k)
-    sin_t = torch.sin(theta)[..., None]
-    cos_t = torch.cos(theta)[..., None]
-    small = theta[..., None] < 1.0e-6
-    rot = eye + sin_t * k + (1.0 - cos_t) * (k @ k)
-    return torch.where(small, eye + k, rot)
+    theta2 = (rotvec * rotvec).sum(dim=-1, keepdim=True)
+    theta = torch.sqrt(theta2.clamp_min(1.0e-8))
+    small = theta2 < 1.0e-8
+    a = torch.where(small, 1.0 - theta2 / 6.0 + theta2.square() / 120.0, torch.sin(theta) / theta)
+    b = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2.square() / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(1.0e-8),
+    )
+    return eye + a[..., None] * k + b[..., None] * (k @ k)
 
 
 class _FrozenFeatureExtractor(nn.Module):
