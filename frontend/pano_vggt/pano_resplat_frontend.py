@@ -72,7 +72,7 @@ class PanoReSplatFrontend(nn.Module):
         for _iter_idx in range(max(0, int(num_refine))):
             render_output = self._render_context_views(state, poses, tuple(int(x) for x in images.shape[-2:]))
             context_renders.append(render_output)
-            feedback, debug = self.feedback_encoder(
+            feedback, state_for_update, debug = self.feedback_encoder.refine_state_and_feedback(
                 state,
                 images,
                 poses,
@@ -80,7 +80,7 @@ class PanoReSplatFrontend(nn.Module):
                 context_depth=depths,
                 context_valid_mask=valid_mask,
             )
-            state, metrics = self.update_block(state, feedback)
+            state, metrics = self.update_block(state_for_update, feedback)
             states.append(state)
             feedback_debug.append(debug)
             update_metrics.append(metrics)

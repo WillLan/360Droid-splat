@@ -12,9 +12,9 @@ from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
 from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_point_transformer import PanoKNNTransformerBlock
-from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock
-from frontend.pano_vggt.resplat_types import PanoGaussianState
-from frontend.pano_vggt.train_resplat_gaussian import _load_checkpoint
+from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock, PanoGaussianUpdateLimits
+from frontend.pano_vggt.resplat_types import PanoGaussianState, PanoRenderOutput
+from frontend.pano_vggt.train_resplat_gaussian import _latitude_weighted_image_l1, _load_checkpoint, _single_output_loss
 
 
 def _state(batch: int = 1, points: int = 12, latent_dim: int = 8, sh_dim: int = 16) -> PanoGaussianState:
@@ -128,11 +128,13 @@ def test_invalid_points_are_not_updated_when_delta_head_is_nonzero():
     assert not torch.allclose(updated.means[valid], state.means[valid])
 
 
-def test_update_block_does_not_clamp_existing_large_log_scales():
+def test_update_block_clamps_min_scale_without_max_clamp():
     state = _state(points=8)
+    low = torch.full_like(state.log_scales, -30.0)
+    low[:, 0::2] = 4.0
     state = PanoGaussianState(
         means=state.means,
-        log_scales=torch.full_like(state.log_scales, 4.0),
+        log_scales=low,
         rotations_unnorm=state.rotations_unnorm,
         opacity_logits=state.opacity_logits,
         sh_coeffs=state.sh_coeffs,
@@ -151,12 +153,103 @@ def test_update_block_does_not_clamp_existing_large_log_scales():
         num_heads=1,
         attn_proj_channels=8,
         max_knn_points=0,
+        limits=PanoGaussianUpdateLimits(min_scale=1.0e-3),
     )
     feedback = torch.randn(state.batch_size, state.num_gaussians, 5)
 
     updated, _metrics = block(state, feedback)
 
-    assert torch.allclose(updated.log_scales, state.log_scales, atol=1.0e-7)
+    assert torch.all(updated.log_scales >= torch.log(torch.tensor(1.0e-3)) - 1.0e-7)
+    assert torch.allclose(updated.log_scales[:, 0::2], state.log_scales[:, 0::2], atol=1.0e-7)
+
+
+def test_resplat_pano_error_decoder_feedback_and_group_metrics_are_finite():
+    state = _state(points=10, latent_dim=8, sh_dim=4)
+    state = PanoGaussianState(
+        means=torch.tensor(
+            [[[0.0, 0.0, 2.0], [0.2, 0.0, 2.0], [-0.2, 0.0, 2.0], [0.0, 0.2, 2.0], [0.0, -0.2, 2.0],
+              [0.0, 0.0, 2.2], [0.2, 0.0, 2.2], [-0.2, 0.0, 2.2], [0.0, 0.2, 2.2], [0.0, -0.2, 2.2]]],
+            dtype=torch.float32,
+        ),
+        log_scales=state.log_scales,
+        rotations_unnorm=state.rotations_unnorm,
+        opacity_logits=state.opacity_logits,
+        sh_coeffs=state.sh_coeffs,
+        latent_features=state.latent_features,
+        source_view_ids=torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.long),
+        source_uv=torch.tensor([[[0.5, 4.5], [15.5, 4.5], [4.5, 4.5], [8.5, 2.5], [8.5, 6.5],
+                                 [0.5, 4.5], [15.5, 4.5], [4.5, 4.5], [8.5, 2.5], [8.5, 6.5]]]),
+        valid_mask=state.valid_mask,
+        confidence=state.confidence,
+    )
+    b, v, h, w = 1, 2, 8, 16
+    context = torch.zeros(b, v, 3, h, w)
+    render = torch.ones(b, v, 3, h, w) * 0.25
+    depth = torch.ones(b, v, 1, h, w)
+    alpha = torch.ones(b, v, 1, h, w)
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(b, v, 1, 1)
+    poses[:, 1, 0, 3] = 0.1
+    valid = torch.ones(b, v, 1, h, w, dtype=torch.bool)
+    feedback_encoder = PanoRenderFeedbackEncoder(
+        feedback_dim=6,
+        hidden_dim=12,
+        feedback_type="resplat_pano_error_decoder",
+        error_dim=8,
+        mv_down_factor=2,
+        mv_num_heads=2,
+        enable_group_correction=True,
+    )
+
+    feedback, corrected, debug = feedback_encoder.refine_state_and_feedback(
+        state,
+        context,
+        poses,
+        PanoRenderOutput(color=render, depth=depth, alpha=alpha, extras={}),
+        context_valid_mask=valid,
+    )
+
+    assert feedback.shape == (1, 10, 6)
+    assert corrected.means.shape == state.means.shape
+    assert torch.isfinite(feedback).all()
+    assert torch.isfinite(corrected.means).all()
+    assert debug["projected_valid_ratio"] > 0.0
+    assert "group_rot_deg_abs" in debug
+
+
+def test_latitude_weighted_image_l1_downweights_poles():
+    gt = torch.zeros(1, 1, 3, 8, 16)
+    pred_pole = gt.clone()
+    pred_mid = gt.clone()
+    pred_pole[..., 0, :] = 1.0
+    pred_mid[..., 4, :] = 1.0
+
+    pole_loss = _latitude_weighted_image_l1(pred_pole, gt, None)
+    mid_loss = _latitude_weighted_image_l1(pred_mid, gt, None)
+
+    assert mid_loss > pole_loss
+
+
+def test_image_lpips_latitude_loss_ignores_depth_and_gaussian_regularizers_when_lpips_zero():
+    state = _state(points=4, latent_dim=4, sh_dim=1)
+    pred = torch.zeros(1, 1, 3, 8, 16)
+    gt = torch.ones_like(pred) * 0.2
+    target = {
+        "images": gt,
+        "depths": torch.ones(1, 1, 1, 8, 16) * 100.0,
+        "valid_mask": torch.ones(1, 1, 1, 8, 16, dtype=torch.bool),
+    }
+    render = PanoRenderOutput(color=pred, depth=torch.zeros(1, 1, 1, 8, 16), alpha=torch.zeros(1, 1, 1, 8, 16), extras={})
+    loss, metrics = _single_output_loss(
+        state,
+        render,
+        target,
+        context_render=None,
+        context={"images": gt},
+        prev_state=None,
+        config={"Loss": {"type": "image_lpips_latitude", "rgb_l1_weight": 1.0, "lpips_weight": 0.0}},
+    )
+
+    assert torch.allclose(loss, metrics["latitude_image_l1"])
 
 
 def test_checkpoint_load_skips_incompatible_refiner_shapes():

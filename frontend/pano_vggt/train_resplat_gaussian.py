@@ -30,6 +30,7 @@ import yaml
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from frontend.pano_droid.spherical_camera import latitude_area_weight
 from frontend.pano_vggt.matching_dataset import build_matching_dataset_from_config, validate_training_sample
 from frontend.pano_vggt.pano_resplat_feedback import PanoRenderFeedbackEncoder
 from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
@@ -101,7 +102,20 @@ def _default_config() -> dict[str, Any]:
             "max_offset_abs": 0.05,
             "max_offset_depth_ratio": 0.02,
         },
-        "Feedback": {"feedback_dim": 32, "hidden_dim": 64},
+        "Feedback": {
+            "type": "legacy",
+            "feedback_dim": 32,
+            "hidden_dim": 64,
+            "error_dim": 64,
+            "mv_down_factor": 4,
+            "mv_attn_blocks": 1,
+            "mv_num_heads": 4,
+            "feature_backbone": "resnet18",
+            "enable_group_correction": False,
+            "group_rotation_deg": 1.0,
+            "group_translation": 0.03,
+            "group_translation_scale_ratio": 0.005,
+        },
         "Refiner": {
             "hidden_dim": 64,
             "knn": 8,
@@ -172,6 +186,7 @@ def _default_config() -> dict[str, Any]:
             "mean_step_reg_weight": 0.01,
             "sh_reg_weight": 0.0005,
             "intermediate_weight": 0.5,
+            "type": "default",
         },
         "Optimizer": {
             "lr": 2.0e-4,
@@ -356,6 +371,16 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
     feedback = PanoRenderFeedbackEncoder(
         feedback_dim=int(feedback_cfg.get("feedback_dim", 32)),
         hidden_dim=int(feedback_cfg.get("hidden_dim", 64)),
+        feedback_type=str(feedback_cfg.get("type", feedback_cfg.get("feedback_type", "legacy"))),
+        error_dim=int(feedback_cfg.get("error_dim", 64)),
+        mv_down_factor=int(feedback_cfg.get("mv_down_factor", 4)),
+        mv_attn_blocks=int(feedback_cfg.get("mv_attn_blocks", 1)),
+        mv_num_heads=int(feedback_cfg.get("mv_num_heads", 4)),
+        feature_backbone=str(feedback_cfg.get("feature_backbone", "resnet18")),
+        enable_group_correction=bool(feedback_cfg.get("enable_group_correction", False)),
+        group_rotation_deg=float(feedback_cfg.get("group_rotation_deg", 1.0)),
+        group_translation=float(feedback_cfg.get("group_translation", 0.03)),
+        group_translation_scale_ratio=float(feedback_cfg.get("group_translation_scale_ratio", 0.005)),
     )
     ref_cfg = config.get("Refiner", {})
     limits = PanoGaussianUpdateLimits(**dict(ref_cfg.get("limits", {})))
@@ -835,6 +860,53 @@ def _gaussian_masked_mean(values: torch.Tensor, mask: torch.Tensor | None, *, de
     return values[valid].mean()
 
 
+def _latitude_weighted_image_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if pred.ndim != 5 or target.ndim != 5:
+        raise ValueError("latitude weighted image loss expects BxVx3xHxW tensors")
+    err = (pred - target).abs().mean(dim=2, keepdim=True)
+    h, w = int(pred.shape[-2]), int(pred.shape[-1])
+    lat = latitude_area_weight(h, w, device=pred.device, dtype=pred.dtype, normalize=False).view(1, 1, 1, h, w)
+    if mask is None:
+        weight = lat.expand_as(err)
+    else:
+        valid = _as_5d_mask(mask, name="loss_mask").to(device=pred.device)
+        if valid.shape[-2:] != pred.shape[-2:]:
+            flat = valid.float().reshape(-1, 1, int(valid.shape[-2]), int(valid.shape[-1]))
+            flat = F.interpolate(flat, size=pred.shape[-2:], mode="nearest")
+            valid = flat.reshape(*valid.shape[:-2], *pred.shape[-2:]) > 0.5
+        weight = lat * valid.to(dtype=pred.dtype)
+    denom = weight.sum().clamp_min(torch.finfo(pred.dtype).eps)
+    return (err * weight).sum() / denom
+
+
+def _clamp_state_min_scale(state: PanoGaussianState, min_scale: float | None) -> PanoGaussianState:
+    if min_scale is None or float(min_scale) <= 0.0:
+        return state
+    min_log_scale = math.log(max(float(min_scale), 1.0e-12))
+    return PanoGaussianState(
+        means=state.means,
+        log_scales=torch.nan_to_num(state.log_scales, nan=float(min_log_scale), posinf=0.0, neginf=float(min_log_scale)).clamp_min(float(min_log_scale)),
+        rotations_unnorm=state.rotations_unnorm,
+        opacity_logits=state.opacity_logits,
+        sh_coeffs=state.sh_coeffs,
+        latent_features=state.latent_features,
+        source_view_ids=state.source_view_ids,
+        source_uv=state.source_uv,
+        valid_mask=state.valid_mask,
+        confidence=state.confidence,
+    )
+
+
+def _configured_min_scale(config: dict[str, Any]) -> float | None:
+    loss_cfg = config.get("Loss", {})
+    if "min_scale" in loss_cfg:
+        return float(loss_cfg["min_scale"])
+    ref_limits = config.get("Refiner", {}).get("limits", {})
+    if "min_scale" in ref_limits:
+        return float(ref_limits["min_scale"])
+    return None
+
+
 def _ssim_dssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_f = pred.reshape(-1, 3, pred.shape[-2], pred.shape[-1])
     target_f = target.reshape(-1, 3, target.shape[-2], target.shape[-1])
@@ -894,10 +966,12 @@ def _single_output_loss(
     lpips_model: nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     loss_cfg = config.get("Loss", {})
+    loss_type = str(loss_cfg.get("type", loss_cfg.get("loss_type", "default"))).lower()
     pred = target_render.color
     gt = target["images"].to(pred).clamp(0.0, 1.0)
     target_mask = target.get("valid_mask") if torch.is_tensor(target.get("valid_mask")) else None
-    rgb_l1 = _masked_mean((pred - gt).abs(), target_mask)
+    latitude_l1 = _latitude_weighted_image_l1(pred, gt, target_mask)
+    rgb_l1 = latitude_l1 if loss_type in {"image_lpips_latitude", "resplat_image_lpips_latitude"} else _masked_mean((pred - gt).abs(), target_mask)
     dssim = _masked_ssim_dssim(pred, gt, target_mask)
     lpips_loss = pred.new_tensor(0.0)
     if lpips_model is not None:
@@ -942,22 +1016,26 @@ def _single_output_loss(
             + _gaussian_masked_mean((state.sh_coeffs - prev_state.sh_coeffs).abs(), valid_delta)
         )
         mean_step = _gaussian_masked_mean((state.means - prev_state.means).norm(dim=-1), valid_delta)
-    loss = (
-        float(loss_cfg.get("rgb_l1_weight", 1.0)) * rgb_l1
-        + float(loss_cfg.get("dssim_weight", 0.1)) * dssim
-        + float(loss_cfg.get("lpips_weight", 0.0)) * lpips_loss
-        + float(loss_cfg.get("depth_weight", 0.05)) * depth_loss
-        + float(loss_cfg.get("context_weight", 0.0)) * context_l1
-        + float(loss_cfg.get("opacity_reg_weight", 0.001)) * opacity_reg
-        + float(loss_cfg.get("alpha_coverage_weight", 0.01)) * (1.0 - alpha_coverage)
-        + float(loss_cfg.get("scale_reg_weight", 0.001)) * scale_reg
-        + float(loss_cfg.get("anisotropy_reg_weight", 0.001)) * anisotropy_reg
-        + float(loss_cfg.get("delta_reg_weight", 0.01)) * delta_reg
-        + float(loss_cfg.get("mean_step_reg_weight", 0.01)) * mean_step
-        + float(loss_cfg.get("sh_reg_weight", 0.0005)) * sh_reg
-    )
+    if loss_type in {"image_lpips_latitude", "resplat_image_lpips_latitude"}:
+        loss = float(loss_cfg.get("rgb_l1_weight", loss_cfg.get("image_weight", 1.0))) * latitude_l1 + float(loss_cfg.get("lpips_weight", 0.5)) * lpips_loss
+    else:
+        loss = (
+            float(loss_cfg.get("rgb_l1_weight", 1.0)) * rgb_l1
+            + float(loss_cfg.get("dssim_weight", 0.1)) * dssim
+            + float(loss_cfg.get("lpips_weight", 0.0)) * lpips_loss
+            + float(loss_cfg.get("depth_weight", 0.05)) * depth_loss
+            + float(loss_cfg.get("context_weight", 0.0)) * context_l1
+            + float(loss_cfg.get("opacity_reg_weight", 0.001)) * opacity_reg
+            + float(loss_cfg.get("alpha_coverage_weight", 0.01)) * (1.0 - alpha_coverage)
+            + float(loss_cfg.get("scale_reg_weight", 0.001)) * scale_reg
+            + float(loss_cfg.get("anisotropy_reg_weight", 0.001)) * anisotropy_reg
+            + float(loss_cfg.get("delta_reg_weight", 0.01)) * delta_reg
+            + float(loss_cfg.get("mean_step_reg_weight", 0.01)) * mean_step
+            + float(loss_cfg.get("sh_reg_weight", 0.0005)) * sh_reg
+        )
     return loss, {
         "rgb_l1": rgb_l1.detach(),
+        "latitude_image_l1": latitude_l1.detach(),
         "dssim": dssim.detach(),
         "lpips": lpips_loss.detach(),
         "depth_loss": depth_loss.detach(),
@@ -1013,13 +1091,15 @@ def _forward_train(
             tokens=context.get("tokens"),
             token_hw=context.get("token_hw"),
         )
+    state = _clamp_state_min_scale(state, _configured_min_scale(config))
     states = [state]
     context_renders: list[PanoRenderOutput | None] = []
     update_metrics: list[dict[str, torch.Tensor]] = []
+    feedback_metrics: list[dict[str, torch.Tensor]] = []
     for _ in range(int(num_refine)):
         context_render = _render_views(frontend, state, context["poses_c2w"], tuple(int(x) for x in context["images"].shape[-2:]))
         context_renders.append(context_render)
-        feedback, _debug = frontend.feedback_encoder(
+        feedback, state_for_update, feedback_debug = frontend.feedback_encoder.refine_state_and_feedback(
             state,
             context["images"],
             context["poses_c2w"],
@@ -1027,9 +1107,12 @@ def _forward_train(
             context_depth=context.get("depths"),
             context_valid_mask=context.get("valid_mask"),
         )
-        state, metrics = frontend.update_block(state, feedback)
+        state_for_update = _clamp_state_min_scale(state_for_update, _configured_min_scale(config))
+        state, metrics = frontend.update_block(state_for_update, feedback)
+        state = _clamp_state_min_scale(state, _configured_min_scale(config))
         states.append(state)
         update_metrics.append(metrics)
+        feedback_metrics.append(feedback_debug)
     final_context_render = _render_views(frontend, states[-1], context["poses_c2w"], tuple(int(x) for x in context["images"].shape[-2:]))
     target_renders = [_render_views(frontend, s, target["poses_c2w"], image_hw) for s in states]
     losses, metrics_by_iter = [], []
@@ -1068,6 +1151,9 @@ def _forward_train(
     for idx, update in enumerate(update_metrics):
         for key, value in update.items():
             metrics[f"update{idx}/{key}"] = value.detach()
+    for idx, feedback_debug in enumerate(feedback_metrics):
+        for key, value in feedback_debug.items():
+            metrics[f"feedback{idx}/{key}"] = value.detach() if torch.is_tensor(value) else target_renders[-1].color.new_tensor(float(value))
     artifacts = {
         "states": states,
         "target_renders": target_renders,

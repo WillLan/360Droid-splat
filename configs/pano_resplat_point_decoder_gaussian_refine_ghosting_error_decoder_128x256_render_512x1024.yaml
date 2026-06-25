@@ -1,0 +1,146 @@
+Training:
+  stage: refine
+  steps: 10000
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  frames_per_sample: 4
+  context_views: 4
+  target_views: 4
+  view_mode: input_reconstruction
+  window_mode: fixed
+  render_height: 512
+  render_width: 1024
+  train_min_refine: 3
+  train_max_refine: 3
+  eval_refine: 3
+  num_workers: 2
+  output_dir: outputs/pano_resplat/point_decoder_gaussian_refine_ghosting_error_decoder_128x256_render_512x1024
+  save_every: 1000
+  eval_every: 250
+  vis_every: 250
+  log_every: 10
+  grad_clip: 1.0
+
+Model:
+  use_synthetic_features: false
+  panovggt_repo: /mnt/disk1/lanboyang/Project/PanoVGGT
+  panovggt_config: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  panovggt_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_geometry/finetune_omni360_256x512_20260623_191432/last_geometry.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  feature_hook: aggregator
+  feature_dim: 2048
+  image_size: [128, 256]
+  patch_size: 14
+  patch_multiple: 14
+  amp: true
+  input_batch_dim: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+
+Initializer:
+  type: panovggt_point_decoder_gaussian
+  state_dim: 64
+  sh_degree: 3
+  patch_size: 14
+  decoder_embed_dim: 1024
+  decoder_depth: 5
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4.0
+  init_scale: 0.015
+  use_local_offsets: true
+  max_offset_abs: 0.05
+  max_offset_depth_ratio: 0.02
+
+Feedback:
+  type: resplat_pano_error_decoder
+  feedback_dim: 64
+  hidden_dim: 128
+  error_dim: 64
+  mv_down_factor: 4
+  mv_attn_blocks: 1
+  mv_num_heads: 4
+  feature_backbone: resnet18
+  enable_group_correction: true
+  group_rotation_deg: 1.0
+  group_translation: 0.03
+  group_translation_scale_ratio: 0.005
+
+Refiner:
+  hidden_dim: 256
+  knn: 8
+  num_heads: 1
+  attn_proj_channels: 64
+  mlp_ratio: 4.0
+  num_basic_refine_blocks: 4
+  knn_backend: pointops
+  strict_knn_backend: true
+  cache_knn: true
+  detach_feedback: false
+  gradient_checkpoint: true
+  max_knn_points: 0
+  chunk_size: null
+  limits:
+    mean: 0.02
+    log_scale: 0.05
+    rotation: 0.05
+    opacity: 0.25
+    sh: 0.10
+    latent: 0.10
+    min_scale: 1.0e-5
+    max_scale: 0.50
+
+Dataset:
+  synthetic: false
+  root: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene
+  pose_root: /mnt/disk1/lanboyang/Datasets/Airsim360/UE_Raw_sample_pts
+  scenes: ["DTW", "NYC"]
+  erp_resize_height: 128
+  erp_resize_width: 256
+  use_native_supervision_gt: true
+  supervision_resize_height: 512
+  supervision_resize_width: 1024
+  clip_stride: 1
+  temporal_radius: 4
+  depth_format: euclidean_range
+  depth_scale: 1.0
+  depth_invalid_value: 1000.0
+  pose_coordinate_system: ue_airsim
+  pose_translation_scale: 0.01
+  validation_fraction: 0.05
+  validation_split: tail
+  class_map:
+    sky_names: ["Sky", "sky"]
+    sky_ids: [3]
+
+Renderer:
+  backend: gsplat360
+  allow_soft_splat_fallback: false
+  soft_max_points: 4096
+
+Loss:
+  type: image_lpips_latitude
+  rgb_l1_weight: 1.0
+  lpips_weight: 0.5
+  intermediate_weight: 0.5
+  min_scale: 1.0e-5
+
+Optimizer:
+  lr: 2.0e-4
+  weight_decay: 0.01
+
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  project: 360Droid-splat
+  run_name: pano_resplat_point_decoder_gaussian_refine_ghosting_error_decoder_128x256_render_512x1024
+  tags: ["pano-resplat", "point-decoder-gaussian", "sh3", "refine", "ghosting", "error-decoder"]
+
+Validation:
+  enabled: true
+  fraction: 0.05
+  max_batches: 32
+
+Checks:
+  target_leakage_check: true
+  renderer_gradient_check: true
+  nan_check: true

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
@@ -179,14 +180,16 @@ class PanoGaussianUpdateBlock(nn.Module):
         latent_delta = torch.tanh(raw[..., cursor : cursor + self.latent_dim]) * float(self.limits.latent)
 
         valid = state.valid_mask.unsqueeze(-1).to(dtype=state.means.dtype)
+        min_log_scale = math.log(max(float(self.limits.min_scale), 1.0e-12))
+        log_scales = torch.nan_to_num(
+            state.log_scales + scale_delta * valid,
+            nan=float(min_log_scale),
+            posinf=0.0,
+            neginf=float(min_log_scale),
+        ).clamp_min(float(min_log_scale))
         new_state = PanoGaussianState(
             means=torch.nan_to_num(state.means + mean_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),
-            log_scales=torch.nan_to_num(
-                state.log_scales + scale_delta * valid,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ),
+            log_scales=log_scales,
             rotations_unnorm=torch.nan_to_num(state.rotations_unnorm + rot_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),
             opacity_logits=torch.nan_to_num(state.opacity_logits + opacity_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),
             sh_coeffs=torch.nan_to_num(state.sh_coeffs + sh_delta * valid.unsqueeze(-1), nan=0.0, posinf=0.0, neginf=0.0),
