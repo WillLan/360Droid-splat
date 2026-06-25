@@ -121,6 +121,8 @@ Loss:
   type: image_lpips_latitude
   rgb_l1_weight: 1.0
   lpips_weight: 0.5
+  lpips_resize_height: 256
+  lpips_resize_width: 512
   intermediate_weight: 0.5
   min_scale: 1.0e-5
 

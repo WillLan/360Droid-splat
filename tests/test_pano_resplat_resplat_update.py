@@ -252,6 +252,49 @@ def test_image_lpips_latitude_loss_ignores_depth_and_gaussian_regularizers_when_
     assert torch.allclose(loss, metrics["latitude_image_l1"])
 
 
+def test_image_lpips_latitude_loss_can_resize_lpips_inputs():
+    class FakeLPIPS(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_shape = None
+
+        def forward(self, pred, target):
+            self.seen_shape = tuple(pred.shape)
+            return pred.new_ones(pred.shape[0], 1, 1, 1) * 0.25
+
+    state = _state(points=4, latent_dim=4, sh_dim=1)
+    pred = torch.zeros(1, 1, 3, 8, 16)
+    gt = torch.ones_like(pred) * 0.2
+    target = {
+        "images": gt,
+        "valid_mask": torch.ones(1, 1, 1, 8, 16, dtype=torch.bool),
+    }
+    render = PanoRenderOutput(color=pred, depth=None, alpha=torch.ones(1, 1, 1, 8, 16), extras={})
+    lpips_model = FakeLPIPS()
+    loss, metrics = _single_output_loss(
+        state,
+        render,
+        target,
+        context_render=None,
+        context={"images": gt},
+        prev_state=None,
+        config={
+            "Loss": {
+                "type": "image_lpips_latitude",
+                "rgb_l1_weight": 1.0,
+                "lpips_weight": 0.5,
+                "lpips_resize_height": 4,
+                "lpips_resize_width": 8,
+            }
+        },
+        lpips_model=lpips_model,
+    )
+
+    assert lpips_model.seen_shape == (1, 3, 4, 8)
+    assert torch.allclose(metrics["lpips"], torch.tensor(0.25))
+    assert torch.allclose(loss, metrics["latitude_image_l1"] + 0.5 * metrics["lpips"])
+
+
 def test_checkpoint_load_skips_incompatible_refiner_shapes():
     initializer = PanoVGGTPointDecoderGaussianInitializer(
         {

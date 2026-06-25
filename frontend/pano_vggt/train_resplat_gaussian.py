@@ -954,6 +954,57 @@ def _gaussian_stats(state: PanoGaussianState) -> dict[str, torch.Tensor]:
     }
 
 
+def _lpips_resize_hw(loss_cfg: dict[str, Any], image_hw: tuple[int, int]) -> tuple[int, int]:
+    height, width = image_hw
+    resize_h = loss_cfg.get("lpips_resize_height", loss_cfg.get("lpips_height"))
+    resize_w = loss_cfg.get("lpips_resize_width", loss_cfg.get("lpips_width"))
+    max_side = loss_cfg.get("lpips_max_side")
+    if resize_h is None and resize_w is None and max_side is None:
+        return height, width
+    if max_side is not None and (resize_h is None or resize_w is None):
+        max_side_i = max(1, int(max_side))
+        scale = min(1.0, float(max_side_i) / float(max(height, width)))
+        return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
+    if resize_h is None:
+        resize_w_i = max(1, int(resize_w))
+        resize_h_i = max(1, int(round(height * resize_w_i / max(1, width))))
+        return resize_h_i, resize_w_i
+    if resize_w is None:
+        resize_h_i = max(1, int(resize_h))
+        resize_w_i = max(1, int(round(width * resize_h_i / max(1, height))))
+        return resize_h_i, resize_w_i
+    return max(1, int(resize_h)), max(1, int(resize_w))
+
+
+def _prepare_lpips_inputs(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    target_mask: torch.Tensor | None,
+    loss_cfg: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = pred.shape[-2:]
+    pred_f = pred.reshape(-1, 3, height, width).clamp(0.0, 1.0)
+    gt_f = gt.reshape(-1, 3, height, width).clamp(0.0, 1.0)
+    mask_f = None
+    if torch.is_tensor(target_mask):
+        mask_5d = _as_5d_mask(target_mask, name="lpips_mask").to(device=pred.device)
+        if mask_5d.shape[-2:] != (height, width):
+            flat = mask_5d.float().reshape(-1, 1, int(mask_5d.shape[-2]), int(mask_5d.shape[-1]))
+            flat = F.interpolate(flat, size=(height, width), mode="nearest")
+            mask_5d = flat.reshape(*mask_5d.shape[:-2], height, width) > 0.5
+        mask_f = mask_5d.reshape(-1, 1, height, width).to(dtype=pred.dtype)
+    lpips_h, lpips_w = _lpips_resize_hw(loss_cfg, (height, width))
+    if (lpips_h, lpips_w) != (height, width):
+        pred_f = F.interpolate(pred_f, size=(lpips_h, lpips_w), mode="bilinear", align_corners=False)
+        gt_f = F.interpolate(gt_f, size=(lpips_h, lpips_w), mode="bilinear", align_corners=False)
+        if mask_f is not None:
+            mask_f = F.interpolate(mask_f, size=(lpips_h, lpips_w), mode="nearest")
+    if mask_f is not None:
+        pred_f = pred_f * mask_f
+        gt_f = gt_f * mask_f
+    return pred_f * 2.0 - 1.0, gt_f * 2.0 - 1.0
+
+
 def _single_output_loss(
     state: PanoGaussianState,
     target_render: PanoRenderOutput,
@@ -975,13 +1026,7 @@ def _single_output_loss(
     dssim = _masked_ssim_dssim(pred, gt, target_mask)
     lpips_loss = pred.new_tensor(0.0)
     if lpips_model is not None:
-        lpips_mask = _broadcast_mask(target_mask, pred)
-        mask_f = 1.0 if lpips_mask is None else lpips_mask.to(dtype=pred.dtype)
-        pred_f = pred.reshape(-1, 3, pred.shape[-2], pred.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
-        gt_f = gt.reshape(-1, 3, gt.shape[-2], gt.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
-        if torch.is_tensor(mask_f):
-            pred_f = (pred * mask_f).reshape(-1, 3, pred.shape[-2], pred.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
-            gt_f = (gt * mask_f).reshape(-1, 3, gt.shape[-2], gt.shape[-1]).clamp(0.0, 1.0) * 2.0 - 1.0
+        pred_f, gt_f = _prepare_lpips_inputs(pred, gt, target_mask, loss_cfg)
         lpips_loss = lpips_model(pred_f, gt_f).mean()
     depth_loss = pred.new_tensor(0.0)
     if torch.is_tensor(target.get("depths")) and torch.is_tensor(target_render.depth):
