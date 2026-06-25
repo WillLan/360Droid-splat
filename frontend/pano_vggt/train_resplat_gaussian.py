@@ -1000,8 +1000,9 @@ def _prepare_lpips_inputs(
         if mask_f is not None:
             mask_f = F.interpolate(mask_f, size=(lpips_h, lpips_w), mode="nearest")
     if mask_f is not None:
-        pred_f = pred_f * mask_f
-        gt_f = gt_f * mask_f
+        # Avoid feeding large all-zero invalid regions into LPIPS' feature normalization.
+        # Invalid pixels contribute no difference because pred is filled with GT there.
+        pred_f = pred_f * mask_f + gt_f.detach() * (1.0 - mask_f)
     return pred_f * 2.0 - 1.0, gt_f * 2.0 - 1.0
 
 
