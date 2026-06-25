@@ -14,7 +14,7 @@ from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE,
 from frontend.pano_vggt.pano_point_transformer import PanoKNNTransformerBlock
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock, PanoGaussianUpdateLimits
 from frontend.pano_vggt.resplat_types import PanoGaussianState, PanoRenderOutput
-from frontend.pano_vggt.train_resplat_gaussian import _latitude_weighted_image_l1, _load_checkpoint, _single_output_loss
+from frontend.pano_vggt.train_resplat_gaussian import _latitude_weighted_image_l1, _load_checkpoint, _set_stage_trainability, _single_output_loss
 
 
 def _state(batch: int = 1, points: int = 12, latent_dim: int = 8, sh_dim: int = 16) -> PanoGaussianState:
@@ -224,6 +224,36 @@ def test_axis_angle_to_matrix_has_finite_zero_gradient():
 
     assert torch.isfinite(rot).all()
     assert torch.isfinite(rotvec.grad).all()
+
+
+def test_refine_stage_keeps_render_feature_extractor_frozen():
+    initializer = PanoVGGTPointDecoderGaussianInitializer(
+        {
+            "type": INITIALIZER_TYPE,
+            "state_dim": 8,
+            "sh_degree": 0,
+            "patch_size": 4,
+            "decoder_embed_dim": 16,
+            "decoder_depth": 1,
+            "decoder_num_heads": 4,
+        }
+    )
+    feedback = PanoRenderFeedbackEncoder(
+        feedback_dim=5,
+        hidden_dim=8,
+        feedback_type="resplat_pano_error_decoder",
+        error_dim=8,
+        mv_down_factor=2,
+        mv_num_heads=2,
+    )
+    update = PanoGaussianUpdateBlock(feedback_dim=5, latent_dim=8, sh_dim=1, hidden_dim=8)
+    frontend = PanoReSplatFrontend(initializer=initializer, feedback_encoder=feedback, update_block=update)
+
+    _set_stage_trainability(frontend, "refine")
+
+    assert not any(param.requires_grad for param in feedback.feature_extractor.parameters())
+    assert any(param.requires_grad for param in feedback.rgb_error_proj.parameters())
+    assert any(param.requires_grad for param in update.parameters())
 
 
 def test_latitude_weighted_image_l1_downweights_poles():

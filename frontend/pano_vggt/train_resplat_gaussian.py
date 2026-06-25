@@ -437,6 +437,10 @@ def _set_stage_trainability(frontend: PanoReSplatFrontend, stage: str, *, overfi
     if stage in {"refine", "joint"} or (stage == "overfit" and overfit_trains_refiner):
         _set_requires_grad(frontend.feedback_encoder, True)
         _set_requires_grad(frontend.update_block, True)
+        feature_extractor = getattr(frontend.feedback_encoder, "feature_extractor", None)
+        if isinstance(feature_extractor, nn.Module):
+            _set_requires_grad(feature_extractor, False)
+            feature_extractor.eval()
 
 
 def _optimizer(frontend: PanoReSplatFrontend, config: dict[str, Any], stage: str) -> torch.optim.Optimizer:
