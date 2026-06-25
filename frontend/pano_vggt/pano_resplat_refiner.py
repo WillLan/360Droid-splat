@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 from torch import nn
@@ -183,13 +182,10 @@ class PanoGaussianUpdateBlock(nn.Module):
         new_state = PanoGaussianState(
             means=torch.nan_to_num(state.means + mean_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),
             log_scales=torch.nan_to_num(
-                (state.log_scales + scale_delta * valid).clamp(
-                    math.log(float(self.limits.min_scale)),
-                    math.log(float(self.limits.max_scale)),
-                ),
-                nan=math.log(float(self.limits.min_scale)),
-                posinf=math.log(float(self.limits.max_scale)),
-                neginf=math.log(float(self.limits.min_scale)),
+                state.log_scales + scale_delta * valid,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
             ),
             rotations_unnorm=torch.nan_to_num(state.rotations_unnorm + rot_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),
             opacity_logits=torch.nan_to_num(state.opacity_logits + opacity_delta * valid, nan=0.0, posinf=0.0, neginf=0.0),

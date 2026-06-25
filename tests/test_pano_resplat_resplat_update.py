@@ -128,6 +128,37 @@ def test_invalid_points_are_not_updated_when_delta_head_is_nonzero():
     assert not torch.allclose(updated.means[valid], state.means[valid])
 
 
+def test_update_block_does_not_clamp_existing_large_log_scales():
+    state = _state(points=8)
+    state = PanoGaussianState(
+        means=state.means,
+        log_scales=torch.full_like(state.log_scales, 4.0),
+        rotations_unnorm=state.rotations_unnorm,
+        opacity_logits=state.opacity_logits,
+        sh_coeffs=state.sh_coeffs,
+        latent_features=state.latent_features,
+        source_view_ids=state.source_view_ids,
+        source_uv=state.source_uv,
+        valid_mask=state.valid_mask,
+        confidence=state.confidence,
+    )
+    block = PanoGaussianUpdateBlock(
+        feedback_dim=5,
+        latent_dim=state.latent_dim,
+        sh_dim=state.sh_dim,
+        hidden_dim=16,
+        knn=4,
+        num_heads=1,
+        attn_proj_channels=8,
+        max_knn_points=0,
+    )
+    feedback = torch.randn(state.batch_size, state.num_gaussians, 5)
+
+    updated, _metrics = block(state, feedback)
+
+    assert torch.allclose(updated.log_scales, state.log_scales, atol=1.0e-7)
+
+
 def test_checkpoint_load_skips_incompatible_refiner_shapes():
     initializer = PanoVGGTPointDecoderGaussianInitializer(
         {
