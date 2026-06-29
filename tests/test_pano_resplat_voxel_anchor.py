@@ -170,3 +170,17 @@ def test_view_pose_residual_head_updates_poses_with_bounds():
     assert metrics["pose_rot_deg_abs"] <= 1.0 + 1.0e-5
     assert metrics["pose_trans_norm"] <= (3.0**0.5) * 0.03 + 1.0e-5
     assert not torch.allclose(refined, poses)
+
+
+def test_view_pose_residual_head_has_nonzero_zero_init_gradient():
+    head = PanoViewPoseResidualHead(4, hidden_dim=8, max_rotation_deg=1.0, max_translation=0.03)
+    tokens = torch.ones(1, 2, 4)
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+
+    refined, _metrics = head(tokens, poses)
+    loss = refined[..., :3, 3].sum() + refined[..., :3, :3].sum()
+    loss.backward()
+
+    assert head.net[-1].bias.grad is not None
+    assert torch.isfinite(head.net[-1].bias.grad).all()
+    assert head.net[-1].bias.grad.abs().sum() > 0.0

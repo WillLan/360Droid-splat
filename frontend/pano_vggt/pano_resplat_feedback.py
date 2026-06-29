@@ -71,9 +71,12 @@ def _axis_angle_to_matrix(rotvec: torch.Tensor) -> torch.Tensor:
 
 def _bounded_vector(raw: torch.Tensor, max_norm: float) -> torch.Tensor:
     norm = raw.norm(dim=-1, keepdim=True)
-    direction = raw / norm.clamp_min(1.0e-8)
-    magnitude = torch.tanh(norm) * float(max_norm)
-    return direction * magnitude
+    scale = torch.where(
+        norm < 1.0e-6,
+        torch.ones_like(norm),
+        torch.tanh(norm) / norm.clamp_min(1.0e-6),
+    )
+    return raw * scale * float(max_norm)
 
 
 class _FrozenFeatureExtractor(nn.Module):
