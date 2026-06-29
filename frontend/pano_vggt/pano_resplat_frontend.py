@@ -15,6 +15,10 @@ from .pano_resplat_voxel import VoxelGaussianCompactor
 from .resplat_types import PanoGaussianState, PanoRenderOutput
 
 
+def _unwrap_ddp(module: nn.Module) -> nn.Module:
+    return module.module if hasattr(module, "module") else module
+
+
 class PanoReSplatFrontend(nn.Module):
     """Initializer + recurrent context-feedback Gaussian refinement."""
 
@@ -78,7 +82,8 @@ class PanoReSplatFrontend(nn.Module):
         for _iter_idx in range(max(0, int(num_refine))):
             render_output = self._render_context_views(state, render_poses, tuple(int(x) for x in images.shape[-2:]))
             context_renders.append(render_output)
-            feedback, state_for_update, debug = self.feedback_encoder.refine_state_and_feedback(
+            feedback_encoder = _unwrap_ddp(self.feedback_encoder)
+            feedback, state_for_update, debug = feedback_encoder.refine_state_and_feedback(
                 state,
                 images,
                 render_poses,

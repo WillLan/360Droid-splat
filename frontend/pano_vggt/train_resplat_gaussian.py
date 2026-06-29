@@ -1183,7 +1183,8 @@ def _forward_train(
     for _ in range(int(num_refine)):
         context_render = _render_views(frontend, state, current_context_poses, tuple(int(x) for x in context["images"].shape[-2:]))
         context_renders.append(context_render)
-        feedback, state_for_update, feedback_debug = frontend.feedback_encoder.refine_state_and_feedback(
+        feedback_encoder = _unwrap_module(frontend.feedback_encoder)
+        feedback, state_for_update, feedback_debug = feedback_encoder.refine_state_and_feedback(
             state,
             context["images"],
             current_context_poses,
