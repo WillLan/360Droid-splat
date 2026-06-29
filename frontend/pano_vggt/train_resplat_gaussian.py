@@ -37,6 +37,7 @@ from frontend.pano_vggt.pano_resplat_frontend import PanoReSplatFrontend
 from frontend.pano_vggt.pano_resplat_point_decoder_init import INITIALIZER_TYPE, PanoVGGTPointDecoderGaussianInitializer
 from frontend.pano_vggt.pano_resplat_refiner import PanoGaussianUpdateBlock, PanoGaussianUpdateLimits
 from frontend.pano_vggt.pano_resplat_renderer import PanoGaussianRendererAdapter
+from frontend.pano_vggt.pano_resplat_voxel import VoxelGaussianCompactor
 from frontend.pano_vggt.resplat_types import PanoGaussianState, PanoRenderOutput, state_to_explicit_gaussian_set
 from frontend.pano_vggt.train_gaussian import _build_prior_extractor
 from frontend.pano_vggt.train_matching import _merge_config, matching_collate
@@ -115,6 +116,9 @@ def _default_config() -> dict[str, Any]:
             "group_rotation_deg": 1.0,
             "group_translation": 0.03,
             "group_translation_scale_ratio": 0.005,
+            "enable_pose_residual": False,
+            "pose_rotation_deg": 1.0,
+            "pose_translation": 0.03,
         },
         "Refiner": {
             "hidden_dim": 64,
@@ -140,6 +144,12 @@ def _default_config() -> dict[str, Any]:
                 "min_scale": 1.0e-5,
                 "max_scale": 0.50,
             },
+        },
+        "Compactor": {
+            "enabled": False,
+            "voxel_size": 0.02,
+            "detach_input": True,
+            "inject_anchor_stats": True,
         },
         "Dataset": {
             "synthetic": True,
@@ -381,6 +391,9 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
         group_rotation_deg=float(feedback_cfg.get("group_rotation_deg", 1.0)),
         group_translation=float(feedback_cfg.get("group_translation", 0.03)),
         group_translation_scale_ratio=float(feedback_cfg.get("group_translation_scale_ratio", 0.005)),
+        enable_pose_residual=bool(feedback_cfg.get("enable_pose_residual", False)),
+        pose_rotation_deg=float(feedback_cfg.get("pose_rotation_deg", 1.0)),
+        pose_translation=float(feedback_cfg.get("pose_translation", 0.03)),
     )
     ref_cfg = config.get("Refiner", {})
     limits = PanoGaussianUpdateLimits(**dict(ref_cfg.get("limits", {})))
@@ -412,10 +425,19 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
         soft_sigma_px=float(render_cfg.get("soft_sigma_px", 1.25)),
         soft_max_points=int(render_cfg.get("soft_max_points", 4096)),
     )
+    compactor = None
+    compact_cfg = config.get("Compactor", {})
+    if bool(compact_cfg.get("enabled", False)):
+        compactor = VoxelGaussianCompactor(
+            voxel_size=float(compact_cfg.get("voxel_size", 0.02)),
+            detach_input=bool(compact_cfg.get("detach_input", True)),
+            inject_anchor_stats=bool(compact_cfg.get("inject_anchor_stats", True)),
+        )
     frontend = PanoReSplatFrontend(
         initializer=initializer,
         feedback_encoder=feedback,
         update_block=update,
+        compactor=compactor,
         renderer=renderer,
         renderer_backend=str(render_cfg.get("backend", "soft_splat")),
     )
@@ -911,6 +933,15 @@ def _configured_min_scale(config: dict[str, Any]) -> float | None:
     return None
 
 
+def _compact_state_if_configured(frontend: PanoReSplatFrontend, state: PanoGaussianState) -> tuple[PanoGaussianState, dict[str, torch.Tensor]]:
+    compactor = getattr(frontend, "compactor", None)
+    if compactor is None:
+        return state, {}
+    compact, stats = compactor.compact(state)
+    compactor.last_stats = {key: value.detach() for key, value in stats.items()}
+    return compact, stats
+
+
 def _ssim_dssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_f = pred.reshape(-1, 3, pred.shape[-2], pred.shape[-1])
     target_f = target.reshape(-1, 3, target.shape[-2], target.shape[-1])
@@ -1120,7 +1151,7 @@ def _forward_train(
     image_hw = tuple(int(x) for x in target["images"].shape[-2:])
     if stage == "refine":
         with torch.no_grad():
-            state = frontend.initializer(
+            dense_state = frontend.initializer(
                 context["images"],
                 context["features"],
                 context["depths"],
@@ -1131,7 +1162,7 @@ def _forward_train(
                 token_hw=context.get("token_hw"),
             )
     else:
-        state = frontend.initializer(
+        dense_state = frontend.initializer(
             context["images"],
             context["features"],
             context["depths"],
@@ -1141,30 +1172,41 @@ def _forward_train(
             tokens=context.get("tokens"),
             token_hw=context.get("token_hw"),
         )
+    state, compactor_metrics = _compact_state_if_configured(frontend, dense_state)
     state = _clamp_state_min_scale(state, _configured_min_scale(config))
     states = [state]
     context_renders: list[PanoRenderOutput | None] = []
     update_metrics: list[dict[str, torch.Tensor]] = []
     feedback_metrics: list[dict[str, torch.Tensor]] = []
+    current_context_poses = context["poses_c2w"]
+    context_poses_by_iter = [current_context_poses]
     for _ in range(int(num_refine)):
-        context_render = _render_views(frontend, state, context["poses_c2w"], tuple(int(x) for x in context["images"].shape[-2:]))
+        context_render = _render_views(frontend, state, current_context_poses, tuple(int(x) for x in context["images"].shape[-2:]))
         context_renders.append(context_render)
         feedback, state_for_update, feedback_debug = frontend.feedback_encoder.refine_state_and_feedback(
             state,
             context["images"],
-            context["poses_c2w"],
+            current_context_poses,
             context_render,
             context_depth=context.get("depths"),
             context_valid_mask=context.get("valid_mask"),
         )
+        next_context_poses = feedback_debug.pop("refined_context_poses_c2w", None)
+        if torch.is_tensor(next_context_poses):
+            current_context_poses = next_context_poses
         state_for_update = _clamp_state_min_scale(state_for_update, _configured_min_scale(config))
         state, metrics = frontend.update_block(state_for_update, feedback)
         state = _clamp_state_min_scale(state, _configured_min_scale(config))
         states.append(state)
+        context_poses_by_iter.append(current_context_poses)
         update_metrics.append(metrics)
         feedback_metrics.append(feedback_debug)
-    final_context_render = _render_views(frontend, states[-1], context["poses_c2w"], tuple(int(x) for x in context["images"].shape[-2:]))
-    target_renders = [_render_views(frontend, s, target["poses_c2w"], image_hw) for s in states]
+    final_context_render = _render_views(frontend, states[-1], current_context_poses, tuple(int(x) for x in context["images"].shape[-2:]))
+    target_poses = target["poses_c2w"]
+    if target_poses.ndim == 4 and tuple(target_poses.shape[:2]) == tuple(current_context_poses.shape[:2]):
+        target_renders = [_render_views(frontend, s, pose_i, image_hw) for s, pose_i in zip(states, context_poses_by_iter)]
+    else:
+        target_renders = [_render_views(frontend, s, target_poses, image_hw) for s in states]
     losses, metrics_by_iter = [], []
     for idx, (s, target_render) in enumerate(zip(states, target_renders)):
         context_render_i = final_context_render if idx == len(states) - 1 else (context_renders[idx] if idx < len(context_renders) else None)
@@ -1198,6 +1240,8 @@ def _forward_train(
         metrics["iter_final/loss"] = losses[-1].detach()
         metrics["iter_final/psnr"] = metrics_by_iter[-1]["psnr"]
     metrics.update(_gaussian_stats(states[-1]))
+    for key, value in compactor_metrics.items():
+        metrics[f"compactor/{key}"] = value.detach()
     for idx, update in enumerate(update_metrics):
         for key, value in update.items():
             metrics[f"update{idx}/{key}"] = value.detach()
@@ -1205,9 +1249,12 @@ def _forward_train(
         for key, value in feedback_debug.items():
             metrics[f"feedback{idx}/{key}"] = value.detach() if torch.is_tensor(value) else target_renders[-1].color.new_tensor(float(value))
     artifacts = {
+        "dense_init_state": dense_state,
         "states": states,
         "target_renders": target_renders,
         "context_render": final_context_render,
+        "compactor_metrics": compactor_metrics,
+        "refined_context_poses_c2w": current_context_poses,
     }
     return total, metrics, artifacts
 

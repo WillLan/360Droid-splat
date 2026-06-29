@@ -11,6 +11,7 @@ from .pano_resplat_feedback import PanoRenderFeedbackEncoder
 from .pano_resplat_point_decoder_init import PanoVGGTPointDecoderGaussianInitializer
 from .pano_resplat_refiner import PanoGaussianUpdateBlock
 from .pano_resplat_renderer import PanoGaussianRendererAdapter
+from .pano_resplat_voxel import VoxelGaussianCompactor
 from .resplat_types import PanoGaussianState, PanoRenderOutput
 
 
@@ -23,12 +24,14 @@ class PanoReSplatFrontend(nn.Module):
         initializer: PanoVGGTPointDecoderGaussianInitializer | None = None,
         feedback_encoder: PanoRenderFeedbackEncoder | None = None,
         update_block: PanoGaussianUpdateBlock | None = None,
+        compactor: VoxelGaussianCompactor | None = None,
         renderer: PanoGaussianRendererAdapter | None = None,
         renderer_backend: str = "soft_splat",
     ) -> None:
         super().__init__()
         self.initializer = initializer or PanoVGGTPointDecoderGaussianInitializer()
         self.feedback_encoder = feedback_encoder or PanoRenderFeedbackEncoder()
+        self.compactor = compactor
         latent_dim = int(getattr(self.initializer, "state_dim", 64))
         sh_dim = int(getattr(self.initializer, "sh_dim", 1))
         feedback_dim = int(getattr(self.feedback_encoder, "feedback_dim", 32))
@@ -53,9 +56,10 @@ class PanoReSplatFrontend(nn.Module):
         features = context["features"]
         depths = context["depths"]
         poses = context["poses_c2w"]
+        render_poses = poses
         valid_mask = context.get("valid_mask", context.get("valid_depth"))
         world_points = context.get("world_points")
-        state = self.initializer(
+        dense_state = self.initializer(
             images,
             features,
             depths,
@@ -65,41 +69,64 @@ class PanoReSplatFrontend(nn.Module):
             tokens=context.get("tokens"),
             token_hw=context.get("token_hw"),
         )
+        state = self._compact_init_state(dense_state)
         states: list[PanoGaussianState] = [state]
+        poses_by_iter: list[torch.Tensor] = [render_poses]
         context_renders: list[PanoRenderOutput] = []
         feedback_debug: list[dict[str, torch.Tensor]] = []
         update_metrics: list[dict[str, torch.Tensor]] = []
         for _iter_idx in range(max(0, int(num_refine))):
-            render_output = self._render_context_views(state, poses, tuple(int(x) for x in images.shape[-2:]))
+            render_output = self._render_context_views(state, render_poses, tuple(int(x) for x in images.shape[-2:]))
             context_renders.append(render_output)
             feedback, state_for_update, debug = self.feedback_encoder.refine_state_and_feedback(
                 state,
                 images,
-                poses,
+                render_poses,
                 render_output,
                 context_depth=depths,
                 context_valid_mask=valid_mask,
             )
+            next_render_poses = debug.pop("refined_context_poses_c2w", None)
+            if torch.is_tensor(next_render_poses):
+                render_poses = next_render_poses
             state, metrics = self.update_block(state_for_update, feedback)
             states.append(state)
+            poses_by_iter.append(render_poses)
             feedback_debug.append(debug)
             update_metrics.append(metrics)
 
         target_render = None
         if target is not None and "poses_c2w" in target:
-            target_render = self._render_target_views(state, target["poses_c2w"], target, tuple(int(x) for x in images.shape[-2:]))
+            target_poses = target["poses_c2w"]
+            if target_poses.ndim == 4 and tuple(target_poses.shape[:2]) == tuple(render_poses.shape[:2]):
+                target_poses = poses_by_iter[-1]
+            target_render = self._render_target_views(state, target_poses, target, tuple(int(x) for x in images.shape[-2:]))
 
         result: dict[str, Any] = {
             "init_state": states[0],
+            "dense_init_state": dense_state,
             "final_state": state,
             "target_render": target_render,
             "context_renders": context_renders,
             "feedback_debug": feedback_debug,
             "update_metrics": update_metrics,
+            "compactor_debug": self._compactor_debug(),
+            "refined_context_poses_c2w": render_poses,
+            "context_poses_by_iter": poses_by_iter,
         }
         if return_all:
             result["states"] = states
         return result
+
+    def _compact_init_state(self, state: PanoGaussianState) -> PanoGaussianState:
+        if self.compactor is None:
+            return state
+        return self.compactor(state)
+
+    def _compactor_debug(self) -> dict[str, torch.Tensor]:
+        if self.compactor is None:
+            return {}
+        return dict(getattr(self.compactor, "last_stats", {}))
 
     def _render_context_views(
         self,

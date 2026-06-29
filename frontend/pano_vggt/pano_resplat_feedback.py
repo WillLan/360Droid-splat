@@ -69,6 +69,13 @@ def _axis_angle_to_matrix(rotvec: torch.Tensor) -> torch.Tensor:
     return eye + a[..., None] * k + b[..., None] * (k @ k)
 
 
+def _bounded_vector(raw: torch.Tensor, max_norm: float) -> torch.Tensor:
+    norm = raw.norm(dim=-1, keepdim=True)
+    direction = raw / norm.clamp_min(1.0e-8)
+    magnitude = torch.tanh(norm) * float(max_norm)
+    return direction * magnitude
+
+
 class _FrozenFeatureExtractor(nn.Module):
     """Frozen image feature extractor used for ReSplat-style render error."""
 
@@ -274,6 +281,46 @@ class PanoSourceGroupPoseUpdateHead(nn.Module):
         return out, metrics
 
 
+class PanoViewPoseResidualHead(nn.Module):
+    """Predict bounded per-context-view pose residuals for refinement renders."""
+
+    def __init__(self, channels: int, hidden_dim: int = 128, *, max_rotation_deg: float = 1.0, max_translation: float = 0.03) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.max_rotation_rad = math.radians(float(max_rotation_deg))
+        self.max_translation = float(max_translation)
+        self.net = nn.Sequential(
+            nn.LayerNorm(self.channels),
+            nn.Linear(self.channels, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), 6),
+        )
+        last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, source_tokens: torch.Tensor, poses_c2w: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if source_tokens.ndim != 3:
+            raise ValueError(f"source_tokens must have shape BxVxC, got {tuple(source_tokens.shape)}")
+        if poses_c2w.ndim != 4 or tuple(poses_c2w.shape[:2]) != tuple(source_tokens.shape[:2]) or tuple(poses_c2w.shape[-2:]) != (4, 4):
+            raise ValueError("poses_c2w must have shape BxVx4x4 and share B,V with source_tokens")
+        raw = self.net(source_tokens)
+        rot = _bounded_vector(raw[..., :3], float(self.max_rotation_rad))
+        trans = _bounded_vector(raw[..., 3:6], float(self.max_translation))
+        delta = torch.eye(4, device=poses_c2w.device, dtype=poses_c2w.dtype).view(1, 1, 4, 4).repeat(
+            int(poses_c2w.shape[0]), int(poses_c2w.shape[1]), 1, 1
+        )
+        delta[..., :3, :3] = _axis_angle_to_matrix(rot.to(device=poses_c2w.device, dtype=poses_c2w.dtype))
+        delta[..., :3, 3] = trans.to(device=poses_c2w.device, dtype=poses_c2w.dtype)
+        refined = poses_c2w @ delta
+        metrics = {
+            "pose_rot_deg_abs": rot.norm(dim=-1).mean().detach() * (180.0 / math.pi),
+            "pose_trans_norm": trans.norm(dim=-1).mean().detach(),
+        }
+        return _finite(refined), metrics
+
+
 class PanoRenderFeedbackEncoder(nn.Module):
     """Encode per-Gaussian feedback from context-only render residuals."""
 
@@ -292,6 +339,9 @@ class PanoRenderFeedbackEncoder(nn.Module):
         group_rotation_deg: float = 1.0,
         group_translation: float = 0.03,
         group_translation_scale_ratio: float = 0.005,
+        enable_pose_residual: bool = False,
+        pose_rotation_deg: float = 1.0,
+        pose_translation: float = 0.03,
     ) -> None:
         super().__init__()
         self.feedback_dim = int(feedback_dim)
@@ -299,6 +349,7 @@ class PanoRenderFeedbackEncoder(nn.Module):
         self.feedback_type = str(feedback_type).lower()
         self.error_dim = int(error_dim)
         self.enable_group_correction = bool(enable_group_correction)
+        self.enable_pose_residual = bool(enable_pose_residual)
         self.legacy_input_dim = 14
         self.encoder = nn.Sequential(
             nn.Linear(self.legacy_input_dim, self.hidden_dim),
@@ -331,6 +382,12 @@ class PanoRenderFeedbackEncoder(nn.Module):
             max_rotation_deg=group_rotation_deg,
             max_translation=group_translation,
             translation_scale_ratio=group_translation_scale_ratio,
+        )
+        self.pose_head = PanoViewPoseResidualHead(
+            self.error_dim,
+            hidden_dim=max(self.hidden_dim, self.error_dim),
+            max_rotation_deg=pose_rotation_deg,
+            max_translation=pose_translation,
         )
 
     def forward(
@@ -429,6 +486,13 @@ class PanoRenderFeedbackEncoder(nn.Module):
         group_metrics: dict[str, torch.Tensor] = {}
         if self.enable_group_correction and apply_group_correction:
             corrected_state, group_metrics = self.group_head(state, source_tokens, context_poses_c2w)
+        pose_metrics: dict[str, torch.Tensor] = {}
+        refined_context_poses = None
+        if self.enable_pose_residual:
+            refined_context_poses, pose_metrics = self.pose_head(
+                source_tokens,
+                context_poses_c2w.to(device=decoded.device, dtype=decoded.dtype),
+            )
         debug = {
             "mean_abs_residual": rgb_error.abs().mean().detach(),
             "feature_error_norm": feat_error.detach().norm(dim=1).mean(),
@@ -437,7 +501,10 @@ class PanoRenderFeedbackEncoder(nn.Module):
             "projected_feedback_norm": projected_feedback.detach().norm(dim=-1).mean(),
             "projected_valid_ratio": projected_valid_ratio.detach().mean(),
             **group_metrics,
+            **pose_metrics,
         }
+        if refined_context_poses is not None:
+            debug["refined_context_poses_c2w"] = refined_context_poses
         return _finite(feedback), corrected_state, debug
 
     def _legacy_feedback(
