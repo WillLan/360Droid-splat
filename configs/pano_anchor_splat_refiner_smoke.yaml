@@ -1,0 +1,54 @@
+Training:
+  steps: 2
+  batch_size: 1
+  frames_per_sample: 4
+  input_frames: 3
+  target_frame: last
+  num_refine: 1
+  grad_accum_steps: 1
+  num_workers: 0
+  output_dir: outputs/pano_anchor_splat/refiner_smoke
+
+Model:
+  use_synthetic_features: true
+  feature_dim: 8
+  feature_stride: 4
+
+PanoAnchorSplat:
+  enabled: true
+  sh_degree: 2
+  min_sh_degree: 2
+  gaussians_per_anchor: 2
+  max_anchors: 24
+  max_gaussians: 48
+  anchor_dim: 32
+  decoder_dim: 32
+  decoder_depth: 1
+  decoder_heads: 4
+  refiner_dim: 32
+  error_dim: 16
+  error_transformer_depth: 1
+  point_transformer_depth: 1
+  dtype: bf16
+  batch_size_per_gpu: 1
+  grad_accum_steps: 1
+  decoder_chunk_size: 16
+  num_global_tokens: 2
+  raw_feature_bins: 16
+
+Dataset:
+  synthetic: true
+  synthetic_length: 2
+  height: 12
+  width: 24
+  depth_format: euclidean_range
+  pose_coordinate_system: ue_airsim
+
+Renderer:
+  backend: soft_splat
+  allow_soft_splat_fallback: true
+  soft_max_points: 48
+
+WeightsAndBiases:
+  enabled: false
+  mode: disabled
