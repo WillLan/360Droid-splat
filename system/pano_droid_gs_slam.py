@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 
 from backend.pano_gs import NeuralScaffoldPanoMap, PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.adapter import build_frontend_from_config
-from frontend.pano_droid.dataset import discover_erp_images, load_erp_image
+from frontend.pano_droid.dataset import discover_erp_images, discover_ob3d_images, load_erp_image, load_ob3d_camera_c2w
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_droid.spherical_ba import se3_exp, skew
@@ -132,19 +132,29 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
     root = ds_cfg.get("dataset_path")
     if root is None:
         raise ValueError("Dataset.dataset_path is required unless Dataset.synthetic=true.")
-    files = discover_erp_images(root, sequence=ds_cfg.get("sequence"))
+    dataset_type = str(ds_cfg.get("type", ds_cfg.get("dataset_type", "")) or "").lower()
+    if dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"}:
+        files = discover_ob3d_images(
+            root,
+            scene=ds_cfg.get("scene", ds_cfg.get("sequence")),
+            split=str(ds_cfg.get("split", "Egocentric")),
+        )
+    else:
+        files = discover_erp_images(root, sequence=ds_cfg.get("sequence"))
     begin = int(ds_cfg.get("begin", 0))
     end = ds_cfg.get("end")
     files = files[begin:end]
     h = ds_cfg.get("erp_resize_height")
     w = ds_cfg.get("erp_resize_width")
     resize = (int(h), int(w)) if h is not None and w is not None else None
-    gt_poses = _load_panocity_gt_poses(root)
+    gt_poses = {} if dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"} else _load_panocity_gt_poses(root)
     for local_idx, path in enumerate(files):
         frame_id = begin + local_idx
         gt = gt_poses.get(str(Path(path).resolve()))
         if gt is None:
             gt = gt_poses.get(Path(path).name)
+        if gt is None and dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"}:
+            gt = load_ob3d_camera_c2w(path)
         meta = {"path": path}
         if gt is not None:
             meta["gt_c2w"] = torch.from_numpy(gt).float()
@@ -1776,6 +1786,17 @@ class PanoDroidGSSlamSystem:
         feedforward_window_enabled = bool(feedforward_cfg.get("enabled", False)) or bool(
             backend_cfg.get("optimize_after_every_chunk", False)
         )
+        frontend_mode = str(self.config.get("Frontend", {}).get("mode", "") or "").lower()
+        resplat_fusion_cfg = self.config.get("ReSplatFusion", {})
+        resplat_fusion_cfg = resplat_fusion_cfg if isinstance(resplat_fusion_cfg, dict) else {}
+        resplat_direct_fusion_enabled = bool(resplat_fusion_cfg.get("enabled", False)) and frontend_mode in {
+            "pano_resplat_online",
+            "panoresplat_online",
+            "resplat_online",
+        }
+        resplat_global_cfg = backend_cfg.get("ReSplatGlobal", {}) if isinstance(backend_cfg, dict) else {}
+        resplat_global_cfg = resplat_global_cfg if isinstance(resplat_global_cfg, dict) else {}
+        resplat_global_iters = int(resplat_global_cfg.get("iters", 20))
         non_keyframe_steps = int(backend_cfg.get("non_keyframe_steps", 0))
         pano_cfg = self.config.get("PanoVGGT", {})
         keyframe_anchor_cfg = pano_cfg.get("KeyframeAnchor", {}) if isinstance(pano_cfg, dict) else {}
@@ -1802,6 +1823,7 @@ class PanoDroidGSSlamSystem:
         chunk_keyframe_anchor_frame_id: int | None = None
         frame_count = 0
         keyframes = 0
+        resplat_fusion_count = 0
         last_status = None
         frontend_sky_required = str(mapping_cfg.get("sky_mask_source", "heuristic") or "heuristic").lower() in {
             "panovggt",
@@ -2262,6 +2284,8 @@ class PanoDroidGSSlamSystem:
         def optimize_feedforward_after_batch(outputs: list[FrontendOutput]) -> None:
             nonlocal backend_feedback_decision_count, backend_feedback_applied_count, last_feedforward_metrics
             nonlocal last_optimized_frontend_chunk
+            if resplat_direct_fusion_enabled:
+                return
             if not feedforward_window_enabled or not outputs:
                 return
             chunk_index = current_frontend_chunk_index()
@@ -2334,6 +2358,65 @@ class PanoDroidGSSlamSystem:
                 },
             )
 
+        def drain_resplat_artifacts() -> None:
+            nonlocal last_feedforward_metrics, resplat_fusion_count, keyframes
+            if not resplat_direct_fusion_enabled:
+                return
+            consume = getattr(self.frontend, "consume_resplat_artifacts", None)
+            if not callable(consume):
+                return
+            artifacts = consume()
+            for artifact in artifacts:
+                frame_ids = [int(fid) for fid in getattr(artifact, "frame_ids", ())]
+                window_id = int(getattr(artifact, "window_id", resplat_fusion_count))
+                state = getattr(artifact, "final_state", None)
+                if state is None or not frame_ids:
+                    continue
+                section_start = time.perf_counter()
+                fusion_stats = self.mapper.fuse_resplat_state(
+                    state,
+                    frame_ids=frame_ids,
+                    config=resplat_fusion_cfg,
+                    window_id=window_id,
+                )
+                fusion_sec = float(time.perf_counter() - section_start)
+                section_start = time.perf_counter()
+                metrics = self.mapper.optimize_resplat_global_window(
+                    frame_ids=frame_ids,
+                    iters=resplat_global_iters,
+                )
+                optimize_sec = float(time.perf_counter() - section_start)
+                last_feedforward_metrics = dict(metrics)
+                resplat_fusion_count += 1
+                keyframes = int(getattr(self.mapper.stats, "n_keyframes", keyframes))
+                step = max(1, int(logger._step) + 1)
+                logger._log_wandb_payload(
+                    {
+                        "backend/resplat_window_id": int(window_id),
+                        "backend/resplat_fused": int(fusion_stats.get("fused", 0)),
+                        "backend/resplat_inserted": int(fusion_stats.get("inserted", 0)),
+                        "backend/resplat_skipped": int(fusion_stats.get("skipped", 0)),
+                        "backend/resplat_global_steps": float(metrics.get("steps", 0.0)),
+                        "backend/resplat_global_loss": float(metrics.get("loss", 0.0)),
+                    },
+                    step=step,
+                )
+                write_profile(
+                    "backend_resplat_direct_fusion",
+                    window_id=float(window_id),
+                    frame_count=float(len(frame_ids)),
+                    frame_start=float(frame_ids[0]),
+                    frame_end=float(frame_ids[-1]),
+                    fused=float(fusion_stats.get("fused", 0)),
+                    inserted=float(fusion_stats.get("inserted", 0)),
+                    skipped=float(fusion_stats.get("skipped", 0)),
+                    anchors_after=float(fusion_stats.get("anchors_after", self.map.anchor_count())),
+                    optimize_steps=float(metrics.get("steps", 0.0)),
+                    optimize_loss=float(metrics.get("loss", 0.0)),
+                    fusion_sec=fusion_sec,
+                    optimize_sec=optimize_sec,
+                )
+
         def process_output(out) -> None:
             nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
             nonlocal last_profiled_frontend_chunk
@@ -2351,6 +2434,13 @@ class PanoDroidGSSlamSystem:
                 output_profile["total_sec"] = float(time.perf_counter() - process_start)
                 write_profile("process_output", **output_profile)
                 return
+            backend_image = source_frame.image
+            if resplat_direct_fusion_enabled:
+                image_for_frame = getattr(self.frontend, "image_for_frame", None)
+                cached_image = image_for_frame(int(out.frame_id)) if callable(image_for_frame) else None
+                if torch.is_tensor(cached_image):
+                    backend_image = cached_image
+                    output_profile["resplat_backend_image_override"] = 1
             frontend_is_keyframe = bool(out.is_keyframe)
             effective_is_keyframe = backend_effective_keyframe_flag(out)
             output_profile["frontend_is_keyframe"] = int(frontend_is_keyframe)
@@ -2361,13 +2451,13 @@ class PanoDroidGSSlamSystem:
             if effective_is_keyframe != frontend_is_keyframe:
                 out = replace(out, is_keyframe=bool(effective_is_keyframe))
             output_profile["is_keyframe"] = int(bool(out.is_keyframe))
-            sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), source_frame.image)
-            remember_final_frame(out, source_frame, sky_mask)
-            if feedforward_window_enabled and out.inverse_depth is not None:
+            sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), backend_image)
+            remember_final_frame(out, replace(source_frame, image=backend_image), sky_mask)
+            if (feedforward_window_enabled or resplat_direct_fusion_enabled) and out.inverse_depth is not None:
                 section_start = time.perf_counter()
                 self.mapper.register_observation(
                     out,
-                    source_frame.image,
+                    backend_image,
                     is_keyframe=bool(out.is_keyframe),
                     sky_mask=sky_mask,
                 )
@@ -2389,7 +2479,11 @@ class PanoDroidGSSlamSystem:
             backend_loss = None
             keyframe_opt_diagnostic = None
             neural_anchor_mode = str(getattr(self.map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
-            if out.is_keyframe and (out.inverse_depth is not None or (neural_anchor_mode and out.world_points is not None)):
+            if (
+                not resplat_direct_fusion_enabled
+                and out.is_keyframe
+                and (out.inverse_depth is not None or (neural_anchor_mode and out.world_points is not None))
+            ):
                 section_start = time.perf_counter()
                 first_chunk_multiframe_used = False
                 if neural_anchor_mode:
@@ -2694,6 +2788,7 @@ class PanoDroidGSSlamSystem:
                 self.mapper.uses_joint_optimization
                 and non_keyframe_steps > 0
                 and not feedforward_window_enabled
+                and not resplat_direct_fusion_enabled
             ):
                 section_start = time.perf_counter()
                 metrics = self.mapper.optimize_frame_observation(
@@ -2931,6 +3026,7 @@ class PanoDroidGSSlamSystem:
                 pop_ready_sec = float(time.perf_counter() - section_start)
                 for ready in outputs:
                     process_output(ready)
+                drain_resplat_artifacts()
                 for ready in outputs:
                     frame_cache.pop(int(ready.frame_id), None)
                 optimize_feedforward_after_batch(outputs)
@@ -2953,6 +3049,7 @@ class PanoDroidGSSlamSystem:
                     flushed += 1
                     flushed_outputs.append(ready)
                     process_output(ready)
+                drain_resplat_artifacts()
                 for ready in flushed_outputs:
                     frame_cache.pop(int(ready.frame_id), None)
                 optimize_feedforward_after_batch(flushed_outputs)
@@ -3013,6 +3110,10 @@ class PanoDroidGSSlamSystem:
                 "backend_last_replace_fused_existing": self.mapper.stats.last_replace_fused_existing,
                 "backend_last_replace_fused_new_duplicate": self.mapper.stats.last_replace_fused_new_duplicate,
                 "backend_last_replace_newly_inserted": self.mapper.stats.last_replace_newly_inserted,
+                "backend_resplat_fusion_count": int(resplat_fusion_count),
+                "backend_last_resplat_fused": self.mapper.stats.last_resplat_fused,
+                "backend_last_resplat_inserted": self.mapper.stats.last_resplat_inserted,
+                "backend_last_resplat_skipped": self.mapper.stats.last_resplat_skipped,
                 "backend_last_pred_depth_generated_seeds": self.mapper.stats.last_pred_depth_generated_seeds,
                 "backend_last_pred_depth_invalid_pixels": self.mapper.stats.last_pred_depth_invalid_pixels,
                 "backend_last_insert_mask_pixels": self.mapper.stats.last_insert_mask_pixels,

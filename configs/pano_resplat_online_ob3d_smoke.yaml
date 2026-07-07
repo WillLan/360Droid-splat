@@ -1,0 +1,113 @@
+Runtime:
+  mode: sync_mvp
+
+Dataset:
+  type: ob3d_pfgs360
+  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D/OB3D
+  scene: sponza
+  split: Egocentric
+  begin: 0
+  end: 8
+  erp_resize_height: 512
+  erp_resize_width: 1024
+
+Frontend:
+  mode: pano_resplat_online
+  keyframe_threshold: 0.0
+  force_keyframe_interval: 1
+
+PanoVGGT:
+  engine: fake
+  image_size: [512, 1024]
+  chunk_size: 4
+  overlap: 0
+  emit_delay: 0
+  align_mode: sim3
+  force_accept_alignment: true
+  require_aligned_world_points: false
+
+PanoReSplatOnline:
+  enabled: true
+  window_size: 4
+  stride: 4
+  image_height: 512
+  image_width: 1024
+  num_refine: 1
+  require_checkpoint: false
+  require_features: false
+  allow_synthetic_features: true
+  synthetic_feature_dim: 16
+  synthetic_feature_stride: 14
+
+PanoReSplat:
+  Initializer:
+    type: panovggt_point_decoder_gaussian
+    state_dim: 32
+    sh_degree: 2
+    patch_size: 14
+    decoder_embed_dim: 96
+    decoder_depth: 1
+    decoder_num_heads: 4
+    init_scale: 0.02
+  Feedback:
+    feedback_dim: 16
+    hidden_dim: 32
+  Refiner:
+    hidden_dim: 32
+    knn: 4
+    num_heads: 4
+    max_knn_points: 256
+  Renderer:
+    backend: soft_splat
+    allow_soft_splat_fallback: true
+    soft_sigma_px: 1.25
+    soft_max_points: 4096
+  Compactor:
+    enabled: true
+    voxel_size: 0.08
+    detach_input: true
+    inject_anchor_stats: true
+
+Renderer:
+  allow_smoke_fallback: true
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Mapping:
+  lr: 0.002
+  sky_mask_enable: false
+  seed_source: world_points_only
+  refine_steps_per_keyframe: 0
+
+ReSplatFusion:
+  enabled: true
+  voxel_size: 0.08
+  merge_radius: 0.08
+  min_confidence: 0.05
+  min_opacity: 0.01
+  max_new_gaussians_per_window: 100000
+  max_total_gaussians: 1000000
+
+BackendOptimization:
+  enabled: true
+  sh_degree: 2
+  gaussian_refine_enable: true
+  pose_refine_enable: false
+  gaussian_lr: 0.001
+  ReSplatGlobal:
+    iters: 20
+    gaussian_scope: all
+    pose_refine_enable: false
+
+WeightsAndBiases:
+  enabled: false
+
+Visualization:
+  enabled: true
+
+Results:
+  save_dir: outputs/pano_resplat_online_ob3d_smoke
+  save_final_ply: false
+  save_final_checkpoint: false
+  save_final_all_frame_renders: false

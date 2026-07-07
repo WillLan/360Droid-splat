@@ -42,6 +42,13 @@ def build_frontend_from_config(config: dict) -> PanoDROIDFrontend:
         from frontend.pano_vggt.pano_anchor_splat_frontend import build_pano_anchor_splat_frontend_from_config
 
         return build_pano_anchor_splat_frontend_from_config(config)
+    resplat_online_cfg = config.get("PanoReSplatOnline", {})
+    if mode in {"pano_resplat_online", "panoresplat_online", "resplat_online"} or bool(
+        resplat_online_cfg.get("enabled", False)
+    ):
+        from frontend.pano_vggt.pano_resplat_online_frontend import build_pano_resplat_online_frontend_from_config
+
+        return build_pano_resplat_online_frontend_from_config(config)
     if mode in {"graph", "pano_droid", "pano_droid_graph"}:
         return _build_graph_frontend_from_config(config)
     if mode in {"panovggt_long", "pano_vggt_long", "panovggt"}:

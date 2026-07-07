@@ -331,6 +331,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.pose_by_frame: dict[int, torch.Tensor] = {}
         self.depth_by_frame: dict[int, torch.Tensor] = {}
         self.conf_by_frame: dict[int, torch.Tensor] = {}
+        self.features_by_frame: dict[int, torch.Tensor] = {}
         self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
@@ -783,6 +784,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             self.depth_by_frame[frame_id] = inv_full
             self.conf_by_frame[frame_id] = conf_full
             self.global_points_by_frame[frame_id] = points
+            if pred.dense_descriptors is not None and local_idx < int(pred.dense_descriptors.shape[0]):
+                self.features_by_frame[frame_id] = pred.dense_descriptors[local_idx].detach()
             output_data[frame_id] = (
                 pose,
                 inv_full,
@@ -1879,6 +1882,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             if frame_id in live:
                 continue
             self.global_points_by_frame.pop(frame_id, None)
+            self.features_by_frame.pop(frame_id, None)
 
 
 def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:

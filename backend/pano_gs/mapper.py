@@ -80,6 +80,9 @@ class MapperStats:
     last_neural_insert_accept_sec: float = 0.0
     last_neural_insert_append_sec: float = 0.0
     last_neural_insert_compact_sec: float = 0.0
+    last_resplat_fused: int = 0
+    last_resplat_inserted: int = 0
+    last_resplat_skipped: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -159,6 +162,9 @@ class PanoGaussianMap(nn.Module):
         self._anchor_birth_frame = torch.zeros(0, dtype=torch.int32)
         self._anchor_last_seen_kf = torch.zeros(0, dtype=torch.int32)
         self._anchor_last_update_kf_ord = torch.zeros(0, dtype=torch.int32)
+        self._anchor_source_window_id = torch.zeros(0, dtype=torch.int32)
+        self._anchor_source_frame_start = torch.zeros(0, dtype=torch.int32)
+        self._anchor_source_frame_end = torch.zeros(0, dtype=torch.int32)
         self._anchor_inlier_obs = torch.zeros(0, dtype=torch.int32)
         self._anchor_outlier_obs = torch.zeros(0, dtype=torch.int32)
 
@@ -227,6 +233,21 @@ class PanoGaussianMap(nn.Module):
     def _inv_sigmoid(x: torch.Tensor) -> torch.Tensor:
         x = x.clamp(1e-5, 1.0 - 1e-5)
         return torch.log(x / (1.0 - x))
+
+    @staticmethod
+    def _inverse_softplus_scale(scale: torch.Tensor) -> torch.Tensor:
+        """Convert renderer-space scale to this map's unconstrained parameter."""
+
+        target = (scale.clamp_min(2.0e-5) - 1.0e-5).clamp_min(1.0e-8)
+        return torch.log(torch.expm1(target).clamp_min(1.0e-8))
+
+    @staticmethod
+    def _normalize_quaternion(quaternion: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+        quat = torch.nan_to_num(quaternion, nan=0.0, posinf=0.0, neginf=0.0)
+        identity = torch.zeros_like(quat)
+        identity[..., 0] = 1.0
+        norm = torch.linalg.norm(quat, dim=-1, keepdim=True)
+        return torch.where(norm > float(eps), quat / norm.clamp_min(float(eps)), identity)
 
     @property
     def has_skybox(self) -> bool:
@@ -310,9 +331,321 @@ class PanoGaussianMap(nn.Module):
             [self._anchor_last_update_kf_ord, torch.full((len(seeds),), update_ord, dtype=torch.int32)],
             dim=0,
         )
+        self._anchor_source_window_id = torch.cat(
+            [self._anchor_source_window_id, torch.full((len(seeds),), -1, dtype=torch.int32)],
+            dim=0,
+        )
+        self._anchor_source_frame_start = torch.cat([self._anchor_source_frame_start, frame_ids], dim=0)
+        self._anchor_source_frame_end = torch.cat([self._anchor_source_frame_end, frame_ids], dim=0)
         self._anchor_inlier_obs = torch.cat([self._anchor_inlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         self._anchor_outlier_obs = torch.cat([self._anchor_outlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         return int(xyz.shape[0])
+
+    def add_or_fuse_resplat_gaussians(
+        self,
+        state,
+        *,
+        batch_index: int = 0,
+        frame_ids: list[int] | tuple[int, ...] | None = None,
+        window_id: int | None = None,
+        config: dict | None = None,
+    ) -> dict[str, int | float]:
+        """Insert or merge a refined local ``PanoGaussianState`` into the global map.
+
+        ``state`` is intentionally duck-typed to avoid making the backend import
+        the frontend module at import time. Expected tensor shapes follow
+        ``PanoGaussianState``: ``means/log_scales/...`` are ``B x N x ...`` and
+        ``sh_coeffs`` is ``B x N x 3 x SH``.
+        """
+
+        cfg = config if isinstance(config, dict) else {}
+        idx = int(batch_index)
+        if idx < 0 or idx >= int(state.means.shape[0]):
+            raise IndexError(f"batch_index={idx} out of range for state batch {int(state.means.shape[0])}")
+
+        device = self.xyz.device
+        dtype = self.xyz.dtype
+        from backend.pano_gs.adapter import SH_C0
+
+        means = state.means[idx].detach().to(device=device, dtype=dtype)
+        log_scales = state.log_scales[idx].detach().to(device=device, dtype=dtype)
+        rotations = state.rotations_unnorm[idx].detach().to(device=device, dtype=dtype)
+        opacity_logits = state.opacity_logits[idx].detach().to(device=device, dtype=dtype)
+        sh_coeffs = state.sh_coeffs[idx].detach().to(device=device, dtype=dtype)
+        valid_mask = state.valid_mask[idx].detach().to(device=device, dtype=torch.bool).view(-1)
+        confidence_t = getattr(state, "confidence", None)
+        if confidence_t is None:
+            confidence = torch.ones(means.shape[0], device=device, dtype=dtype)
+        else:
+            confidence = confidence_t[idx].detach().to(device=device, dtype=dtype).view(-1).clamp(0.0, 1.0)
+
+        target_sh_dim = int(self.sh_rest.shape[1]) + 1
+        target_sh_dim = max(1, target_sh_dim)
+        incoming_sh_dim = int(sh_coeffs.shape[-1])
+        if incoming_sh_dim != target_sh_dim:
+            padded = torch.zeros(
+                int(sh_coeffs.shape[0]),
+                3,
+                target_sh_dim,
+                device=device,
+                dtype=dtype,
+            )
+            copy_dim = min(incoming_sh_dim, target_sh_dim)
+            padded[..., :copy_dim] = sh_coeffs[..., :copy_dim]
+            sh_coeffs = padded
+
+        scale = torch.exp(torch.nan_to_num(log_scales, nan=-8.0, posinf=2.0, neginf=-8.0))
+        scale = scale.clamp(
+            min=float(cfg.get("min_scale", 1.0e-5)),
+            max=float(cfg.get("max_scale", 1.0)),
+        )
+        opacity_logits = torch.nan_to_num(opacity_logits, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-20.0, 20.0)
+        opacity_prob = torch.sigmoid(opacity_logits).view(-1)
+        finite = (
+            torch.isfinite(means).all(dim=-1)
+            & torch.isfinite(scale).all(dim=-1)
+            & torch.isfinite(rotations).all(dim=-1)
+            & torch.isfinite(opacity_logits).all(dim=-1)
+            & torch.isfinite(sh_coeffs).all(dim=(-1, -2))
+            & torch.isfinite(confidence)
+        )
+        keep = (
+            valid_mask
+            & finite
+            & (confidence >= float(cfg.get("min_confidence", 0.0)))
+            & (opacity_prob >= float(cfg.get("min_opacity", 0.0)))
+        )
+        requested = int(means.shape[0])
+        if not bool(keep.any()):
+            return {
+                "requested": requested,
+                "valid": 0,
+                "fused": 0,
+                "inserted": 0,
+                "skipped": requested,
+                "anchors_before": self.anchor_count(),
+                "anchors_after": self.anchor_count(),
+            }
+
+        keep_idx = torch.nonzero(keep, as_tuple=False).flatten()
+        weight = (confidence * opacity_prob).clamp_min(1.0e-6)
+        order = keep_idx[torch.argsort(weight[keep_idx].detach(), descending=True)]
+
+        voxel_size = float(cfg.get("voxel_size", cfg.get("merge_radius", 0.12)))
+        voxel_size = max(voxel_size, 1.0e-8)
+        merge_radius = float(cfg.get("merge_radius", voxel_size))
+        max_scale_ratio = max(1.0, float(cfg.get("max_scale_ratio", 8.0)))
+        neighbor_radius = max(0, int(cfg.get("neighbor_radius", 1)))
+        max_new = int(cfg.get("max_new_gaussians_per_window", requested))
+        max_total = int(cfg.get("max_total_gaussians", 0))
+        remaining_total = requested if max_total <= 0 else max(0, max_total - self.anchor_count())
+        insert_budget = max(0, min(max_new, remaining_total))
+        last_frame = int(frame_ids[-1]) if frame_ids else int(window_id or 0)
+        first_frame = int(frame_ids[0]) if frame_ids else last_frame
+        update_ord = int(window_id) if window_id is not None else last_frame
+
+        old_count = self.anchor_count()
+        xyz = self.xyz.detach().clone()
+        rot = self.get_rotation.detach().clone()
+        scale_actual = self.get_scaling.detach().clone()
+        opacity = self.get_opacity.detach().clone()
+        old_sh = self.get_sh_coefficients.detach().permute(0, 2, 1).contiguous()
+        if int(old_sh.shape[-1]) != target_sh_dim:
+            resized = torch.zeros(old_count, 3, target_sh_dim, device=device, dtype=dtype)
+            copy_dim = min(int(old_sh.shape[-1]), target_sh_dim)
+            if copy_dim > 0:
+                resized[..., :copy_dim] = old_sh[..., :copy_dim]
+            old_sh = resized
+
+        meta_level = self._anchor_level.detach().clone()
+        meta_voxel = self._anchor_voxel_size.detach().clone()
+        meta_grid = self._anchor_grid_coord.detach().clone()
+        meta_obs = self._anchor_obs_count.detach().clone()
+        meta_conf = self._anchor_conf_accum.detach().clone()
+        meta_birth = self._anchor_birth_frame.detach().clone()
+        meta_seen = self._anchor_last_seen_kf.detach().clone()
+        meta_update = self._anchor_last_update_kf_ord.detach().clone()
+        meta_window = self._anchor_source_window_id.detach().clone()
+        meta_frame_start = self._anchor_source_frame_start.detach().clone()
+        meta_frame_end = self._anchor_source_frame_end.detach().clone()
+        meta_inlier = self._anchor_inlier_obs.detach().clone()
+        meta_outlier = self._anchor_outlier_obs.detach().clone()
+
+        def key_for_point(point: torch.Tensor) -> tuple[int, int, int]:
+            grid = torch.floor(point.detach().cpu().float() / voxel_size).to(torch.int64)
+            return (int(grid[0].item()), int(grid[1].item()), int(grid[2].item()))
+
+        occupied: dict[tuple[int, int, int], list[int]] = {}
+        for row in range(old_count):
+            key = key_for_point(xyz[row])
+            occupied.setdefault(key, []).append(row)
+
+        insert_xyz: list[torch.Tensor] = []
+        insert_rot: list[torch.Tensor] = []
+        insert_scale: list[torch.Tensor] = []
+        insert_opacity: list[torch.Tensor] = []
+        insert_sh: list[torch.Tensor] = []
+        insert_grid: list[tuple[int, int, int]] = []
+        insert_conf: list[float] = []
+        insert_weight: list[float] = []
+        insert_obs: list[int] = []
+        fused = 0
+        inserted = 0
+        skipped_budget = 0
+
+        def params_for_index(global_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if global_idx < old_count:
+                return xyz[global_idx], scale_actual[global_idx], opacity[global_idx], old_sh[global_idx]
+            rel = int(global_idx) - old_count
+            return insert_xyz[rel], insert_scale[rel], insert_opacity[rel], insert_sh[rel]
+
+        def assign_existing(global_idx: int, new_xyz: torch.Tensor, new_scale: torch.Tensor, new_rot: torch.Tensor, new_opacity: torch.Tensor, new_sh: torch.Tensor, alpha: float) -> None:
+            a = float(alpha)
+            if global_idx < old_count:
+                old_r = rot[global_idx]
+                if torch.sum(old_r * new_rot) < 0:
+                    new_rot = -new_rot
+                xyz[global_idx] = (1.0 - a) * xyz[global_idx] + a * new_xyz
+                log_s = (1.0 - a) * scale_actual[global_idx].clamp_min(1.0e-8).log() + a * new_scale.clamp_min(1.0e-8).log()
+                scale_actual[global_idx] = torch.exp(log_s).clamp_min(1.0e-5)
+                rot[global_idx] = self._normalize_quaternion((1.0 - a) * old_r + a * new_rot)
+                opacity[global_idx] = ((1.0 - a) * opacity[global_idx] + a * new_opacity).clamp(1.0e-5, 1.0 - 1.0e-5)
+                old_sh[global_idx] = (1.0 - a) * old_sh[global_idx] + a * new_sh
+            else:
+                rel = int(global_idx) - old_count
+                old_r = insert_rot[rel]
+                if torch.sum(old_r * new_rot) < 0:
+                    new_rot = -new_rot
+                insert_xyz[rel] = (1.0 - a) * insert_xyz[rel] + a * new_xyz
+                log_s = (1.0 - a) * insert_scale[rel].clamp_min(1.0e-8).log() + a * new_scale.clamp_min(1.0e-8).log()
+                insert_scale[rel] = torch.exp(log_s).clamp_min(1.0e-5)
+                insert_rot[rel] = self._normalize_quaternion((1.0 - a) * old_r + a * new_rot)
+                insert_opacity[rel] = ((1.0 - a) * insert_opacity[rel] + a * new_opacity).clamp(1.0e-5, 1.0 - 1.0e-5)
+                insert_sh[rel] = (1.0 - a) * insert_sh[rel] + a * new_sh
+
+        for src_idx in order.tolist():
+            mean_i = torch.nan_to_num(means[src_idx], nan=0.0, posinf=0.0, neginf=0.0)
+            scale_i = scale[src_idx]
+            rot_i = self._normalize_quaternion(rotations[src_idx])
+            opacity_i = opacity_prob[src_idx].view(1).clamp(1.0e-5, 1.0 - 1.0e-5)
+            sh_i = torch.nan_to_num(sh_coeffs[src_idx], nan=0.0, posinf=0.0, neginf=0.0)
+            key = key_for_point(mean_i)
+            candidates: list[int] = []
+            for dz in range(-neighbor_radius, neighbor_radius + 1):
+                for dy in range(-neighbor_radius, neighbor_radius + 1):
+                    for dx in range(-neighbor_radius, neighbor_radius + 1):
+                        candidates.extend(occupied.get((key[0] + dx, key[1] + dy, key[2] + dz), []))
+            best_idx: int | None = None
+            best_dist = float("inf")
+            for cand in candidates:
+                cand_xyz, cand_scale, _, _ = params_for_index(cand)
+                dist = float(torch.linalg.norm((cand_xyz - mean_i).detach()).cpu())
+                if dist > merge_radius or dist >= best_dist:
+                    continue
+                ratio = torch.maximum(
+                    cand_scale.clamp_min(1.0e-8) / scale_i.clamp_min(1.0e-8),
+                    scale_i.clamp_min(1.0e-8) / cand_scale.clamp_min(1.0e-8),
+                )
+                if float(ratio.max().detach().cpu()) > max_scale_ratio:
+                    continue
+                best_idx = int(cand)
+                best_dist = dist
+            conf_i = float(confidence[src_idx].detach().cpu())
+            weight_i = float(weight[src_idx].detach().cpu())
+            if best_idx is not None:
+                if best_idx < old_count:
+                    old_weight = float(max(1.0e-6, meta_conf[best_idx].item()))
+                    meta_conf[best_idx] = float(meta_conf[best_idx].item()) + weight_i
+                    meta_obs[best_idx] = int(meta_obs[best_idx].item()) + 1
+                    meta_seen[best_idx] = last_frame
+                    meta_update[best_idx] = update_ord
+                    meta_window[best_idx] = update_ord
+                    meta_frame_start[best_idx] = first_frame
+                    meta_frame_end[best_idx] = last_frame
+                else:
+                    rel = best_idx - old_count
+                    old_weight = max(1.0e-6, insert_weight[rel])
+                    insert_weight[rel] += weight_i
+                    insert_conf[rel] += conf_i
+                    insert_obs[rel] += 1
+                alpha = weight_i / max(old_weight + weight_i, 1.0e-6)
+                assign_existing(best_idx, mean_i, scale_i, rot_i, opacity_i, sh_i, alpha)
+                fused += 1
+                continue
+            if inserted >= insert_budget:
+                skipped_budget += 1
+                continue
+            global_idx = old_count + len(insert_xyz)
+            insert_xyz.append(mean_i)
+            insert_scale.append(scale_i)
+            insert_rot.append(rot_i)
+            insert_opacity.append(opacity_i)
+            insert_sh.append(sh_i)
+            insert_grid.append(key)
+            insert_conf.append(conf_i)
+            insert_weight.append(weight_i)
+            insert_obs.append(1)
+            occupied.setdefault(key, []).append(global_idx)
+            inserted += 1
+
+        if insert_xyz:
+            xyz = torch.cat([xyz, torch.stack(insert_xyz, dim=0)], dim=0)
+            rot = torch.cat([rot, torch.stack(insert_rot, dim=0)], dim=0)
+            scale_actual = torch.cat([scale_actual, torch.stack(insert_scale, dim=0)], dim=0)
+            opacity = torch.cat([opacity, torch.stack(insert_opacity, dim=0)], dim=0)
+            old_sh = torch.cat([old_sh, torch.stack(insert_sh, dim=0)], dim=0)
+            n_new = len(insert_xyz)
+            meta_level = torch.cat([meta_level, torch.zeros(n_new, dtype=torch.int8)], dim=0)
+            meta_voxel = torch.cat([meta_voxel, torch.full((n_new,), voxel_size, dtype=torch.float32)], dim=0)
+            meta_grid = torch.cat([meta_grid, torch.tensor(insert_grid, dtype=torch.int32)], dim=0)
+            meta_obs = torch.cat([meta_obs, torch.tensor(insert_obs, dtype=torch.int32)], dim=0)
+            meta_conf = torch.cat([meta_conf, torch.tensor(insert_weight, dtype=torch.float32)], dim=0)
+            meta_birth = torch.cat([meta_birth, torch.full((n_new,), last_frame, dtype=torch.int32)], dim=0)
+            meta_seen = torch.cat([meta_seen, torch.full((n_new,), last_frame, dtype=torch.int32)], dim=0)
+            meta_update = torch.cat([meta_update, torch.full((n_new,), update_ord, dtype=torch.int32)], dim=0)
+            meta_window = torch.cat([meta_window, torch.full((n_new,), update_ord, dtype=torch.int32)], dim=0)
+            meta_frame_start = torch.cat([meta_frame_start, torch.full((n_new,), first_frame, dtype=torch.int32)], dim=0)
+            meta_frame_end = torch.cat([meta_frame_end, torch.full((n_new,), last_frame, dtype=torch.int32)], dim=0)
+            meta_inlier = torch.cat([meta_inlier, torch.zeros(n_new, dtype=torch.int32)], dim=0)
+            meta_outlier = torch.cat([meta_outlier, torch.zeros(n_new, dtype=torch.int32)], dim=0)
+
+        self.xyz = nn.Parameter(xyz)
+        self.rotation = nn.Parameter(rot)
+        self.scaling = nn.Parameter(self._inverse_softplus_scale(scale_actual))
+        self.opacity_logit = nn.Parameter(self._inv_sigmoid(opacity))
+        dc_rgb = (old_sh[..., 0] * SH_C0 + 0.5).clamp(0.0, 1.0)
+        self.features = nn.Parameter(self._inv_sigmoid(dc_rgb))
+        rest_dim = int(self.sh_rest.shape[1])
+        if rest_dim > 0:
+            self.sh_rest = nn.Parameter(old_sh[..., 1 : 1 + rest_dim].permute(0, 2, 1).contiguous())
+        else:
+            self.sh_rest = nn.Parameter(torch.zeros(int(xyz.shape[0]), 0, 3, device=device, dtype=dtype))
+
+        self._anchor_level = meta_level
+        self._anchor_voxel_size = meta_voxel
+        self._anchor_grid_coord = meta_grid
+        self._anchor_obs_count = meta_obs
+        self._anchor_conf_accum = meta_conf
+        self._anchor_birth_frame = meta_birth
+        self._anchor_last_seen_kf = meta_seen
+        self._anchor_last_update_kf_ord = meta_update
+        self._anchor_source_window_id = meta_window
+        self._anchor_source_frame_start = meta_frame_start
+        self._anchor_source_frame_end = meta_frame_end
+        self._anchor_inlier_obs = meta_inlier
+        self._anchor_outlier_obs = meta_outlier
+
+        valid_count = int(keep.sum().detach().cpu())
+        return {
+            "requested": requested,
+            "valid": valid_count,
+            "fused": int(fused),
+            "inserted": int(inserted),
+            "skipped": int(requested - valid_count + skipped_budget),
+            "skipped_budget": int(skipped_budget),
+            "anchors_before": int(old_count),
+            "anchors_after": self.anchor_count(),
+        }
 
     def prune_anchors(self, prune_mask: torch.Tensor) -> int:
         if self.anchor_count() == 0:
@@ -339,6 +672,9 @@ class PanoGaussianMap(nn.Module):
         self._anchor_birth_frame = self._anchor_birth_frame[keep_cpu]
         self._anchor_last_seen_kf = self._anchor_last_seen_kf[keep_cpu]
         self._anchor_last_update_kf_ord = self._anchor_last_update_kf_ord[keep_cpu]
+        self._anchor_source_window_id = self._anchor_source_window_id[keep_cpu]
+        self._anchor_source_frame_start = self._anchor_source_frame_start[keep_cpu]
+        self._anchor_source_frame_end = self._anchor_source_frame_end[keep_cpu]
         self._anchor_inlier_obs = self._anchor_inlier_obs[keep_cpu]
         self._anchor_outlier_obs = self._anchor_outlier_obs[keep_cpu]
         return n_pruned
@@ -851,6 +1187,126 @@ class PanoGaussianMapper:
                 )
             )
         return n
+
+    def fuse_resplat_state(
+        self,
+        state,
+        *,
+        frame_ids: list[int] | tuple[int, ...],
+        config: dict | None = None,
+        window_id: int | None = None,
+    ) -> dict[str, int | float]:
+        """Fuse a local ReSplat ``PanoGaussianState`` directly into the global map."""
+
+        ids = [int(fid) for fid in frame_ids]
+        start = self.map.anchor_count()
+        stats = self.map.add_or_fuse_resplat_gaussians(
+            state,
+            frame_ids=ids,
+            window_id=window_id,
+            config=config,
+        )
+        end = self.map.anchor_count()
+        self.last_inserted_range = (start, end)
+        base_lr = float(self.optimizer.param_groups[0].get("lr", 2e-3)) if self.optimizer.param_groups else 2e-3
+        self.optimizer = self.map.make_optimizer(lr=base_lr)
+
+        for fid in ids:
+            obs = self.observations.get(int(fid))
+            if obs is None:
+                continue
+            device = self.map.get_xyz.device
+            dtype = self.map.get_xyz.dtype
+            self.pose_deltas[int(fid)] = PoseDelta(obs.pose_c2w.to(device=device, dtype=dtype)).to(device=device)
+            obs.is_keyframe = True
+            record = MapperKeyframe(
+                frame_id=int(fid),
+                image=obs.image.detach().cpu().float(),
+                gaussian_start=start,
+                gaussian_end=end,
+                sky_mask=None if obs.sky_mask is None else obs.sky_mask.detach().cpu().bool(),
+                target_depth=None if obs.target_depth is None else obs.target_depth.detach().cpu().float(),
+                depth_confidence=None if obs.depth_confidence is None else obs.depth_confidence.detach().cpu().float(),
+            )
+            self.keyframes = [kf for kf in self.keyframes if int(kf.frame_id) != int(fid)]
+            self.keyframes.append(record)
+        self.keyframes.sort(key=lambda kf: int(kf.frame_id))
+        self.stats.n_keyframes = int(len(self.keyframes))
+        self.stats.n_anchors = self.map.anchor_count()
+        self.stats.last_inserted_anchors = int(stats.get("inserted", 0))
+        self.stats.last_replace_fused = int(stats.get("fused", 0))
+        self.stats.last_replace_newly_inserted = int(stats.get("inserted", 0))
+        self.stats.last_anchor_count_before_insert = int(stats.get("anchors_before", start))
+        self.stats.last_anchor_count_after_insert = int(stats.get("anchors_after", end))
+        self.stats.last_resplat_fused = int(stats.get("fused", 0))
+        self.stats.last_resplat_inserted = int(stats.get("inserted", 0))
+        self.stats.last_resplat_skipped = int(stats.get("skipped", 0))
+        return dict(stats)
+
+    def optimize_resplat_global_window(
+        self,
+        *,
+        frame_ids: list[int] | tuple[int, ...],
+        iters: int = 20,
+    ) -> dict[str, float]:
+        """Run Gaussian-only global refinement after one ReSplat local window."""
+
+        steps = max(0, int(iters))
+        ids = [int(fid) for fid in frame_ids]
+        if steps <= 0 or not ids:
+            return {"loss": 0.0, "steps": 0.0, "resplat_global_steps": 0.0}
+        resplat_cfg = self.optim_cfg.get("ReSplatGlobal", {}) if isinstance(self.optim_cfg, dict) else {}
+        if not isinstance(resplat_cfg, dict):
+            resplat_cfg = {}
+        old_enabled = self.optim_cfg.get("enabled", None)
+        old_pose = self.optim_cfg.get("pose_refine_enable", None)
+        old_ff = self.optim_cfg.get("FeedForwardWindow", None)
+        old_early = self.optim_cfg.get("early_stop", None)
+        old_opt_after_chunk = self.optim_cfg.get("optimize_after_every_chunk", None)
+        ff_cfg = dict(old_ff) if isinstance(old_ff, dict) else {}
+        ff_cfg["enabled"] = True
+        ff_cfg["steps"] = steps
+        ff_cfg["gaussian_scope"] = str(resplat_cfg.get("gaussian_scope", "all"))
+        ff_cfg["optimize_non_keyframe_observations"] = True
+        ff_cfg["random_observation_per_iter"] = bool(resplat_cfg.get("random_observation_per_iter", False))
+        ff_cfg["sample_observations_per_step"] = int(resplat_cfg.get("sample_observations_per_step", len(ids)))
+        self.optim_cfg["enabled"] = True
+        self.optim_cfg["pose_refine_enable"] = bool(resplat_cfg.get("pose_refine_enable", False))
+        self.optim_cfg["optimize_after_every_chunk"] = False
+        self.optim_cfg["FeedForwardWindow"] = ff_cfg
+        self.optim_cfg["early_stop"] = {"enabled": False}
+        try:
+            metrics = self.optimize_feedforward_window(
+                current_frame_ids=ids,
+                history_frame_ids=[],
+                chunk_index=None,
+                active_keyframe_ids=ids,
+            )
+        finally:
+            if old_enabled is None:
+                self.optim_cfg.pop("enabled", None)
+            else:
+                self.optim_cfg["enabled"] = old_enabled
+            if old_pose is None:
+                self.optim_cfg.pop("pose_refine_enable", None)
+            else:
+                self.optim_cfg["pose_refine_enable"] = old_pose
+            if old_ff is None:
+                self.optim_cfg.pop("FeedForwardWindow", None)
+            else:
+                self.optim_cfg["FeedForwardWindow"] = old_ff
+            if old_early is None:
+                self.optim_cfg.pop("early_stop", None)
+            else:
+                self.optim_cfg["early_stop"] = old_early
+            if old_opt_after_chunk is None:
+                self.optim_cfg.pop("optimize_after_every_chunk", None)
+            else:
+                self.optim_cfg["optimize_after_every_chunk"] = old_opt_after_chunk
+        out = dict(metrics)
+        out["resplat_global_steps"] = float(out.get("steps", 0.0))
+        out["resplat_global_configured_steps"] = float(steps)
+        return out
 
     def set_frontend_graph_window_ids(self, frame_ids) -> None:
         ids: list[int] = []

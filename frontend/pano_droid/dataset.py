@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +44,66 @@ def discover_erp_images(root: str, sequence: Optional[str] = None) -> list[str]:
         if files:
             return files
     raise FileNotFoundError(f"No ERP images found under {root}")
+
+
+def _numeric_frame_key(path: str | Path) -> tuple[int, str]:
+    name = Path(path).name
+    match = re.search(r"(\d+)", name)
+    if match is None:
+        return (0, name)
+    return (int(match.group(1)), name)
+
+
+def discover_ob3d_images(root: str, *, scene: str | None = None, split: str = "Egocentric") -> list[str]:
+    """Discover PFGS360 OB3D ERP frames under ``scene/split/images``."""
+
+    root_path = Path(root)
+    candidates: list[Path] = []
+    if scene:
+        candidates.append(root_path / str(scene) / str(split) / "images")
+        candidates.append(root_path / str(scene) / "images")
+    candidates.append(root_path / str(split) / "images")
+    candidates.append(root_path / "images")
+    exts = ("*_rgb.png", "*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG")
+    for folder in candidates:
+        if not folder.is_dir():
+            continue
+        files: list[str] = []
+        for ext in exts:
+            files.extend(glob.glob(str(folder / ext)))
+        files = sorted(dict.fromkeys(files), key=_numeric_frame_key)
+        if files:
+            return files
+    raise FileNotFoundError(f"No OB3D ERP images found under {root} scene={scene!r} split={split!r}")
+
+
+def load_ob3d_camera_c2w(image_path: str | Path) -> np.ndarray | None:
+    """Load the neighboring OB3D camera JSON as a 4x4 pose when present."""
+
+    path = Path(image_path)
+    frame_key = _numeric_frame_key(path)[0]
+    cam_path = path.parent.parent / "cameras" / f"{frame_key:05d}_cam.json"
+    if not cam_path.is_file():
+        return None
+    with open(cam_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, list):
+        if not payload:
+            return None
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        return None
+    extrinsics = payload.get("extrinsics", {})
+    if not isinstance(extrinsics, dict):
+        return None
+    rotation = np.asarray(extrinsics.get("rotation"), dtype=np.float32)
+    translation = np.asarray(extrinsics.get("translation"), dtype=np.float32)
+    if rotation.shape != (3, 3) or translation.shape not in {(3,), (3, 1)}:
+        return None
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = rotation
+    c2w[:3, 3] = translation.reshape(3)
+    return c2w
 
 
 def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
