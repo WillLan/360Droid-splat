@@ -249,7 +249,7 @@ class PanoReSplatOnlineFrontend(PanoDROIDFrontend):
         with torch.no_grad():
             result = self.resplat_frontend(
                 context,
-                target={"poses_c2w": context["poses_c2w"], "images": context["images"]},
+                target=None,
                 num_refine=self.num_refine,
                 return_all=False,
             )
