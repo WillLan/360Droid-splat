@@ -586,6 +586,8 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         skip_dinov2_pretrain: bool = False,
         patch_multiple: int = 14,
         m3_config: M3SphereConfig | None = None,
+        resplat_feature_hook: str | None = None,
+        resplat_feature_key: str | int | None = None,
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.config_path = config_path
@@ -596,6 +598,9 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         self.skip_dinov2_pretrain = bool(skip_dinov2_pretrain)
         self.patch_multiple = int(patch_multiple)
         self.m3_config = m3_config or M3SphereConfig()
+        self.resplat_feature_hook = str(resplat_feature_hook) if resplat_feature_hook else None
+        self.resplat_feature_key = resplat_feature_key
+        self.last_resplat_dense_features: torch.Tensor | None = None
         self.matching_adapter: MatchingSkyAdapter | None = None
         self.last_dense_factor_graph: DenseSphereFactorGraph | None = None
         if repo_path:
@@ -703,6 +708,7 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         self.model.eval()
 
     def infer(self, images: torch.Tensor) -> PanoVGGTLocalPrediction:
+        self.last_resplat_dense_features = None
         images = _resize_images(images.float().to(self.device), self.image_size)
         target_size = tuple(int(v) for v in images.shape[-2:])
         model_size = _ceil_size_to_multiple(target_size, self.patch_multiple)
@@ -724,8 +730,21 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
         pred, self.last_dense_factor_graph = _run_dense_matching_if_enabled(pred, self.m3_config)
         return pred
 
+    def _cache_resplat_feature(self, feature: torch.Tensor | None) -> None:
+        self.last_resplat_dense_features = None if feature is None else feature.detach()
+
     def _call_model_and_maybe_capture_feature(self, model_input: torch.Tensor) -> tuple[Any, torch.Tensor | None]:
         if self.matching_adapter is None:
+            if self.resplat_feature_hook:
+                output, feature = extract_features_with_hook(
+                    self.model,
+                    self.resplat_feature_hook,
+                    lambda: self._call_model(model_input),
+                    patch_size=self.patch_multiple,
+                    feature_key=self.resplat_feature_key,
+                )
+                self._cache_resplat_feature(feature)
+                return output, None
             return self._call_model(model_input), None
         feature_hook = self.matching_adapter.feature_hook
         if feature_hook:
@@ -736,9 +755,12 @@ class ExternalPanoVGGTInferenceEngine(PanoVGGTInferenceEngine):
                 patch_size=self.patch_multiple,
                 feature_key=self.m3_config.matching_head.feature_key,
             )
+            if self.resplat_feature_hook is None or str(self.resplat_feature_hook) == str(feature_hook):
+                self._cache_resplat_feature(feature)
             return output, feature
         explicit = call_forward_with_features(self.model, model_input, patch_size=self.patch_multiple)
         if explicit is not None:
+            self._cache_resplat_feature(explicit[1] if self.resplat_feature_hook else None)
             return explicit
         raise RuntimeError(
             "PanoVGGT MatchingHead is enabled, but no feature_hook was configured or stored in the checkpoint, "
@@ -782,4 +804,6 @@ def build_panovggt_engine(config: dict, *, device: torch.device | str | None = N
         skip_dinov2_pretrain=bool(config.get("skip_dinov2_pretrain", False)),
         patch_multiple=int(config.get("patch_multiple", 14)),
         m3_config=m3_config,
+        resplat_feature_hook=config.get("resplat_feature_hook"),
+        resplat_feature_key=config.get("resplat_feature_key"),
     )

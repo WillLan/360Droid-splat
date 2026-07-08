@@ -13,6 +13,7 @@ class _FakeTracker:
         self.frames: list[PanoFrame] = []
         self.emitted = 0
         self.features_by_frame: dict[int, torch.Tensor] = {}
+        self.resplat_features_by_frame: dict[int, torch.Tensor] = {}
 
     def initialize(self, sequence_meta: dict) -> None:
         self.reset()
@@ -21,6 +22,7 @@ class _FakeTracker:
         self.frames = []
         self.emitted = 0
         self.features_by_frame = {}
+        self.resplat_features_by_frame = {}
 
     def load_checkpoint(self, path: str) -> None:
         return None
@@ -68,9 +70,11 @@ class _FakeReSplat(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(()))
         self.last_context_shape: tuple[int, ...] | None = None
+        self.last_feature_shape: tuple[int, ...] | None = None
 
     def forward(self, context, target=None, *, num_refine: int = 0, return_all: bool = True):
         self.last_context_shape = tuple(int(v) for v in context["images"].shape)
+        self.last_feature_shape = tuple(int(v) for v in context["features"].shape)
         n = 6
         means = context["world_points"][:, :, :1, :n, :].reshape(1, n * 4, 3)[:, :n]
         log_scales = torch.full((1, n, 3), -3.0, device=means.device, dtype=means.dtype)
@@ -121,6 +125,29 @@ def test_pano_resplat_online_emits_one_artifact_per_four_frame_window() -> None:
     assert artifacts[0].frame_ids == (0, 1, 2, 3)
     assert artifacts[0].final_state.num_gaussians == 6
     assert resplat.last_context_shape == (1, 4, 3, 8, 16)
+
+
+def test_pano_resplat_online_prefers_resplat_feature_cache() -> None:
+    tracker = _FakeTracker()
+    resplat = _FakeReSplat()
+    frontend = PanoReSplatOnlineFrontend(
+        tracker=tracker,  # type: ignore[arg-type]
+        resplat_frontend=resplat,  # type: ignore[arg-type]
+        window_size=4,
+        stride=4,
+        image_height=8,
+        image_width=16,
+        require_features=True,
+        allow_synthetic_features=False,
+    )
+
+    for frame_id in range(4):
+        tracker.features_by_frame[frame_id] = torch.zeros(24, 2, 4)
+        tracker.resplat_features_by_frame[frame_id] = torch.ones(2048, 2, 4)
+        frontend.track(PanoFrame(image=torch.rand(3, 8, 16), timestamp=float(frame_id), frame_id=frame_id))
+    frontend.pop_ready_outputs()
+
+    assert resplat.last_feature_shape == (1, 4, 2048, 2, 4)
 
 
 class _FakeSystemFrontend:

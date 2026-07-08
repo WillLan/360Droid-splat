@@ -332,6 +332,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
         self.depth_by_frame: dict[int, torch.Tensor] = {}
         self.conf_by_frame: dict[int, torch.Tensor] = {}
         self.features_by_frame: dict[int, torch.Tensor] = {}
+        self.resplat_features_by_frame: dict[int, torch.Tensor] = {}
         self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
         self.global_points_by_frame: dict[int, torch.Tensor] = {}
         self.backend_pose_overrides: dict[int, torch.Tensor] = {}
@@ -597,6 +598,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             if joint_context.history_count > 0
             else pred_full0
         )
+        resplat_features = getattr(self.engine, "last_resplat_dense_features", None)
         anchor_context = self._joint_anchor_context(joint_context)
         if anchor_context is None:
             anchor_context = self._anchor_context_from_current_chunk(frame_ids)
@@ -786,6 +788,10 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             self.global_points_by_frame[frame_id] = points
             if pred.dense_descriptors is not None and local_idx < int(pred.dense_descriptors.shape[0]):
                 self.features_by_frame[frame_id] = pred.dense_descriptors[local_idx].detach()
+            if torch.is_tensor(resplat_features):
+                feature_idx = int(local_idx) + int(joint_context.history_count)
+                if feature_idx < int(resplat_features.shape[0]):
+                    self.resplat_features_by_frame[frame_id] = resplat_features[feature_idx].detach()
             output_data[frame_id] = (
                 pose,
                 inv_full,
@@ -1883,6 +1889,7 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
                 continue
             self.global_points_by_frame.pop(frame_id, None)
             self.features_by_frame.pop(frame_id, None)
+            self.resplat_features_by_frame.pop(frame_id, None)
 
 
 def build_panovggt_frontend_from_config(config: dict) -> PanoVGGTLongTracker:

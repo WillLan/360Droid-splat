@@ -1,0 +1,216 @@
+Runtime:
+  mode: sync_mvp
+
+Dataset:
+  type: ob3d_pfgs360
+  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D/OB3D
+  scene: barbershop
+  split: Egocentric
+  begin: 0
+  end: null
+  erp_resize_height: 512
+  erp_resize_width: 1024
+
+Frontend:
+  mode: pano_resplat_online
+  checkpoint: null
+  keyframe_threshold: 0.0
+  force_keyframe_interval: 1
+
+PanoVGGT:
+  engine: external
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_geometry/finetune_omni360_256x512_20260623_191432/last_geometry.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+  image_size: [512, 1024]
+  patch_multiple: 14
+  chunk_size: 4
+  overlap: 0
+  emit_delay: 0
+  align_mode: sim3
+  require_aligned_world_points: true
+  emit_unaligned: false
+  min_overlap_points: 2048
+  max_align_rmse: 0.35
+  min_inlier_ratio: 0.35
+  max_scale_jump: 2.0
+  force_accept_alignment: true
+  loop_enable: false
+  max_alignment_points: 4096
+  max_alignment_cache_frames: 32
+  amp: true
+  input_batch_dim: true
+  resplat_feature_hook: aggregator
+  resplat_feature_key: null
+
+  M3Sphere:
+    enabled: true
+    descriptor_dim: 24
+
+  MatchingHead:
+    enabled: true
+    checkpoint: null
+    matching_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_matching_ddp_b2_20k_8f_parallaxfix_dtw_nyc_20260604_1036/checkpoints/matching_head.pt
+    sky_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_sky_ddp_b4_10k_dtw_nyc_20260604_0845/checkpoints/sky_head.pt
+    descriptor_dim: 24
+    feature_hook: aggregator
+    feature_key: null
+    strict: true
+    allow_fake_matching: false
+
+  DenseMatching:
+    enabled: false
+
+  DenseBA:
+    enabled: false
+
+PanoReSplatOnline:
+  enabled: true
+  window_size: 4
+  stride: 4
+  image_height: 512
+  image_width: 1024
+  num_refine: 1
+  checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/pano_resplat/pano_resplat_voxel_anchor_posegrad_lpips512_b1x2_acc2_20260629_190007/best_refine.pt
+  require_checkpoint: true
+  require_features: true
+  allow_synthetic_features: false
+
+PanoReSplat:
+  Initializer:
+    type: panovggt_point_decoder_gaussian
+    state_dim: 64
+    sh_degree: 3
+    patch_size: 14
+    decoder_embed_dim: 1024
+    decoder_depth: 5
+    decoder_num_heads: 16
+    decoder_mlp_ratio: 4.0
+    init_scale: 0.015
+    use_local_offsets: true
+    max_offset_abs: 0.05
+    max_offset_depth_ratio: 0.02
+  Feedback:
+    type: resplat_pano_error_decoder
+    feedback_dim: 64
+    hidden_dim: 128
+    error_dim: 64
+    mv_down_factor: 4
+    mv_attn_blocks: 1
+    mv_num_heads: 4
+    feature_backbone: resnet18
+    enable_group_correction: false
+    enable_pose_residual: true
+    pose_rotation_deg: 1.0
+    pose_translation: 0.03
+  Refiner:
+    hidden_dim: 256
+    knn: 8
+    num_heads: 1
+    attn_proj_channels: 64
+    mlp_ratio: 4.0
+    num_basic_refine_blocks: 4
+    knn_backend: pointops
+    strict_knn_backend: true
+    cache_knn: true
+    detach_feedback: true
+    gradient_checkpoint: true
+    max_knn_points: 0
+    chunk_size: null
+    limits:
+      mean: 0.02
+      log_scale: 0.05
+      rotation: 0.05
+      opacity: 0.25
+      sh: 0.1
+      latent: 0.1
+      min_scale: 0.002
+      max_scale: 0.5
+  Renderer:
+    backend: gsplat360
+    allow_soft_splat_fallback: false
+    extra_gsplat360_roots: []
+  TrainingRender:
+    panorama_render_mode: pfgs360_gsplat
+    pfgs360_render_mode: RGB+ED
+    pfgs360_rasterize_mode: antialiased
+    pfgs360_packed: false
+    pfgs360_near_plane: 0.01
+    pfgs360_far_plane: 100000.0
+    pfgs360_absgrad: true
+    pfgs360_distloss: false
+  Compactor:
+    enabled: true
+    voxel_size: 0.02
+    detach_input: true
+    inject_anchor_stats: true
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Renderer:
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+Mapping:
+  lr: 0.002
+  sky_mask_enable: false
+  seed_source: world_points_only
+  refine_steps_per_keyframe: 0
+
+ReSplatFusion:
+  enabled: true
+  voxel_size: 0.08
+  merge_radius: 0.08
+  min_confidence: 0.05
+  min_opacity: 0.01
+  max_new_gaussians_per_window: 100000
+  max_total_gaussians: 1000000
+
+BackendOptimization:
+  enabled: true
+  sh_degree: 2
+  gaussian_refine_enable: true
+  pose_refine_enable: false
+  gaussian_lr: 0.001
+  ReSplatGlobal:
+    iters: 20
+    gaussian_scope: all
+    pose_refine_enable: false
+
+RuntimeProfiling:
+  enabled: true
+  path: runtime_profile.jsonl
+
+WeightsAndBiases:
+  enabled: false
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  kf_opt_max_width: 1920
+
+Results:
+  save_dir: outputs/pano_resplat_online_ob3d_barbershop_quality_gsplat360_real
+  kf_render_format: png
+  kf_jpeg_quality: 95
+  save_final_ply: false
+  save_final_checkpoint: false
+  save_final_all_frame_renders: true
+  final_all_frames_max_width: 1600

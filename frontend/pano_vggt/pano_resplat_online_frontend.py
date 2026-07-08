@@ -181,10 +181,11 @@ class PanoReSplatOnlineFrontend(PanoDROIDFrontend):
             self._window_cursor += self.stride
 
     def _feature_for_frame(self, frame_id: int, image: torch.Tensor) -> torch.Tensor:
-        feature_cache = getattr(self.tracker, "features_by_frame", {})
-        feature = feature_cache.get(int(frame_id)) if isinstance(feature_cache, dict) else None
-        if torch.is_tensor(feature):
-            return feature.detach().float()
+        for cache_name in ("resplat_features_by_frame", "features_by_frame"):
+            feature_cache = getattr(self.tracker, cache_name, {})
+            feature = feature_cache.get(int(frame_id)) if isinstance(feature_cache, dict) else None
+            if torch.is_tensor(feature):
+                return feature.detach().float()
         if self.require_features and not self.allow_synthetic_features:
             raise RuntimeError(
                 "pano_resplat_online requires PanoVGGT dense features/descriptors. "
