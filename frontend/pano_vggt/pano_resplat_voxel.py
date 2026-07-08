@@ -47,6 +47,7 @@ class VoxelGaussianCompactor(nn.Module):
         self,
         *,
         voxel_size: float = 0.02,
+        max_anchors: int = 0,
         detach_input: bool = True,
         inject_anchor_stats: bool = True,
         eps: float = 1.0e-6,
@@ -55,6 +56,7 @@ class VoxelGaussianCompactor(nn.Module):
         if float(voxel_size) <= 0.0:
             raise ValueError("voxel_size must be positive")
         self.voxel_size = float(voxel_size)
+        self.max_anchors = max(0, int(max_anchors))
         self.detach_input = bool(detach_input)
         self.inject_anchor_stats = bool(inject_anchor_stats)
         self.eps = float(eps)
@@ -167,7 +169,7 @@ class VoxelGaussianCompactor(nn.Module):
             if latent.shape[-1] > 1:
                 latent[:, 1:2] = conf_mean.to(dtype=latent.dtype)
 
-        return {
+        compact = {
             "means": group_mean(state.means[batch_idx]),
             "log_scales": log_scales,
             "rotations_unnorm": rotations_mean,
@@ -181,6 +183,24 @@ class VoxelGaussianCompactor(nn.Module):
             "dense_count": torch.as_tensor(float(dense_count), device=means.device, dtype=means.dtype),
             "voxel_count": counts,
         }
+        return self._cap_anchors(compact)
+
+    def _cap_anchors(self, item: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if self.max_anchors <= 0:
+            return item
+        n = int(item["valid_mask"].numel())
+        if n <= self.max_anchors:
+            return item
+        score = item["confidence"].flatten()
+        _values, order = torch.topk(score, k=int(self.max_anchors), largest=True, sorted=False)
+        order = order.sort().values
+        capped: dict[str, torch.Tensor] = {}
+        for key, value in item.items():
+            if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == n:
+                capped[key] = value.index_select(0, order)
+            else:
+                capped[key] = value
+        return capped
 
     def _empty_one(self, state: PanoGaussianState, batch_idx: int) -> dict[str, torch.Tensor]:
         device = state.means.device

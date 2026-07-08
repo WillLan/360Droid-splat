@@ -430,6 +430,7 @@ def _build_frontend(config: dict[str, Any], *, device: torch.device) -> PanoReSp
     if bool(compact_cfg.get("enabled", False)):
         compactor = VoxelGaussianCompactor(
             voxel_size=float(compact_cfg.get("voxel_size", 0.02)),
+            max_anchors=int(compact_cfg.get("max_anchors", compact_cfg.get("max_gaussians", 0))),
             detach_input=bool(compact_cfg.get("detach_input", True)),
             inject_anchor_stats=bool(compact_cfg.get("inject_anchor_stats", True)),
         )

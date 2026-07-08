@@ -80,6 +80,18 @@ def test_voxel_compactor_detaches_initializer_outputs_by_default():
     assert not compact.means.requires_grad
 
 
+def test_voxel_compactor_caps_anchor_count_by_confidence():
+    state = _dense_state()
+    compactor = VoxelGaussianCompactor(voxel_size=0.02, max_anchors=2, detach_input=True)
+
+    compact, stats = compactor.compact(state)
+
+    assert compact.valid_mask.sum().item() == 2
+    assert compact.means.shape[1] == 2
+    assert stats["anchor_count"].item() == 2.0
+    assert torch.all(compact.confidence[0, compact.valid_mask[0], 0] >= 0.3)
+
+
 def test_voxel_compactor_preserves_quaternion_materialization_and_render_smoke():
     state = _dense_state()
     compact = VoxelGaussianCompactor(voxel_size=0.02)(state)
