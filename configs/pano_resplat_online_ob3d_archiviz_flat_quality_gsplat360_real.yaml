@@ -28,7 +28,7 @@ PanoVGGT:
   image_size: [512, 1024]
   patch_multiple: 14
   chunk_size: 4
-  overlap: 0
+  overlap: 2
   emit_delay: 0
   align_mode: sim3
   require_aligned_world_points: true
@@ -208,7 +208,7 @@ Visualization:
   kf_opt_max_width: 1920
 
 Results:
-  save_dir: outputs/pano_resplat_online_ob3d_archiviz_flat_quality_gsplat360_real_retry3
+  save_dir: outputs/pano_resplat_online_ob3d_archiviz_flat_quality_gsplat360_real_retry4
   kf_render_format: png
   kf_jpeg_quality: 95
   save_final_ply: false
