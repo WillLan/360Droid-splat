@@ -207,7 +207,7 @@ Visualization:
   kf_opt_max_width: 1920
 
 Results:
-  save_dir: outputs/pano_resplat_online_ob3d_barbershop_quality_gsplat360_real
+  save_dir: outputs/pano_resplat_online_ob3d_barbershop_quality_gsplat360_real_retry1
   kf_render_format: png
   kf_jpeg_quality: 95
   save_final_ply: false

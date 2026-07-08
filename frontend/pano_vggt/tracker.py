@@ -599,6 +599,8 @@ class PanoVGGTLongTracker(PanoDROIDFrontend):
             else pred_full0
         )
         resplat_features = getattr(self.engine, "last_resplat_dense_features", None)
+        if torch.is_tensor(resplat_features) and resplat_features.ndim == 5 and int(resplat_features.shape[0]) == 1:
+            resplat_features = resplat_features[0]
         anchor_context = self._joint_anchor_context(joint_context)
         if anchor_context is None:
             anchor_context = self._anchor_context_from_current_chunk(frame_ids)
