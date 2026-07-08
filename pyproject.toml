@@ -24,7 +24,7 @@ dev = ["pytest"]
 legacy360gs = ["opencv-python", "scipy", "plyfile", "pandas", "munch"]
 
 [tool.setuptools.packages.find]
-include = ["frontend*", "mapping*", "backend*", "system*"]
+include = ["frontend*", "mapping*", "backend*", "system*", "geometry*", "models*", "losses*", "data*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
