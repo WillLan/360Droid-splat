@@ -133,17 +133,21 @@ visible = abs(range_pred - range_tgt) / clamp(range_tgt, min=eps)
 
 ## Reprojection / Alignment Error
 
-The Stage 1 training loss main term is spherical geodesic distance, not ERP
-pixel distance:
+The default Stage 1 training loss is full-resolution spherical soft-label CE,
+not ERP pixel distance. The target descriptor map keeps the full adapter output
+resolution, and the target distribution is built from unit-sphere geodesic
+distance:
 
 ```python
-angular = spherical_geodesic_distance(pred_ray, entries["tgt_ray"], eps=self.config.eps)
-spherical = weighted_mean(angular, entries["weight"], self.config.eps)
-loss = spherical + erp_aux_weight * erp_aux
+score_i = dot(f_src, f_tgt_i) / temperature
+P_i = softmax(score_i + log(area_i))
+Q_i = softmax(-geodesic(ray_i, target_ray) ** 2 / (2 * sigma ** 2) + log(area_i))
+loss = CE(Q, P) + expected_geodesic_weight * sum_i P_i * geodesic(ray_i, target_ray)
 ```
 
-`erp_aux` is a seam-aware pixel auxiliary term. It is optional and weighted by
-`erp_aux_weight`; it is not the main reprojection residual.
+The geodesic distance uses the stable great-circle `atan2(||cross||, dot)` form.
+`erp_aux` is a seam-aware pixel diagnostic for predicted argmax matches; it is
+not the main reprojection residual.
 
 The overlap and visualization tools also report angular metrics by converting
 ERP pixels back to unit rays and measuring great-circle distance.

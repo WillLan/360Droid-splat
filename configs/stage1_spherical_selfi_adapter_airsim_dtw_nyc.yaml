@@ -1,6 +1,6 @@
 stage: 1
 task: spherical_selfi_adapter
-experiment_name: stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
+experiment_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
 
 image:
   height: 504
@@ -69,16 +69,20 @@ correspondence:
   visibility_rel_thresh: 0.05
 
 matching:
-  mode: global_lowres
-  loss_stride: 4
+  mode: global_fullres_spherical_ce
+  loss_stride: 1
   local_window_radius: 16
   temperature: 0.07
   max_queries: 512
-  use_spherical_soft_argmax: true
+  soft_label_sigma_deg: 2.0
+  ce_query_chunk_size: 32
+  use_spherical_area_correction: true
+  prediction: argmax
 
 loss:
   spherical_match_weight: 1.0
-  erp_aux_weight: 0.01
+  erp_aux_weight: 0.0
+  expected_geodesic_weight: 0.05
   cycle_weight: 0.0
   seam_weight: 0.05
 
@@ -94,7 +98,7 @@ train:
   save_interval: 5000
   val_interval: 1000
   max_val_batches: 8
-  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
+  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
   grad_clip: 1.0
   seed: 1234
 
@@ -102,7 +106,7 @@ WeightsAndBiases:
   enabled: true
   project: 360Droid-splat
   entity: null
-  run_name: stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
+  run_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
   mode: online
   log_every: 50
   tags:
@@ -112,6 +116,7 @@ WeightsAndBiases:
     - dtw-nyc
     - stable-geodesic
     - fibonacci-depth-filtered
+    - fullres-spherical-ce
 
 Visualization:
   enabled: true

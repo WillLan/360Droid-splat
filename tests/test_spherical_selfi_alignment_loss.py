@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from geometry.spherical_erp import erp_pixel_to_unit_ray
+from geometry.spherical_erp import build_erp_ray_grid, erp_pixel_to_unit_ray
 from geometry.spherical_pseudo_correspondence import SphericalCorrespondence
 from losses.spherical_selfi_alignment_loss import SphericalSelfiAlignmentLoss
 from models.spherical_selfi_dpt_adapter import SphericalSelfiDPTAdapter
@@ -47,6 +47,59 @@ def test_spherical_selfi_alignment_loss_backpropagates():
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
     assert features.grad.abs().sum() > 0
+
+
+def test_global_fullres_spherical_ce_backpropagates_and_returns_argmax_matches():
+    height, width = 8, 16
+    ray_grid = build_erp_ray_grid(height, width).permute(2, 0, 1)
+    features = torch.stack([ray_grid, ray_grid], dim=0).unsqueeze(0).clone().requires_grad_(True)
+    uv = torch.tensor([[4.5, 3.5], [8.5, 4.5]], dtype=torch.float32)
+    loss_fn = SphericalSelfiAlignmentLoss(
+        mode="global_fullres_spherical_ce",
+        loss_stride=1,
+        temperature=0.03,
+        max_queries=2,
+        soft_label_sigma_deg=12.0,
+        expected_geodesic_weight=0.05,
+        ce_query_chunk_size=1,
+        use_spherical_area_correction=False,
+        erp_aux_weight=0.0,
+    )
+
+    loss, metrics, matches = loss_fn(features, _corr_from_uv(uv, height=height, width=width), return_matches=True)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["spherical_ce"])
+    assert torch.isfinite(metrics["expected_geodesic"])
+    assert metrics["num_queries"].item() == 2
+    assert matches["pred_uv"].shape == (2, 2)
+    assert torch.allclose(matches["pred_uv"], uv, atol=1.0)
+    loss.backward()
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+    assert features.grad.abs().sum() > 0
+
+
+def test_global_fullres_spherical_ce_prefers_correct_spherical_target():
+    height, width = 8, 16
+    ray_grid = build_erp_ray_grid(height, width).permute(2, 0, 1)
+    features = torch.stack([ray_grid, ray_grid], dim=0).unsqueeze(0)
+    uv = torch.tensor([[4.5, 3.5], [8.5, 4.5]], dtype=torch.float32)
+    loss_fn = SphericalSelfiAlignmentLoss(
+        mode="global_fullres_spherical_ce",
+        temperature=0.03,
+        max_queries=2,
+        soft_label_sigma_deg=8.0,
+        expected_geodesic_weight=0.0,
+        ce_query_chunk_size=1,
+        use_spherical_area_correction=False,
+        erp_aux_weight=0.0,
+    )
+
+    same, _ = loss_fn(features, _corr_from_uv(uv, height=height, width=width, target_shift=0.0))
+    shifted, _ = loss_fn(features, _corr_from_uv(uv, height=height, width=width, target_shift=4.0))
+
+    assert shifted > same
 
 
 def test_local_fullres_loss_is_smaller_when_predicted_ray_equals_target_ray():

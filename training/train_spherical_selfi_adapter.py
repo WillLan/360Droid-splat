@@ -90,13 +90,16 @@ def default_config() -> dict[str, Any]:
             "visibility_rel_thresh": 0.05,
         },
         "matching": {
-            "mode": "global_lowres",
-            "loss_stride": 4,
+            "mode": "global_fullres_spherical_ce",
+            "loss_stride": 1,
             "local_window_radius": 16,
             "temperature": 0.07,
             "max_queries": 128,
+            "soft_label_sigma_deg": 2.0,
+            "ce_query_chunk_size": 32,
+            "use_spherical_area_correction": True,
         },
-        "loss": {"erp_aux_weight": 0.01, "spherical_match_weight": 1.0},
+        "loss": {"erp_aux_weight": 0.0, "spherical_match_weight": 1.0, "expected_geodesic_weight": 0.0},
         "train": {
             "batch_size": 1,
             "num_workers": 0,
@@ -495,12 +498,16 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
     wrapper = build_panovggt_wrapper(config, device=device)
     adapter = build_adapter(config, device=device)
     loss_cfg = SphericalSelfiAlignmentLossConfig(
-        mode=str(config.get("matching", {}).get("mode", "global_lowres")),
-        loss_stride=int(config.get("matching", {}).get("loss_stride", 4)),
+        mode=str(config.get("matching", {}).get("mode", "global_fullres_spherical_ce")),
+        loss_stride=int(config.get("matching", {}).get("loss_stride", 1)),
         local_window_radius=int(config.get("matching", {}).get("local_window_radius", 16)),
         temperature=float(config.get("matching", {}).get("temperature", 0.07)),
         max_queries=config.get("matching", {}).get("max_queries", 512),
         erp_aux_weight=float(config.get("loss", {}).get("erp_aux_weight", 0.01)),
+        soft_label_sigma_deg=float(config.get("matching", {}).get("soft_label_sigma_deg", 2.0)),
+        expected_geodesic_weight=float(config.get("loss", {}).get("expected_geodesic_weight", 0.0)),
+        ce_query_chunk_size=int(config.get("matching", {}).get("ce_query_chunk_size", 32)),
+        use_spherical_area_correction=bool(config.get("matching", {}).get("use_spherical_area_correction", True)),
     )
     criterion = SphericalSelfiAlignmentLoss(loss_cfg)
     optimizer = torch.optim.AdamW(

@@ -92,28 +92,34 @@ adapter:
 
 Implemented in `losses/spherical_selfi_alignment_loss.py`.
 
-Main residual:
+The default training mode is `global_fullres_spherical_ce`. It keeps Selfi's
+full-image probability matching idea, but replaces planar pixel-distance
+supervision with a spherical soft-label objective.
 
 ```text
-theta = acos(clamp(dot(normalize(pred_ray), normalize(target_ray)), -1, 1))
+score_i = dot(f_src(q), f_tgt(i)) / temperature
+P_i = softmax(score_i + log(area_i))
+Q_i = softmax(-d_S2(ray_i, ray_gt)^2 / (2 * sigma^2) + log(area_i))
+loss = CE(Q, P) + expected_geodesic_weight * sum_i P_i * d_S2(ray_i, ray_gt)
 ```
 
-This is the unit-sphere geodesic / great-circle angular distance. It is the main
-loss term:
+`d_S2` is the unit-sphere geodesic / great-circle angular distance, implemented
+with the stable `atan2(||cross||, dot)` form. `area_i` is the ERP spherical area
+weight, proportional to `cos(latitude)`, so equator and pole pixels contribute as
+solid angle samples rather than flat ERP pixels.
 
-```text
-loss = weighted_mean(theta) + erp_aux_weight * erp_aux
-```
-
-`erp_aux` is a small seam-aware pixel auxiliary term for diagnostics and
-stabilization. It is not the main reprojection residual.
+`erp_aux` is kept as a seam-aware pixel diagnostic for predicted argmax matches.
+It is not used as the main reprojection residual in the full-resolution CE mode.
 
 Supported matching modes:
 
+- `global_fullres_spherical_ce`: computes source-target similarity against the
+  full `H x W` target feature map, supervises the full target probability
+  distribution with a spherical soft label, and visualizes the argmax match.
 - `global_lowres`: predicts a target bearing from a downsampled target feature
-  grid.
+  grid. This is retained for compatibility and ablations.
 - `local_fullres`: predicts a target bearing inside a local ERP window around
-  the pseudo target pixel.
+  the pseudo target pixel. This is retained for local-window ablations.
 
 ## Pose and Depth Convention
 

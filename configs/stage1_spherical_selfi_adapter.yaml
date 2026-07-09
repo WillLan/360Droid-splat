@@ -48,16 +48,20 @@ correspondence:
   visibility_rel_thresh: 0.05
 
 matching:
-  mode: global_lowres
-  loss_stride: 4
+  mode: global_fullres_spherical_ce
+  loss_stride: 1
   local_window_radius: 16
   temperature: 0.07
   max_queries: 512
-  use_spherical_soft_argmax: true
+  soft_label_sigma_deg: 2.0
+  ce_query_chunk_size: 32
+  use_spherical_area_correction: true
+  prediction: argmax
 
 loss:
   spherical_match_weight: 1.0
-  erp_aux_weight: 0.01
+  erp_aux_weight: 0.0
+  expected_geodesic_weight: 0.05
   cycle_weight: 0.0
   seam_weight: 0.05
 

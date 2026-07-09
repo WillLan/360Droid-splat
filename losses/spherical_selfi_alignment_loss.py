@@ -23,12 +23,16 @@ from geometry.spherical_pseudo_correspondence import SphericalCorrespondence
 class SphericalSelfiAlignmentLossConfig:
     """Configuration for Stage 1C spherical Selfi alignment."""
 
-    mode: str = "global_lowres"
-    loss_stride: int = 4
+    mode: str = "global_fullres_spherical_ce"
+    loss_stride: int = 1
     local_window_radius: int = 16
     temperature: float = 0.07
     max_queries: int | None = 512
-    erp_aux_weight: float = 0.01
+    erp_aux_weight: float = 0.0
+    soft_label_sigma_deg: float = 2.0
+    expected_geodesic_weight: float = 0.0
+    ce_query_chunk_size: int = 32
+    use_spherical_area_correction: bool = True
     eps: float = 1.0e-6
 
 
@@ -122,6 +126,11 @@ def _feature_grid_uv(height: int, width: int, image_hw: tuple[int, int], *, devi
     return torch.stack([xx * scale_x, yy * scale_y], dim=-1).reshape(-1, 2)
 
 
+def _erp_area_weights(uv: torch.Tensor, image_height: int, eps: float) -> torch.Tensor:
+    latitude = math.pi * (uv[..., 1] / max(float(image_height), 1.0) - 0.5)
+    return torch.cos(latitude).clamp_min(float(eps))
+
+
 def _weighted_mean(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     w = weight.clamp_min(0.0)
     if w.numel() == 0:
@@ -174,7 +183,10 @@ class SphericalSelfiAlignmentLoss(nn.Module):
             metrics = {
                 "loss": zero.detach(),
                 "spherical": zero.detach(),
+                "spherical_ce": zero.detach(),
+                "expected_geodesic": zero.detach(),
                 "erp_aux": zero.detach(),
+                "pred_entropy": zero.detach(),
                 "num_queries": torch.tensor(0.0, device=features.device),
                 "mean_angular_deg": torch.tensor(0.0, device=features.device),
                 "median_angular_deg": torch.tensor(0.0, device=features.device),
@@ -195,6 +207,14 @@ class SphericalSelfiAlignmentLoss(nn.Module):
             return zero, metrics
         src_values = _sample_features_by_flat_index(flat, entries["flat_src"], entries["src_uv"])
         src_values = F.normalize(src_values, dim=-1, eps=self.config.eps)
+        if self.config.mode == "global_fullres_spherical_ce":
+            return self._global_fullres_spherical_ce(
+                flat,
+                src_values,
+                entries,
+                image_hw=(height, width),
+                return_matches=return_matches,
+            )
         if self.config.mode == "global_lowres":
             pred_ray, pred_uv = self._global_lowres_prediction(flat, src_values, entries, image_hw=(height, width))
         elif self.config.mode == "local_fullres":
@@ -210,7 +230,10 @@ class SphericalSelfiAlignmentLoss(nn.Module):
         metrics = {
             "loss": loss.detach(),
             "spherical": spherical.detach(),
+            "spherical_ce": torch.zeros((), device=features.device, dtype=features.dtype),
+            "expected_geodesic": spherical.detach(),
             "erp_aux": erp_aux.detach(),
+            "pred_entropy": torch.zeros((), device=features.device, dtype=features.dtype),
             "num_queries": torch.tensor(float(entries["flat_src"].numel()), device=features.device),
             "mean_angular_deg": angular_deg.mean(),
             "median_angular_deg": angular_deg.median(),
@@ -223,6 +246,117 @@ class SphericalSelfiAlignmentLoss(nn.Module):
                 "src_uv": entries["src_uv"].detach(),
                 "tgt_uv": entries["tgt_uv"].detach(),
                 "pred_uv": pred_uv.detach(),
+                "angular_deg": angular_deg,
+                "flat_src": entries["flat_src"].detach(),
+                "flat_tgt": entries["flat_tgt"].detach(),
+            }
+        return loss, metrics
+
+    def _global_fullres_spherical_ce(
+        self,
+        flat_features: torch.Tensor,
+        src_values: torch.Tensor,
+        entries: dict[str, torch.Tensor],
+        *,
+        image_hw: tuple[int, int],
+        return_matches: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        image_h, image_w = int(image_hw[0]), int(image_hw[1])
+        sigma = math.radians(float(self.config.soft_label_sigma_deg))
+        if sigma <= 0.0:
+            raise ValueError("soft_label_sigma_deg must be positive for global_fullres_spherical_ce.")
+        temp = max(float(self.config.temperature), float(self.config.eps))
+        chunk_size = max(1, int(self.config.ce_query_chunk_size))
+        query_count = int(src_values.shape[0])
+        device = flat_features.device
+        amp_device = "cuda" if flat_features.is_cuda else "cpu"
+
+        with torch.amp.autocast(device_type=amp_device, enabled=False):
+            src_float = F.normalize(src_values.float(), dim=-1, eps=self.config.eps)
+            uv = _feature_grid_uv(image_h, image_w, image_hw, device=device, dtype=torch.float32)
+            rays = erp_pixel_to_unit_ray(uv, image_h, image_w).to(device=device, dtype=torch.float32)
+            if bool(self.config.use_spherical_area_correction):
+                log_area = _erp_area_weights(uv, image_h, self.config.eps).log().view(1, -1)
+            else:
+                log_area = torch.zeros(1, uv.shape[0], device=device, dtype=torch.float32)
+
+            weights = entries["weight"].to(device=device, dtype=torch.float32).clamp_min(0.0)
+            denom = weights.sum().clamp_min(float(self.config.eps))
+            loss_numer = src_float.sum() * 0.0
+            ce_numer = torch.zeros((), device=device, dtype=torch.float32)
+            expected_numer = torch.zeros((), device=device, dtype=torch.float32)
+            erp_numer = torch.zeros((), device=device, dtype=torch.float32)
+            entropy_numer = torch.zeros((), device=device, dtype=torch.float32)
+            angular = torch.empty(query_count, device=device, dtype=torch.float32)
+            pred_uv = torch.empty(query_count, 2, device=device, dtype=torch.float32)
+            pred_ray = torch.empty(query_count, 3, device=device, dtype=torch.float32)
+
+            for view_id in torch.unique(entries["flat_tgt"], sorted=True):
+                view_mask = entries["flat_tgt"] == view_id
+                view_query_idx = torch.nonzero(view_mask, as_tuple=False).flatten()
+                target = F.normalize(flat_features[view_id].float().flatten(1), dim=0, eps=self.config.eps)
+                for start in range(0, int(view_query_idx.numel()), chunk_size):
+                    chunk_idx = view_query_idx[start : start + chunk_size]
+                    src_chunk = src_float[chunk_idx]
+                    tgt_ray = entries["tgt_ray"][chunk_idx].to(device=device, dtype=torch.float32)
+                    logits = (src_chunk @ target) / temp
+                    logits = logits + log_area
+                    log_prob = F.log_softmax(logits, dim=-1)
+                    prob = log_prob.exp()
+
+                    with torch.no_grad():
+                        dist = spherical_geodesic_distance(
+                            rays.view(1, -1, 3),
+                            tgt_ray.view(-1, 1, 3),
+                            eps=self.config.eps,
+                        )
+                        target_logits = -0.5 * (dist / sigma).square() + log_area
+                        target_prob = F.softmax(target_logits, dim=-1)
+                        argmax_idx = logits.detach().argmax(dim=-1)
+                        angular[chunk_idx] = dist[torch.arange(int(chunk_idx.numel()), device=device), argmax_idx]
+                        pred_uv[chunk_idx] = uv[argmax_idx]
+                        pred_ray[chunk_idx] = rays[argmax_idx]
+
+                    ce = -(target_prob * log_prob).sum(dim=-1)
+                    expected = (prob * dist).sum(dim=-1)
+                    entropy = -(prob * log_prob).sum(dim=-1)
+                    expected_weight = float(self.config.expected_geodesic_weight)
+                    chunk_loss = ce + expected_weight * expected if expected_weight != 0.0 else ce
+                    w = weights[chunk_idx]
+                    loss_numer = loss_numer + (chunk_loss * w).sum()
+                    ce_numer = ce_numer + (ce.detach() * w).sum()
+                    expected_numer = expected_numer + (expected.detach() * w).sum()
+                    entropy_numer = entropy_numer + (entropy.detach() * w).sum()
+                    erp_numer = erp_numer + (
+                        _seam_aware_pixel_l1(pred_uv[chunk_idx], entries["tgt_uv"][chunk_idx].to(device=device, dtype=torch.float32), image_w)
+                        * w
+                    ).sum()
+
+        loss = loss_numer / denom
+        spherical_ce = ce_numer / denom
+        expected_geodesic = expected_numer / denom
+        erp_aux = erp_numer / denom
+        pred_entropy = entropy_numer / denom
+        angular_deg = torch.rad2deg(angular.detach())
+        metrics = {
+            "loss": loss.detach(),
+            "spherical": loss.detach(),
+            "spherical_ce": spherical_ce.detach(),
+            "expected_geodesic": expected_geodesic.detach(),
+            "erp_aux": erp_aux.detach(),
+            "pred_entropy": pred_entropy.detach(),
+            "num_queries": torch.tensor(float(query_count), device=device),
+            "mean_angular_deg": angular_deg.mean(),
+            "median_angular_deg": angular_deg.median(),
+            "pck_1deg": (angular_deg <= 1.0).float().mean(),
+            "pck_3deg": (angular_deg <= 3.0).float().mean(),
+            "pck_5deg": (angular_deg <= 5.0).float().mean(),
+        }
+        if return_matches:
+            return loss, metrics, {
+                "src_uv": entries["src_uv"].detach(),
+                "tgt_uv": entries["tgt_uv"].detach(),
+                "pred_uv": pred_uv.to(dtype=flat_features.dtype).detach(),
                 "angular_deg": angular_deg,
                 "flat_src": entries["flat_src"].detach(),
                 "flat_tgt": entries["flat_tgt"].detach(),

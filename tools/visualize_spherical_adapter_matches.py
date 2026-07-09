@@ -138,12 +138,16 @@ def main() -> None:
             dense = adapter(pano_out.stage_features)
             criterion = SphericalSelfiAlignmentLoss(
                 SphericalSelfiAlignmentLossConfig(
-                    mode=str(config.get("matching", {}).get("mode", "global_lowres")),
-                    loss_stride=int(config.get("matching", {}).get("loss_stride", 4)),
+                    mode=str(config.get("matching", {}).get("mode", "global_fullres_spherical_ce")),
+                    loss_stride=int(config.get("matching", {}).get("loss_stride", 1)),
                     local_window_radius=int(config.get("matching", {}).get("local_window_radius", 16)),
                     temperature=float(config.get("matching", {}).get("temperature", 0.07)),
                     max_queries=max(1, int(args.max_matches)),
                     erp_aux_weight=float(config.get("loss", {}).get("erp_aux_weight", 0.01)),
+                    soft_label_sigma_deg=float(config.get("matching", {}).get("soft_label_sigma_deg", 2.0)),
+                    expected_geodesic_weight=float(config.get("loss", {}).get("expected_geodesic_weight", 0.0)),
+                    ce_query_chunk_size=int(config.get("matching", {}).get("ce_query_chunk_size", 32)),
+                    use_spherical_area_correction=bool(config.get("matching", {}).get("use_spherical_area_correction", True)),
                 )
             )
             _, _, matches = criterion(dense, corr, return_matches=True)
