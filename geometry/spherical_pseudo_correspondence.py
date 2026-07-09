@@ -125,6 +125,86 @@ def _sample_query_uv(
     return torch.stack([u, v], dim=-1)
 
 
+def _fibonacci_erp_candidates(
+    *,
+    count: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    sample_count = max(1, int(count))
+    idx = torch.arange(sample_count, device=device, dtype=dtype)
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    if generator is None:
+        phase = torch.rand((), device=device, dtype=dtype) * (2.0 * math.pi)
+    else:
+        phase = torch.rand((), device=device, dtype=dtype, generator=generator) * (2.0 * math.pi)
+    y = 1.0 - 2.0 * ((idx + 0.5) / float(sample_count))
+    longitude = torch.remainder(idx * golden_angle + phase, 2.0 * math.pi) - math.pi
+    latitude = torch.asin(y.clamp(-1.0, 1.0))
+    u = float(width) * (longitude / (2.0 * math.pi) + 0.5)
+    v = float(height) * (latitude / math.pi + 0.5)
+    return torch.stack([torch.remainder(u, float(width)), v.clamp(0.0, float(height))], dim=-1)
+
+
+def _sample_depth_filtered_fibonacci_uv(
+    src_depth_maps: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    count: int,
+    min_depth: float,
+    max_depth: float,
+    oversample_factor: int,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    map_count = int(src_depth_maps.shape[0])
+    sample_count = max(1, int(count))
+    factor = max(1, int(oversample_factor))
+    candidate_count = max(sample_count, sample_count * factor)
+    candidates = _fibonacci_erp_candidates(
+        count=candidate_count,
+        height=height,
+        width=width,
+        device=src_depth_maps.device,
+        dtype=dtype,
+        generator=generator,
+    )
+    expanded_candidates = candidates.view(1, candidate_count, 2).expand(map_count, -1, -1)
+    candidate_depth = sample_erp_with_wrap(src_depth_maps, expanded_candidates)[..., 0]
+    depth_floor = torch.as_tensor(float(min_depth), device=src_depth_maps.device, dtype=src_depth_maps.dtype)
+    depth_ceiling = torch.as_tensor(float(max_depth), device=src_depth_maps.device, dtype=src_depth_maps.dtype)
+    finite_depth = torch.isfinite(candidate_depth) & (candidate_depth >= depth_floor) & (candidate_depth <= depth_ceiling)
+    sampled = torch.empty(map_count, sample_count, 2, device=src_depth_maps.device, dtype=dtype)
+    fallback = torch.linspace(
+        0,
+        candidate_count - 1,
+        steps=sample_count,
+        device=src_depth_maps.device,
+    ).round().long()
+    for map_idx in range(map_count):
+        valid_idx = torch.nonzero(finite_depth[map_idx], as_tuple=False).flatten()
+        if valid_idx.numel() >= sample_count:
+            keep = torch.linspace(
+                0,
+                valid_idx.numel() - 1,
+                steps=sample_count,
+                device=src_depth_maps.device,
+            ).round().long()
+            selected = valid_idx[keep]
+        elif valid_idx.numel() > 0:
+            fill_count = sample_count - int(valid_idx.numel())
+            fill = fallback[:fill_count]
+            selected = torch.cat([valid_idx, fill], dim=0)
+        else:
+            selected = fallback
+        sampled[map_idx] = candidates[selected.to(device=candidates.device)]
+    return sampled
+
+
 def _normalize_query_uv(
     query_uv: torch.Tensor | None,
     *,
@@ -188,6 +268,7 @@ def generate_spherical_pseudo_correspondence(
     min_depth: float = 0.05,
     max_depth: float = 100.0,
     visibility_rel_thresh: float = 0.05,
+    fibonacci_oversample_factor: int = 8,
     query_uv: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> SphericalCorrespondence:
@@ -206,23 +287,36 @@ def generate_spherical_pseudo_correspondence(
     edge_count = int(pairs.shape[1])
     src_idx = pairs[..., 0]
     tgt_idx = pairs[..., 1]
-    src_uv = _normalize_query_uv(
-        query_uv,
-        batch_size=batch_size,
-        edge_count=edge_count,
-        height=h,
-        width=w,
-        count=int(num_query_per_pair),
-        sampling=sampling,
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
-    sample_count = int(src_uv.shape[-2])
-
     src_depth_maps = _gather_frames(depth_bv, src_idx).reshape(batch_size * edge_count, 1, h, w)
     tgt_depth_maps = _gather_frames(depth_bv, tgt_idx).reshape(batch_size * edge_count, 1, h, w)
-    flat_src_uv = src_uv.reshape(batch_size * edge_count, sample_count, 2)
+    if query_uv is None and str(sampling).lower() in {"fibonacci_depth_filtered", "fibonacci_depth", "fibonacci"}:
+        flat_src_uv = _sample_depth_filtered_fibonacci_uv(
+            src_depth_maps,
+            height=h,
+            width=w,
+            count=int(num_query_per_pair),
+            min_depth=float(min_depth),
+            max_depth=float(max_depth),
+            oversample_factor=int(fibonacci_oversample_factor),
+            dtype=dtype,
+            generator=generator,
+        )
+        src_uv = flat_src_uv.reshape(batch_size, edge_count, -1, 2)
+    else:
+        src_uv = _normalize_query_uv(
+            query_uv,
+            batch_size=batch_size,
+            edge_count=edge_count,
+            height=h,
+            width=w,
+            count=int(num_query_per_pair),
+            sampling=sampling,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        flat_src_uv = src_uv.reshape(batch_size * edge_count, int(src_uv.shape[-2]), 2)
+    sample_count = int(src_uv.shape[-2])
     src_depth = sample_erp_with_wrap(src_depth_maps, flat_src_uv)[..., 0]
 
     src_poses = _gather_frames(poses_bv, src_idx).reshape(batch_size * edge_count, 4, 4)

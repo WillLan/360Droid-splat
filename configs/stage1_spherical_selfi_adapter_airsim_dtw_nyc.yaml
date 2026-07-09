@@ -1,6 +1,6 @@
 stage: 1
 task: spherical_selfi_adapter
-experiment_name: stage1_selfi_adapter_airsim_dtw_nyc
+experiment_name: stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
 
 image:
   height: 504
@@ -34,12 +34,18 @@ panovggt:
 
 adapter:
   type: dpt
-  hidden_dim: 128
+  hidden_dim: 256
   out_dim: 24
   output_resolution: full
   use_4stage_features: true
   use_circular_padding: true
   norm_output: true
+  reassemble_sizes:
+    - [144, 288]
+    - [72, 144]
+    - [36, 72]
+    - [18, 36]
+  fusion_output_size: [288, 576]
 
 dataset:
   manifest: data/stage1_airsim_dtw_nyc_manifest.json
@@ -56,7 +62,8 @@ dataset:
 
 correspondence:
   num_query_per_pair: 2048
-  sampling: cosine_latitude_weighted
+  sampling: fibonacci_depth_filtered
+  fibonacci_oversample_factor: 8
   min_depth: 0.05
   max_depth: 200.0
   visibility_rel_thresh: 0.05
@@ -87,7 +94,7 @@ train:
   save_interval: 5000
   val_interval: 1000
   max_val_batches: 8
-  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc
+  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
   grad_clip: 1.0
   seed: 1234
 
@@ -95,7 +102,7 @@ WeightsAndBiases:
   enabled: true
   project: 360Droid-splat
   entity: null
-  run_name: stage1_selfi_adapter_airsim_dtw_nyc
+  run_name: stage1_selfi_adapter_airsim_dtw_nyc_stable_fibonacci
   mode: online
   log_every: 50
   tags:
@@ -103,6 +110,8 @@ WeightsAndBiases:
     - spherical-selfi-adapter
     - airsim360
     - dtw-nyc
+    - stable-geodesic
+    - fibonacci-depth-filtered
 
 Visualization:
   enabled: true

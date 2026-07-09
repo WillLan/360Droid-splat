@@ -1,8 +1,11 @@
 import torch
+import pytest
 
 from geometry.spherical_erp import erp_pixel_to_unit_ray
 from geometry.spherical_pseudo_correspondence import SphericalCorrespondence
 from losses.spherical_selfi_alignment_loss import SphericalSelfiAlignmentLoss
+from models.spherical_selfi_dpt_adapter import SphericalSelfiDPTAdapter
+from training.train_spherical_selfi_adapter import _assert_adapter_finite, _assert_metrics_finite
 
 
 def _corr_from_uv(uv: torch.Tensor, *, height: int, width: int, target_shift: float = 0.0) -> SphericalCorrespondence:
@@ -123,3 +126,13 @@ def test_global_loss_handles_many_queries_per_view_without_expanding_maps():
     loss.backward()
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
+
+
+def test_training_finite_guards_reject_nan_metrics_and_parameters():
+    adapter = SphericalSelfiDPTAdapter([4, 6, 8, 10], hidden_dim=8, image_height=8, image_width=16)
+    with torch.no_grad():
+        next(adapter.parameters()).view(-1)[0] = float("nan")
+    with pytest.raises(RuntimeError, match="Non-finite adapter parameter"):
+        _assert_adapter_finite(adapter, context="unit test")
+    with pytest.raises(RuntimeError, match="Non-finite metrics"):
+        _assert_metrics_finite({"loss": float("nan")}, context="unit test")

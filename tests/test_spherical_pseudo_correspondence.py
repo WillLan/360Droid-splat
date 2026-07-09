@@ -132,3 +132,48 @@ def test_trailing_singleton_depth_channel_from_model_output():
     assert corr.valid_mask.all()
     assert torch.allclose(corr.src_uv[0, 0], query)
     assert torch.allclose(corr.tgt_uv[0, 0], query, atol=1e-4)
+
+
+def test_fibonacci_sampling_prefers_equator_over_poles():
+    height, width = 64, 128
+    depth = torch.full((2, 1, height, width), 2.0)
+    corr = generate_spherical_pseudo_correspondence(
+        depth,
+        _eye_poses(2),
+        torch.tensor([[0, 1]]),
+        height=height,
+        width=width,
+        num_query_per_pair=512,
+        sampling="fibonacci_depth_filtered",
+        fibonacci_oversample_factor=2,
+        min_depth=0.01,
+        max_depth=10.0,
+        visibility_rel_thresh=0.01,
+    )
+    rows = corr.src_uv[0, :, 1]
+    equator = ((rows >= height * 0.375) & (rows <= height * 0.625)).sum()
+    poles = ((rows < height * 0.125) | (rows > height * 0.875)).sum()
+    assert equator > poles
+    assert corr.valid_mask.all()
+
+
+def test_fibonacci_depth_filtered_sampling_prefers_finite_source_depth():
+    height, width = 16, 32
+    depth = torch.full((2, 1, height, width), 1000.0)
+    depth[:, :, height // 2 :, :] = 2.0
+    corr = generate_spherical_pseudo_correspondence(
+        depth,
+        _eye_poses(2),
+        torch.tensor([[0, 1]]),
+        height=height,
+        width=width,
+        num_query_per_pair=64,
+        sampling="fibonacci_depth_filtered",
+        fibonacci_oversample_factor=4,
+        min_depth=0.01,
+        max_depth=10.0,
+        visibility_rel_thresh=0.01,
+    )
+    rows = corr.src_uv[0, :, 1]
+    assert (rows >= float(height // 2)).float().mean() > 0.9
+    assert corr.valid_mask.float().mean() > 0.9

@@ -76,6 +76,16 @@ def test_great_circle_distance_same_and_orthogonal_rays():
     assert torch.allclose(spherical_geodesic_distance(ray_a, ray_b), torch.tensor([math.pi / 2.0]), atol=1e-6)
 
 
+def test_stable_geodesic_backward_is_finite_near_same_ray():
+    ray_a = torch.tensor([[1.0, 1.0e-7, 0.0]], requires_grad=True)
+    ray_b = torch.tensor([[1.0, 0.0, 0.0]])
+    distance = spherical_geodesic_distance(ray_a, ray_b)
+    assert torch.isfinite(distance).all()
+    distance.sum().backward()
+    assert ray_a.grad is not None
+    assert torch.isfinite(ray_a.grad).all()
+
+
 def test_circular_pad_longitude_only_pads_last_dimension():
     x = torch.tensor([[[[1.0, 2.0, 3.0]]]])
     padded = circular_pad_longitude(x, 1)

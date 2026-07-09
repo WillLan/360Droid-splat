@@ -20,6 +20,41 @@ def _num_groups(channels: int) -> int:
     return groups
 
 
+def _normalize_size_list(
+    value: list[tuple[int, int] | list[int] | None] | tuple[tuple[int, int] | list[int] | None, ...] | None,
+    *,
+    expected_len: int,
+    name: str,
+) -> list[tuple[int, int] | None]:
+    if value is None:
+        return [None] * expected_len
+    if len(value) != expected_len:
+        raise ValueError(f"{name} must contain {expected_len} entries when provided.")
+    normalized: list[tuple[int, int] | None] = []
+    for item in value:
+        if item is None:
+            normalized.append(None)
+            continue
+        if len(item) != 2:
+            raise ValueError(f"{name} entries must be (height, width), got {item!r}.")
+        height, width = int(item[0]), int(item[1])
+        if height <= 0 or width <= 0:
+            raise ValueError(f"{name} entries must be positive, got {(height, width)!r}.")
+        normalized.append((height, width))
+    return normalized
+
+
+def _normalize_optional_size(value: tuple[int, int] | list[int] | None, *, name: str) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError(f"{name} must be (height, width), got {value!r}.")
+    height, width = int(value[0]), int(value[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"{name} must be positive, got {(height, width)!r}.")
+    return height, width
+
+
 class _ERPConvNormAct(nn.Module):
     def __init__(
         self,
@@ -72,6 +107,8 @@ class SphericalSelfiDPTAdapter(nn.Module):
         use_circular_padding: bool = True,
         norm_output: bool = True,
         token_hw: list[tuple[int, int] | None] | tuple[tuple[int, int] | None, ...] | None = None,
+        reassemble_sizes: list[tuple[int, int] | list[int] | None] | tuple[tuple[int, int] | list[int] | None, ...] | None = None,
+        fusion_output_size: tuple[int, int] | list[int] | None = None,
     ) -> None:
         super().__init__()
         if len(in_channels) != 4:
@@ -90,6 +127,12 @@ class SphericalSelfiDPTAdapter(nn.Module):
         self.token_hw = list(token_hw) if token_hw is not None else [None] * 4
         if len(self.token_hw) != 4:
             raise ValueError("token_hw must contain 4 entries when provided.")
+        self.reassemble_sizes = _normalize_size_list(
+            reassemble_sizes,
+            expected_len=4,
+            name="reassemble_sizes",
+        )
+        self.fusion_output_size = _normalize_optional_size(fusion_output_size, name="fusion_output_size")
 
         self.projections = nn.ModuleList(
             [
@@ -192,7 +235,11 @@ class SphericalSelfiDPTAdapter(nn.Module):
         restore_shape: tuple[int, int] | None = None
         for feature, projection in zip(normalized, self.projections):
             flat, restore_shape = self._flatten_bv(feature)
-            projected.append(projection(flat))
+            value = projection(flat)
+            target_size = self.reassemble_sizes[len(projected)]
+            if target_size is not None and tuple(value.shape[-2:]) != target_size:
+                value = F.interpolate(value, size=target_size, mode="bilinear", align_corners=False)
+            projected.append(value)
         assert restore_shape is not None
 
         fused = projected[-1]
@@ -200,13 +247,17 @@ class SphericalSelfiDPTAdapter(nn.Module):
         for idx in range(2, -1, -1):
             fused = F.interpolate(fused, size=projected[idx].shape[-2:], mode="bilinear", align_corners=False)
             fused = self.fusion_blocks[idx](fused + projected[idx])
-        fused = F.interpolate(
-            fused,
-            size=(self.image_height, self.image_width),
-            mode="bilinear",
-            align_corners=False,
-        )
+        refine_size = self.fusion_output_size or (self.image_height, self.image_width)
+        if tuple(fused.shape[-2:]) != refine_size:
+            fused = F.interpolate(fused, size=refine_size, mode="bilinear", align_corners=False)
         fused = self.output_refine(fused)
+        if tuple(fused.shape[-2:]) != (self.image_height, self.image_width):
+            fused = F.interpolate(
+                fused,
+                size=(self.image_height, self.image_width),
+                mode="bilinear",
+                align_corners=False,
+            )
         dense = self.output_proj(fused)
         out = self._restore_bv(dense, restore_shape)
         if self.norm_output:

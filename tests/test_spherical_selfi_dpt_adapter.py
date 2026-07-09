@@ -163,6 +163,62 @@ def test_adapter_supports_token_features_with_explicit_token_hw():
     assert torch.allclose(torch.linalg.norm(out, dim=2), torch.ones(b, v, 32, 64), atol=1e-5)
 
 
+def test_adapter_reassembles_and_fuses_through_configured_sizes():
+    b, v = 1, 1
+    token_hw = [(2, 4), (2, 4), (2, 4), (2, 4)]
+    channels = [4, 6, 8, 10]
+    tokens = [torch.rand(b, v, h * w, c) for (h, w), c in zip(token_hw, channels)]
+    adapter = SphericalSelfiDPTAdapter(
+        channels,
+        hidden_dim=8,
+        image_height=16,
+        image_width=32,
+        token_hw=token_hw,
+        reassemble_sizes=[(8, 16), (4, 8), (2, 4), (1, 2)],
+        fusion_output_size=(16, 32),
+    )
+    seen_shapes: list[tuple[int, int]] = []
+    handles = [
+        adapter.fusion_blocks[3].register_forward_hook(lambda _m, _i, out: seen_shapes.append(tuple(out.shape[-2:]))),
+        adapter.fusion_blocks[2].register_forward_hook(lambda _m, _i, out: seen_shapes.append(tuple(out.shape[-2:]))),
+        adapter.fusion_blocks[1].register_forward_hook(lambda _m, _i, out: seen_shapes.append(tuple(out.shape[-2:]))),
+        adapter.fusion_blocks[0].register_forward_hook(lambda _m, _i, out: seen_shapes.append(tuple(out.shape[-2:]))),
+        adapter.output_refine.register_forward_hook(lambda _m, _i, out: seen_shapes.append(tuple(out.shape[-2:]))),
+    ]
+    try:
+        out = adapter(tokens)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert out.shape == (b, v, 24, 16, 32)
+    assert seen_shapes == [(1, 2), (2, 4), (4, 8), (8, 16), (16, 32)]
+
+
+def test_adapter_hidden_dim_256_backpropagates_with_finite_parameters():
+    features = [
+        torch.rand(1, 1, 4, 4, 8),
+        torch.rand(1, 1, 6, 4, 8),
+        torch.rand(1, 1, 8, 4, 8),
+        torch.rand(1, 1, 10, 4, 8),
+    ]
+    adapter = SphericalSelfiDPTAdapter(
+        [4, 6, 8, 10],
+        hidden_dim=256,
+        image_height=16,
+        image_width=32,
+        reassemble_sizes=[(8, 16), (4, 8), (4, 8), (2, 4)],
+        fusion_output_size=(16, 32),
+    )
+    out = adapter(features)
+    loss = out[:, :, 0].mean()
+    loss.backward()
+    assert out.shape == (1, 1, 24, 16, 32)
+    for param in adapter.parameters():
+        assert torch.isfinite(param).all()
+    assert any(param.grad is not None and torch.isfinite(param.grad).all() for param in adapter.parameters())
+
+
 def test_frozen_wrapper_features_can_train_adapter_without_panovggt_grads():
     model = _DummyPanoVGGT()
     wrapper = PanoVGGTFeatureWrapper(model, stage_hooks=["stage1", "stage2", "stage3", "stage4"])

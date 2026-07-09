@@ -279,6 +279,8 @@ def build_adapter(config: dict[str, Any], *, device: torch.device) -> SphericalS
         use_circular_padding=bool(adapter_cfg.get("use_circular_padding", True)),
         norm_output=bool(adapter_cfg.get("norm_output", True)),
         token_hw=list(pano_cfg.get("token_hw", [None, None, None, None])),
+        reassemble_sizes=adapter_cfg.get("reassemble_sizes"),
+        fusion_output_size=adapter_cfg.get("fusion_output_size"),
     )
     return adapter.to(device)
 
@@ -335,6 +337,24 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
+def _assert_adapter_finite(adapter: SphericalSelfiDPTAdapter, *, context: str) -> None:
+    for name, param in adapter.named_parameters():
+        if not torch.isfinite(param).all():
+            raise RuntimeError(f"Non-finite adapter parameter {name!r} detected {context}.")
+
+
+def _assert_adapter_grads_finite(adapter: SphericalSelfiDPTAdapter, *, context: str) -> None:
+    for name, param in adapter.named_parameters():
+        if param.grad is not None and not torch.isfinite(param.grad).all():
+            raise RuntimeError(f"Non-finite adapter gradient {name!r} detected {context}.")
+
+
+def _assert_metrics_finite(metrics: dict[str, float], *, context: str) -> None:
+    bad = [key for key, value in metrics.items() if not np.isfinite(float(value))]
+    if bad:
+        raise RuntimeError(f"Non-finite metrics {bad} detected {context}; refusing to continue.")
+
+
 def _save_checkpoint(
     path: Path,
     adapter: SphericalSelfiDPTAdapter,
@@ -344,6 +364,8 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     best_val_angular_error: float | None = None,
 ) -> None:
+    _assert_adapter_finite(adapter, context=f"before saving {path}")
+    _assert_metrics_finite(metrics, context=f"before saving {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -358,6 +380,8 @@ def _save_checkpoint(
                 "image_width": adapter.image_width,
                 "use_circular_padding": adapter.use_circular_padding,
                 "norm_output": adapter.norm_output,
+                "reassemble_sizes": adapter.reassemble_sizes,
+                "fusion_output_size": adapter.fusion_output_size,
             },
             "training_config": config,
             "global_step": int(step),
@@ -533,6 +557,7 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
                     _, metrics_t = criterion(dense, corr)
                 metrics = _float_metrics(metrics_t)
                 metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+                _assert_metrics_finite(metrics, context=f"during validation at step {current_step}")
                 for key, value in metrics.items():
                     sums[key] = sums.get(key, 0.0) + float(value)
                 count += 1
@@ -560,13 +585,21 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
                     loss, metrics_t = criterion(dense, corr)
                     matches = None
             loss = float(config.get("loss", {}).get("spherical_match_weight", 1.0)) * loss
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(f"Non-finite training loss detected before backward at step {step + 1}.")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(train_cfg.get("grad_clip", 1.0)))
+            _assert_adapter_grads_finite(adapter, context=f"before gradient clipping at step {step + 1}")
+            grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(train_cfg.get("grad_clip", 1.0)))
+            if not torch.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite adapter gradient norm detected at step {step + 1}.")
+            _assert_adapter_grads_finite(adapter, context=f"after gradient clipping at step {step + 1}")
             optimizer.step()
+            _assert_adapter_finite(adapter, context=f"after optimizer step {step + 1}")
             step += 1
             latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
             latest_metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+            _assert_metrics_finite(latest_metrics, context=f"after training step {step}")
             if matches is not None:
                 path = _save_match_visualization(
                     output_dir=output_dir,

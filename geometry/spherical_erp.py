@@ -129,7 +129,11 @@ def spherical_geodesic_distance(
 ) -> torch.Tensor:
     """Great-circle angular distance on the unit sphere, in radians."""
 
-    return safe_acos_dot(ray_a, ray_b, eps=eps)
+    a = _normalize(ray_a, eps=eps)
+    b = _normalize(ray_b, eps=eps)
+    dot = (a * b).sum(dim=-1).clamp(-1.0, 1.0)
+    cross_norm = torch.linalg.norm(torch.cross(a, b, dim=-1), dim=-1)
+    return torch.atan2(cross_norm, dot)
 
 
 def circular_pad_longitude(x: torch.Tensor, pad: int) -> torch.Tensor:
