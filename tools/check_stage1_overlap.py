@@ -96,7 +96,17 @@ def _pseudo_overlap_stats(
     angular_deg: list[float] = []
     checked = min(len(dataset), max(0, int(max_windows)))
     for idx in range(checked):
-        sample = dataset[idx]
+        try:
+            sample = dataset[idx]
+        except Exception as exc:
+            return {
+                "pseudo_stats_available": False,
+                "pseudo_stats_reason": repr(exc),
+                "pseudo_windows_checked": checked,
+                "pseudo_windows_with_geometry": len(ratios),
+                "mean_valid_corr_ratio": None,
+                "mean_angular_pseudo_reprojection_error_deg": None,
+            }
         if sample["depths"] is None or sample["poses_c2w"] is None:
             continue
         corr = generate_spherical_pseudo_correspondence(

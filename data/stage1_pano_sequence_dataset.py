@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -177,11 +178,36 @@ def _load_optional_tensor(path: Path | None) -> torch.Tensor | None:
         return torch.from_numpy(np.load(path)).float()
     if suffix == ".json":
         return torch.as_tensor(_read_json(path), dtype=torch.float32)
+    if suffix in {".h5", ".hdf5"}:
+        try:
+            import h5py
+        except ImportError as exc:  # pragma: no cover - exercised only without h5py installed.
+            raise RuntimeError("Reading .h5 Stage 1 tensors requires h5py.") from exc
+        with h5py.File(path, "r") as handle:
+            key = "depth" if "depth" in handle else next(iter(handle.keys()))
+            return torch.from_numpy(np.asarray(handle[key], dtype=np.float32)).contiguous()
     image = Image.open(path)
     arr = np.asarray(image, dtype=np.float32)
     if arr.ndim == 2:
         return torch.from_numpy(arr).unsqueeze(0).contiguous()
     return torch.from_numpy(arr).float()
+
+
+def _resize_depth_tensor(value: torch.Tensor, resize: tuple[int, int]) -> torch.Tensor:
+    if value.ndim == 2:
+        tensor = value.unsqueeze(0).unsqueeze(0)
+        squeeze = "hw"
+    elif value.ndim == 3 and int(value.shape[0]) == 1:
+        tensor = value.unsqueeze(0)
+        squeeze = "chw"
+    else:
+        return value
+    if tuple(tensor.shape[-2:]) == tuple(resize):
+        return value
+    out = F.interpolate(tensor.float(), size=resize, mode="nearest")
+    if squeeze == "hw":
+        return out[0, 0]
+    return out[0]
 
 
 class Stage1PanoSequenceDataset(Dataset):
@@ -232,7 +258,11 @@ class Stage1PanoSequenceDataset(Dataset):
             ],
             dim=0,
         )
-        depth_values = [_load_optional_tensor(_resolve_path(record.depth_path, self.manifest_dir)) for record in window]
+        depth_values = [
+            None if (value := _load_optional_tensor(_resolve_path(record.depth_path, self.manifest_dir))) is None
+            else _resize_depth_tensor(value, self.resize)
+            for record in window
+        ]
         pose_values = [_load_optional_tensor(_resolve_path(record.pose_path, self.manifest_dir)) for record in window]
         depths = torch.stack([value if value.ndim == 3 else value.unsqueeze(0) for value in depth_values], dim=0) if all(value is not None for value in depth_values) else None
         poses = torch.stack([value.reshape(4, 4) for value in pose_values], dim=0) if all(value is not None for value in pose_values) else None

@@ -152,6 +152,7 @@ def normalize_stage_feature(
     image_hw: tuple[int, int] | None,
     feature_key: str | int | None = None,
     token_hw: tuple[int, int] | None = None,
+    token_start_idx: int | None = None,
 ) -> torch.Tensor:
     """Normalize map or token features to ``B x V x C x H x W``."""
 
@@ -161,6 +162,8 @@ def normalize_stage_feature(
         raw = raw[0]
     else:
         start = 0
+    if token_start_idx is not None:
+        start = int(token_start_idx)
     tensor = _select_from_container(raw, feature_key)
     if not torch.is_tensor(tensor):
         raise TypeError(f"Selected feature must be a tensor, got {type(tensor)!r}.")
@@ -195,6 +198,7 @@ class PanoVGGTFeatureWrapper(nn.Module):
         stage_hooks: list[str] | tuple[str, ...],
         feature_keys: list[str | int | None] | tuple[str | int | None, ...] | None = None,
         token_hw: list[tuple[int, int] | None] | tuple[tuple[int, int] | None, ...] | None = None,
+        token_start_idx: list[int | None] | tuple[int | None, ...] | None = None,
         use_no_grad: bool = True,
         pose_convention: str = "c2w",
         depth_convention: str = "euclidean_ray_depth",
@@ -206,8 +210,9 @@ class PanoVGGTFeatureWrapper(nn.Module):
         self.stage_hooks = [str(name) for name in stage_hooks]
         self.feature_keys = list(feature_keys) if feature_keys is not None else [None] * 4
         self.token_hw = list(token_hw) if token_hw is not None else [None] * 4
-        if len(self.feature_keys) != 4 or len(self.token_hw) != 4:
-            raise ValueError("feature_keys and token_hw must each contain 4 entries when provided.")
+        self.token_start_idx = list(token_start_idx) if token_start_idx is not None else [None] * 4
+        if len(self.feature_keys) != 4 or len(self.token_hw) != 4 or len(self.token_start_idx) != 4:
+            raise ValueError("feature_keys, token_hw, and token_start_idx must each contain 4 entries when provided.")
         self.use_no_grad = bool(use_no_grad)
         self.pose_convention = str(pose_convention)
         self.depth_convention = str(depth_convention)
@@ -264,6 +269,7 @@ class PanoVGGTFeatureWrapper(nn.Module):
                     image_hw=image_hw,
                     feature_key=self.feature_keys[stage_index],
                     token_hw=self.token_hw[stage_index],
+                    token_start_idx=self.token_start_idx[stage_index],
                 )
 
             return hook_fn

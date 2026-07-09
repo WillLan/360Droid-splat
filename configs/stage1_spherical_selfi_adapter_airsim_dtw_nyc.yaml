@@ -1,0 +1,111 @@
+stage: 1
+task: spherical_selfi_adapter
+experiment_name: stage1_selfi_adapter_airsim_dtw_nyc
+
+image:
+  height: 504
+  width: 1008
+
+panovggt:
+  synthetic: false
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  model_kwargs: {}
+  freeze: true
+  use_no_grad: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+  allow_dataset_geometry_fallback: false
+  stage_hooks:
+    - aggregator.decoder.8
+    - aggregator.decoder.16
+    - aggregator.decoder.24
+    - aggregator.decoder.34
+  feature_keys: [null, null, null, null]
+  token_hw:
+    - [36, 72]
+    - [36, 72]
+    - [36, 72]
+    - [36, 72]
+  token_start_idx: [5, 5, 5, 5]
+  in_channels: [1024, 1024, 1024, 1024]
+
+adapter:
+  type: dpt
+  hidden_dim: 128
+  out_dim: 24
+  output_resolution: full
+  use_4stage_features: true
+  use_circular_padding: true
+  norm_output: true
+
+dataset:
+  manifest: data/stage1_airsim_dtw_nyc_manifest.json
+  debug_manifest: data/stage1_airsim_dtw_nyc_debug_manifest.json
+  views_per_sample: 4
+  domains: ["outdoor"]
+  image_height: 504
+  image_width: 1008
+  pair_mode: adjacent_and_skip
+  max_temporal_gap: 10
+  min_valid_corr_ratio: 0.03
+  max_train_frames: null
+  max_val_frames: 1000
+
+correspondence:
+  num_query_per_pair: 2048
+  sampling: cosine_latitude_weighted
+  min_depth: 0.05
+  max_depth: 200.0
+  visibility_rel_thresh: 0.05
+
+matching:
+  mode: global_lowres
+  loss_stride: 4
+  local_window_radius: 16
+  temperature: 0.07
+  max_queries: 512
+  use_spherical_soft_argmax: true
+
+loss:
+  spherical_match_weight: 1.0
+  erp_aux_weight: 0.01
+  cycle_weight: 0.0
+  seam_weight: 0.05
+
+train:
+  batch_size: 1
+  views_per_sample: 4
+  num_workers: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  amp: true
+  max_steps: 50000
+  log_interval: 50
+  save_interval: 5000
+  val_interval: 1000
+  max_val_batches: 8
+  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc
+  grad_clip: 1.0
+  seed: 1234
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: stage1_selfi_adapter_airsim_dtw_nyc
+  mode: online
+  log_every: 50
+  tags:
+    - stage1
+    - spherical-selfi-adapter
+    - airsim360
+    - dtw-nyc
+
+Visualization:
+  enabled: true
+  interval: 1000
+  max_matches: 80
+  save_dir: visualizations

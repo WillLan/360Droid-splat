@@ -7,6 +7,8 @@ runtime path.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import inspect
 from importlib import import_module
 from pathlib import Path
 import sys
@@ -17,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
+from PIL import Image
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -31,6 +35,7 @@ from losses.spherical_selfi_alignment_loss import (
 )
 from models.panovggt_feature_wrapper import PanoVGGTFeatureWrapper
 from models.spherical_selfi_dpt_adapter import SphericalSelfiDPTAdapter
+from tools.visualize_spherical_adapter_matches import save_stage1_match_preview
 
 
 def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -47,15 +52,20 @@ def default_config() -> dict[str, Any]:
         "image": {"height": 64, "width": 128},
         "panovggt": {
             "synthetic": True,
+            "repo_path": None,
+            "config_path": None,
             "checkpoint": None,
             "class_path": None,
             "model_kwargs": {},
             "stage_hooks": ["stage1", "stage2", "stage3", "stage4"],
             "feature_keys": [None, None, None, None],
             "token_hw": [None, None, None, None],
+            "token_start_idx": [None, None, None, None],
             "in_channels": [8, 16, 24, 32],
             "use_no_grad": True,
             "allow_dataset_geometry_fallback": False,
+            "strict_checkpoint": False,
+            "skip_dinov2_pretrain": False,
         },
         "adapter": {
             "hidden_dim": 16,
@@ -96,6 +106,8 @@ def default_config() -> dict[str, Any]:
             "max_steps": 2,
             "log_interval": 1,
             "save_interval": 1,
+            "val_interval": 1000,
+            "max_val_batches": 8,
             "output_dir": "outputs/stage1_spherical_selfi_adapter",
             "grad_clip": 1.0,
             "seed": 1234,
@@ -153,12 +165,72 @@ def _import_attr(path: str) -> Any:
     return getattr(import_module(module_name), attr)
 
 
+@contextmanager
+def _maybe_skip_dinov2_pretrain(enabled: bool):
+    if not enabled:
+        yield
+        return
+    try:
+        aggregator_mod = import_module("panovggt.models.aggregator")
+        aggregator_cls = getattr(aggregator_mod, "Aggregator", None)
+        original = getattr(aggregator_cls, "_try_load_dinov2", None) if aggregator_cls is not None else None
+        if aggregator_cls is None or original is None:
+            yield
+            return
+
+        def _skip(self, hub_name, url, patch_embed_key):
+            return None
+
+        aggregator_cls._try_load_dinov2 = _skip
+        try:
+            yield
+        finally:
+            aggregator_cls._try_load_dinov2 = original
+    except ModuleNotFoundError:
+        yield
+
+
+def _instantiate_panovggt_model(cls: type, cfg: dict[str, Any]) -> nn.Module:
+    kwargs = dict(cfg.get("model_kwargs", {}))
+    config_path = cfg.get("config_path")
+    if config_path is not None and cls.__name__ == "PanoVGGTModel":
+        try:
+            from omegaconf import OmegaConf
+        except ImportError as exc:
+            raise ImportError("PanoVGGT config_path loading requires omegaconf.") from exc
+        official = OmegaConf.load(str(config_path))
+        OmegaConf.resolve(official)
+        mc = official.model
+        aggregator = OmegaConf.to_container(mc.aggregator, resolve=True)
+        kwargs = {
+            "img_size": int(official.img_size),
+            "patch_size": int(official.patch_size),
+            "embed_dim": int(official.embed_dim),
+            "enable_camera": bool(mc.enable_camera),
+            "enable_depth": bool(mc.enable_depth),
+            "enable_point": bool(mc.enable_point),
+            "aggregator": aggregator,
+            **kwargs,
+        }
+    signature = inspect.signature(cls)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return cls(**kwargs)
+    filtered = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return cls(**filtered)
+
+
 def _build_external_model(cfg: dict[str, Any]) -> nn.Module:
+    repo_path = cfg.get("repo_path")
+    if repo_path:
+        repo = str(Path(repo_path).expanduser().resolve())
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
     class_path = cfg.get("class_path")
     if not class_path:
         raise ValueError("panovggt.class_path is required when panovggt.synthetic=false.")
     cls = _import_attr(str(class_path))
-    model = cls(**dict(cfg.get("model_kwargs", {})))
+    with _maybe_skip_dinov2_pretrain(bool(cfg.get("skip_dinov2_pretrain", False))):
+        model = _instantiate_panovggt_model(cls, cfg)
     checkpoint = cfg.get("checkpoint")
     if checkpoint:
         payload = torch.load(checkpoint, map_location="cpu")
@@ -169,7 +241,10 @@ def _build_external_model(cfg: dict[str, Any]) -> nn.Module:
                 break
         if not isinstance(state, dict):
             raise ValueError(f"Unsupported PanoVGGT checkpoint payload: {checkpoint}")
-        model.load_state_dict({str(k).removeprefix("module."): v for k, v in state.items()}, strict=False)
+        model.load_state_dict(
+            {str(k).removeprefix("module."): v for k, v in state.items()},
+            strict=bool(cfg.get("strict_checkpoint", False)),
+        )
     return model
 
 
@@ -185,6 +260,7 @@ def build_panovggt_wrapper(config: dict[str, Any], *, device: torch.device) -> P
         stage_hooks=list(cfg.get("stage_hooks", [])),
         feature_keys=list(cfg.get("feature_keys", [None, None, None, None])),
         token_hw=list(cfg.get("token_hw", [None, None, None, None])),
+        token_start_idx=list(cfg.get("token_start_idx", [None, None, None, None])),
         use_no_grad=bool(cfg.get("use_no_grad", True)),
     )
     return wrapper.to(device)
@@ -246,23 +322,34 @@ def _init_wandb(config: dict[str, Any], output_dir: Path):
     try:
         return wandb.init(**kwargs)
     except Exception as exc:
-        if mode == "offline":
-            raise
-        print(f"W&B online init failed, falling back to offline mode: {exc}")
-        kwargs["mode"] = "offline"
-        return wandb.init(**kwargs)
+        if mode == "online":
+            raise RuntimeError("W&B online init failed; refusing to continue an online-required training run.") from exc
+        raise
 
 
 def _float_metrics(metrics: dict[str, torch.Tensor | float]) -> dict[str, float]:
     return {key: float(value.detach().cpu()) if torch.is_tensor(value) else float(value) for key, value in metrics.items()}
 
 
-def _save_checkpoint(path: Path, adapter: SphericalSelfiDPTAdapter, config: dict[str, Any], step: int, metrics: dict[str, float]) -> None:
+def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}/{key}": value for key, value in metrics.items()}
+
+
+def _save_checkpoint(
+    path: Path,
+    adapter: SphericalSelfiDPTAdapter,
+    config: dict[str, Any],
+    step: int,
+    metrics: dict[str, float],
+    optimizer: torch.optim.Optimizer | None = None,
+    best_val_angular_error: float | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "format": "spherical_selfi_adapter_v1",
             "adapter": adapter.state_dict(),
+            "optimizer": None if optimizer is None else optimizer.state_dict(),
             "adapter_config": {
                 "in_channels": adapter.in_channels,
                 "hidden_dim": adapter.hidden_dim,
@@ -275,8 +362,84 @@ def _save_checkpoint(path: Path, adapter: SphericalSelfiDPTAdapter, config: dict
             "training_config": config,
             "global_step": int(step),
             "metrics": metrics,
+            "best_val_angular_error": best_val_angular_error,
         },
         path,
+    )
+
+
+def _load_checkpoint(
+    path: str | Path,
+    adapter: SphericalSelfiDPTAdapter,
+    optimizer: torch.optim.Optimizer | None = None,
+    *,
+    device: torch.device,
+) -> tuple[int, dict[str, float], float | None]:
+    payload = torch.load(path, map_location=device)
+    if not isinstance(payload, dict) or "adapter" not in payload:
+        raise ValueError(f"Unsupported Stage 1 adapter checkpoint: {path}")
+    adapter.load_state_dict(payload["adapter"])
+    if optimizer is not None and payload.get("optimizer") is not None:
+        optimizer.load_state_dict(payload["optimizer"])
+    metrics = payload.get("metrics", {})
+    return int(payload.get("global_step", 0)), dict(metrics), payload.get("best_val_angular_error")
+
+
+def _valid_ratio(corr) -> torch.Tensor:
+    valid = corr.valid_mask.float()
+    return valid.mean() if valid.numel() else torch.tensor(0.0, device=valid.device)
+
+
+def _make_correspondence(config: dict[str, Any], batch: dict[str, Any], pano_out, images: torch.Tensor):
+    init_depth = pano_out.init_depth
+    init_poses = pano_out.init_poses
+    if init_depth is None or init_poses is None:
+        if not bool(config.get("panovggt", {}).get("allow_dataset_geometry_fallback", False)):
+            raise RuntimeError("PanoVGGT wrapper did not return init depth/poses for pseudo correspondence.")
+        init_depth = batch.get("depths")
+        init_poses = batch.get("poses_c2w")
+    if init_depth is None or init_poses is None:
+        raise RuntimeError("Stage 1 training requires init depth and c2w poses.")
+    return generate_spherical_pseudo_correspondence(
+        init_depth,
+        init_poses,
+        batch["pair_indices"],
+        height=int(images.shape[-2]),
+        width=int(images.shape[-1]),
+        **dict(config.get("correspondence", {})),
+    )
+
+
+def _save_match_visualization(
+    *,
+    output_dir: Path,
+    save_dir: str,
+    split: str,
+    step: int,
+    images: torch.Tensor,
+    matches: dict[str, torch.Tensor],
+    max_matches: int,
+) -> Path | None:
+    if matches["src_uv"].numel() == 0:
+        return None
+    flat_images = images.detach().cpu().reshape(images.shape[0] * images.shape[1], *images.shape[2:])
+    flat_src = matches["flat_src"].detach().cpu().long()
+    flat_tgt = matches["flat_tgt"].detach().cpu().long()
+    first_src, first_tgt = int(flat_src[0]), int(flat_tgt[0])
+    same_pair = (flat_src == first_src) & (flat_tgt == first_tgt)
+    src_uv = matches["src_uv"].detach().cpu()[same_pair]
+    tgt_uv = matches["tgt_uv"].detach().cpu()[same_pair]
+    pred_uv = matches["pred_uv"].detach().cpu()[same_pair]
+    vis_dir = output_dir / str(save_dir) / split
+    path = vis_dir / f"matches_step_{int(step):06d}.png"
+    return save_stage1_match_preview(
+        flat_images[first_src],
+        flat_images[first_tgt],
+        src_uv,
+        tgt_uv,
+        path,
+        pred_tgt_uv=pred_uv,
+        max_matches=int(max_matches),
     )
 
 
@@ -284,11 +447,23 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
     torch.manual_seed(int(config.get("train", {}).get("seed", 1234)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = build_dataset(config, split="train")
+    try:
+        val_dataset = build_dataset(config, split="val")
+    except ValueError:
+        val_dataset = None
     train_cfg = config.get("train", {})
     loader = DataLoader(
         dataset,
         batch_size=int(train_cfg.get("batch_size", 1)),
         shuffle=True,
+        num_workers=int(train_cfg.get("num_workers", 0)),
+        collate_fn=stage1_collate,
+        drop_last=False,
+    )
+    val_loader = None if val_dataset is None else DataLoader(
+        val_dataset,
+        batch_size=int(train_cfg.get("batch_size", 1)),
+        shuffle=False,
         num_workers=int(train_cfg.get("num_workers", 0)),
         collate_fn=stage1_collate,
         drop_last=False,
@@ -316,36 +491,74 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
     max_steps = int(train_cfg.get("max_steps", 1))
     save_interval = max(1, int(train_cfg.get("save_interval", 1000)))
     log_interval = max(1, int(train_cfg.get("log_interval", 50)))
+    val_interval = max(1, int(train_cfg.get("val_interval", 1000)))
+    max_val_batches = max(1, int(train_cfg.get("max_val_batches", 8)))
+    resume = train_cfg.get("resume")
     step = 0
     latest_metrics: dict[str, float] = {}
+    best_val_angular_error: float | None = None
+    if resume:
+        step, latest_metrics, best_val_angular_error = _load_checkpoint(
+            resume,
+            adapter,
+            optimizer,
+            device=device,
+        )
     start = time.time()
+    amp_enabled = bool(train_cfg.get("amp", False)) and device.type == "cuda"
+    vis_cfg = config.get("Visualization", {})
+    vis_enabled = bool(vis_cfg.get("enabled", False))
+    vis_interval = max(1, int(vis_cfg.get("interval", val_interval)))
+    vis_max_matches = int(vis_cfg.get("max_matches", 80))
+    vis_save_dir = str(vis_cfg.get("save_dir", "visualizations"))
     adapter.train()
     wrapper.eval()
+
+    def run_validation(current_step: int) -> dict[str, float]:
+        if val_loader is None:
+            return {}
+        adapter.eval()
+        sums: dict[str, float] = {}
+        count = 0
+        with torch.no_grad():
+            for batch_idx, raw_batch in enumerate(val_loader):
+                if batch_idx >= max_val_batches:
+                    break
+                batch = _to_device(raw_batch, device)
+                images = batch["images"].float()
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
+                    pano_out = wrapper(images)
+                    corr = _make_correspondence(config, batch, pano_out, images)
+                    dense = adapter(pano_out.stage_features)
+                    _, metrics_t = criterion(dense, corr)
+                metrics = _float_metrics(metrics_t)
+                metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+                for key, value in metrics.items():
+                    sums[key] = sums.get(key, 0.0) + float(value)
+                count += 1
+        adapter.train()
+        if count == 0:
+            return {}
+        metrics = {key: value / float(count) for key, value in sums.items()}
+        if wandb_run is not None:
+            wandb_run.log(_prefixed("val", metrics), step=current_step)
+        return metrics
+
     while step < max_steps:
         for raw_batch in loader:
             batch = _to_device(raw_batch, device)
             images = batch["images"].float()
-            with torch.no_grad():
-                pano_out = wrapper(images)
-            init_depth = pano_out.init_depth
-            init_poses = pano_out.init_poses
-            if init_depth is None or init_poses is None:
-                if not bool(config.get("panovggt", {}).get("allow_dataset_geometry_fallback", False)):
-                    raise RuntimeError("PanoVGGT wrapper did not return init depth/poses for pseudo correspondence.")
-                init_depth = batch.get("depths")
-                init_poses = batch.get("poses_c2w")
-            if init_depth is None or init_poses is None:
-                raise RuntimeError("Stage 1C training requires init depth and c2w poses.")
-            corr = generate_spherical_pseudo_correspondence(
-                init_depth,
-                init_poses,
-                batch["pair_indices"],
-                height=int(images.shape[-2]),
-                width=int(images.shape[-1]),
-                **dict(config.get("correspondence", {})),
-            )
-            dense = adapter(pano_out.stage_features)
-            loss, metrics_t = criterion(dense, corr)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
+                with torch.no_grad():
+                    pano_out = wrapper(images)
+                corr = _make_correspondence(config, batch, pano_out, images)
+                dense = adapter(pano_out.stage_features)
+                need_matches = vis_enabled and (step == 0 or (step + 1) % vis_interval == 0)
+                if need_matches:
+                    loss, metrics_t, matches = criterion(dense, corr, return_matches=True)
+                else:
+                    loss, metrics_t = criterion(dense, corr)
+                    matches = None
             loss = float(config.get("loss", {}).get("spherical_match_weight", 1.0)) * loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -353,32 +566,100 @@ def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
             optimizer.step()
             step += 1
             latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
+            latest_metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+            if matches is not None:
+                path = _save_match_visualization(
+                    output_dir=output_dir,
+                    save_dir=vis_save_dir,
+                    split="train",
+                    step=step,
+                    images=images,
+                    matches=matches,
+                    max_matches=vis_max_matches,
+                )
+                if path is not None and wandb_run is not None:
+                    try:
+                        import wandb
+                        wandb_run.log({"diagnostics/stage1_matches_train": wandb.Image(str(path))}, step=step)
+                    except ImportError:
+                        pass
             if wandb_run is not None and (step == 1 or step % int(config.get("WeightsAndBiases", {}).get("log_every", 50)) == 0):
-                wandb_run.log({f"train/{key}": value for key, value in latest_metrics.items()}, step=step)
+                wandb_run.log(_prefixed("train", latest_metrics), step=step)
             if step == 1 or step % log_interval == 0:
                 print(yaml.safe_dump({"step": step, "metrics": latest_metrics}, sort_keys=False).strip())
+            if val_loader is not None and (step % val_interval == 0 or step == max_steps):
+                val_metrics = run_validation(step)
+                if val_metrics:
+                    print(yaml.safe_dump({"step": step, "val_metrics": val_metrics}, sort_keys=False).strip())
+                    val_angular = val_metrics.get("mean_angular_deg")
+                    if val_angular is not None and (
+                        best_val_angular_error is None or float(val_angular) < float(best_val_angular_error)
+                    ):
+                        best_val_angular_error = float(val_angular)
+                        _save_checkpoint(
+                            ckpt_dir / "best_val_angular_error.pt",
+                            adapter,
+                            config,
+                            step,
+                            {**latest_metrics, **_prefixed("val", val_metrics)},
+                            optimizer,
+                            best_val_angular_error,
+                        )
             if step % save_interval == 0 or step == max_steps:
-                _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics)
+                _save_checkpoint(ckpt_dir / "latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
+                _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
+                if step % save_interval == 0:
+                    _save_checkpoint(
+                        ckpt_dir / f"step_{step:06d}.pt",
+                        adapter,
+                        config,
+                        step,
+                        latest_metrics,
+                        optimizer,
+                        best_val_angular_error,
+                    )
             if step >= max_steps:
                 break
-    _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics)
+    _save_checkpoint(ckpt_dir / "latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
+    _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
     if wandb_run is not None:
         wandb_run.finish()
-    return {"steps": step, "last_metrics": latest_metrics, "checkpoint": str(ckpt_dir / "adapter_latest.pt"), "elapsed_sec": time.time() - start}
+    return {
+        "steps": step,
+        "last_metrics": latest_metrics,
+        "checkpoint": str(ckpt_dir / "latest.pt"),
+        "best_val_angular_error": best_val_angular_error,
+        "elapsed_sec": time.time() - start,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/stage1_spherical_selfi_adapter.yaml")
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--max-steps", "--max_steps", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--log-interval", "--log_interval", type=int, default=None)
+    parser.add_argument("--save-interval", "--save_interval", type=int, default=None)
+    parser.add_argument("--val-interval", "--val_interval", type=int, default=None)
+    parser.add_argument("--resume", default=None)
     parser.add_argument("--wandb-mode", default=None, choices=["online", "offline", "disabled"])
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.manifest is not None:
+        config.setdefault("dataset", {})["manifest"] = args.manifest
     if args.max_steps is not None:
         config.setdefault("train", {})["max_steps"] = int(args.max_steps)
     if args.output_dir is not None:
         config.setdefault("train", {})["output_dir"] = args.output_dir
+    if args.log_interval is not None:
+        config.setdefault("train", {})["log_interval"] = int(args.log_interval)
+    if args.save_interval is not None:
+        config.setdefault("train", {})["save_interval"] = int(args.save_interval)
+    if args.val_interval is not None:
+        config.setdefault("train", {})["val_interval"] = int(args.val_interval)
+    if args.resume is not None:
+        config.setdefault("train", {})["resume"] = args.resume
     if args.wandb_mode is not None:
         if args.wandb_mode == "disabled":
             config.setdefault("WeightsAndBiases", {})["enabled"] = False

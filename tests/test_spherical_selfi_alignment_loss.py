@@ -38,6 +38,8 @@ def test_spherical_selfi_alignment_loss_backpropagates():
     loss, metrics = loss_fn(features, corr)
     assert torch.isfinite(loss)
     assert metrics["num_queries"].item() == 3
+    assert "median_angular_deg" in metrics
+    assert "pck_1deg" in metrics
     loss.backward()
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
@@ -73,3 +75,24 @@ def test_empty_correspondence_returns_zero_loss():
     loss.backward()
     assert features.grad is not None
     assert features.grad.abs().sum() == 0.0
+
+
+def test_alignment_loss_can_return_predicted_matches_for_visualization():
+    height, width = 8, 16
+    features = torch.randn(1, 2, 24, height, width)
+    uv = torch.tensor([[4.5, 3.5], [8.5, 4.5]], dtype=torch.float32)
+    loss_fn = SphericalSelfiAlignmentLoss(
+        mode="global_lowres",
+        loss_stride=2,
+        temperature=0.2,
+        max_queries=2,
+        erp_aux_weight=0.0,
+    )
+    loss, metrics, matches = loss_fn(features, _corr_from_uv(uv, height=height, width=width), return_matches=True)
+    assert torch.isfinite(loss)
+    assert metrics["num_queries"].item() == 2
+    assert matches["src_uv"].shape == (2, 2)
+    assert matches["tgt_uv"].shape == (2, 2)
+    assert matches["pred_uv"].shape == (2, 2)
+    assert matches["flat_src"].shape == (2,)
+    assert matches["flat_tgt"].shape == (2,)

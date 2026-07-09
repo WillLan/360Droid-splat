@@ -38,6 +38,39 @@ class _DummyPanoVGGT(nn.Module):
         return {"depth": depth, "poses_c2w": poses}
 
 
+class _TokenStage(nn.Module):
+    def __init__(self, channels: int, token_count: int, register_count: int = 5) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.token_count = int(token_count)
+        self.register_count = int(register_count)
+        self.proj = nn.Linear(3, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, v, c, h, w = x.shape
+        seed = x.mean(dim=(-1, -2)).reshape(b, v, 1, c).expand(b, v, self.token_count + self.register_count, c)
+        return self.proj(seed)
+
+
+class _TokenPanoVGGT(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stage1 = _TokenStage(4, 8)
+        self.stage2 = _TokenStage(6, 8)
+        self.stage3 = _TokenStage(8, 8)
+        self.stage4 = _TokenStage(10, 8)
+
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        _ = self.stage1(images)
+        _ = self.stage2(images)
+        _ = self.stage3(images)
+        _ = self.stage4(images)
+        b, v, _, h, w = images.shape
+        depth = torch.ones(b, v, 1, h, w, device=images.device, dtype=images.dtype)
+        poses = torch.eye(4, device=images.device, dtype=images.dtype).view(1, 1, 4, 4).repeat(b, v, 1, 1)
+        return {"depth": depth, "poses_c2w": poses}
+
+
 def test_panovggt_feature_wrapper_freezes_model_and_captures_four_stages():
     model = _DummyPanoVGGT()
     wrapper = PanoVGGTFeatureWrapper(
@@ -58,6 +91,23 @@ def test_panovggt_feature_wrapper_freezes_model_and_captures_four_stages():
     assert out.init_depth is not None and out.init_depth.shape == (1, 2, 1, 32, 64)
     assert out.init_poses is not None and out.init_poses.shape == (1, 2, 4, 4)
     assert all(not feature.requires_grad for feature in out.stage_features)
+
+
+def test_panovggt_feature_wrapper_drops_register_tokens_before_grid_reshape():
+    model = _TokenPanoVGGT()
+    wrapper = PanoVGGTFeatureWrapper(
+        model,
+        stage_hooks=["stage1", "stage2", "stage3", "stage4"],
+        token_hw=[(2, 4), (2, 4), (2, 4), (2, 4)],
+        token_start_idx=[5, 5, 5, 5],
+    )
+    out = wrapper(torch.rand(1, 2, 3, 8, 16))
+    assert out.feature_shapes == [
+        (1, 2, 4, 2, 4),
+        (1, 2, 6, 2, 4),
+        (1, 2, 8, 2, 4),
+        (1, 2, 10, 2, 4),
+    ]
 
 
 def test_adapter_default_output_shape_and_l2_norm():

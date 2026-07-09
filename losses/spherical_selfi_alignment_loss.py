@@ -148,20 +148,37 @@ class SphericalSelfiAlignmentLoss(nn.Module):
         self,
         adapter_features: torch.Tensor,
         correspondences: SphericalCorrespondence,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        *,
+        return_matches: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         features = F.normalize(adapter_features, dim=2, eps=self.config.eps)
         flat = features.reshape(features.shape[0] * features.shape[1], features.shape[2], features.shape[3], features.shape[4])
         height, width = int(features.shape[-2]), int(features.shape[-1])
         entries = _flatten_valid(features, correspondences, self.config.max_queries)
         if entries["flat_src"].numel() == 0:
             zero = features.sum() * 0.0
-            return zero, {
+            metrics = {
                 "loss": zero.detach(),
                 "spherical": zero.detach(),
                 "erp_aux": zero.detach(),
                 "num_queries": torch.tensor(0.0, device=features.device),
                 "mean_angular_deg": torch.tensor(0.0, device=features.device),
+                "median_angular_deg": torch.tensor(0.0, device=features.device),
+                "pck_1deg": torch.tensor(0.0, device=features.device),
+                "pck_3deg": torch.tensor(0.0, device=features.device),
+                "pck_5deg": torch.tensor(0.0, device=features.device),
             }
+            if return_matches:
+                empty = torch.empty(0, device=features.device, dtype=features.dtype)
+                return zero, metrics, {
+                    "src_uv": empty.view(0, 2),
+                    "tgt_uv": empty.view(0, 2),
+                    "pred_uv": empty.view(0, 2),
+                    "angular_deg": empty,
+                    "flat_src": torch.empty(0, device=features.device, dtype=torch.long),
+                    "flat_tgt": torch.empty(0, device=features.device, dtype=torch.long),
+                }
+            return zero, metrics
         src_values = sample_erp_with_wrap(flat[entries["flat_src"]], entries["src_uv"])
         src_values = F.normalize(src_values, dim=-1, eps=self.config.eps)
         if self.config.mode == "global_lowres":
@@ -172,16 +189,31 @@ class SphericalSelfiAlignmentLoss(nn.Module):
             raise ValueError(f"Unsupported spherical Selfi matching mode: {self.config.mode!r}.")
 
         angular = spherical_geodesic_distance(pred_ray, entries["tgt_ray"], eps=self.config.eps)
+        angular_deg = torch.rad2deg(angular.detach())
         spherical = _weighted_mean(angular, entries["weight"], self.config.eps)
         erp_aux = _weighted_mean(_seam_aware_pixel_l1(pred_uv, entries["tgt_uv"], width), entries["weight"], self.config.eps)
         loss = spherical + float(self.config.erp_aux_weight) * erp_aux
-        return loss, {
+        metrics = {
             "loss": loss.detach(),
             "spherical": spherical.detach(),
             "erp_aux": erp_aux.detach(),
             "num_queries": torch.tensor(float(entries["flat_src"].numel()), device=features.device),
-            "mean_angular_deg": torch.rad2deg(angular.detach()).mean(),
+            "mean_angular_deg": angular_deg.mean(),
+            "median_angular_deg": angular_deg.median(),
+            "pck_1deg": (angular_deg <= 1.0).float().mean(),
+            "pck_3deg": (angular_deg <= 3.0).float().mean(),
+            "pck_5deg": (angular_deg <= 5.0).float().mean(),
         }
+        if return_matches:
+            return loss, metrics, {
+                "src_uv": entries["src_uv"].detach(),
+                "tgt_uv": entries["tgt_uv"].detach(),
+                "pred_uv": pred_uv.detach(),
+                "angular_deg": angular_deg,
+                "flat_src": entries["flat_src"].detach(),
+                "flat_tgt": entries["flat_tgt"].detach(),
+            }
+        return loss, metrics
 
     def _global_lowres_prediction(
         self,

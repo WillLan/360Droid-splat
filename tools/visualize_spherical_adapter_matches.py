@@ -88,16 +88,69 @@ def save_stage1_match_preview(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--output-dir", "--output_dir", default=None)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--num-samples", "--num_samples", type=int, default=1)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--height", type=int, default=504)
     parser.add_argument("--width", type=int, default=1008)
     parser.add_argument("--max-matches", type=int, default=80)
     parser.add_argument("--predicted-uv-npy", default=None)
     parser.add_argument("--metrics-json", default=None)
     args = parser.parse_args()
+    if args.output is None and args.output_dir is None:
+        raise ValueError("Pass either --output or --output-dir.")
     dataset = Stage1PanoSequenceDataset(args.manifest, image_height=args.height, image_width=args.width)
     sample = dataset[0]
-    if sample["depths"] is not None and sample["poses_c2w"] is not None:
+    predicted = None
+    if args.checkpoint is not None:
+        if args.config is None:
+            raise ValueError("--checkpoint visualization requires --config.")
+        from losses.spherical_selfi_alignment_loss import SphericalSelfiAlignmentLoss, SphericalSelfiAlignmentLossConfig
+        from training.train_spherical_selfi_adapter import build_adapter, build_panovggt_wrapper, load_config
+
+        config = load_config(args.config)
+        torch_device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        wrapper = build_panovggt_wrapper(config, device=torch_device)
+        adapter = build_adapter(config, device=torch_device)
+        payload = torch.load(args.checkpoint, map_location=torch_device)
+        adapter.load_state_dict(payload["adapter"] if isinstance(payload, dict) and "adapter" in payload else payload)
+        wrapper.eval()
+        adapter.eval()
+        images = sample["images"].unsqueeze(0).to(torch_device)
+        with torch.no_grad():
+            pano_out = wrapper(images)
+            depth = pano_out.init_depth if pano_out.init_depth is not None else None
+            poses = pano_out.init_poses if pano_out.init_poses is not None else None
+            if depth is None or poses is None:
+                raise RuntimeError("PanoVGGT output did not provide depth/poses for match visualization.")
+            corr = generate_spherical_pseudo_correspondence(
+                depth,
+                poses,
+                sample["pair_indices"].unsqueeze(0).to(torch_device),
+                height=args.height,
+                width=args.width,
+                num_query_per_pair=max(1, int(args.max_matches)),
+                sampling="grid",
+            )
+            dense = adapter(pano_out.stage_features)
+            criterion = SphericalSelfiAlignmentLoss(
+                SphericalSelfiAlignmentLossConfig(
+                    mode=str(config.get("matching", {}).get("mode", "global_lowres")),
+                    loss_stride=int(config.get("matching", {}).get("loss_stride", 4)),
+                    local_window_radius=int(config.get("matching", {}).get("local_window_radius", 16)),
+                    temperature=float(config.get("matching", {}).get("temperature", 0.07)),
+                    max_queries=max(1, int(args.max_matches)),
+                    erp_aux_weight=float(config.get("loss", {}).get("erp_aux_weight", 0.01)),
+                )
+            )
+            _, _, matches = criterion(dense, corr, return_matches=True)
+        src_uv = matches["src_uv"].detach().cpu()
+        pseudo_uv = matches["tgt_uv"].detach().cpu()
+        predicted = matches["pred_uv"].detach().cpu()
+    elif sample["depths"] is not None and sample["poses_c2w"] is not None:
         corr = generate_spherical_pseudo_correspondence(
             sample["depths"],
             sample["poses_c2w"],
@@ -114,15 +167,17 @@ def main() -> None:
         h, w = int(sample["images"].shape[-2]), int(sample["images"].shape[-1])
         src_uv = torch.tensor([[w * 0.25, h * 0.5], [w * 0.5, h * 0.5], [w * 0.75, h * 0.5]], dtype=torch.float32)
         pseudo_uv = src_uv.clone()
-    predicted = None
     if args.predicted_uv_npy:
         predicted = torch.as_tensor(np.load(args.predicted_uv_npy), dtype=torch.float32)
+    output = args.output
+    if output is None:
+        output = str(Path(args.output_dir) / "stage1_match_preview_000000.png")
     save_stage1_match_preview(
         sample["images"][0],
         sample["images"][1],
         src_uv,
         pseudo_uv,
-        args.output,
+        output,
         pred_tgt_uv=predicted,
         max_matches=args.max_matches,
     )
@@ -130,7 +185,7 @@ def main() -> None:
     if args.metrics_json:
         Path(args.metrics_json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.metrics_json).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(json.dumps({"output": str(args.output), **metrics}, indent=2))
+    print(json.dumps({"output": str(output), **metrics}, indent=2))
 
 
 if __name__ == "__main__":
