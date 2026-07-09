@@ -10,6 +10,7 @@ import argparse
 from contextlib import contextmanager
 import inspect
 from importlib import import_module
+import os
 from pathlib import Path
 import sys
 import time
@@ -22,9 +23,11 @@ if str(ROOT) not in sys.path:
 import numpy as np
 from PIL import Image
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 import yaml
 
 from data.stage1_pano_sequence_dataset import Stage1PanoSequenceDataset, stage1_collate
@@ -340,6 +343,54 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
+def _setup_distributed() -> tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 1:
+        return False, 0, 0, 1
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is required for multi-GPU Stage 1 adapter training.")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+    return True, rank, local_rank, world_size
+
+
+def _cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_main_process(rank: int) -> bool:
+    return int(rank) == 0
+
+
+def _mean_metrics_across_ranks(
+    metrics: dict[str, float],
+    *,
+    device: torch.device,
+    distributed: bool,
+    world_size: int,
+) -> dict[str, float]:
+    if not distributed:
+        return metrics
+    keys = sorted(metrics.keys())
+    values = torch.tensor([float(metrics[key]) for key in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values /= float(world_size)
+    return {key: float(value.item()) for key, value in zip(keys, values)}
+
+
+def _distributed_barrier(distributed: bool) -> None:
+    if distributed:
+        dist.barrier()
+
+
 def _assert_adapter_finite(adapter: SphericalSelfiDPTAdapter, *, context: str) -> None:
     for name, param in adapter.named_parameters():
         if not torch.isfinite(param).all():
@@ -471,206 +522,297 @@ def _save_match_visualization(
 
 
 def train_spherical_selfi_adapter(config: dict[str, Any]) -> dict[str, Any]:
-    torch.manual_seed(int(config.get("train", {}).get("seed", 1234)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = build_dataset(config, split="train")
+    distributed, rank, local_rank, world_size = _setup_distributed()
+    is_main = _is_main_process(rank)
     try:
-        val_dataset = build_dataset(config, split="val")
-    except ValueError:
-        val_dataset = None
-    train_cfg = config.get("train", {})
-    loader = DataLoader(
-        dataset,
-        batch_size=int(train_cfg.get("batch_size", 1)),
-        shuffle=True,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=stage1_collate,
-        drop_last=False,
-    )
-    val_loader = None if val_dataset is None else DataLoader(
-        val_dataset,
-        batch_size=int(train_cfg.get("batch_size", 1)),
-        shuffle=False,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=stage1_collate,
-        drop_last=False,
-    )
-    wrapper = build_panovggt_wrapper(config, device=device)
-    adapter = build_adapter(config, device=device)
-    loss_cfg = SphericalSelfiAlignmentLossConfig(
-        mode=str(config.get("matching", {}).get("mode", "global_fullres_spherical_ce")),
-        loss_stride=int(config.get("matching", {}).get("loss_stride", 1)),
-        local_window_radius=int(config.get("matching", {}).get("local_window_radius", 16)),
-        temperature=float(config.get("matching", {}).get("temperature", 0.07)),
-        max_queries=config.get("matching", {}).get("max_queries", 512),
-        erp_aux_weight=float(config.get("loss", {}).get("erp_aux_weight", 0.01)),
-        soft_label_sigma_deg=float(config.get("matching", {}).get("soft_label_sigma_deg", 2.0)),
-        expected_geodesic_weight=float(config.get("loss", {}).get("expected_geodesic_weight", 0.0)),
-        ce_query_chunk_size=int(config.get("matching", {}).get("ce_query_chunk_size", 32)),
-        use_spherical_area_correction=bool(config.get("matching", {}).get("use_spherical_area_correction", True)),
-    )
-    criterion = SphericalSelfiAlignmentLoss(loss_cfg)
-    optimizer = torch.optim.AdamW(
-        adapter.parameters(),
-        lr=float(train_cfg.get("lr", 1.0e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 1.0e-4)),
-    )
-    output_dir = Path(train_cfg.get("output_dir", "outputs/stage1_spherical_selfi_adapter"))
-    ckpt_dir = output_dir / "checkpoints"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    wandb_run = _init_wandb(config, output_dir)
-    max_steps = int(train_cfg.get("max_steps", 1))
-    save_interval = max(1, int(train_cfg.get("save_interval", 1000)))
-    log_interval = max(1, int(train_cfg.get("log_interval", 50)))
-    val_interval = max(1, int(train_cfg.get("val_interval", 1000)))
-    max_val_batches = max(1, int(train_cfg.get("max_val_batches", 8)))
-    resume = train_cfg.get("resume")
-    step = 0
-    latest_metrics: dict[str, float] = {}
-    best_val_angular_error: float | None = None
-    if resume:
-        step, latest_metrics, best_val_angular_error = _load_checkpoint(
-            resume,
-            adapter,
-            optimizer,
-            device=device,
-        )
-    start = time.time()
-    amp_enabled = bool(train_cfg.get("amp", False)) and device.type == "cuda"
-    vis_cfg = config.get("Visualization", {})
-    vis_enabled = bool(vis_cfg.get("enabled", False))
-    vis_interval = max(1, int(vis_cfg.get("interval", val_interval)))
-    vis_max_matches = int(vis_cfg.get("max_matches", 80))
-    vis_save_dir = str(vis_cfg.get("save_dir", "visualizations"))
-    adapter.train()
-    wrapper.eval()
+        train_cfg = config.get("train", {})
+        torch.manual_seed(int(train_cfg.get("seed", 1234)) + rank)
+        if torch.cuda.is_available():
+            device = torch.device("cuda", local_rank if distributed else 0)
+        else:
+            device = torch.device("cpu")
 
-    def run_validation(current_step: int) -> dict[str, float]:
-        if val_loader is None:
-            return {}
-        adapter.eval()
-        sums: dict[str, float] = {}
-        count = 0
-        with torch.no_grad():
-            for batch_idx, raw_batch in enumerate(val_loader):
-                if batch_idx >= max_val_batches:
-                    break
+        dataset = build_dataset(config, split="train")
+        try:
+            val_dataset = build_dataset(config, split="val")
+        except ValueError:
+            val_dataset = None
+
+        train_sampler = (
+            DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+            if distributed
+            else None
+        )
+        val_sampler = (
+            DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+            if distributed and val_dataset is not None
+            else None
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=int(train_cfg.get("batch_size", 1)),
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            num_workers=int(train_cfg.get("num_workers", 0)),
+            collate_fn=stage1_collate,
+            drop_last=False,
+        )
+        val_loader = None if val_dataset is None else DataLoader(
+            val_dataset,
+            batch_size=int(train_cfg.get("batch_size", 1)),
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=int(train_cfg.get("num_workers", 0)),
+            collate_fn=stage1_collate,
+            drop_last=False,
+        )
+        wrapper = build_panovggt_wrapper(config, device=device)
+        adapter_module = build_adapter(config, device=device)
+        adapter: nn.Module
+        if distributed:
+            adapter = DistributedDataParallel(
+                adapter_module,
+                device_ids=[local_rank] if device.type == "cuda" else None,
+                output_device=local_rank if device.type == "cuda" else None,
+            )
+        else:
+            adapter = adapter_module
+        loss_cfg = SphericalSelfiAlignmentLossConfig(
+            mode=str(config.get("matching", {}).get("mode", "global_fullres_spherical_ce")),
+            loss_stride=int(config.get("matching", {}).get("loss_stride", 1)),
+            local_window_radius=int(config.get("matching", {}).get("local_window_radius", 16)),
+            temperature=float(config.get("matching", {}).get("temperature", 0.07)),
+            max_queries=config.get("matching", {}).get("max_queries", 512),
+            erp_aux_weight=float(config.get("loss", {}).get("erp_aux_weight", 0.01)),
+            soft_label_sigma_deg=float(config.get("matching", {}).get("soft_label_sigma_deg", 2.0)),
+            expected_geodesic_weight=float(config.get("loss", {}).get("expected_geodesic_weight", 0.0)),
+            ce_query_chunk_size=int(config.get("matching", {}).get("ce_query_chunk_size", 32)),
+            use_spherical_area_correction=bool(config.get("matching", {}).get("use_spherical_area_correction", True)),
+        )
+        criterion = SphericalSelfiAlignmentLoss(loss_cfg)
+        optimizer = torch.optim.AdamW(
+            adapter.parameters(),
+            lr=float(train_cfg.get("lr", 1.0e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1.0e-4)),
+        )
+        output_dir = Path(train_cfg.get("output_dir", "outputs/stage1_spherical_selfi_adapter"))
+        ckpt_dir = output_dir / "checkpoints"
+        if is_main:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        _distributed_barrier(distributed)
+        wandb_run = _init_wandb(config, output_dir) if is_main else None
+        max_steps = int(train_cfg.get("max_steps", 1))
+        save_interval = max(1, int(train_cfg.get("save_interval", 1000)))
+        log_interval = max(1, int(train_cfg.get("log_interval", 50)))
+        val_interval = max(1, int(train_cfg.get("val_interval", 1000)))
+        max_val_batches = max(1, int(train_cfg.get("max_val_batches", 8)))
+        resume = train_cfg.get("resume")
+        step = 0
+        latest_metrics: dict[str, float] = {}
+        best_val_angular_error: float | None = None
+        if resume:
+            step, latest_metrics, best_val_angular_error = _load_checkpoint(
+                resume,
+                adapter_module,
+                optimizer,
+                device=device,
+            )
+        start = time.time()
+        amp_enabled = bool(train_cfg.get("amp", False)) and device.type == "cuda"
+        vis_cfg = config.get("Visualization", {})
+        vis_enabled = bool(vis_cfg.get("enabled", False))
+        vis_interval = max(1, int(vis_cfg.get("interval", val_interval)))
+        vis_max_matches = int(vis_cfg.get("max_matches", 80))
+        vis_save_dir = str(vis_cfg.get("save_dir", "visualizations"))
+        adapter.train()
+        wrapper.eval()
+
+        def run_validation(current_step: int) -> dict[str, float]:
+            if val_loader is None:
+                return {}
+            adapter.eval()
+            sums: dict[str, float] = {}
+            count = 0
+            with torch.no_grad():
+                for batch_idx, raw_batch in enumerate(val_loader):
+                    if batch_idx >= max_val_batches:
+                        break
+                    batch = _to_device(raw_batch, device)
+                    images = batch["images"].float()
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
+                        pano_out = wrapper(images)
+                        corr = _make_correspondence(config, batch, pano_out, images)
+                        dense = adapter(pano_out.stage_features)
+                        _, metrics_t = criterion(dense, corr)
+                    metrics = _float_metrics(metrics_t)
+                    metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+                    _assert_metrics_finite(metrics, context=f"during validation at step {current_step}")
+                    for key, value in metrics.items():
+                        sums[key] = sums.get(key, 0.0) + float(value)
+                    count += 1
+            adapter.train()
+            if count == 0:
+                return {}
+            keys = sorted(sums.keys())
+            values = torch.tensor(
+                [float(sums[key]) for key in keys] + [float(count)],
+                device=device,
+                dtype=torch.float64,
+            )
+            if distributed:
+                dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            total_count = float(values[-1].item())
+            if total_count <= 0.0:
+                return {}
+            metrics = {key: float(values[idx].item() / total_count) for idx, key in enumerate(keys)}
+            _assert_metrics_finite(metrics, context=f"after validation reduction at step {current_step}")
+            if wandb_run is not None:
+                wandb_run.log(_prefixed("val", metrics), step=current_step)
+            return metrics
+
+        epoch = 0
+        while step < max_steps:
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            for raw_batch in loader:
                 batch = _to_device(raw_batch, device)
                 images = batch["images"].float()
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
-                    pano_out = wrapper(images)
+                    with torch.no_grad():
+                        pano_out = wrapper(images)
                     corr = _make_correspondence(config, batch, pano_out, images)
                     dense = adapter(pano_out.stage_features)
-                    _, metrics_t = criterion(dense, corr)
-                metrics = _float_metrics(metrics_t)
-                metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
-                _assert_metrics_finite(metrics, context=f"during validation at step {current_step}")
-                for key, value in metrics.items():
-                    sums[key] = sums.get(key, 0.0) + float(value)
-                count += 1
-        adapter.train()
-        if count == 0:
-            return {}
-        metrics = {key: value / float(count) for key, value in sums.items()}
-        if wandb_run is not None:
-            wandb_run.log(_prefixed("val", metrics), step=current_step)
-        return metrics
-
-    while step < max_steps:
-        for raw_batch in loader:
-            batch = _to_device(raw_batch, device)
-            images = batch["images"].float()
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_enabled):
-                with torch.no_grad():
-                    pano_out = wrapper(images)
-                corr = _make_correspondence(config, batch, pano_out, images)
-                dense = adapter(pano_out.stage_features)
-                need_matches = vis_enabled and (step == 0 or (step + 1) % vis_interval == 0)
-                if need_matches:
-                    loss, metrics_t, matches = criterion(dense, corr, return_matches=True)
-                else:
-                    loss, metrics_t = criterion(dense, corr)
-                    matches = None
-            loss = float(config.get("loss", {}).get("spherical_match_weight", 1.0)) * loss
-            if not torch.isfinite(loss).all():
-                raise RuntimeError(f"Non-finite training loss detected before backward at step {step + 1}.")
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            _assert_adapter_grads_finite(adapter, context=f"before gradient clipping at step {step + 1}")
-            grad_norm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), float(train_cfg.get("grad_clip", 1.0)))
-            if not torch.isfinite(grad_norm):
-                raise RuntimeError(f"Non-finite adapter gradient norm detected at step {step + 1}.")
-            _assert_adapter_grads_finite(adapter, context=f"after gradient clipping at step {step + 1}")
-            optimizer.step()
-            _assert_adapter_finite(adapter, context=f"after optimizer step {step + 1}")
-            step += 1
-            latest_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
-            latest_metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
-            _assert_metrics_finite(latest_metrics, context=f"after training step {step}")
-            if matches is not None:
-                path = _save_match_visualization(
-                    output_dir=output_dir,
-                    save_dir=vis_save_dir,
-                    split="train",
-                    step=step,
-                    images=images,
-                    matches=matches,
-                    max_matches=vis_max_matches,
+                    need_matches = is_main and vis_enabled and (step == 0 or (step + 1) % vis_interval == 0)
+                    if need_matches:
+                        loss, metrics_t, matches = criterion(dense, corr, return_matches=True)
+                    else:
+                        loss, metrics_t = criterion(dense, corr)
+                        matches = None
+                loss = float(config.get("loss", {}).get("spherical_match_weight", 1.0)) * loss
+                if not torch.isfinite(loss).all():
+                    raise RuntimeError(f"Non-finite training loss detected before backward at step {step + 1}.")
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                _assert_adapter_grads_finite(adapter_module, context=f"before gradient clipping at step {step + 1}")
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    adapter_module.parameters(),
+                    float(train_cfg.get("grad_clip", 1.0)),
                 )
-                if path is not None and wandb_run is not None:
-                    try:
-                        import wandb
-                        wandb_run.log({"diagnostics/stage1_matches_train": wandb.Image(str(path))}, step=step)
-                    except ImportError:
-                        pass
-            if wandb_run is not None and (step == 1 or step % int(config.get("WeightsAndBiases", {}).get("log_every", 50)) == 0):
-                wandb_run.log(_prefixed("train", latest_metrics), step=step)
-            if step == 1 or step % log_interval == 0:
-                print(yaml.safe_dump({"step": step, "metrics": latest_metrics}, sort_keys=False).strip())
-            if val_loader is not None and (step % val_interval == 0 or step == max_steps):
-                val_metrics = run_validation(step)
-                if val_metrics:
-                    print(yaml.safe_dump({"step": step, "val_metrics": val_metrics}, sort_keys=False).strip())
-                    val_angular = val_metrics.get("mean_angular_deg")
-                    if val_angular is not None and (
-                        best_val_angular_error is None or float(val_angular) < float(best_val_angular_error)
-                    ):
-                        best_val_angular_error = float(val_angular)
-                        _save_checkpoint(
-                            ckpt_dir / "best_val_angular_error.pt",
-                            adapter,
-                            config,
-                            step,
-                            {**latest_metrics, **_prefixed("val", val_metrics)},
-                            optimizer,
-                            best_val_angular_error,
-                        )
-            if step % save_interval == 0 or step == max_steps:
-                _save_checkpoint(ckpt_dir / "latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
-                _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
-                if step % save_interval == 0:
+                if not torch.isfinite(grad_norm):
+                    raise RuntimeError(f"Non-finite adapter gradient norm detected at step {step + 1}.")
+                _assert_adapter_grads_finite(adapter_module, context=f"after gradient clipping at step {step + 1}")
+                optimizer.step()
+                _assert_adapter_finite(adapter_module, context=f"after optimizer step {step + 1}")
+                step += 1
+                local_metrics = _float_metrics({"loss": loss.detach(), **metrics_t})
+                local_metrics["valid_corr_ratio"] = float(_valid_ratio(corr).detach().cpu())
+                _assert_metrics_finite(local_metrics, context=f"after local training step {step}")
+                latest_metrics = _mean_metrics_across_ranks(
+                    local_metrics,
+                    device=device,
+                    distributed=distributed,
+                    world_size=world_size,
+                )
+                _assert_metrics_finite(latest_metrics, context=f"after training metric reduction at step {step}")
+                if is_main and matches is not None:
+                    path = _save_match_visualization(
+                        output_dir=output_dir,
+                        save_dir=vis_save_dir,
+                        split="train",
+                        step=step,
+                        images=images,
+                        matches=matches,
+                        max_matches=vis_max_matches,
+                    )
+                    if path is not None and wandb_run is not None:
+                        try:
+                            import wandb
+                            wandb_run.log({"diagnostics/stage1_matches_train": wandb.Image(str(path))}, step=step)
+                        except ImportError:
+                            pass
+                if (
+                    is_main
+                    and wandb_run is not None
+                    and (step == 1 or step % int(config.get("WeightsAndBiases", {}).get("log_every", 50)) == 0)
+                ):
+                    wandb_run.log(_prefixed("train", latest_metrics), step=step)
+                if is_main and (step == 1 or step % log_interval == 0):
+                    print(yaml.safe_dump({"step": step, "metrics": latest_metrics}, sort_keys=False).strip())
+                if val_loader is not None and (step % val_interval == 0 or step == max_steps):
+                    val_metrics = run_validation(step)
+                    if is_main and val_metrics:
+                        print(yaml.safe_dump({"step": step, "val_metrics": val_metrics}, sort_keys=False).strip())
+                        val_angular = val_metrics.get("mean_angular_deg")
+                        if val_angular is not None and (
+                            best_val_angular_error is None or float(val_angular) < float(best_val_angular_error)
+                        ):
+                            best_val_angular_error = float(val_angular)
+                            _save_checkpoint(
+                                ckpt_dir / "best_val_angular_error.pt",
+                                adapter_module,
+                                config,
+                                step,
+                                {**latest_metrics, **_prefixed("val", val_metrics)},
+                                optimizer,
+                                best_val_angular_error,
+                            )
+                if is_main and (step % save_interval == 0 or step == max_steps):
                     _save_checkpoint(
-                        ckpt_dir / f"step_{step:06d}.pt",
-                        adapter,
+                        ckpt_dir / "latest.pt",
+                        adapter_module,
                         config,
                         step,
                         latest_metrics,
                         optimizer,
                         best_val_angular_error,
                     )
-            if step >= max_steps:
-                break
-    _save_checkpoint(ckpt_dir / "latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
-    _save_checkpoint(ckpt_dir / "adapter_latest.pt", adapter, config, step, latest_metrics, optimizer, best_val_angular_error)
-    if wandb_run is not None:
-        wandb_run.finish()
-    return {
-        "steps": step,
-        "last_metrics": latest_metrics,
-        "checkpoint": str(ckpt_dir / "latest.pt"),
-        "best_val_angular_error": best_val_angular_error,
-        "elapsed_sec": time.time() - start,
-    }
+                    _save_checkpoint(
+                        ckpt_dir / "adapter_latest.pt",
+                        adapter_module,
+                        config,
+                        step,
+                        latest_metrics,
+                        optimizer,
+                        best_val_angular_error,
+                    )
+                    if step % save_interval == 0:
+                        _save_checkpoint(
+                            ckpt_dir / f"step_{step:06d}.pt",
+                            adapter_module,
+                            config,
+                            step,
+                            latest_metrics,
+                            optimizer,
+                            best_val_angular_error,
+                        )
+                if step >= max_steps:
+                    break
+            epoch += 1
+        if is_main:
+            _save_checkpoint(ckpt_dir / "latest.pt", adapter_module, config, step, latest_metrics, optimizer, best_val_angular_error)
+            _save_checkpoint(
+                ckpt_dir / "adapter_latest.pt",
+                adapter_module,
+                config,
+                step,
+                latest_metrics,
+                optimizer,
+                best_val_angular_error,
+            )
+            if wandb_run is not None:
+                wandb_run.finish()
+        return {
+            "steps": step,
+            "last_metrics": latest_metrics,
+            "checkpoint": str(ckpt_dir / "latest.pt"),
+            "best_val_angular_error": best_val_angular_error,
+            "elapsed_sec": time.time() - start,
+            "distributed": distributed,
+            "rank": rank,
+            "world_size": world_size,
+        }
+    finally:
+        _cleanup_distributed(distributed)
 
 
 def main() -> None:
@@ -707,7 +849,8 @@ def main() -> None:
             config.setdefault("WeightsAndBiases", {})["enabled"] = True
             config.setdefault("WeightsAndBiases", {})["mode"] = args.wandb_mode
     result = train_spherical_selfi_adapter(config)
-    print(yaml.safe_dump(result, sort_keys=False).strip())
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(yaml.safe_dump(result, sort_keys=False).strip())
 
 
 if __name__ == "__main__":

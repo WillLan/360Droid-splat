@@ -1,6 +1,6 @@
 stage: 1
 task: spherical_selfi_adapter
-experiment_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
+experiment_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2
 
 image:
   height: 504
@@ -65,7 +65,7 @@ correspondence:
   sampling: fibonacci_depth_filtered
   fibonacci_oversample_factor: 8
   min_depth: 0.05
-  max_depth: 200.0
+  max_depth: 20.0
   visibility_rel_thresh: 0.05
 
 matching:
@@ -98,7 +98,7 @@ train:
   save_interval: 5000
   val_interval: 1000
   max_val_batches: 8
-  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
+  output_dir: outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2
   grad_clip: 1.0
   seed: 1234
 
@@ -106,7 +106,7 @@ WeightsAndBiases:
   enabled: true
   project: 360Droid-splat
   entity: null
-  run_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce
+  run_name: stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2
   mode: online
   log_every: 50
   tags:
@@ -117,6 +117,8 @@ WeightsAndBiases:
     - stable-geodesic
     - fibonacci-depth-filtered
     - fullres-spherical-ce
+    - depth20
+    - ddp2
 
 Visualization:
   enabled: true
