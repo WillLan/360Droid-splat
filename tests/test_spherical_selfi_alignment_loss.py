@@ -96,3 +96,30 @@ def test_alignment_loss_can_return_predicted_matches_for_visualization():
     assert matches["pred_uv"].shape == (2, 2)
     assert matches["flat_src"].shape == (2,)
     assert matches["flat_tgt"].shape == (2,)
+
+
+def test_global_loss_handles_many_queries_per_view_without_expanding_maps():
+    height, width = 12, 24
+    features = torch.randn(1, 2, 8, height, width, requires_grad=True)
+    yy, xx = torch.meshgrid(
+        torch.arange(0.5, float(height), 1.0),
+        torch.arange(0.5, float(width), 1.0),
+        indexing="ij",
+    )
+    uv = torch.stack([xx, yy], dim=-1).reshape(-1, 2)
+    corr = _corr_from_uv(uv, height=height, width=width)
+    loss_fn = SphericalSelfiAlignmentLoss(
+        mode="global_lowres",
+        loss_stride=2,
+        temperature=0.2,
+        max_queries=None,
+        erp_aux_weight=0.0,
+    )
+
+    loss, metrics = loss_fn(features, corr)
+
+    assert torch.isfinite(loss)
+    assert metrics["num_queries"].item() == uv.shape[0]
+    loss.backward()
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()

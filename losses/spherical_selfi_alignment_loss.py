@@ -135,6 +135,20 @@ def _seam_aware_pixel_l1(pred_uv: torch.Tensor, tgt_uv: torch.Tensor, width: int
     return torch.stack([du / float(width), dv / max(float(width), 1.0)], dim=-1).abs().sum(dim=-1)
 
 
+def _sample_features_by_flat_index(
+    flat_features: torch.Tensor,
+    flat_index: torch.Tensor,
+    pixel: torch.Tensor,
+) -> torch.Tensor:
+    if flat_index.numel() == 0:
+        return torch.empty(0, flat_features.shape[1], device=flat_features.device, dtype=flat_features.dtype)
+    values = torch.empty(flat_index.shape[0], flat_features.shape[1], device=flat_features.device, dtype=flat_features.dtype)
+    for view_id in torch.unique(flat_index, sorted=True):
+        mask = flat_index == view_id
+        values[mask] = sample_erp_with_wrap(flat_features[view_id], pixel[mask])
+    return values
+
+
 class SphericalSelfiAlignmentLoss(nn.Module):
     """Compute spherical Selfi alignment loss from adapter features."""
 
@@ -179,7 +193,7 @@ class SphericalSelfiAlignmentLoss(nn.Module):
                     "flat_tgt": torch.empty(0, device=features.device, dtype=torch.long),
                 }
             return zero, metrics
-        src_values = sample_erp_with_wrap(flat[entries["flat_src"]], entries["src_uv"])
+        src_values = _sample_features_by_flat_index(flat, entries["flat_src"], entries["src_uv"])
         src_values = F.normalize(src_values, dim=-1, eps=self.config.eps)
         if self.config.mode == "global_lowres":
             pred_ray, pred_uv = self._global_lowres_prediction(flat, src_values, entries, image_hw=(height, width))
@@ -228,12 +242,15 @@ class SphericalSelfiAlignmentLoss(nn.Module):
         target_w = max(1, int(math.ceil(float(image_hw[1]) / float(stride))))
         target = F.interpolate(flat_features, size=(target_h, target_w), mode="bilinear", align_corners=False)
         target = F.normalize(target, dim=1, eps=self.config.eps)
-        selected = target[entries["flat_tgt"]].flatten(2)
-        scores = torch.einsum("nc,nck->nk", src_values, selected) / max(float(self.config.temperature), self.config.eps)
-        prob = torch.softmax(scores, dim=-1)
         uv = _feature_grid_uv(target_h, target_w, image_hw, device=flat_features.device, dtype=flat_features.dtype)
         rays = erp_pixel_to_unit_ray(uv, image_hw[0], image_hw[1]).to(device=flat_features.device, dtype=flat_features.dtype)
-        pred_ray = F.normalize(prob @ rays, dim=-1, eps=self.config.eps)
+        pred_ray = torch.empty(src_values.shape[0], 3, device=flat_features.device, dtype=flat_features.dtype)
+        for view_id in torch.unique(entries["flat_tgt"], sorted=True):
+            mask = entries["flat_tgt"] == view_id
+            selected = target[view_id].flatten(1)
+            scores = (src_values[mask] @ selected) / max(float(self.config.temperature), self.config.eps)
+            prob = torch.softmax(scores, dim=-1)
+            pred_ray[mask] = F.normalize(prob @ rays, dim=-1, eps=self.config.eps)
         pred_uv = unit_ray_to_erp_pixel(pred_ray, image_hw[0], image_hw[1])
         return pred_ray, pred_uv
 
@@ -256,13 +273,17 @@ class SphericalSelfiAlignmentLoss(nn.Module):
         candidates = candidates.clone()
         candidates[..., 0] = wrap_longitude_pixel(candidates[..., 0], image_hw[1])
         candidates[..., 1] = candidates[..., 1].clamp(0.5, float(image_hw[0]) - 0.5)
-        target_maps = flat_features[entries["flat_tgt"]]
-        sampled = sample_erp_with_wrap(target_maps, candidates)
-        sampled = F.normalize(sampled, dim=-1, eps=self.config.eps)
-        scores = torch.einsum("nkc,nc->nk", sampled, src_values) / max(float(self.config.temperature), self.config.eps)
-        prob = torch.softmax(scores, dim=-1)
         rays = erp_pixel_to_unit_ray(candidates, image_hw[0], image_hw[1]).to(device=flat_features.device, dtype=flat_features.dtype)
-        pred_ray = F.normalize((prob.unsqueeze(-1) * rays).sum(dim=1), dim=-1, eps=self.config.eps)
+        pred_ray = torch.empty(src_values.shape[0], 3, device=flat_features.device, dtype=flat_features.dtype)
+        for view_id in torch.unique(entries["flat_tgt"], sorted=True):
+            mask = entries["flat_tgt"] == view_id
+            sampled = sample_erp_with_wrap(flat_features[view_id], candidates[mask])
+            sampled = F.normalize(sampled, dim=-1, eps=self.config.eps)
+            scores = torch.einsum("nkc,nc->nk", sampled, src_values[mask]) / max(
+                float(self.config.temperature), self.config.eps
+            )
+            prob = torch.softmax(scores, dim=-1)
+            pred_ray[mask] = F.normalize((prob.unsqueeze(-1) * rays[mask]).sum(dim=1), dim=-1, eps=self.config.eps)
         pred_uv = unit_ray_to_erp_pixel(pred_ray, image_hw[0], image_hw[1])
         return pred_ray, pred_uv
 
