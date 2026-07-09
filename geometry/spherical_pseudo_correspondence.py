@@ -37,11 +37,15 @@ def _normalize_depth(depth: torch.Tensor) -> tuple[torch.Tensor, bool]:
     if value.ndim == 4:
         if int(value.shape[1]) == 1:
             return value.unsqueeze(0), True
+        if int(value.shape[-1]) == 1:
+            return value.squeeze(-1).unsqueeze(0).unsqueeze(2), True
         return value.unsqueeze(2), False
+    if value.ndim == 5 and int(value.shape[-1]) == 1:
+        return value.squeeze(-1).unsqueeze(2), False
     if value.ndim == 5 and int(value.shape[2]) == 1:
         return value, False
     raise ValueError(
-        "depth must have shape VxHxW, Vx1xHxW, BxVxHxW, or BxVx1xHxW; "
+        "depth must have shape VxHxW, Vx1xHxW, VxHxWx1, BxVxHxW, BxVxHxWx1, or BxVx1xHxW; "
         f"got {tuple(depth.shape)}."
     )
 

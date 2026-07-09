@@ -110,3 +110,25 @@ def test_correspondence_fields_are_finite_and_keep_device_dtype_shape():
     assert corr.tgt_ray.dtype == torch.float64
     for value in (corr.src_uv, corr.tgt_uv, corr.src_ray, corr.tgt_ray, corr.weight):
         assert torch.isfinite(value).all()
+
+
+def test_trailing_singleton_depth_channel_from_model_output():
+    height, width = 8, 16
+    depth = torch.full((1, 2, height, width, 1), 2.0)
+    poses = _eye_poses(2).unsqueeze(0)
+    query = torch.tensor([[3.5, 3.5], [10.5, 4.5]], dtype=torch.float32)
+
+    corr = generate_spherical_pseudo_correspondence(
+        depth,
+        poses,
+        torch.tensor([[[0, 1]]]),
+        query_uv=query,
+        height=height,
+        width=width,
+        visibility_rel_thresh=0.01,
+    )
+
+    assert corr.valid_mask.shape == (1, 1, 2)
+    assert corr.valid_mask.all()
+    assert torch.allclose(corr.src_uv[0, 0], query)
+    assert torch.allclose(corr.tgt_uv[0, 0], query, atol=1e-4)
