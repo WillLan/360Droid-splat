@@ -1,0 +1,136 @@
+stage: 2
+task: spherical_selfi_gaussian_head
+experiment_name: stage2_selfi_gaussian_head_airsim_source_reconstruction_fullres
+
+stage2:
+  enabled: true
+
+image:
+  # Frozen PanoVGGT and adapter always run at this checkpoint-compatible size.
+  height: 504
+  width: 1008
+  # Change only these two values for the explicit post-adapter debug tiers.
+  head_height: 504
+  head_width: 1008
+
+panovggt:
+  synthetic: false
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  model_kwargs: {}
+  freeze: true
+  use_no_grad: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+  pose_convention: c2w
+  depth_convention: euclidean_ray_depth
+  stage_hooks:
+    - aggregator.decoder.8
+    - aggregator.decoder.16
+    - aggregator.decoder.24
+    - aggregator.decoder.34
+  feature_keys: [null, null, null, null]
+  token_hw:
+    - [36, 72]
+    - [36, 72]
+    - [36, 72]
+    - [36, 72]
+  token_start_idx: [5, 5, 5, 5]
+  in_channels: [1024, 1024, 1024, 1024]
+
+adapter_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2/checkpoints/best_val_angular_error.pt
+  sha256: 95cdbb5404acba8654e868335ede6a00c281451d7ef7c104d3a10f63fc3730b9
+  strict: true
+
+head:
+  feature_dim: 24
+  channels: [32, 64, 128, 256]
+  mlp_hidden_dim: 64
+  rgb_sh_degree: 2
+  density_sh_degree: 1
+  depth_residual_ratio: 0.25
+  initial_opacity: 0.10
+  min_depth: 1.0e-4
+  min_scale: 1.0e-5
+  max_scale_ratio: 0.25
+  latitude_cos_min: 1.0e-3
+  log_scale_clamp: 5.0
+  render_prune_fraction: 0.30
+  gradient_checkpointing: true
+
+dataset:
+  synthetic: false
+  manifest: data/stage1_airsim_dtw_nyc_manifest.json
+  domains: [outdoor]
+  views_per_sample: 4
+  stride_min: 2
+  stride_max: 6
+  max_train_samples: null
+  max_val_samples: 1000
+
+renderer:
+  backend: gsplat360
+  extra_gsplat360_roots: []
+
+loss:
+  rgb_weight: 1.0
+  depth_residual_weight: 1.0e-3
+  dssim_weight: 0.0
+  rendered_depth_weight: 0.0
+  geometry_weight: 0.0
+  geometry_num_queries: 512
+  geometry_min_depth: 0.05
+  geometry_max_depth: 20.0
+  geometry_visibility_rel_thresh: 0.05
+
+train:
+  batch_size: 1
+  num_workers: 4
+  feature_device: cuda:0
+  train_device: cuda:1
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 50000
+  amp: true
+  # Recompute the U-Net for each target so only one rasterizer graph is live.
+  recompute_head_per_target: true
+  grad_clip: 1.0
+  log_interval: 50
+  val_interval: 1000
+  max_val_batches: 8
+  save_interval: 5000
+  output_dir: outputs/stage2_selfi_gaussian_head_airsim_source_reconstruction_fullres
+  resume: null
+  seed: 1234
+
+Validation:
+  copy_diagnostics: true
+  lpips: false
+
+Training:
+  pfgs360_packed: false
+  pfgs360_render_mode: RGB+ED
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 1.0e5
+  pfgs360_radius_clip: 0.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+  pfgs360_rasterize_mode: antialiased
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: stage2_selfi_gaussian_head_airsim_source_reconstruction_fullres
+  mode: online
+  log_every: 50
+  tags: [stage2, selfi, per-pixel-gaussian, spherical-erp, source-reconstruction]
+
+Visualization:
+  enabled: true
+  interval: 200
+  save_dir: visualizations

@@ -1,9 +1,12 @@
+import hashlib
+
+import pytest
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 from models.panovggt_feature_wrapper import PanoVGGTFeatureWrapper
-from models.spherical_selfi_dpt_adapter import SphericalSelfiDPTAdapter
+from models.spherical_selfi_dpt_adapter import SphericalSelfiDPTAdapter, load_spherical_selfi_adapter_checkpoint
 
 
 class _Stage(nn.Module):
@@ -228,3 +231,52 @@ def test_frozen_wrapper_features_can_train_adapter_without_panovggt_grads():
     out[:, :, 0].mean().backward()
     assert all(param.grad is None for param in model.parameters())
     assert any(param.grad is not None and param.grad.abs().sum() > 0 for param in adapter.parameters())
+
+
+def test_strict_adapter_loader_checks_sha_hooks_grid_and_geometry(tmp_path):
+    adapter = SphericalSelfiDPTAdapter(
+        [4, 6, 8, 10], hidden_dim=8, image_height=16, image_width=32
+    )
+    path = tmp_path / "adapter.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_adapter_v1",
+            "adapter": adapter.state_dict(),
+            "adapter_config": {
+                "in_channels": [4, 6, 8, 10],
+                "hidden_dim": 8,
+                "out_dim": 24,
+                "image_height": 16,
+                "image_width": 32,
+                "use_circular_padding": True,
+                "norm_output": True,
+            },
+            "training_config": {
+                "panovggt": {
+                    "stage_hooks": ["a", "b", "c", "d"],
+                    "token_hw": [[2, 4]] * 4,
+                    "token_start_idx": [5, 5, 5, 5],
+                    "pose_convention": "c2w",
+                    "depth_convention": "euclidean_ray_depth",
+                }
+            },
+            "global_step": 7,
+        },
+        path,
+    )
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    loaded = load_spherical_selfi_adapter_checkpoint(
+        path,
+        expected_sha256=digest,
+        expected_image_size=(16, 32),
+        expected_stage_hooks=["a", "b", "c", "d"],
+        expected_token_hw=[[2, 4]] * 4,
+        expected_token_start_idx=[5, 5, 5, 5],
+        expected_pose_convention="c2w",
+        expected_depth_convention="euclidean_ray_depth",
+    )
+    assert loaded.metadata["global_step"] == 7
+    assert not loaded.module.training
+    assert all(not parameter.requires_grad for parameter in loaded.module.parameters())
+    with pytest.raises(ValueError, match="token-grid"):
+        load_spherical_selfi_adapter_checkpoint(path, expected_token_hw=[[3, 4]] * 4)

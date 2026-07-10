@@ -1,6 +1,6 @@
 # Stage 1.5 Airsim DTW/NYC Training Summary
 
-Status: implementation ready; training not launched by this change.
+Status: formal training completed; the best validated checkpoint is the Stage 2 baseline.
 
 ## Data
 
@@ -69,15 +69,11 @@ Run only after smoke training passes:
 
 ## Results
 
-To be filled after training:
-
-- smoke training result:
-- best checkpoint:
-- latest checkpoint:
-- mean angular error:
-- median angular error:
-- PCK@1/3/5deg:
-- GPU memory:
-- seconds per step:
-- visualization paths:
-- recommendation for next stage:
+- completed step: `39,000`
+- best validation mean angular error: `0.2859647 deg`
+- recommended checkpoint:
+  `/mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2/checkpoints/best_val_angular_error.pt`
+- checkpoint format: `spherical_selfi_adapter_v1`
+- SHA256: `95cdbb5404acba8654e868335ede6a00c281451d7ef7c104d3a10f63fc3730b9`
+- Stage 2 policy: load this checkpoint strictly, keep the adapter in `eval()` with
+  `requires_grad=False`, and do not copy its weights into Stage 2 checkpoints.

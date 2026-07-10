@@ -6,13 +6,133 @@ frontend and does not alter the existing PanoVGGT inference path.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from importlib import import_module
+import inspect
 import math
+from pathlib import Path
+import sys
 from typing import Any
 
 import torch
 from torch import nn
+
+
+def _import_attr(path: str) -> Any:
+    module_name, attr = str(path).rsplit(".", 1)
+    return getattr(import_module(module_name), attr)
+
+
+@contextmanager
+def _maybe_skip_dinov2_pretrain(enabled: bool):
+    """Temporarily disable the external PanoVGGT DINOv2 preload hook."""
+
+    if not enabled:
+        yield
+        return
+    try:
+        aggregator_mod = import_module("panovggt.models.aggregator")
+        aggregator_cls = getattr(aggregator_mod, "Aggregator", None)
+        original = getattr(aggregator_cls, "_try_load_dinov2", None) if aggregator_cls is not None else None
+        if aggregator_cls is None or original is None:
+            yield
+            return
+
+        def _skip(self, hub_name, url, patch_embed_key):
+            return None
+
+        aggregator_cls._try_load_dinov2 = _skip
+        try:
+            yield
+        finally:
+            aggregator_cls._try_load_dinov2 = original
+    except ModuleNotFoundError:
+        yield
+
+
+def _instantiate_external_panovggt(cls: type, config: dict[str, Any]) -> nn.Module:
+    kwargs = dict(config.get("model_kwargs", {}))
+    config_path = config.get("config_path")
+    if config_path is not None and cls.__name__ == "PanoVGGTModel":
+        try:
+            from omegaconf import OmegaConf
+        except ImportError as exc:  # pragma: no cover - external dependency
+            raise ImportError("PanoVGGT config_path loading requires omegaconf.") from exc
+        official = OmegaConf.load(str(config_path))
+        OmegaConf.resolve(official)
+        model_cfg = official.model
+        kwargs = {
+            "img_size": int(official.img_size),
+            "patch_size": int(official.patch_size),
+            "embed_dim": int(official.embed_dim),
+            "enable_camera": bool(model_cfg.enable_camera),
+            "enable_depth": bool(model_cfg.enable_depth),
+            "enable_point": bool(model_cfg.enable_point),
+            "aggregator": OmegaConf.to_container(model_cfg.aggregator, resolve=True),
+            **kwargs,
+        }
+    signature = inspect.signature(cls)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return cls(**kwargs)
+    return cls(**{key: value for key, value in kwargs.items() if key in signature.parameters})
+
+
+def build_external_panovggt_model(config: dict[str, Any]) -> nn.Module:
+    """Build and load a real external PanoVGGT model from a config mapping."""
+
+    repo_path = config.get("repo_path")
+    if repo_path:
+        repo = str(Path(repo_path).expanduser().resolve())
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+    class_path = config.get("class_path")
+    if not class_path:
+        raise ValueError("panovggt.class_path is required for a real PanoVGGT model.")
+    cls = _import_attr(str(class_path))
+    with _maybe_skip_dinov2_pretrain(bool(config.get("skip_dinov2_pretrain", False))):
+        model = _instantiate_external_panovggt(cls, config)
+    checkpoint = config.get("checkpoint")
+    if checkpoint:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        state = payload
+        for key in ("state_dict", "model", "model_state_dict", "net"):
+            if isinstance(payload, dict) and key in payload:
+                state = payload[key]
+                break
+        if not isinstance(state, dict):
+            raise ValueError(f"Unsupported PanoVGGT checkpoint payload: {checkpoint}")
+        model.load_state_dict(
+            {str(key).removeprefix("module."): value for key, value in state.items()},
+            strict=bool(config.get("strict_checkpoint", False)),
+        )
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def build_frozen_panovggt_wrapper(
+    config: dict[str, Any],
+    *,
+    device: torch.device | str,
+    model: nn.Module | None = None,
+) -> "PanoVGGTFeatureWrapper":
+    """Build the reusable frozen four-stage feature wrapper used by Stages 1/2."""
+
+    if model is None:
+        model = build_external_panovggt_model(config)
+    wrapper = PanoVGGTFeatureWrapper(
+        model,
+        stage_hooks=list(config.get("stage_hooks", [])),
+        feature_keys=list(config.get("feature_keys", [None, None, None, None])),
+        token_hw=list(config.get("token_hw", [None, None, None, None])),
+        token_start_idx=list(config.get("token_start_idx", [None, None, None, None])),
+        use_no_grad=bool(config.get("use_no_grad", True)),
+        pose_convention=str(config.get("pose_convention", "c2w")),
+        depth_convention=str(config.get("depth_convention", "euclidean_ray_depth")),
+    )
+    return wrapper.to(device)
 
 
 @dataclass

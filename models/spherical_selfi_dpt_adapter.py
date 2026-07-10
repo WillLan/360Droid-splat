@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -11,6 +14,24 @@ import torch.nn.functional as F
 
 from geometry.spherical_erp import DEFAULT_ERP_HEIGHT, DEFAULT_ERP_WIDTH
 from .panovggt_feature_wrapper import normalize_stage_feature
+
+
+@dataclass(frozen=True)
+class LoadedSphericalSelfiAdapter:
+    """A frozen adapter together with verified checkpoint provenance."""
+
+    module: "SphericalSelfiDPTAdapter"
+    checkpoint_path: str
+    sha256: str
+    metadata: dict[str, Any]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _num_groups(channels: int) -> int:
@@ -263,3 +284,129 @@ class SphericalSelfiDPTAdapter(nn.Module):
         if self.norm_output:
             out = F.normalize(out, dim=2, eps=1.0e-6)
         return out
+
+
+def load_spherical_selfi_adapter_checkpoint(
+    checkpoint: str | Path,
+    *,
+    device: torch.device | str = "cpu",
+    expected_sha256: str | None = None,
+    expected_out_dim: int = 24,
+    expected_normalized: bool = True,
+    expected_image_size: tuple[int, int] | None = None,
+    expected_stage_hooks: list[str] | tuple[str, ...] | None = None,
+    expected_token_hw: list[list[int] | tuple[int, int] | None] | tuple[list[int] | tuple[int, int] | None, ...] | None = None,
+    expected_token_start_idx: list[int | None] | tuple[int | None, ...] | None = None,
+    expected_pose_convention: str | None = None,
+    expected_depth_convention: str | None = None,
+) -> LoadedSphericalSelfiAdapter:
+    """Load, validate, and freeze a ``spherical_selfi_adapter_v1`` checkpoint."""
+
+    path = Path(checkpoint).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Spherical Selfi adapter checkpoint does not exist: {path}")
+    digest = _sha256_file(path)
+    if expected_sha256 is not None and digest.lower() != str(expected_sha256).lower():
+        raise ValueError(
+            "Spherical Selfi adapter checkpoint SHA256 mismatch: "
+            f"expected {expected_sha256}, got {digest}."
+        )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("format") != "spherical_selfi_adapter_v1":
+        actual = payload.get("format") if isinstance(payload, dict) else type(payload).__name__
+        raise ValueError(f"Unsupported Stage 1 adapter checkpoint format: {actual!r}.")
+    state = payload.get("adapter")
+    config = payload.get("adapter_config")
+    if not isinstance(state, dict) or not isinstance(config, dict):
+        raise ValueError("Stage 1 adapter checkpoint must contain adapter and adapter_config mappings.")
+    required = ("in_channels", "hidden_dim", "out_dim", "image_height", "image_width")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(f"Stage 1 adapter checkpoint is missing config keys: {missing}.")
+    if int(config["out_dim"]) != int(expected_out_dim):
+        raise ValueError(
+            f"Stage 1 adapter descriptor dimension must be {expected_out_dim}, got {config['out_dim']}."
+        )
+    if bool(config.get("norm_output", True)) != bool(expected_normalized):
+        raise ValueError(
+            "Stage 1 adapter normalization mismatch: "
+            f"expected norm_output={bool(expected_normalized)}, got {config.get('norm_output')!r}."
+        )
+    image_size = (int(config["image_height"]), int(config["image_width"]))
+    if expected_image_size is not None and image_size != tuple(int(value) for value in expected_image_size):
+        raise ValueError(
+            f"Stage 1 adapter image size mismatch: expected {expected_image_size}, got {image_size}."
+        )
+    training_config = payload.get("training_config")
+    training_panovggt = training_config.get("panovggt", {}) if isinstance(training_config, dict) else {}
+    if expected_stage_hooks is not None:
+        saved_hooks = training_panovggt.get("stage_hooks")
+        if saved_hooks is None or [str(value) for value in saved_hooks] != [str(value) for value in expected_stage_hooks]:
+            raise ValueError(
+                "Stage 1 adapter hook metadata mismatch: "
+                f"expected {list(expected_stage_hooks)!r}, got {saved_hooks!r}."
+            )
+    if expected_token_hw is not None:
+        def normalize_grids(values):
+            return [None if value is None else [int(value[0]), int(value[1])] for value in values]
+
+        saved_grids = training_panovggt.get("token_hw")
+        if saved_grids is None or normalize_grids(saved_grids) != normalize_grids(expected_token_hw):
+            raise ValueError(
+                "Stage 1 adapter token-grid metadata mismatch: "
+                f"expected {normalize_grids(expected_token_hw)!r}, got {saved_grids!r}."
+            )
+    if expected_token_start_idx is not None:
+        saved_start = training_panovggt.get("token_start_idx")
+        normalized_expected_start = [None if value is None else int(value) for value in expected_token_start_idx]
+        normalized_saved_start = None if saved_start is None else [None if value is None else int(value) for value in saved_start]
+        if normalized_saved_start != normalized_expected_start:
+            raise ValueError(
+                "Stage 1 adapter token-start metadata mismatch: "
+                f"expected {normalized_expected_start!r}, got {saved_start!r}."
+            )
+    saved_pose = str(training_panovggt.get("pose_convention", "c2w"))
+    saved_depth = str(training_panovggt.get("depth_convention", "euclidean_ray_depth"))
+    if expected_pose_convention is not None and saved_pose != str(expected_pose_convention):
+        raise ValueError(
+            f"Stage 1 adapter pose convention mismatch: expected {expected_pose_convention!r}, got {saved_pose!r}."
+        )
+    if expected_depth_convention is not None and saved_depth != str(expected_depth_convention):
+        raise ValueError(
+            "Stage 1 adapter depth convention mismatch: "
+            f"expected {expected_depth_convention!r}, got {saved_depth!r}."
+        )
+    adapter = SphericalSelfiDPTAdapter(
+        [int(value) for value in config["in_channels"]],
+        hidden_dim=int(config["hidden_dim"]),
+        out_dim=int(config["out_dim"]),
+        image_height=image_size[0],
+        image_width=image_size[1],
+        use_circular_padding=bool(config.get("use_circular_padding", True)),
+        norm_output=bool(config.get("norm_output", True)),
+        reassemble_sizes=config.get("reassemble_sizes"),
+        fusion_output_size=config.get("fusion_output_size"),
+    )
+    adapter.load_state_dict(state, strict=True)
+    adapter.to(device)
+    adapter.eval()
+    for parameter in adapter.parameters():
+        parameter.requires_grad_(False)
+    metadata = {
+        "format": payload["format"],
+        "adapter_config": dict(config),
+        "training_config": training_config,
+        "stage_hooks": training_panovggt.get("stage_hooks"),
+        "token_hw": training_panovggt.get("token_hw"),
+        "pose_convention": saved_pose,
+        "depth_convention": saved_depth,
+        "global_step": int(payload.get("global_step", 0)),
+        "metrics": dict(payload.get("metrics", {})),
+        "best_val_angular_error": payload.get("best_val_angular_error"),
+    }
+    return LoadedSphericalSelfiAdapter(
+        module=adapter,
+        checkpoint_path=str(path),
+        sha256=digest,
+        metadata=metadata,
+    )
