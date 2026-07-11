@@ -132,7 +132,8 @@ def default_config() -> dict[str, Any]:
             "warmup_steps": 1,
             "max_steps": 2,
             "amp": False,
-            "recompute_head_per_target": True,
+            "joint_multiview_backward": True,
+            "diagnostics_interval": 200,
             "grad_clip": 1.0,
             "log_interval": 1,
             "val_interval": 1,
@@ -509,7 +510,8 @@ def _observation_diagnostics(observation: PerPixelGaussianObservation, *, batch_
     batch = int(batch_index)
     valid = observation.valid_mask[batch].bool()
     residual = (observation.depth_residual[batch] / observation.initial_depth[batch].clamp_min(1.0e-4))[valid]
-    scale = observation.scales()[batch][valid.expand_as(observation.scales()[batch])]
+    scales = observation.scales()[batch]
+    scale = scales[valid.expand_as(scales)]
     confidence = observation.confidence[batch][valid]
     result: dict[str, float] = {"canonical_gaussians": float(valid.sum().detach().cpu())}
     for name, tensor in (("relative_depth_residual", residual), ("scale", scale), ("confidence", confidence)):
@@ -518,16 +520,22 @@ def _observation_diagnostics(observation: PerPixelGaussianObservation, *, batch_
         tensor = tensor.detach().float()
         for quantile in (0.1, 0.5, 0.9):
             result[f"{name}_p{int(quantile * 100)}"] = float(tensor.quantile(quantile).cpu())
-    # Source-view opacity contribution is evaluated at each source camera.
+    # Confidence is density SH evaluated along each source ray, so it equals
+    # the unpruned opacity when that source camera renders its own observation.
+    # Avoid four full target-conditioned materializations for this diagnostic.
     for source in range(observation.num_source_views):
-        camera = PanoRenderCamera(*observation.image_size, observation.poses_c2w[batch, source])
-        explicit = observation.materialize_batch(
-            camera, batch_index=batch, source_indices=[source], prune_fraction=0.0
-        )
+        source_valid = valid[source]
+        source_confidence = observation.confidence[batch, source][source_valid]
         result[f"source_{source}_mean_opacity"] = (
-            float(explicit.opacity.mean().detach().cpu()) if explicit.opacity.numel() else 0.0
+            float(source_confidence.mean().detach().cpu()) if source_confidence.numel() else 0.0
         )
     return result
+
+
+def _is_interval_step(step: int, interval: int) -> bool:
+    if int(interval) <= 0:
+        raise ValueError("interval must be positive.")
+    return int(step) > 0 and int(step) % int(interval) == 0
 
 
 def _loss_weights(config: dict[str, Any]) -> Stage2GaussianLossWeights:
@@ -836,10 +844,10 @@ def train_spherical_selfi_gaussian_head(config: dict[str, Any]) -> dict[str, Any
     first_depth_residual: torch.Tensor | None = None
     first_confidence: torch.Tensor | None = None
     last_observation: PerPixelGaussianObservation | None = None
-    if not bool(train_cfg.get("recompute_head_per_target", True)):
+    if not bool(train_cfg.get("joint_multiview_backward", True)):
         raise ValueError(
-            "Stage 2 currently requires train.recompute_head_per_target=true so each CUDA rasterizer graph "
-            "is released before the next target view."
+            "Stage 2 requires train.joint_multiview_backward=true so one Head forward is shared by all "
+            "source-view reconstruction renders."
         )
     while step < max_steps:
         if hasattr(train_dataset, "set_epoch"):
@@ -849,86 +857,85 @@ def train_spherical_selfi_gaussian_head(config: dict[str, Any]) -> dict[str, Any
         for batch in loader:
             dense, rgb, depth, poses = make_inputs(batch["images"])
             final_microbatch = accumulated_microbatches + 1 == accumulation_steps
-            divisor = float(int(rgb.shape[0]) * int(rgb.shape[1]) * accumulation_steps)
-            for item in range(int(rgb.shape[0])):
-                for target_view in range(int(rgb.shape[1])):
-                    final_backward = (
-                        final_microbatch
-                        and item + 1 == int(rgb.shape[0])
-                        and target_view + 1 == int(rgb.shape[1])
-                    )
-                    sync_context = nullcontext()
-                    if isinstance(head, DistributedDataParallel) and not final_backward:
-                        sync_context = head.no_sync()
-                    with sync_context:
-                        observation = predict_observation(
-                            dense[item : item + 1],
-                            rgb[item : item + 1],
-                            depth[item : item + 1],
-                            poses[item : item + 1],
-                            batch["frame_ids"][item : item + 1],
+            batch_size = int(rgb.shape[0])
+            divisor = float(batch_size * accumulation_steps)
+            sync_context = nullcontext()
+            if isinstance(head, DistributedDataParallel) and not final_microbatch:
+                sync_context = head.no_sync()
+            with sync_context:
+                # Predict the complete source window once. All target-view
+                # renders branch from this shared observation and contribute
+                # to one joint backward pass.
+                observation = predict_observation(
+                    dense,
+                    rgb,
+                    depth,
+                    poses,
+                    batch["frame_ids"],
+                )
+                scaled_loss = observation.depth_residual.sum() * 0.0
+                for item in range(batch_size):
+                    with torch.amp.autocast(
+                        device_type=train_device.type,
+                        dtype=torch.bfloat16,
+                        enabled=amp_enabled,
+                    ):
+                        packages = render_observation_views(
+                            renderer,
+                            observation,
+                            batch_index=item,
+                            source_mode="all",
                         )
-                        with torch.amp.autocast(
-                            device_type=train_device.type,
-                            dtype=torch.bfloat16,
-                            enabled=amp_enabled,
-                        ):
-                            package = render_observation_target(
-                                renderer,
+                        if first_package is None:
+                            package = packages[0]
+                            first_package = {
+                                "render": package["render"].detach(),
+                                "stage2_materialize_sec": package.get("stage2_materialize_sec", 0.0),
+                                "profile_renderer_rasterize_sec": package.get(
+                                    "profile_renderer_rasterize_sec", 0.0
+                                ),
+                                "profile_renderer_total_sec": package.get(
+                                    "profile_renderer_total_sec", 0.0
+                                ),
+                                "stage2_materialized_gaussians": package.get(
+                                    "stage2_materialized_gaussians", 0.0
+                                ),
+                            }
+                            first_rgb = rgb[item, 0].detach()
+                            first_depth_residual = observation.depth_residual[item, 0].detach()
+                            first_confidence = observation.confidence[item, 0].detach()
+                        geometry = None
+                        if float(weights.geometry) != 0.0:
+                            loss_cfg = config.get("loss", {})
+                            geometry = spherical_pseudo_geometry_consistency_loss(
                                 observation,
-                                batch_index=0,
-                                target_view=target_view,
-                                source_mode="all",
+                                batch_index=item,
+                                num_query_per_pair=int(loss_cfg.get("geometry_num_queries", 512)),
+                                min_depth=float(loss_cfg.get("geometry_min_depth", 0.05)),
+                                max_depth=float(loss_cfg.get("geometry_max_depth", 100.0)),
+                                visibility_rel_thresh=float(
+                                    loss_cfg.get("geometry_visibility_rel_thresh", 0.05)
+                                ),
                             )
-                            if first_package is None:
-                                first_package = {
-                                    "render": package["render"].detach(),
-                                    "stage2_materialize_sec": package.get("stage2_materialize_sec", 0.0),
-                                    "profile_renderer_rasterize_sec": package.get(
-                                        "profile_renderer_rasterize_sec", 0.0
-                                    ),
-                                    "profile_renderer_total_sec": package.get(
-                                        "profile_renderer_total_sec", 0.0
-                                    ),
-                                    "stage2_materialized_gaussians": package.get(
-                                        "stage2_materialized_gaussians", 0.0
-                                    ),
-                                }
-                                first_rgb = rgb[0, 0].detach()
-                                first_depth_residual = observation.depth_residual[0, 0].detach()
-                                first_confidence = observation.confidence[0, 0].detach()
-                            last_observation = observation
-                            geometry = None
-                            if float(weights.geometry) != 0.0:
-                                loss_cfg = config.get("loss", {})
-                                geometry = spherical_pseudo_geometry_consistency_loss(
-                                    observation,
-                                    batch_index=0,
-                                    num_query_per_pair=int(loss_cfg.get("geometry_num_queries", 512)),
-                                    min_depth=float(loss_cfg.get("geometry_min_depth", 0.05)),
-                                    max_depth=float(loss_cfg.get("geometry_max_depth", 100.0)),
-                                    visibility_rel_thresh=float(
-                                        loss_cfg.get("geometry_visibility_rel_thresh", 0.05)
-                                    ),
-                                )
-                            terms = stage2_gaussian_render_loss(
-                                [package],
-                                rgb[item, target_view : target_view + 1],
-                                observation,
-                                batch_index=0,
-                                target_depths=observation.initial_depth[0, target_view : target_view + 1],
-                                geometry_loss=geometry,
-                                weights=weights,
-                            )
-                            scaled_loss = terms["loss"] / divisor
-                        if not bool(torch.isfinite(scaled_loss)):
-                            raise RuntimeError(f"Non-finite Stage 2 loss at step {step + 1}.")
-                        scaled_loss.backward()
-                    total_loss_value += float(scaled_loss.detach().float().cpu())
+                        terms = stage2_gaussian_render_loss(
+                            packages,
+                            rgb[item],
+                            observation,
+                            batch_index=item,
+                            target_depths=observation.initial_depth[item],
+                            geometry_loss=geometry,
+                            weights=weights,
+                        )
+                        scaled_loss = scaled_loss + terms["loss"] / divisor
                     for key, value in terms.items():
                         aggregate[key] = (
                             aggregate.get(key, torch.zeros_like(value.detach())) + value.detach() / divisor
                         )
+                if not bool(torch.isfinite(scaled_loss)):
+                    raise RuntimeError(f"Non-finite Stage 2 loss at step {step + 1}.")
+                scaled_loss.backward()
+            last_observation = observation
+            total_loss_value += float(scaled_loss.detach().float().cpu())
             accumulated_microbatches += 1
             if not final_microbatch:
                 continue
@@ -953,7 +960,9 @@ def train_spherical_selfi_gaussian_head(config: dict[str, Any]) -> dict[str, Any
                     "stage2_materialized_gaussians",
                 ):
                     local_metrics[key] = float(first_package.get(key, 0.0))
-            local_metrics.update(_observation_diagnostics(last_observation, batch_index=0))
+            diagnostics_interval = int(train_cfg.get("diagnostics_interval", 200))
+            if _is_interval_step(step, diagnostics_interval):
+                local_metrics.update(_observation_diagnostics(last_observation, batch_index=0))
             local_metrics["grad_norm"] = float(grad_norm.detach().float().cpu())
             local_metrics["lr"] = float(optimizer.param_groups[0]["lr"])
             local_metrics["elapsed_sec"] = float(time.perf_counter() - start_time)
@@ -980,7 +989,7 @@ def train_spherical_selfi_gaussian_head(config: dict[str, Any]) -> dict[str, Any
                 and first_rgb is not None
                 and first_depth_residual is not None
                 and first_confidence is not None
-                and (step == 1 or step % int(vis_cfg.get("interval", 200)) == 0)
+                and _is_interval_step(step, int(vis_cfg.get("interval", 200)))
             ):
                 path = save_stage2_render_panel(
                     first_rgb,

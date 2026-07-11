@@ -101,8 +101,12 @@ train:
   warmup_steps: 1000
   max_steps: 50000
   amp: true
-  # Recompute the U-Net for each target so only one rasterizer graph is live.
-  recompute_head_per_target: true
+  # Run the Head once for the source window, retain all target-render branches,
+  # average their losses, and execute one joint backward pass.
+  joint_multiview_backward: true
+  # Full Gaussian quantiles and source-opacity statistics scan millions of
+  # values and intentionally run only at this interval.
+  diagnostics_interval: 200
   grad_clip: 1.0
   log_interval: 50
   val_interval: 1000

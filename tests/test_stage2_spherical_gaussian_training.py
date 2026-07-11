@@ -16,15 +16,19 @@ from losses.spherical_gaussian_render_loss import (
     periodic_ssim_map,
     spherical_pseudo_geometry_consistency_loss,
     spherical_weighted_l1,
+    stage2_gaussian_render_loss,
 )
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from training.train_spherical_selfi_gaussian_head import (
     DistributedContext,
     _effective_batch_size,
+    _is_interval_step,
     _scheduler,
     build_frozen_feature_stack,
     default_config,
     load_stage2_checkpoint,
+    render_observation_target,
+    render_observation_views,
     save_stage2_checkpoint,
     train_spherical_selfi_gaussian_head,
 )
@@ -121,6 +125,94 @@ def test_ddp_effective_batch_size_uses_microbatch_accumulation_and_world_size() 
     assert _effective_batch_size(train_config, distributed) == 4
     with pytest.raises(ValueError, match="gradient_accumulation_steps"):
         _effective_batch_size({"batch_size": 1, "gradient_accumulation_steps": 0}, distributed)
+
+
+def test_diagnostics_interval_runs_only_every_200_steps() -> None:
+    assert not _is_interval_step(1, 200)
+    assert not _is_interval_step(199, 200)
+    assert _is_interval_step(200, 200)
+    assert _is_interval_step(400, 200)
+    with pytest.raises(ValueError, match="positive"):
+        _is_interval_step(200, 0)
+
+
+class _DifferentiableFakeRenderer:
+    def render(self, camera, gaussians) -> dict[str, torch.Tensor]:
+        height = int(camera.image_height)
+        width = int(camera.image_width)
+        opacity = gaussians.get_opacity
+        color = (gaussians.get_features * opacity).mean(dim=0)
+        geometry = 1.0e-3 * (
+            gaussians.get_xyz.mean()
+            + gaussians.get_scaling.mean()
+            + gaussians.get_rotation.mean()
+        )
+        render = (color + geometry).view(3, 1, 1).expand(3, height, width)
+        alpha = opacity.mean().view(1, 1, 1).expand(1, height, width)
+        depth = torch.linalg.norm(gaussians.get_xyz, dim=-1).mean().view(1, 1, 1).expand(1, height, width)
+        return {"render": render, "alpha": alpha, "depth": depth}
+
+
+def test_joint_multiview_backward_matches_recomputed_head_gradients() -> None:
+    torch.manual_seed(7)
+    repeated_head = _small_head()
+    joint_head = copy.deepcopy(repeated_head)
+    height, width, views = 8, 16, 4
+    feature = torch.randn(1, views, 24, height, width)
+    image = torch.rand(1, views, 3, height, width)
+    depth = torch.full((1, views, 1, height, width), 2.0)
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, views, 1, 1)
+    renderer = _DifferentiableFakeRenderer()
+
+    repeated_forward_count = 0
+    joint_forward_count = 0
+
+    def count_repeated(*_args) -> None:
+        nonlocal repeated_forward_count
+        repeated_forward_count += 1
+
+    def count_joint(*_args) -> None:
+        nonlocal joint_forward_count
+        joint_forward_count += 1
+
+    repeated_hook = repeated_head.register_forward_hook(count_repeated)
+    joint_hook = joint_head.register_forward_hook(count_joint)
+    repeated_loss = torch.zeros(())
+    for target_view in range(views):
+        observation = repeated_head(feature, image, depth, poses)
+        package = render_observation_target(
+            renderer,
+            observation,
+            batch_index=0,
+            target_view=target_view,
+        )
+        terms = stage2_gaussian_render_loss(
+            [package],
+            image[0, target_view : target_view + 1],
+            observation,
+        )
+        repeated_loss = repeated_loss + terms["loss"] / float(views)
+    repeated_loss.backward()
+
+    joint_observation = joint_head(feature, image, depth, poses)
+    joint_packages = render_observation_views(renderer, joint_observation, batch_index=0)
+    joint_terms = stage2_gaussian_render_loss(
+        joint_packages,
+        image[0],
+        joint_observation,
+    )
+    joint_terms["loss"].backward()
+    repeated_hook.remove()
+    joint_hook.remove()
+
+    assert repeated_forward_count == views
+    assert joint_forward_count == 1
+    torch.testing.assert_close(joint_terms["loss"], repeated_loss, atol=1.0e-6, rtol=1.0e-5)
+    for repeated_parameter, joint_parameter in zip(repeated_head.parameters(), joint_head.parameters()):
+        if repeated_parameter.grad is None or joint_parameter.grad is None:
+            assert repeated_parameter.grad is None and joint_parameter.grad is None
+        else:
+            torch.testing.assert_close(joint_parameter.grad, repeated_parameter.grad, atol=2.0e-5, rtol=2.0e-4)
 
 
 def test_source_dataset_has_no_target_and_reproducible_random_stride(tmp_path: Path) -> None:

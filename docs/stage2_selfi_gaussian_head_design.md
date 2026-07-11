@@ -148,7 +148,11 @@ validation uses the minimum stride. There is no target field or target split in
 a sample, and manifest train/validation records remain isolated.
 
 For every batch item and every source camera, all canonical source observations
-are materialized for that target and rendered sequentially. Default loss is:
+are materialized for that target. The Head runs once for the complete source
+window; all target-conditioned renderer branches share that observation, their
+losses are averaged, and one joint backward pass updates the Head. SH evaluation
+and opacity pruning remain separate per target camera because their explicit
+Gaussian attributes and retained indices differ. Default loss is:
 
 ```text
 L = latitude_weighted_L1(render(all sources), source RGB)
@@ -164,9 +168,9 @@ only and is imported only when enabled.
 
 The optimizer is AdamW with peak LR `2e-4`, 1,000-step linear warmup, cosine
 decay, BF16 autocast, gradient clipping, and finite parameter/gradient/loss
-guards. During training the Head is recomputed for each target view and that
-view is backpropagated immediately. This costs additional U-Net compute but
-keeps only one CUDA rasterizer graph live at a time. Checkpoints use
+guards. During training all target-view rasterizer graphs remain live until the
+joint multi-view backward pass. This removes redundant Head forward and
+checkpoint recomputation at the cost of higher peak renderer memory. Checkpoints use
 `spherical_selfi_gaussian_head_v1` and contain Head,
 config, optimizer, scheduler, step, metrics, adapter SHA, and PanoVGGT config;
 frozen weights are not copied.
@@ -182,6 +186,8 @@ Validation reports latitude-weighted L1/PSNR/SSIM for:
 It also records per-source mean opacity and depth-residual, scale, confidence
 quantiles. If all-source improves without leave-one-out improvement, the run is
 reported as source-copy degeneration rather than cross-view reconstruction.
+These full-observation training diagnostics run every 200 optimizer steps,
+aligned with the default visualization interval.
 Local PNG panels and the same W&B image include target, all-source render, RGB
 error, depth residual, and confidence.
 
