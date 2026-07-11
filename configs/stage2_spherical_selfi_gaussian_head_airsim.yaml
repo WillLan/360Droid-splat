@@ -88,6 +88,11 @@ loss:
 
 train:
   batch_size: 1
+  # For torchrun DDP, global effective batch is
+  # batch_size * gradient_accumulation_steps * WORLD_SIZE.
+  gradient_accumulation_steps: 1
+  ddp: false
+  ddp_backend: nccl
   num_workers: 4
   feature_device: cuda:0
   train_device: cuda:1

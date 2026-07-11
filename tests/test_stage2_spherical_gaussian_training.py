@@ -19,6 +19,8 @@ from losses.spherical_gaussian_render_loss import (
 )
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from training.train_spherical_selfi_gaussian_head import (
+    DistributedContext,
+    _effective_batch_size,
     _scheduler,
     build_frozen_feature_stack,
     default_config,
@@ -111,6 +113,14 @@ def test_synthetic_panovggt_and_adapter_stack_is_frozen() -> None:
     assert not wrapper.training and not adapter.training
     assert all(not parameter.requires_grad for parameter in wrapper.parameters())
     assert all(not parameter.requires_grad for parameter in adapter.parameters())
+
+
+def test_ddp_effective_batch_size_uses_microbatch_accumulation_and_world_size() -> None:
+    train_config = {"batch_size": 1, "gradient_accumulation_steps": 2}
+    distributed = DistributedContext(enabled=True, rank=0, local_rank=0, world_size=2)
+    assert _effective_batch_size(train_config, distributed) == 4
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        _effective_batch_size({"batch_size": 1, "gradient_accumulation_steps": 0}, distributed)
 
 
 def test_source_dataset_has_no_target_and_reproducible_random_stride(tmp_path: Path) -> None:
