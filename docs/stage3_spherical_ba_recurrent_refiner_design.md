@@ -36,7 +36,9 @@ cosine(normalized_query, normalized_target) / 0.07 + log(cos(target_latitude))
 The target is the global argmax over the full `504 x 1008` ERP. Computation is
 chunked by 32 queries, but does not use pose windows or approximate candidate
 search. Four frames produce at most 8192 shared sparse-depth variables and
-24576 directed factors. The same cache is reused by all three BA calls.
+24576 directed factors. Forward-backward consistency is enabled, then the
+formal path retains the top 10% factors per directed pair by cached feature
+reliability. The same cache is reused by the single BA0 call.
 
 ## Spherical BA and dense depth shift
 
@@ -48,19 +50,25 @@ residual is always:
 Log_{matched_target_bearing}(predicted_target_bearing) in R^2
 ```
 
-The first pose is fixed. The other poses use left-multiplicative SE(3) updates,
-and each source query owns one log-inverse-depth variable shared by its three
-target factors. Huber-weighted LM builds factor-local Jacobians and uses a
-Schur complement to eliminate the diagonal sparse-depth block before solving
-the at-most `18 x 18` pose system. The default solver is gain-ratio
-Levenberg-Marquardt with diagonal damping, rejected-step retries, and Nielsen
-damping updates.
+The first pose is fixed. The formal path uses right-local rotation-only updates
+for the other poses, capped at `0.05 degrees` per LM iteration. Camera centers
+therefore remain exactly unchanged. Each source query still owns one
+log-inverse-depth nuisance variable shared by its three target factors.
+Huber-weighted LM builds factor-local Jacobians and uses a Schur complement to
+eliminate the diagonal sparse-depth block before solving the active rotation
+system. The solver is gain-ratio Levenberg-Marquardt with diagonal damping,
+rejected-step retries, and Nielsen damping updates.
 
-Because bearing-only BA has an unobservable global scale, every accepted trial
-is projected onto the initial-baseline gauge: the longest camera baseline from
-the fixed first camera is restored while all camera centers and sparse depths
-are scaled together. This leaves every bearing residual unchanged and does not
-use GT metric information.
+Full SE(3), translation-only, and staged rotation-then-translation modes remain
+config-gated research ablations. They are not formal defaults: translation
+improved one 64-window holdout but reversed on a disjoint 128-window holdout.
+
+Because bearing-only BA has an unobservable global scale, the solver retains an
+explicit initial-baseline gauge. In the formal rotation-only mode it is
+satisfied identically because camera centers never move. In SE(3) ablations,
+the longest camera baseline from the fixed first camera is restored while all
+camera centers and sparse depths are scaled together. This leaves every
+bearing residual unchanged and does not use GT metric information.
 
 The default `dense_depth_mode=none` does not propagate the optimized sparse
 query depths to the dense depth map. They remain nuisance variables that make
@@ -121,6 +129,25 @@ damping, gauge normalization, and update statistics. Refiner snapshots are
 asserted to preserve the preceding BA0 pose.
 Validation runs every 1000 steps and writes latest, best final LOO PSNR, and
 best final pose ATE checkpoints.
+
+## BA validation audit
+
+The original `5 degree / 0.05 translation` update limits reduced the spherical
+objective but moved poses away from GT. Dense affine propagation also worsened
+depth, while omitting the global gauge allowed scale drift. The formal settings
+therefore combine `dense_depth_mode=none`, `gauge_mode=initial_baseline`,
+`solver_mode=standard_lm`, right-local rotation-only updates, top-10% matches,
+and a `0.05 degree` rotation trust region.
+
+| validation batches | windows | mean absolute rotation delta | mean RPE rotation delta |
+|---|---:|---:|---:|
+| 32-95 | 64 | -0.01613 deg | -0.00935 deg |
+| 96-223 | 128 | -0.00448 deg | -0.00132 deg |
+| weighted aggregate | 192 | -0.00836 deg | -0.00400 deg |
+
+Translation metrics are exactly invariant in the formal mode by construction.
+GT is used only for this audit and checkpoint diagnostics, never by matching,
+LM acceptance, training loss, or inference.
 
 ## Formal configuration and launch gate
 

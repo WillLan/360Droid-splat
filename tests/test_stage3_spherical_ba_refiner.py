@@ -36,6 +36,7 @@ from tools.generate_stage3_ba_gate_sweep import (
     VARIANTS,
     generate as generate_gate_sweep,
 )
+from tools.generate_stage3_ba_pilot_config import generate as generate_pilot_config
 from tools.summarize_stage3_ba_ablation import summarize_checkpoint
 from tools.evaluate_stage3_ba import evaluate
 
@@ -691,6 +692,33 @@ def test_zero_dssim_weight_skips_dssim_computation() -> None:
 def test_ba_outer_schedule_is_ba0_only_by_default() -> None:
     config = default_config()
     assert _ba_outer_schedule(config) == (True, False, False)
+    assert config["matching"]["reliability_keep_fraction"] == 0.10
+    assert config["ba"]["pose_update_side"] == "right"
+    assert config["ba"]["pose_dof_mode"] == "rotation_only"
+    assert config["ba"]["max_pose_update_deg"] == 0.05
+
+
+def test_pilot_generator_locks_the_validated_ba_and_training_contract(tmp_path: Path) -> None:
+    output = tmp_path / "pilot.yaml"
+    config = generate_pilot_config(
+        Path("configs/stage3_spherical_ba_recurrent_refiner_omni360.yaml"),
+        output,
+        output_dir="outputs/test-pilot",
+        run_name="test-pilot",
+    )
+    assert output.exists()
+    assert config["ba"]["outer_schedule"] == [True, False, False]
+    assert config["ba"]["dense_depth_mode"] == "none"
+    assert config["ba"]["gauge_mode"] == "initial_baseline"
+    assert config["ba"]["solver_mode"] == "standard_lm"
+    assert config["ba"]["pose_update_side"] == "right"
+    assert config["ba"]["pose_dof_mode"] == "rotation_only"
+    assert config["ba"]["max_pose_update_deg"] == 0.05
+    assert config["matching"]["reliability_keep_fraction"] == 0.10
+    assert config["loss"]["dssim"] == 0.0
+    assert config["train"]["max_steps"] == 200
+    assert config["WeightsAndBiases"]["mode"] == "online"
+    assert config["Visualization"]["enabled"] is True
 
 
 def test_ba_ablation_generator_changes_only_declared_solver_axes(tmp_path: Path) -> None:

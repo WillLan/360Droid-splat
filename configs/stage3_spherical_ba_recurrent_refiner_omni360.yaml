@@ -88,7 +88,10 @@ matching:
   forward_backward: true
   fb_tolerance_deg: 1.0
   min_factor_weight: 0.01
-  reliability_keep_fraction: 1.0
+  # Full-resolution matches are highly redundant. The top 10% was the first
+  # setting to improve both absolute and relative rotation on two disjoint
+  # validation holdouts.
+  reliability_keep_fraction: 0.10
   distinctiveness_exclusion_deg: 0.0
   subpixel_refine_radius: 0
 
@@ -99,8 +102,10 @@ ba:
   huber_delta_deg: 0.5
   pose_prior_weight: 1.0e-3
   depth_prior_weight: 1.0e-2
-  max_pose_update_deg: 5.0
-  max_translation_update: 0.05
+  # PanoVGGT is already within a fraction of a degree. Larger limits let BA
+  # chase descriptor quantization noise and consistently damage the pose.
+  max_pose_update_deg: 0.05
+  max_translation_update: 0.001
   max_logdepth_update: 0.35
   factor_chunk_size: 2048
   min_factors: 256
@@ -116,8 +121,11 @@ ba:
   lm_diagonal_floor: 1.0e-6
   max_initial_residual_deg: null
   min_parallax_deg: 0.0
-  pose_update_side: left
-  pose_dof_mode: se3
+  pose_update_side: right
+  # Translation updates did not generalize across disjoint holdouts. Keep the
+  # safe rotation correction as the formal path; SE3/translation/staged modes
+  # remain explicit research ablations.
+  pose_dof_mode: rotation_only
   min_initial_median_residual_deg: 0.0
 
 refiner:
