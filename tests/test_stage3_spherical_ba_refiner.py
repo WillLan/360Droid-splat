@@ -191,6 +191,28 @@ def test_initial_baseline_gauge_preserves_bearing_geometry() -> None:
     torch.testing.assert_close(after, before, atol=1.0e-6, rtol=0.0)
 
 
+def test_baseline_gauge_jacobian_matches_finite_difference() -> None:
+    solver = BlockSparseSphericalBA(gauge_mode="initial_baseline")
+    poses = torch.eye(4).repeat(3, 1, 1)
+    poses[1, :3, 3] = torch.tensor([0.2, -0.1, 0.0])
+    poses[2, :3, 3] = torch.tensor([0.8, 0.2, -0.1])
+    row = solver._baseline_gauge_jacobian(poses, poses)
+    assert row is not None
+    direction = torch.tensor(
+        [0.1, -0.2, 0.05, 0.03, -0.04, 0.02, -0.1, 0.05, 0.08, -0.02, 0.01, 0.04]
+    )
+    epsilon = 1.0e-4
+    updated = poses.clone()
+    for frame in range(1, 3):
+        delta = epsilon * direction[(frame - 1) * 6 : frame * 6]
+        updated[frame] = se3_exp(delta) @ poses[frame]
+    reference = int((poses[:, :3, 3] - poses[0, :3, 3]).norm(dim=-1).argmax())
+    before = (poses[reference, :3, 3] - poses[0, :3, 3]).norm()
+    after = (updated[reference, :3, 3] - updated[0, :3, 3]).norm()
+    finite_difference = (after - before) / epsilon
+    torch.testing.assert_close(finite_difference, row @ direction, atol=5e-4, rtol=2e-3)
+
+
 def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:
     height, width = 6, 12
     query_count = height * width
@@ -264,6 +286,33 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         atol=2e-4,
         rtol=0.0,
     )
+
+    gauged_output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1e-6,
+        depth_prior_weight=1e-4,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        min_affine_support=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        gauge_mode="initial_baseline",
+        lm_max_trials=8,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert bool(gauged_output.accepted[0])
+    gauged_diagnostics = gauged_output.diagnostics[0]
+    assert gauged_diagnostics["final_objective"] < gauged_diagnostics["initial_objective"]
+    assert gauged_diagnostics["gain_ratio_mean"] > 0.0
+    initial_baseline = (poses_initial[1, :3, 3] - poses_initial[0, :3, 3]).norm()
+    output_baseline = (
+        gauged_output.poses_c2w[0, 1, :3, 3] - gauged_output.poses_c2w[0, 0, :3, 3]
+    ).norm()
+    torch.testing.assert_close(output_baseline, initial_baseline, atol=2e-6, rtol=0.0)
 
 
 def test_block_sparse_ba_rejects_antipodal_factor() -> None:

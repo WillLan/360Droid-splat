@@ -625,6 +625,7 @@ class BlockSparseSphericalBA:
                 else torch.zeros(0, device=device, dtype=torch.float32)
             )
             depth_diagonal = hdd.clamp_min(self.lm_diagonal_floor)
+            gauge_jacobian = self._baseline_gauge_jacobian(cur_pose, poses)
 
             def solve_step(damping: float, *, diagonal: bool) -> tuple[torch.Tensor, torch.Tensor] | None:
                 if pose_dim:
@@ -643,7 +644,20 @@ class BlockSparseSphericalBA:
                 schur = damped_hpp - hpd.transpose(0, 1) @ (inv_hdd[:, None] * hpd)
                 rhs = gp - hpd.transpose(0, 1) @ (inv_hdd * gd)
                 try:
-                    pose_step = -torch.linalg.solve(schur, rhs) if pose_dim else torch.zeros(0, device=device)
+                    if pose_dim and gauge_jacobian is not None:
+                        kkt = torch.zeros(
+                            pose_dim + 1,
+                            pose_dim + 1,
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        kkt[:pose_dim, :pose_dim] = schur
+                        kkt[:pose_dim, pose_dim] = gauge_jacobian
+                        kkt[pose_dim, :pose_dim] = gauge_jacobian
+                        kkt_rhs = torch.cat([-rhs, rhs.new_zeros(1)], dim=0)
+                        pose_step = torch.linalg.solve(kkt, kkt_rhs)[:pose_dim]
+                    else:
+                        pose_step = -torch.linalg.solve(schur, rhs) if pose_dim else torch.zeros(0, device=device)
                 except RuntimeError:
                     return None
                 depth_step = -(gd + hpd @ pose_step) * inv_hdd
@@ -944,6 +958,42 @@ class BlockSparseSphericalBA:
         normalized_pose[0] = initial_poses[0]
         normalized_log_depth = log_depth - torch.log(scale)
         return normalized_pose, normalized_log_depth, float(scale.detach().cpu()), True
+
+    def _baseline_gauge_jacobian(
+        self,
+        poses: torch.Tensor,
+        initial_poses: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Linearized hard constraint for the selected baseline length.
+
+        For a left SE(3) update ``[rho, omega]``, a camera center changes as
+        ``dC = rho + omega x C``.  The selected baseline derivative is thus
+        ``u^T dC = u^T rho + (C x u)^T omega``.  Adding this row to the Schur
+        pose system removes the monocular scale null direction before solving;
+        the exact gauge retraction then only corrects second-order drift.
+        """
+
+        views = int(poses.shape[0])
+        if self.gauge_mode == "none" or views <= 1:
+            return None
+        reference_center = initial_poses[0, :3, 3]
+        initial_offsets = initial_poses[:, :3, 3] - reference_center
+        reference_index = int(initial_offsets.norm(dim=-1).argmax())
+        if reference_index == 0:
+            return None
+        baseline = poses[reference_index, :3, 3] - poses[0, :3, 3]
+        length = baseline.norm()
+        if not bool(torch.isfinite(length)) or float(length) <= 1.0e-8:
+            return None
+        direction = baseline / length
+        row = poses.new_zeros((views - 1) * 6, dtype=torch.float32)
+        frame_slice = slice((reference_index - 1) * 6, reference_index * 6)
+        center = poses[reference_index, :3, 3]
+        row[frame_slice.start : frame_slice.start + 3] = direction
+        row[frame_slice.start + 3 : frame_slice.stop] = torch.cross(center, direction, dim=0)
+        if not bool(torch.isfinite(row).all()) or float(row.norm()) <= 1.0e-8:
+            return None
+        return row
 
     @staticmethod
     def _angular_residual(
