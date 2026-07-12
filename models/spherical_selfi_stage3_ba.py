@@ -299,9 +299,16 @@ def _factor_residual_from_local_delta(
     src_ray: torch.Tensor,
     tgt_ray: torch.Tensor,
     log_inv_depth: torch.Tensor,
+    pose_update_side: str = "left",
 ) -> torch.Tensor:
-    src_updated = _se3_exp_out_of_place(delta[:6]) @ src_pose
-    tgt_updated = _se3_exp_out_of_place(delta[6:12]) @ tgt_pose
+    src_step = _se3_exp_out_of_place(delta[:6])
+    tgt_step = _se3_exp_out_of_place(delta[6:12])
+    if pose_update_side == "right":
+        src_updated = src_pose @ src_step
+        tgt_updated = tgt_pose @ tgt_step
+    else:
+        src_updated = src_step @ src_pose
+        tgt_updated = tgt_step @ tgt_pose
     depth = torch.exp(-(log_inv_depth + delta[12]))
     point_source = depth * src_ray
     point_world = src_updated[:3, :3] @ point_source + src_updated[:3, 3]
@@ -397,6 +404,7 @@ class BlockSparseSphericalBA:
         lm_diagonal_floor: float = 1.0e-6,
         max_initial_residual_deg: float | None = None,
         min_parallax_deg: float = 0.0,
+        pose_update_side: str = "left",
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -432,6 +440,9 @@ class BlockSparseSphericalBA:
             else math.radians(max(0.0, float(max_initial_residual_deg)))
         )
         self.min_parallax = math.radians(max(0.0, float(min_parallax_deg)))
+        self.pose_update_side = str(pose_update_side).lower()
+        if self.pose_update_side not in {"left", "right"}:
+            raise ValueError("pose_update_side must be 'left' or 'right'.")
 
     def __call__(
         self,
@@ -613,7 +624,12 @@ class BlockSparseSphericalBA:
                     updated = [cur_pose[0]]
                     for frame_idx in range(1, views):
                         step = delta[(frame_idx - 1) * 6 : frame_idx * 6]
-                        updated.append(_se3_exp_out_of_place(step) @ cur_pose[frame_idx])
+                        transform = _se3_exp_out_of_place(step)
+                        updated.append(
+                            cur_pose[frame_idx] @ transform
+                            if self.pose_update_side == "right"
+                            else transform @ cur_pose[frame_idx]
+                        )
                     return self._pose_prior_vector(torch.stack(updated, dim=0), poses)
 
                 prior_residual = pose_prior_from_delta(prior_zero)
@@ -631,7 +647,15 @@ class BlockSparseSphericalBA:
                 local_zero = torch.zeros(stop - start, 13, device=device, dtype=torch.float32)
 
                 def single(delta, sp, tp, sr, tr, ld):
-                    return _factor_residual_from_local_delta(delta, sp, tp, sr, tr, ld)
+                    return _factor_residual_from_local_delta(
+                        delta,
+                        sp,
+                        tp,
+                        sr,
+                        tr,
+                        ld,
+                        self.pose_update_side,
+                    )
 
                 jacobian_fn = torch.func.jacrev(single, argnums=0)
                 residual = torch.func.vmap(single)(
@@ -740,9 +764,12 @@ class BlockSparseSphericalBA:
             ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
                 trial_pose = cur_pose.clone()
                 for frame in range(1, views):
-                    trial_pose[frame] = _se3_exp_out_of_place(
-                        float(step_scale) * pose_step[frame - 1]
-                    ) @ cur_pose[frame]
+                    transform = _se3_exp_out_of_place(float(step_scale) * pose_step[frame - 1])
+                    trial_pose[frame] = (
+                        cur_pose[frame] @ transform
+                        if self.pose_update_side == "right"
+                        else transform @ cur_pose[frame]
+                    )
                 trial_log = (
                     cur_log + float(step_scale) * depth_step
                 ).clamp(log0 - self.max_logdepth_update, log0 + self.max_logdepth_update)
@@ -789,7 +816,11 @@ class BlockSparseSphericalBA:
                         tgt_ray,
                         factor_weight,
                     )
-                    relative_pose = trial_pose[1:] @ torch.linalg.inv(cur_pose[1:])
+                    relative_pose = (
+                        torch.linalg.inv(cur_pose[1:]) @ trial_pose[1:]
+                        if self.pose_update_side == "right"
+                        else trial_pose[1:] @ torch.linalg.inv(cur_pose[1:])
+                    )
                     # Gauge projection changes world translations after the raw
                     # LM step.  The gain-ratio model must therefore use the
                     # effective left-multiplicative tangent step, not the
@@ -929,6 +960,7 @@ class BlockSparseSphericalBA:
             "solver_mode": self.solver_mode,
             "dense_depth_mode": self.dense_depth_mode,
             "gauge_mode": self.gauge_mode,
+            "pose_update_side": self.pose_update_side,
             "gain_ratio_mean": float(sum(gain_ratios) / len(gain_ratios)) if gain_ratios else float("nan"),
             "gauge_scale_mean": float(sum(gauge_scales) / len(gauge_scales)) if gauge_scales else 1.0,
             "gauge_scale_min": min(gauge_scales) if gauge_scales else 1.0,
@@ -1052,8 +1084,13 @@ class BlockSparseSphericalBA:
         row = poses.new_zeros((views - 1) * 6, dtype=torch.float32)
         frame_slice = slice((reference_index - 1) * 6, reference_index * 6)
         center = poses[reference_index, :3, 3]
-        row[frame_slice.start : frame_slice.start + 3] = direction
-        row[frame_slice.start + 3 : frame_slice.stop] = torch.cross(center, direction, dim=0)
+        if self.pose_update_side == "right":
+            row[frame_slice.start : frame_slice.start + 3] = (
+                poses[reference_index, :3, :3].transpose(0, 1) @ direction
+            )
+        else:
+            row[frame_slice.start : frame_slice.start + 3] = direction
+            row[frame_slice.start + 3 : frame_slice.stop] = torch.cross(center, direction, dim=0)
         if not bool(torch.isfinite(row).all()) or float(row.norm()) <= 1.0e-8:
             return None
         return row

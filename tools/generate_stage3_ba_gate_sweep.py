@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 
-VARIANTS: dict[str, dict[str, float | None]] = {
+VARIANTS: dict[str, dict[str, Any]] = {
     "v0_kkt_all": {"keep": 1.0, "residual": None, "parallax": 0.0},
     "v1_kkt_reliable50": {"keep": 0.50, "residual": None, "parallax": 0.0},
     "v2_kkt_reliable25": {"keep": 0.25, "residual": None, "parallax": 0.0},
@@ -22,7 +22,7 @@ VARIANTS: dict[str, dict[str, float | None]] = {
     "v7_kkt_reliable25_res3_parallax1": {"keep": 0.25, "residual": 3.0, "parallax": 1.0},
 }
 
-HIGH_PARALLAX_VARIANTS: dict[str, dict[str, float | None]] = {
+HIGH_PARALLAX_VARIANTS: dict[str, dict[str, Any]] = {
     "p0_kkt_all_parallax2": {"keep": 1.0, "residual": None, "parallax": 2.0},
     "p1_kkt_all_parallax3": {"keep": 1.0, "residual": None, "parallax": 3.0},
     "p2_kkt_all_parallax5": {"keep": 1.0, "residual": None, "parallax": 5.0},
@@ -34,12 +34,28 @@ HIGH_PARALLAX_VARIANTS: dict[str, dict[str, float | None]] = {
     "p8_kkt_reliable25_parallax5": {"keep": 0.25, "residual": None, "parallax": 5.0},
 }
 
+TRUST_REGION_VARIANTS: dict[str, dict[str, Any]] = {
+    "t0_left_all_trans01": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "left", "translation": 0.01},
+    "t1_left_all_trans005": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "left", "translation": 0.005},
+    "t2_left_reliable10_trans01": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "left", "translation": 0.01},
+    "t3_left_reliable10_trans005": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "left", "translation": 0.005},
+    "t4_right_all_trans05": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.05},
+    "t5_right_all_trans01": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.01},
+    "t6_right_all_trans005": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.005},
+    "t7_right_reliable50_trans01": {"keep": 0.5, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.01},
+    "t8_right_reliable25_trans01": {"keep": 0.25, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.01},
+    "t9_right_reliable10_trans01": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.01},
+    "t10_right_reliable10_trans005": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.005},
+    "t11_right_reliable10_trans001": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.001},
+    "t12_right_reliable10_iter1": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.05, "iterations": 1},
+}
+
 
 def generate(
     base_path: Path,
     suite_dir: Path,
     *,
-    variants: dict[str, dict[str, float | None]] | None = None,
+    variants: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     if not isinstance(base, dict):
@@ -63,6 +79,12 @@ def generate(
                 "min_parallax_deg": variant["parallax"],
             }
         )
+        if "side" in variant:
+            config["ba"]["pose_update_side"] = variant["side"]
+        if "translation" in variant:
+            config["ba"]["max_translation_update"] = variant["translation"]
+        if "iterations" in variant:
+            config["ba"]["iterations"] = variant["iterations"]
         config["matching"]["reliability_keep_fraction"] = variant["keep"]
         config_path = config_dir / f"{name}.yaml"
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -87,11 +109,15 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax"),
+        choices=("reliability", "high_parallax", "trust_region"),
         default="reliability",
     )
     args = parser.parse_args()
-    variants = VARIANTS if args.profile == "reliability" else HIGH_PARALLAX_VARIANTS
+    variants = {
+        "reliability": VARIANTS,
+        "high_parallax": HIGH_PARALLAX_VARIANTS,
+        "trust_region": TRUST_REGION_VARIANTS,
+    }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
 

@@ -31,6 +31,7 @@ from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, de
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate as generate_ablation_configs
 from tools.generate_stage3_ba_gate_sweep import (
     HIGH_PARALLAX_VARIANTS,
+    TRUST_REGION_VARIANTS,
     VARIANTS,
     generate as generate_gate_sweep,
 )
@@ -218,25 +219,40 @@ def test_initial_baseline_gauge_preserves_bearing_geometry() -> None:
 
 
 def test_baseline_gauge_jacobian_matches_finite_difference() -> None:
-    solver = BlockSparseSphericalBA(gauge_mode="initial_baseline")
     poses = torch.eye(4).repeat(3, 1, 1)
     poses[1, :3, 3] = torch.tensor([0.2, -0.1, 0.0])
     poses[2, :3, 3] = torch.tensor([0.8, 0.2, -0.1])
-    row = solver._baseline_gauge_jacobian(poses, poses)
-    assert row is not None
     direction = torch.tensor(
         [0.1, -0.2, 0.05, 0.03, -0.04, 0.02, -0.1, 0.05, 0.08, -0.02, 0.01, 0.04]
     )
     epsilon = 1.0e-4
-    updated = poses.clone()
-    for frame in range(1, 3):
-        delta = epsilon * direction[(frame - 1) * 6 : frame * 6]
-        updated[frame] = se3_exp(delta) @ poses[frame]
     reference = int((poses[:, :3, 3] - poses[0, :3, 3]).norm(dim=-1).argmax())
-    before = (poses[reference, :3, 3] - poses[0, :3, 3]).norm()
-    after = (updated[reference, :3, 3] - updated[0, :3, 3]).norm()
-    finite_difference = (after - before) / epsilon
-    torch.testing.assert_close(finite_difference, row @ direction, atol=5e-4, rtol=2e-3)
+    for side in ("left", "right"):
+        solver = BlockSparseSphericalBA(gauge_mode="initial_baseline", pose_update_side=side)
+        row = solver._baseline_gauge_jacobian(poses, poses)
+        assert row is not None
+        updated = poses.clone()
+        for frame in range(1, 3):
+            delta = epsilon * direction[(frame - 1) * 6 : frame * 6]
+            updated[frame] = (
+                poses[frame] @ se3_exp(delta)
+                if side == "right"
+                else se3_exp(delta) @ poses[frame]
+            )
+        before = (poses[reference, :3, 3] - poses[0, :3, 3]).norm()
+        after = (updated[reference, :3, 3] - updated[0, :3, 3]).norm()
+        finite_difference = (after - before) / epsilon
+        torch.testing.assert_close(finite_difference, row @ direction, atol=5e-4, rtol=2e-3)
+
+
+def test_right_local_rotation_keeps_camera_center_fixed() -> None:
+    pose = torch.eye(4)
+    pose[:3, 3] = torch.tensor([0.8, -0.2, 0.3])
+    rotation_only = torch.tensor([0.0, 0.0, 0.0, 0.1, -0.05, 0.02])
+    right_updated = pose @ se3_exp(rotation_only)
+    left_updated = se3_exp(rotation_only) @ pose
+    torch.testing.assert_close(right_updated[:3, 3], pose[:3, 3])
+    assert not torch.allclose(left_updated[:3, 3], pose[:3, 3])
 
 
 def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:
@@ -339,6 +355,29 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         gauged_output.poses_c2w[0, 1, :3, 3] - gauged_output.poses_c2w[0, 0, :3, 3]
     ).norm()
     torch.testing.assert_close(output_baseline, initial_baseline, atol=2e-6, rtol=0.0)
+
+    right_output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1e-6,
+        depth_prior_weight=1e-4,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        min_affine_support=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        gauge_mode="initial_baseline",
+        pose_update_side="right",
+        lm_max_trials=8,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert bool(right_output.accepted[0])
+    assert right_output.diagnostics[0]["final_objective"] < right_output.diagnostics[0]["initial_objective"]
+    right_baseline = (right_output.poses_c2w[0, 1, :3, 3] - right_output.poses_c2w[0, 0, :3, 3]).norm()
+    torch.testing.assert_close(right_baseline, initial_baseline, atol=2e-6, rtol=0.0)
 
 
 def test_block_sparse_ba_rejects_antipodal_factor() -> None:
@@ -526,6 +565,15 @@ def test_ba_gate_sweep_generator_keeps_solver_fixed(tmp_path: Path) -> None:
     )
     assert len(parallax_manifest["variants"]) == len(HIGH_PARALLAX_VARIANTS)
     assert all(float(variant["parallax"]) >= 2.0 for variant in parallax_manifest["variants"])
+
+    trust_suite = tmp_path / "trust_sweep"
+    trust_manifest = generate_gate_sweep(
+        root / "configs" / "stage3_spherical_ba_recurrent_refiner_omni360.yaml",
+        trust_suite,
+        variants=TRUST_REGION_VARIANTS,
+    )
+    assert len(trust_manifest["variants"]) == len(TRUST_REGION_VARIANTS)
+    assert any(variant.get("side") == "right" for variant in trust_manifest["variants"])
 
 
 def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
