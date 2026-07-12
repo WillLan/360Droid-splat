@@ -504,12 +504,14 @@ class BlockSparseSphericalBA:
         if self.pose_update_side not in {"left", "right"}:
             raise ValueError("pose_update_side must be 'left' or 'right'.")
         self.pose_dof_mode = str(pose_dof_mode).lower()
-        if self.pose_dof_mode not in {"se3", "rotation_only"}:
-            raise ValueError("pose_dof_mode must be 'se3' or 'rotation_only'.")
-        if self.pose_dof_mode == "rotation_only" and self.pose_update_side != "right":
+        if self.pose_dof_mode not in {"se3", "rotation_only", "translation_only"}:
             raise ValueError(
-                "pose_dof_mode='rotation_only' requires pose_update_side='right' so "
-                "camera centers remain fixed under a pure local rotation."
+                "pose_dof_mode must be 'se3', 'rotation_only', or 'translation_only'."
+            )
+        if self.pose_dof_mode != "se3" and self.pose_update_side != "right":
+            raise ValueError(
+                f"pose_dof_mode='{self.pose_dof_mode}' requires pose_update_side='right' "
+                "for an unambiguous camera-local reduced-DOF update."
             )
         self.min_initial_median_residual_deg = max(
             0.0, float(min_initial_median_residual_deg)
@@ -692,6 +694,12 @@ class BlockSparseSphericalBA:
         if self.pose_dof_mode == "rotation_only":
             active_pose_index = torch.tensor(
                 [frame * 6 + axis for frame in range(max(0, views - 1)) for axis in range(3, 6)],
+                device=device,
+                dtype=torch.long,
+            )
+        elif self.pose_dof_mode == "translation_only":
+            active_pose_index = torch.tensor(
+                [frame * 6 + axis for frame in range(max(0, views - 1)) for axis in range(3)],
                 device=device,
                 dtype=torch.long,
             )

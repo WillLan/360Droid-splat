@@ -118,6 +118,14 @@ SUBPIXEL_VARIANTS: dict[str, dict[str, Any]] = {
     "s6_se3_reliable05_radius2": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "subpixel": 2},
 }
 
+TRANSLATION_ONLY_VARIANTS: dict[str, dict[str, Any]] = {
+    "u0_translation_reliable10_trans001": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.001},
+    "u1_translation_reliable05_trans001": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.001},
+    "u2_translation_reliable10_trans0005": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.0005},
+    "u3_translation_reliable10_trans002": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.002},
+    "u4_translation_reliable05_trans0005": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.0005},
+}
+
 
 def generate(
     base_path: Path,
@@ -190,7 +198,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust", "subpixel"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust", "subpixel", "translation_only"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -204,6 +212,7 @@ def main() -> None:
         "distinctiveness": DISTINCTIVENESS_VARIANTS,
         "rotation_trust": ROTATION_TRUST_VARIANTS,
         "subpixel": SUBPIXEL_VARIANTS,
+        "translation_only": TRANSLATION_ONLY_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
