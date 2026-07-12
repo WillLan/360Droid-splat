@@ -30,6 +30,7 @@ from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate
 from tools.summarize_stage3_ba_ablation import summarize_checkpoint
+from tools.evaluate_stage3_ba import evaluate
 
 
 def _observation(*, views: int = 3, height: int = 8, width: int = 16):
@@ -473,6 +474,42 @@ def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
     assert row["dense_depth_mode"] == "none"
     assert abs(row["ba0_delta_pose_scale_aligned_ate"] + 0.02) < 1.0e-8
     assert abs(row["ba0_delta_loo_psnr"] - 0.2) < 1.0e-8
+
+
+def test_synthetic_ba_only_evaluator() -> None:
+    config = default_config()
+    config["stage3"]["enabled"] = True
+    config["matching"].update(
+        {
+            "num_queries": 2,
+            "query_chunk_size": 1,
+            "forward_backward": False,
+            "min_factor_weight": 0.0,
+        }
+    )
+    config["ba"].update(
+        {
+            "iterations": 0,
+            "min_factors": 1,
+            "min_affine_support": 2,
+            "factor_chunk_size": 4,
+        }
+    )
+    config["dataset"]["max_val_samples"] = 1
+    config["train"].update(
+        {
+            "batch_size": 1,
+            "num_workers": 0,
+            "feature_device": "cpu",
+            "train_device": "cpu",
+            "amp": False,
+        }
+    )
+    result = evaluate(config, max_batches=1)
+    assert result["format"] == "spherical_stage3_ba_evaluation_v1"
+    assert result["num_batches"] == 1
+    assert "delta/pose_scale_aligned_ate" in result["mean"]
+    assert result["records"][0]["metrics"]["matching/valid_factors"] > 0
 
 
 def test_pose_metric_is_zero_for_identical_poses() -> None:
