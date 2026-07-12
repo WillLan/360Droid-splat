@@ -96,6 +96,18 @@ DISTINCTIVENESS_VARIANTS: dict[str, dict[str, Any]] = {
     "d8_se3_reliable05_exclusion5": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "exclusion": 5.0},
 }
 
+ROTATION_TRUST_VARIANTS: dict[str, dict[str, Any]] = {
+    "q0_rotation_reliable05_rot5": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 5.0},
+    "q1_rotation_reliable05_rot02": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.2},
+    "q2_rotation_reliable05_rot01": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.1},
+    "q3_rotation_reliable05_rot005": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.05},
+    "q4_rotation_reliable05_rot002": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.02},
+    "q5_se3_reliable05_rot02": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.2},
+    "q6_se3_reliable05_rot01": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.1},
+    "q7_se3_reliable05_rot005": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.05},
+    "q8_se3_reliable10_rot01": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.1},
+}
+
 
 def generate(
     base_path: Path,
@@ -131,6 +143,8 @@ def generate(
             config["ba"]["pose_dof_mode"] = variant["dof"]
         if "translation" in variant:
             config["ba"]["max_translation_update"] = variant["translation"]
+        if "rotation" in variant:
+            config["ba"]["max_pose_update_deg"] = variant["rotation"]
         if "iterations" in variant:
             config["ba"]["iterations"] = variant["iterations"]
         if "fb" in variant:
@@ -164,7 +178,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -176,6 +190,7 @@ def main() -> None:
         "cycle_consistency": CYCLE_CONSISTENCY_VARIANTS,
         "residual_trigger": RESIDUAL_TRIGGER_VARIANTS,
         "distinctiveness": DISTINCTIVENESS_VARIANTS,
+        "rotation_trust": ROTATION_TRUST_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
