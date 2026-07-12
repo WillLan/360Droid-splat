@@ -368,6 +368,14 @@ class BlockSparseSphericalBA:
         min_affine_support: int = 64,
         min_depth: float = 0.05,
         max_depth: float = 20.0,
+        solver_mode: str = "backtracking_gn",
+        dense_depth_mode: str = "affine",
+        gauge_mode: str = "none",
+        lm_max_trials: int = 4,
+        lm_acceptance_eta: float = 1.0e-4,
+        lm_damping_min: float = 1.0e-8,
+        lm_damping_max: float = 1.0e8,
+        lm_diagonal_floor: float = 1.0e-6,
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -383,6 +391,20 @@ class BlockSparseSphericalBA:
         self.min_affine_support = max(2, int(min_affine_support))
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
+        self.solver_mode = str(solver_mode).lower()
+        if self.solver_mode not in {"backtracking_gn", "standard_lm"}:
+            raise ValueError("solver_mode must be 'backtracking_gn' or 'standard_lm'.")
+        self.dense_depth_mode = str(dense_depth_mode).lower()
+        if self.dense_depth_mode not in {"affine", "none"}:
+            raise ValueError("dense_depth_mode must be 'affine' or 'none'.")
+        self.gauge_mode = str(gauge_mode).lower()
+        if self.gauge_mode not in {"none", "initial_baseline"}:
+            raise ValueError("gauge_mode must be 'none' or 'initial_baseline'.")
+        self.lm_max_trials = max(1, int(lm_max_trials))
+        self.lm_acceptance_eta = float(lm_acceptance_eta)
+        self.lm_damping_min = max(0.0, float(lm_damping_min))
+        self.lm_damping_max = max(self.lm_damping_min, float(lm_damping_max))
+        self.lm_diagonal_floor = max(1.0e-12, float(lm_diagonal_floor))
 
     def __call__(
         self,
@@ -426,11 +448,14 @@ class BlockSparseSphericalBA:
         scale_tensor = torch.stack(scales, dim=0).to(device=dense_depth.device, dtype=dense_depth.dtype).detach()
         shift_tensor = torch.stack(shifts, dim=0).to(device=dense_depth.device, dtype=dense_depth.dtype).detach()
         valid_geometry = torch.isfinite(dense_depth) & (dense_depth >= self.min_depth) & (dense_depth <= self.max_depth)
-        affine = scale_tensor[:, :, None, None, None] * dense_depth + shift_tensor[:, :, None, None, None]
-        affine = affine.clamp(self.min_depth, self.max_depth)
         accepted_tensor = torch.stack(accepted_values)
-        use_affine = accepted_tensor[:, None, None, None, None] & valid_geometry
-        output_depth = torch.where(use_affine, affine, dense_depth)
+        if self.dense_depth_mode == "affine":
+            affine = scale_tensor[:, :, None, None, None] * dense_depth + shift_tensor[:, :, None, None, None]
+            affine = affine.clamp(self.min_depth, self.max_depth)
+            use_affine = accepted_tensor[:, None, None, None, None] & valid_geometry
+            output_depth = torch.where(use_affine, affine, dense_depth)
+        else:
+            output_depth = dense_depth
         return Stage3BAOutput(
             poses_c2w=pose_tensor,
             dense_depth=output_depth,
@@ -500,8 +525,14 @@ class BlockSparseSphericalBA:
         pose_dim = max(0, (views - 1) * 6)
         depth_dim = views * query_count
         failed_reason: str | None = None
-        current_damping = max(self.damping, 1.0e-8)
+        current_damping = min(
+            self.lm_damping_max,
+            max(self.damping, self.lm_damping_min),
+        )
         accepted_steps = 0
+        gain_ratios: list[float] = []
+        gauge_scales: list[float] = []
+        lm_nu = 2.0
         initial_objective = self._objective(
             cur_pose,
             cur_log,
@@ -517,7 +548,7 @@ class BlockSparseSphericalBA:
         current_objective = initial_objective
 
         for _ in range(max(0, self.iterations)):
-            hpp = torch.eye(pose_dim, device=device, dtype=torch.float32) * current_damping
+            hpp = torch.zeros(pose_dim, pose_dim, device=device, dtype=torch.float32)
             gp = torch.zeros(pose_dim, device=device, dtype=torch.float32)
             if pose_dim and self.pose_prior_weight > 0.0:
                 prior_zero = torch.zeros(pose_dim, device=device, dtype=torch.float32)
@@ -534,7 +565,7 @@ class BlockSparseSphericalBA:
                 hpp += self.pose_prior_weight * (prior_jacobian.T @ prior_jacobian)
                 gp += self.pose_prior_weight * (prior_jacobian.T @ prior_residual)
             hpd = torch.zeros(depth_dim, pose_dim, device=device, dtype=torch.float32)
-            hdd = torch.full((depth_dim,), self.depth_prior_weight + current_damping, device=device, dtype=torch.float32)
+            hdd = torch.full((depth_dim,), self.depth_prior_weight, device=device, dtype=torch.float32)
             gd = self.depth_prior_weight * (cur_log - log0)
 
             for start in range(0, int(src.numel()), self.factor_chunk_size):
@@ -587,75 +618,189 @@ class BlockSparseSphericalBA:
             if not all(torch.isfinite(value).all() for value in (hpp, gp, hpd, hdd, gd)):
                 failed_reason = "non_finite_normal_equations"
                 break
-            inv_hdd = hdd.clamp_min(1.0e-8).reciprocal()
-            schur = hpp - hpd.transpose(0, 1) @ (inv_hdd[:, None] * hpd)
-            rhs = gp - hpd.transpose(0, 1) @ (inv_hdd * gd)
-            try:
-                delta_pose = -torch.linalg.solve(schur, rhs) if pose_dim else torch.zeros(0, device=device)
-            except RuntimeError:
-                failed_reason = "linear_solve_failure"
-                break
-            delta_depth = -(gd + hpd @ delta_pose) * inv_hdd
-            if not torch.isfinite(delta_depth).all() or not torch.isfinite(delta_pose).all():
-                failed_reason = "non_finite_step"
-                break
-            delta_pose = delta_pose.reshape(max(0, views - 1), 6)
-            if delta_pose.numel():
-                translation_norm = delta_pose[:, :3].norm(dim=-1).clamp_min(1.0e-8)
-                rotation_norm = delta_pose[:, 3:].norm(dim=-1).clamp_min(1.0e-8)
-                delta_pose[:, :3] *= torch.minimum(
-                    torch.ones_like(translation_norm),
-                    translation_norm.new_tensor(self.max_translation_update) / translation_norm,
-                )[:, None]
-                delta_pose[:, 3:] *= torch.minimum(
-                    torch.ones_like(rotation_norm),
-                    rotation_norm.new_tensor(self.max_pose_update) / rotation_norm,
-                )[:, None]
-            accepted_step = False
-            for step_scale in (1.0, 0.5, 0.25, 0.125):
+            pose_diagonal = (
+                hpp.diagonal().clamp_min(self.lm_diagonal_floor)
+                if pose_dim
+                else torch.zeros(0, device=device, dtype=torch.float32)
+            )
+            depth_diagonal = hdd.clamp_min(self.lm_diagonal_floor)
+
+            def solve_step(damping: float, *, diagonal: bool) -> tuple[torch.Tensor, torch.Tensor] | None:
+                if pose_dim:
+                    if diagonal:
+                        damped_hpp = hpp + torch.diag(pose_diagonal * float(damping))
+                    else:
+                        damped_hpp = hpp + torch.eye(pose_dim, device=device) * float(damping)
+                else:
+                    damped_hpp = hpp
+                damped_hdd = hdd + (
+                    depth_diagonal * float(damping)
+                    if diagonal
+                    else torch.full_like(hdd, float(damping))
+                )
+                inv_hdd = damped_hdd.clamp_min(1.0e-12).reciprocal()
+                schur = damped_hpp - hpd.transpose(0, 1) @ (inv_hdd[:, None] * hpd)
+                rhs = gp - hpd.transpose(0, 1) @ (inv_hdd * gd)
+                try:
+                    pose_step = -torch.linalg.solve(schur, rhs) if pose_dim else torch.zeros(0, device=device)
+                except RuntimeError:
+                    return None
+                depth_step = -(gd + hpd @ pose_step) * inv_hdd
+                if not torch.isfinite(depth_step).all() or not torch.isfinite(pose_step).all():
+                    return None
+                pose_step = pose_step.reshape(max(0, views - 1), 6)
+                if pose_step.numel():
+                    translation_norm = pose_step[:, :3].norm(dim=-1).clamp_min(1.0e-8)
+                    rotation_norm = pose_step[:, 3:].norm(dim=-1).clamp_min(1.0e-8)
+                    pose_step[:, :3] *= torch.minimum(
+                        torch.ones_like(translation_norm),
+                        translation_norm.new_tensor(self.max_translation_update) / translation_norm,
+                    )[:, None]
+                    pose_step[:, 3:] *= torch.minimum(
+                        torch.ones_like(rotation_norm),
+                        rotation_norm.new_tensor(self.max_pose_update) / rotation_norm,
+                    )[:, None]
+                return pose_step, depth_step
+
+            def build_trial(
+                pose_step: torch.Tensor,
+                depth_step: torch.Tensor,
+                *,
+                step_scale: float,
+            ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
                 trial_pose = cur_pose.clone()
                 for frame in range(1, views):
-                    trial_pose[frame] = _se3_exp_out_of_place(step_scale * delta_pose[frame - 1]) @ cur_pose[frame]
+                    trial_pose[frame] = _se3_exp_out_of_place(
+                        float(step_scale) * pose_step[frame - 1]
+                    ) @ cur_pose[frame]
                 trial_log = (
-                    cur_log + step_scale * delta_depth
+                    cur_log + float(step_scale) * depth_step
                 ).clamp(log0 - self.max_logdepth_update, log0 + self.max_logdepth_update)
+                trial_pose, trial_log, gauge_scale, gauge_ok = self._apply_scale_gauge(
+                    trial_pose,
+                    trial_log,
+                    poses,
+                )
+                if not gauge_ok:
+                    return None
                 trial_predicted = self._predicted_bearing(
                     trial_pose, trial_log, src, tgt, depth_index, src_ray
                 )
                 if not bool(torch.isfinite(trial_predicted).all()):
-                    continue
+                    return None
                 if bool(((trial_predicted * tgt_ray).sum(dim=-1) <= -0.99).any()):
-                    continue
-                trial_objective = self._objective(
-                    trial_pose,
-                    trial_log,
-                    poses,
-                    log0,
-                    src,
-                    tgt,
-                    depth_index,
-                    src_ray,
-                    tgt_ray,
-                    factor_weight,
-                )
-                if bool(torch.isfinite(trial_objective)) and float(trial_objective) < float(current_objective) - 1.0e-10:
-                    cur_pose = trial_pose
-                    cur_log = trial_log
-                    current_objective = trial_objective
-                    current_damping = max(self.damping, current_damping * 0.5)
-                    accepted_steps += 1
-                    accepted_step = True
+                    return None
+                return trial_pose, trial_log, gauge_scale
+
+            accepted_step = False
+            if self.solver_mode == "standard_lm":
+                for _trial in range(self.lm_max_trials):
+                    solved = solve_step(current_damping, diagonal=True)
+                    if solved is None:
+                        current_damping = min(self.lm_damping_max, current_damping * lm_nu)
+                        lm_nu *= 2.0
+                        continue
+                    delta_pose, delta_depth = solved
+                    candidate = build_trial(delta_pose, delta_depth, step_scale=1.0)
+                    if candidate is None:
+                        current_damping = min(self.lm_damping_max, current_damping * lm_nu)
+                        lm_nu *= 2.0
+                        continue
+                    trial_pose, trial_log, gauge_scale = candidate
+                    trial_objective = self._objective(
+                        trial_pose,
+                        trial_log,
+                        poses,
+                        log0,
+                        src,
+                        tgt,
+                        depth_index,
+                        src_ray,
+                        tgt_ray,
+                        factor_weight,
+                    )
+                    flat_pose = delta_pose.reshape(-1)
+                    effective_depth = trial_log - cur_log
+                    quadratic = (
+                        (flat_pose @ (hpp @ flat_pose) if pose_dim else hpp.new_tensor(0.0))
+                        + 2.0 * (effective_depth @ (hpd @ flat_pose) if pose_dim else hpp.new_tensor(0.0))
+                        + (hdd * effective_depth.square()).sum()
+                    )
+                    predicted_reduction = -(
+                        (gp @ flat_pose if pose_dim else gp.new_tensor(0.0))
+                        + gd @ effective_depth
+                        + 0.5 * quadratic
+                    )
+                    actual_reduction = current_objective - trial_objective
+                    rho = actual_reduction / predicted_reduction.clamp_min(1.0e-12)
+                    if (
+                        bool(torch.isfinite(trial_objective))
+                        and float(predicted_reduction) > 0.0
+                        and float(rho) > self.lm_acceptance_eta
+                    ):
+                        cur_pose = trial_pose
+                        cur_log = trial_log
+                        current_objective = trial_objective
+                        gain_ratios.append(float(rho.detach().cpu()))
+                        gauge_scales.append(float(gauge_scale))
+                        damping_factor = max(1.0 / 3.0, 1.0 - (2.0 * float(rho) - 1.0) ** 3)
+                        current_damping = max(
+                            self.lm_damping_min,
+                            min(self.lm_damping_max, current_damping * damping_factor),
+                        )
+                        lm_nu = 2.0
+                        accepted_steps += 1
+                        accepted_step = True
+                        break
+                    current_damping = min(self.lm_damping_max, current_damping * lm_nu)
+                    lm_nu *= 2.0
+            else:
+                solved = solve_step(current_damping, diagonal=False)
+                if solved is None:
+                    failed_reason = "linear_solve_failure"
                     break
-            if not accepted_step:
-                current_damping *= 10.0
+                delta_pose, delta_depth = solved
+                for step_scale in (1.0, 0.5, 0.25, 0.125):
+                    candidate = build_trial(delta_pose, delta_depth, step_scale=step_scale)
+                    if candidate is None:
+                        continue
+                    trial_pose, trial_log, gauge_scale = candidate
+                    trial_objective = self._objective(
+                        trial_pose,
+                        trial_log,
+                        poses,
+                        log0,
+                        src,
+                        tgt,
+                        depth_index,
+                        src_ray,
+                        tgt_ray,
+                        factor_weight,
+                    )
+                    if bool(torch.isfinite(trial_objective)) and float(trial_objective) < float(current_objective) - 1.0e-10:
+                        cur_pose = trial_pose
+                        cur_log = trial_log
+                        current_objective = trial_objective
+                        gauge_scales.append(float(gauge_scale))
+                        current_damping = max(self.lm_damping_min, current_damping * 0.5)
+                        accepted_steps += 1
+                        accepted_step = True
+                        break
+                if not accepted_step:
+                    current_damping = min(self.lm_damping_max, current_damping * 10.0)
+            if not accepted_step and self.solver_mode == "standard_lm":
+                break
 
         final_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         final_median = float(torch.rad2deg(final_angle).median().detach().cpu())
         objective_improved = float(current_objective) <= float(initial_objective) + 1.0e-10
+        residual_limit = max(1.0e-6, initial_median * self.residual_worse_tolerance)
+        residual_acceptable = final_median <= residual_limit
         accepted = (
             failed_reason is None
             and math.isfinite(final_median)
             and objective_improved
+            and residual_acceptable
             and (accepted_steps > 0 or self.iterations == 0 or initial_median <= 1.0e-6)
         )
         if not accepted:
@@ -665,7 +810,7 @@ class BlockSparseSphericalBA:
         original_depth = source_depth.reshape(views, query_count)
         scales = torch.ones(views, device=device, dtype=torch.float32)
         shifts = torch.zeros(views, device=device, dtype=torch.float32)
-        if accepted:
+        if accepted and self.dense_depth_mode == "affine":
             for frame in range(views):
                 mask = cache.source_valid[batch_idx, frame].to(device=device)
                 support = int(mask.sum())
@@ -685,15 +830,26 @@ class BlockSparseSphericalBA:
                     median_depth=median_depth,
                 )
         return cur_pose, optimized_depth, scales, shifts, accepted, initial_median, final_median, {
-            "reason": "accepted" if accepted else (failed_reason or "residual_worse"),
+            "reason": "accepted" if accepted else (
+                failed_reason
+                or ("residual_worse" if not residual_acceptable else "objective_not_improved")
+            ),
             "num_factors": int(src.numel()),
             "num_depth_variables": depth_dim,
             "initial_median_residual_deg": initial_median,
             "final_median_residual_deg": final_median,
+            "residual_acceptable": bool(residual_acceptable),
             "initial_objective": float(initial_objective.detach().cpu()),
             "final_objective": float(current_objective.detach().cpu()),
             "accepted_steps": int(accepted_steps),
             "final_damping": float(current_damping),
+            "solver_mode": self.solver_mode,
+            "dense_depth_mode": self.dense_depth_mode,
+            "gauge_mode": self.gauge_mode,
+            "gain_ratio_mean": float(sum(gain_ratios) / len(gain_ratios)) if gain_ratios else float("nan"),
+            "gauge_scale_mean": float(sum(gauge_scales) / len(gauge_scales)) if gauge_scales else 1.0,
+            "gauge_scale_min": min(gauge_scales) if gauge_scales else 1.0,
+            "gauge_scale_max": max(gauge_scales) if gauge_scales else 1.0,
         }
 
     def _objective(
@@ -744,6 +900,44 @@ class BlockSparseSphericalBA:
             output.index_add_(0, local_index, factor_weight[selected])
             count.index_add_(0, local_index, torch.ones_like(factor_weight[selected]))
         return torch.where(count > 0, output / count.clamp_min(1.0), torch.ones_like(output)).clamp_min(1.0e-6)
+
+    def _apply_scale_gauge(
+        self,
+        poses: torch.Tensor,
+        log_depth: torch.Tensor,
+        initial_poses: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, bool]:
+        """Fix the monocular scale gauge to the initial longest baseline.
+
+        Scaling every camera center about the fixed first center and every
+        sparse depth by the same positive scalar leaves all bearing factors
+        unchanged.  This projection therefore selects a stable representative
+        of the gauge orbit without injecting GT metric information.
+        """
+
+        if self.gauge_mode == "none" or int(poses.shape[0]) <= 1:
+            return poses, log_depth, 1.0, True
+        reference_center = initial_poses[0, :3, 3]
+        initial_offsets = initial_poses[:, :3, 3] - reference_center
+        reference_index = int(initial_offsets.norm(dim=-1).argmax())
+        initial_length = initial_offsets[reference_index].norm()
+        current_center = poses[0, :3, 3]
+        current_length = (poses[reference_index, :3, 3] - current_center).norm()
+        if (
+            not bool(torch.isfinite(initial_length))
+            or not bool(torch.isfinite(current_length))
+            or float(initial_length) <= 1.0e-8
+            or float(current_length) <= 1.0e-8
+        ):
+            return poses, log_depth, 1.0, False
+        scale = initial_length / current_length
+        if not bool(torch.isfinite(scale)) or float(scale) <= 0.0:
+            return poses, log_depth, 1.0, False
+        normalized_pose = poses.clone()
+        normalized_pose[:, :3, 3] = current_center + scale * (poses[:, :3, 3] - current_center)
+        normalized_pose[0] = initial_poses[0]
+        normalized_log_depth = log_depth - torch.log(scale)
+        return normalized_pose, normalized_log_depth, float(scale.detach().cpu()), True
 
     @staticmethod
     def _angular_residual(

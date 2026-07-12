@@ -90,6 +90,7 @@ matching:
   min_factor_weight: 0.01
 
 ba:
+  outer_schedule: [true, false, false]
   iterations: 3
   damping: 1.0e-4
   huber_delta_deg: 0.5
@@ -102,6 +103,14 @@ ba:
   min_factors: 256
   residual_worse_tolerance: 1.05
   min_affine_support: 64
+  solver_mode: standard_lm
+  dense_depth_mode: none
+  gauge_mode: initial_baseline
+  lm_max_trials: 4
+  lm_acceptance_eta: 1.0e-4
+  lm_damping_min: 1.0e-8
+  lm_damping_max: 1.0e8
+  lm_diagonal_floor: 1.0e-6
 
 refiner:
   adapter_dim: 24
@@ -115,7 +124,7 @@ refiner:
 
 loss:
   stage_weights: [0.64, 0.80, 1.0]
-  dssim: 0.2
+  dssim: 0.0
   geometry: 0.05
   depth_anchor: 1.0e-3
   update_regularization: 1.0e-4

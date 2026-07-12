@@ -33,12 +33,14 @@ def leave_one_out_render_loss(
         raise ValueError("rendered and target must have matching BxSx3xHxW shapes.")
     batch, views = int(rendered.shape[0]), int(rendered.shape[1])
     l1_values, dssim_values = [], []
+    compute_dssim = float(dssim_weight) != 0.0
     for batch_idx in range(batch):
         for view in range(views):
             l1_values.append(spherical_weighted_l1(rendered[batch_idx, view], target[batch_idx, view]))
-            dssim_values.append(spherical_dssim(rendered[batch_idx, view], target[batch_idx, view]))
+            if compute_dssim:
+                dssim_values.append(spherical_dssim(rendered[batch_idx, view], target[batch_idx, view]))
     l1 = torch.stack(l1_values).mean()
-    dssim = torch.stack(dssim_values).mean()
+    dssim = torch.stack(dssim_values).mean() if dssim_values else l1.new_zeros(())
     return l1 + float(dssim_weight) * dssim, {"l1": l1.detach(), "dssim": dssim.detach()}
 
 

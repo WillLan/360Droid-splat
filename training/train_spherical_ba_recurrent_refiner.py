@@ -133,6 +133,7 @@ def default_config() -> dict[str, Any]:
             "use_spherical_area_correction": True,
         },
         "ba": {
+            "outer_schedule": [True, False, False],
             "iterations": 3,
             "damping": 1.0e-4,
             "huber_delta_deg": 0.5,
@@ -145,6 +146,14 @@ def default_config() -> dict[str, Any]:
             "min_factors": 256,
             "residual_worse_tolerance": 1.05,
             "min_affine_support": 64,
+            "solver_mode": "standard_lm",
+            "dense_depth_mode": "none",
+            "gauge_mode": "initial_baseline",
+            "lm_max_trials": 4,
+            "lm_acceptance_eta": 1.0e-4,
+            "lm_damping_min": 1.0e-8,
+            "lm_damping_max": 1.0e8,
+            "lm_diagonal_floor": 1.0e-6,
         },
         "refiner": {
             "adapter_dim": 24,
@@ -431,7 +440,19 @@ def _unwrap(model: nn.Module) -> Stage3TrainableModel:
 
 
 def build_ba(config: dict[str, Any]) -> BlockSparseSphericalBA:
-    return BlockSparseSphericalBA(**dict(config.get("ba", {})))
+    kwargs = dict(config.get("ba", {}))
+    kwargs.pop("outer_schedule", None)
+    return BlockSparseSphericalBA(**kwargs)
+
+
+def _ba_outer_schedule(config: dict[str, Any]) -> tuple[bool, bool, bool]:
+    raw = config.get("ba", {}).get("outer_schedule", [True, True, True])
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise ValueError("ba.outer_schedule must contain exactly three booleans for BA0/BA1/BA2.")
+    schedule = tuple(bool(value) for value in raw)
+    if not schedule[0]:
+        raise ValueError("Stage 3 currently requires BA0 before Refine1.")
+    return schedule
 
 
 def build_renderer(config: dict[str, Any]):
@@ -606,6 +627,7 @@ def _train_microbatch(
     support = build_ba_support_map(cache, height=stage2_observation.image_size[0], width=stage2_observation.image_size[1])
     stage_weights = [float(value) for value in config["loss"].get("stage_weights", [0.64, 0.8, 1.0])]
     weights = _loss_weights(config)
+    ba_schedule = _ba_outer_schedule(config)
     snapshots: dict[str, PerPixelGaussianObservation] = {"initial": stage2_observation.detach_parameters()}
     match_valid = cache.valid_mask.bool()
     metrics: dict[str, float] = {"matching/valid_factors": float(match_valid.sum().cpu())}
@@ -622,7 +644,7 @@ def _train_microbatch(
     snapshots["ba0"] = current.detach_parameters()
     feedback = render_leave_one_out_group(renderer, current)
     hidden: torch.Tensor | None = None
-    ba_metrics: list[Stage3BAOutput] = [ba0]
+    ba_metrics: list[tuple[int, Stage3BAOutput]] = [(0, ba0)]
     for iteration in range(3):
         sync_context = model.no_sync() if isinstance(model, DistributedDataParallel) and iteration < 2 else nullcontext()
         with sync_context:
@@ -642,10 +664,11 @@ def _train_microbatch(
                     metrics[f"profile/stage{iteration + 1}_{key}"] = float(value)
             snapshots[f"refine{iteration + 1}"] = refined.observation.detach_parameters()
             hidden = refined.hidden
-            if iteration < 2:
+            next_ba_index = iteration + 1
+            if iteration < 2 and ba_schedule[next_ba_index]:
                 current, ba_output = _apply_ba(refined.observation, ba, cache)
-                ba_metrics.append(ba_output)
-                snapshots[f"ba{iteration + 1}"] = current.detach_parameters()
+                ba_metrics.append((next_ba_index, ba_output))
+                snapshots[f"ba{next_ba_index}"] = current.detach_parameters()
             else:
                 current = refined.observation
                 ba_output = None
@@ -677,7 +700,7 @@ def _train_microbatch(
                 source_visibility=render.source_visibility.detach(),
                 profiles=render.profiles,
             )
-    for ba_index, selected_ba in enumerate(ba_metrics):
+    for ba_index, selected_ba in ba_metrics:
         metrics[f"ba{ba_index}/accepted_ratio"] = float(selected_ba.accepted.float().mean().cpu())
         metrics[f"ba{ba_index}/initial_residual_deg"] = float(selected_ba.initial_median_residual_deg.mean().cpu())
         metrics[f"ba{ba_index}/final_residual_deg"] = float(selected_ba.final_median_residual_deg.mean().cpu())
@@ -689,6 +712,20 @@ def _train_microbatch(
         metrics[f"profile/ba{ba_index}_solver_sec"] = float(
             sum(float(value.get("solver_wall_sec", 0.0)) for value in selected_ba.diagnostics)
         )
+        for key in (
+            "initial_objective",
+            "final_objective",
+            "accepted_steps",
+            "final_damping",
+            "gain_ratio_mean",
+            "gauge_scale_mean",
+            "gauge_scale_min",
+            "gauge_scale_max",
+        ):
+            values = [float(item[key]) for item in selected_ba.diagnostics if key in item]
+            finite = [value for value in values if math.isfinite(value)]
+            if finite:
+                metrics[f"ba{ba_index}/{key}"] = float(sum(finite) / len(finite))
     metrics["render/materialized_gaussians"] = float(feedback.profiles.get("materialized_gaussians", 0.0))
     return current, metrics, snapshots
 
@@ -742,10 +779,11 @@ def _diagnostic_metrics(
     for index in range(1, 4):
         ba_name = f"ba{index - 1}"
         refine_name = f"refine{index}"
-        if ba_name in snapshots and refine_name in snapshots:
-            if not torch.equal(snapshots[ba_name].poses_c2w, snapshots[refine_name].poses_c2w):
+        predecessor_name = ba_name if ba_name in snapshots else ("initial" if index == 1 else f"refine{index - 1}")
+        if predecessor_name in snapshots and refine_name in snapshots:
+            if not torch.equal(snapshots[predecessor_name].poses_c2w, snapshots[refine_name].poses_c2w):
                 raise AssertionError("Refiner changed camera poses; only BA may update pose.")
-            before, after = snapshots[ba_name], snapshots[refine_name]
+            before, after = snapshots[predecessor_name], snapshots[refine_name]
             valid = before.valid_mask.bool()
             depth_delta = ((after.refined_depth - before.refined_depth) / before.refined_depth.clamp_min(1.0e-6))[valid]
             scale_delta = (after.log_scale_multiplier - before.log_scale_multiplier)[valid.expand_as(before.log_scale_multiplier)]
@@ -787,18 +825,21 @@ def _inference_snapshots(
     features: torch.Tensor,
     images: torch.Tensor,
     cache: Stage3MatchCache,
+    config: dict[str, Any],
 ) -> Stage3RefinementResult:
     snapshots: dict[str, PerPixelGaussianObservation] = {"initial": stage2.detach_parameters()}
     current = stage2
     hidden: torch.Tensor | None = None
     ba_outputs: list[Stage3BAOutput] = []
     reference = _detach_reference(model.encode_references(images))
+    ba_schedule = _ba_outer_schedule(config)
     for iteration in range(3):
-        with torch.enable_grad():
-            current, ba_output = _apply_ba(current, ba, cache)
-        ba_outputs.append(ba_output)
-        current = current.detach_parameters()
-        snapshots[f"ba{iteration}"] = current
+        if ba_schedule[iteration]:
+            with torch.enable_grad():
+                current, ba_output = _apply_ba(current, ba, cache)
+            ba_outputs.append(ba_output)
+            current = current.detach_parameters()
+            snapshots[f"ba{iteration}"] = current
         feedback = render_leave_one_out_group(renderer, current)
         with torch.no_grad():
             refined = model(
@@ -866,7 +907,7 @@ def _validate(
             step=step + count,
             static_valid_mask=stage2.valid_mask,
         )
-        refinement = _inference_snapshots(model, ba, renderer, stage2, features, images, cache)
+        refinement = _inference_snapshots(model, ba, renderer, stage2, features, images, cache, config)
         metrics, renders = _diagnostic_metrics(
             refinement.snapshot_observations,
             renderer,

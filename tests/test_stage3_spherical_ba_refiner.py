@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
-from losses.spherical_stage3_refinement_loss import aligned_pose_metrics, build_ba_support_map
+from losses.spherical_stage3_refinement_loss import (
+    aligned_pose_metrics,
+    build_ba_support_map,
+    leave_one_out_render_loss,
+)
 from models.spherical_recurrent_gaussian_refiner import (
     ReSplatErrorEncoder,
     SphericalErrorRouter,
@@ -22,7 +27,8 @@ from models.spherical_selfi_stage3_ba import (
 )
 from geometry.spherical_erp import build_erp_ray_grid
 from frontend.pano_droid.spherical_ba import se3_exp
-from training.train_spherical_ba_recurrent_refiner import default_config, train
+from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
+from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate
 
 
 def _observation(*, views: int = 3, height: int = 8, width: int = 16):
@@ -116,6 +122,74 @@ def test_block_sparse_ba_returns_finite_dense_contract() -> None:
     assert bool((output.dense_depth > 0).all())
 
 
+def test_dense_depth_none_is_strict_identity() -> None:
+    observation, feature, _ = _observation(views=3)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=3,
+        query_chunk_size=2,
+        generator=torch.Generator().manual_seed(3),
+    )
+    solver = BlockSparseSphericalBA(
+        iterations=1,
+        min_factors=1,
+        min_affine_support=2,
+        factor_chunk_size=4,
+        dense_depth_mode="none",
+    )
+    output = solver(observation.poses_c2w, observation.refined_depth, cache)
+    assert torch.equal(output.dense_depth, observation.refined_depth)
+    assert torch.equal(output.depth_scale, torch.ones_like(output.depth_scale))
+    assert torch.equal(output.depth_shift, torch.zeros_like(output.depth_shift))
+
+
+def test_initial_baseline_gauge_preserves_bearing_geometry() -> None:
+    solver = BlockSparseSphericalBA(gauge_mode="initial_baseline")
+    initial = torch.eye(4).repeat(3, 1, 1)
+    initial[1, :3, 3] = torch.tensor([0.2, -0.1, 0.0])
+    initial[2, :3, 3] = torch.tensor([0.8, 0.2, -0.1])
+    global_scale = 1.7
+    current = initial.clone()
+    current[:, :3, 3] = initial[0, :3, 3] + global_scale * (
+        initial[:, :3, 3] - initial[0, :3, 3]
+    )
+    inverse_depth = torch.tensor([0.4, 0.25, 0.5])
+    current_log_inverse_depth = inverse_depth.log() - torch.log(torch.tensor(global_scale))
+    source = torch.tensor([0], dtype=torch.long)
+    target = torch.tensor([2], dtype=torch.long)
+    depth_index = torch.tensor([0], dtype=torch.long)
+    source_ray = torch.tensor([[0.2, -0.1, 0.97]])
+    source_ray = torch.nn.functional.normalize(source_ray, dim=-1)
+    before = solver._predicted_bearing(
+        current,
+        current_log_inverse_depth,
+        source,
+        target,
+        depth_index,
+        source_ray,
+    )
+    normalized_pose, normalized_log_depth, gauge_scale, valid = solver._apply_scale_gauge(
+        current,
+        current_log_inverse_depth,
+        initial,
+    )
+    after = solver._predicted_bearing(
+        normalized_pose,
+        normalized_log_depth,
+        source,
+        target,
+        depth_index,
+        source_ray,
+    )
+    assert valid
+    assert abs(gauge_scale - 1.0 / global_scale) < 1.0e-6
+    initial_baseline = (initial[2, :3, 3] - initial[0, :3, 3]).norm()
+    normalized_baseline = (normalized_pose[2, :3, 3] - normalized_pose[0, :3, 3]).norm()
+    torch.testing.assert_close(normalized_baseline, initial_baseline, atol=1.0e-7, rtol=0.0)
+    torch.testing.assert_close(after, before, atol=1.0e-6, rtol=0.0)
+
+
 def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:
     height, width = 6, 12
     query_count = height * width
@@ -173,10 +247,15 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         min_affine_support=8,
         factor_chunk_size=128,
         residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        lm_max_trials=8,
     )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
     assert bool(output.accepted[0])
     diagnostics = output.diagnostics[0]
     assert diagnostics["final_objective"] < diagnostics["initial_objective"]
+    assert diagnostics["accepted_steps"] > 0
+    assert diagnostics["gain_ratio_mean"] > 0.0
     assert diagnostics["final_median_residual_deg"] < 1.0e-3
     torch.testing.assert_close(
         output.poses_c2w[0, 1, :3, 3],
@@ -276,6 +355,44 @@ def test_support_map_has_floor_and_query_peaks() -> None:
     support = build_ba_support_map(cache, height=8, width=16, floor=0.1, dilation_kernel=1)
     assert abs(float(support.min()) - 0.1) < 1.0e-6
     assert float(support.max()) == 1.0
+
+
+def test_zero_dssim_weight_skips_dssim_computation() -> None:
+    rendered = torch.rand(1, 2, 3, 4, 8)
+    target = torch.rand_like(rendered)
+    with patch(
+        "losses.spherical_stage3_refinement_loss.spherical_dssim",
+        side_effect=AssertionError("DSSIM must not run when its weight is zero."),
+    ):
+        loss, metrics = leave_one_out_render_loss(rendered, target, dssim_weight=0.0)
+    assert bool(torch.isfinite(loss))
+    assert float(metrics["dssim"]) == 0.0
+
+
+def test_ba_outer_schedule_is_ba0_only_by_default() -> None:
+    config = default_config()
+    assert _ba_outer_schedule(config) == (True, False, False)
+
+
+def test_ba_ablation_generator_changes_only_declared_solver_axes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    suite_dir = tmp_path / "suite"
+    manifest = generate(
+        root / "configs" / "stage3_spherical_ba_recurrent_refiner_omni360.yaml",
+        suite_dir,
+    )
+    assert len(manifest["experiments"]) == len(EXPERIMENTS)
+    for experiment in manifest["experiments"]:
+        config_path = Path(experiment["config"])
+        assert config_path.is_file()
+        import yaml
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert config["ba"]["outer_schedule"] == [True, False, False]
+        assert config["loss"]["dssim"] == 0.0
+        assert config["train"]["max_steps"] == 200
+        assert config["WeightsAndBiases"]["enabled"] is True
+        assert config["Visualization"]["enabled"] is True
 
 
 def test_pose_metric_is_zero_for_identical_poses() -> None:

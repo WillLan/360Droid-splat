@@ -9,17 +9,18 @@ full-resolution recurrent Refiner. It does not alter `FrontendOutput`, SLAM
 tracker dispatch, backend fusion, or the canonical one-Gaussian-per-valid-pixel
 representation.
 
-The fixed schedule is:
+The default schedule is deliberately restricted to one geometry solve:
 
 ```text
 Stage 2 observation
 -> BA0 -> Refine1
--> BA1 -> Refine2
--> BA2 -> Refine3
+       -> Refine2
+       -> Refine3
 ```
 
-There is no final BA, RAE, point/voxel attention, free XYZ update, or depth
-probability volume.
+`ba.outer_schedule` keeps the three call sites explicit for controlled
+ablations, but defaults to `[true, false, false]`. There is no final BA, RAE,
+point/voxel attention, free XYZ update, or depth probability volume.
 
 ## Adapter matches
 
@@ -49,16 +50,24 @@ Log_{matched_target_bearing}(predicted_target_bearing) in R^2
 
 The first pose is fixed. The other poses use left-multiplicative SE(3) updates,
 and each source query owns one log-inverse-depth variable shared by its three
-target factors. Huber-weighted LM/GN builds factor-local Jacobians and uses a
+target factors. Huber-weighted LM builds factor-local Jacobians and uses a
 Schur complement to eliminate the diagonal sparse-depth block before solving
-the at-most `18 x 18` pose system.
+the at-most `18 x 18` pose system. The default solver is gain-ratio
+Levenberg-Marquardt with diagonal damping, rejected-step retries, and Nielsen
+damping updates.
 
-After each accepted solve, a robust affine fit relates the incoming query
-depths to the optimized sparse depths for every frame. The fitted
-`D_BA = a D_in + b` is applied to all finite pixels in `[0.05, 20] m`; farther
-pixels remain unchanged. Solver outputs and `a/b` are detached, while the
-affine application keeps the linear gradient to `D_in`. A failed, non-finite,
-under-constrained, or more-than-1.05x-worse solve returns the input pose/depth.
+Because bearing-only BA has an unobservable global scale, every accepted trial
+is projected onto the initial-baseline gauge: the longest camera baseline from
+the fixed first camera is restored while all camera centers and sparse depths
+are scaled together. This leaves every bearing residual unchanged and does not
+use GT metric information.
+
+The default `dense_depth_mode=none` does not propagate the optimized sparse
+query depths to the dense depth map. They remain nuisance variables that make
+pose estimation geometrically valid; the Refiner still receives the incoming
+dense depth. The former robust per-frame affine propagation remains available
+only as the explicit `dense_depth_mode=affine` ablation. A failed, non-finite,
+or under-constrained solve returns the input pose/depth.
 
 ## ReSplat-style feedback and Refiner
 
@@ -93,21 +102,23 @@ but may update appearance.
 ## Training and gradient path
 
 Four render groups are used per step: feedback after BA0, loss/feedback after
-BA1, loss/feedback after BA2, and final loss after Refine3. This is 16 target
-rasterizations for a four-frame window. The error branch consumes detached
-renders, while the render loss uses the non-detached tensors. Refine1 and
-Refine2 observations and hidden states are detached after their stage loss;
-the shared network accumulates gradients from all three stages and performs
-one optimizer step.
+Refine1, loss/feedback after Refine2, and final loss after Refine3. This is 16
+target rasterizations for a four-frame window. The error branch consumes
+detached renders, while the render loss uses the non-detached tensors. Refine1
+and Refine2 observations and hidden states are detached after their stage
+loss; the shared network accumulates gradients from all three stages and
+performs one optimizer step.
 
 The stage weights are `0.64, 0.80, 1.0`. Every stage combines ERP-area L1,
-periodic DSSIM, cached-match S2 geometry, a BA-depth anchor, and normalized
-update regularization. GT pose/depth never enter the loss.
+cached-match S2 geometry, a BA-depth anchor, and normalized update
+regularization. Periodic DSSIM remains configurable but defaults to zero and
+is not evaluated in that mode. GT pose/depth never enter the loss.
 
-Every 200 steps, diagnostics render Initial, BA0, Refine1, BA1, Refine2, BA2,
-and Refine3. They log leave-one-out rendering metrics, scale-aligned pose error,
-raw/scale-aligned depth metrics, BA residuals and affine parameters, and update
-statistics. Refiner snapshots are asserted to preserve the preceding BA pose.
+Every 200 steps, diagnostics render Initial, BA0, Refine1, Refine2, and
+Refine3. They log leave-one-out rendering metrics, scale-aligned pose error,
+raw/scale-aligned depth metrics, BA residual/objective, LM gain ratio and
+damping, gauge normalization, and update statistics. Refiner snapshots are
+asserted to preserve the preceding BA0 pose.
 Validation runs every 1000 steps and writes latest, best final LOO PSNR, and
 best final pose ATE checkpoints.
 
