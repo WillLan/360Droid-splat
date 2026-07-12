@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from frontend.pano_droid.spherical_ba import skew, so3_exp
 from frontend.pano_vggt.spherical_correspondence import spherical_tangent_residual
+from geometry.sim3 import sim3_log
 from geometry.spherical_erp import (
     build_erp_ray_grid,
     erp_pixel_to_unit_ray,
@@ -719,7 +720,12 @@ class BlockSparseSphericalBA:
                         tgt_ray,
                         factor_weight,
                     )
-                    flat_pose = delta_pose.reshape(-1)
+                    relative_pose = trial_pose[1:] @ torch.linalg.inv(cur_pose[1:])
+                    # Gauge projection changes world translations after the raw
+                    # LM step.  The gain-ratio model must therefore use the
+                    # effective left-multiplicative tangent step, not the
+                    # pre-projection proposal returned by the linear solve.
+                    flat_pose = sim3_log(relative_pose)[..., :6].reshape(-1)
                     effective_depth = trial_log - cur_log
                     quadratic = (
                         (flat_pose @ (hpp @ flat_pose) if pose_dim else hpp.new_tensor(0.0))
