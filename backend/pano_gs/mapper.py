@@ -149,6 +149,9 @@ class PanoGaussianMap(nn.Module):
         self.map_mode = "anchor_scaffold_panorama"
         backend_cfg = self.config.get("BackendOptimization", {}) if isinstance(self.config, dict) else {}
         configured_sh_degree = int(backend_cfg.get("sh_degree", sh_degree)) if isinstance(backend_cfg, dict) else int(sh_degree)
+        global_selfi_cfg = self.config.get("SphericalSelfiGlobalBackend", {}) if isinstance(self.config, dict) else {}
+        if isinstance(global_selfi_cfg, dict) and bool(global_selfi_cfg.get("enabled", False)):
+            configured_sh_degree = max(configured_sh_degree, int(global_selfi_cfg.get("rgb_sh_degree", 2)))
         self.max_sh_degree = max(0, min(configured_sh_degree, 2))
         self.active_sh_degree = self.max_sh_degree
         self.device_hint = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -167,6 +170,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_source_frame_end = torch.zeros(0, dtype=torch.int32)
         self._anchor_inlier_obs = torch.zeros(0, dtype=torch.int32)
         self._anchor_outlier_obs = torch.zeros(0, dtype=torch.int32)
+        self._anchor_owner_window_id = torch.full((0,), -1, dtype=torch.int32)
+        self._anchor_quality = torch.zeros(0, dtype=torch.float32)
+        self._anchor_visibility_count = torch.zeros(0, dtype=torch.int32)
+        self._anchor_render_error_ema = torch.zeros(0, dtype=torch.float32)
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
@@ -339,6 +346,18 @@ class PanoGaussianMap(nn.Module):
         self._anchor_source_frame_end = torch.cat([self._anchor_source_frame_end, frame_ids], dim=0)
         self._anchor_inlier_obs = torch.cat([self._anchor_inlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
         self._anchor_outlier_obs = torch.cat([self._anchor_outlier_obs, torch.zeros(len(seeds), dtype=torch.int32)], dim=0)
+        self._anchor_owner_window_id = torch.cat(
+            [self._anchor_owner_window_id, torch.full((len(seeds),), -1, dtype=torch.int32)], dim=0
+        )
+        self._anchor_quality = torch.cat(
+            [self._anchor_quality, seeds.confidence.detach().cpu().float()], dim=0
+        )
+        self._anchor_visibility_count = torch.cat(
+            [self._anchor_visibility_count, torch.zeros(len(seeds), dtype=torch.int32)], dim=0
+        )
+        self._anchor_render_error_ema = torch.cat(
+            [self._anchor_render_error_ema, torch.zeros(len(seeds), dtype=torch.float32)], dim=0
+        )
         return int(xyz.shape[0])
 
     def add_or_fuse_resplat_gaussians(
@@ -470,6 +489,10 @@ class PanoGaussianMap(nn.Module):
         meta_frame_end = self._anchor_source_frame_end.detach().clone()
         meta_inlier = self._anchor_inlier_obs.detach().clone()
         meta_outlier = self._anchor_outlier_obs.detach().clone()
+        meta_owner = self._anchor_owner_window_id.detach().clone()
+        meta_quality = self._anchor_quality.detach().clone()
+        meta_visibility = self._anchor_visibility_count.detach().clone()
+        meta_render_error = self._anchor_render_error_ema.detach().clone()
 
         def key_for_point(point: torch.Tensor) -> tuple[int, int, int]:
             grid = torch.floor(point.detach().cpu().float() / voxel_size).to(torch.int64)
@@ -608,6 +631,10 @@ class PanoGaussianMap(nn.Module):
             meta_frame_end = torch.cat([meta_frame_end, torch.full((n_new,), last_frame, dtype=torch.int32)], dim=0)
             meta_inlier = torch.cat([meta_inlier, torch.zeros(n_new, dtype=torch.int32)], dim=0)
             meta_outlier = torch.cat([meta_outlier, torch.zeros(n_new, dtype=torch.int32)], dim=0)
+            meta_owner = torch.cat([meta_owner, torch.full((n_new,), update_ord, dtype=torch.int32)], dim=0)
+            meta_quality = torch.cat([meta_quality, torch.tensor(insert_weight, dtype=torch.float32)], dim=0)
+            meta_visibility = torch.cat([meta_visibility, torch.zeros(n_new, dtype=torch.int32)], dim=0)
+            meta_render_error = torch.cat([meta_render_error, torch.zeros(n_new, dtype=torch.float32)], dim=0)
 
         self.xyz = nn.Parameter(xyz)
         self.rotation = nn.Parameter(rot)
@@ -634,6 +661,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_source_frame_end = meta_frame_end
         self._anchor_inlier_obs = meta_inlier
         self._anchor_outlier_obs = meta_outlier
+        self._anchor_owner_window_id = meta_owner
+        self._anchor_quality = meta_quality
+        self._anchor_visibility_count = meta_visibility
+        self._anchor_render_error_ema = meta_render_error
 
         valid_count = int(keep.sum().detach().cpu())
         return {
@@ -677,6 +708,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_source_frame_end = self._anchor_source_frame_end[keep_cpu]
         self._anchor_inlier_obs = self._anchor_inlier_obs[keep_cpu]
         self._anchor_outlier_obs = self._anchor_outlier_obs[keep_cpu]
+        self._anchor_owner_window_id = self._anchor_owner_window_id[keep_cpu]
+        self._anchor_quality = self._anchor_quality[keep_cpu]
+        self._anchor_visibility_count = self._anchor_visibility_count[keep_cpu]
+        self._anchor_render_error_ema = self._anchor_render_error_ema[keep_cpu]
         return n_pruned
 
     def make_optimizer(self, *, lr: float = 2e-3, weight_decay: float = 0.0) -> torch.optim.Optimizer:
@@ -913,6 +948,10 @@ class PanoGaussianMap(nn.Module):
                 "anchor_last_update_kf_ord": self._anchor_last_update_kf_ord,
                 "anchor_inlier_obs": self._anchor_inlier_obs,
                 "anchor_outlier_obs": self._anchor_outlier_obs,
+                "anchor_owner_window_id": self._anchor_owner_window_id,
+                "anchor_quality": self._anchor_quality,
+                "anchor_visibility_count": self._anchor_visibility_count,
+                "anchor_render_error_ema": self._anchor_render_error_ema,
                 "config": self.config,
             },
             path,

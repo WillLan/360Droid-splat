@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import torch
+
+from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
+from backend.pano_gs.sim3_graph import (
+    CoincidentPanoramaFactor,
+    GlobalSim3FactorGraph,
+    Sim3GraphEdge,
+)
+from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
+from backend.pano_gs.stage2_global_fusion import (
+    Stage2GlobalMapFusion,
+    rotate_sh_coefficients,
+)
+from frontend.pano_droid.spherical_ba import se3_exp
+from frontend.pano_droid.interfaces import PanoFrame
+from frontend.spherical_selfi.panorama_loop import circular_yaw_shift
+from frontend.spherical_selfi.runtime import SphericalSelfiWindowFrontend
+from frontend.spherical_selfi.window_packet import (
+    LocalGaussianWindowPacket,
+    build_panorama_retrieval_descriptor,
+)
+from geometry.sim3 import (
+    apply_sim3,
+    sim3_exp,
+    sim3_from_components,
+    sim3_identity,
+    sim3_log,
+    sim3_components,
+)
+from models.per_pixel_gaussian_observation import real_sh_basis
+from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
+from training.train_spherical_selfi_gaussian_head import default_config as stage2_default_config
+
+
+def _observation(
+    poses: torch.Tensor,
+    frame_ids: tuple[int, ...],
+    *,
+    height: int = 6,
+    width: int = 12,
+    feature_by_frame: dict[int, torch.Tensor] | None = None,
+):
+    torch.manual_seed(11)
+    views = len(frame_ids)
+    feature = torch.stack(
+        [
+            feature_by_frame[int(frame_id)]
+            if feature_by_frame is not None and int(frame_id) in feature_by_frame
+            else torch.randn(24, height, width)
+            for frame_id in frame_ids
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    image = torch.rand(1, views, 3, height, width)
+    depth = torch.full((1, views, 1, height, width), 2.0)
+    head = SphericalSelfiGaussianHead(channels=(8, 12, 16, 24), mlp_hidden_dim=12)
+    observation = head(
+        feature,
+        image,
+        depth,
+        poses.unsqueeze(0),
+        frame_ids=torch.tensor([frame_ids]),
+    )
+    return observation, feature
+
+
+def _packet(
+    window_id: int,
+    poses: torch.Tensor,
+    frame_ids: tuple[int, ...],
+    *,
+    feature_by_frame: dict[int, torch.Tensor] | None = None,
+) -> LocalGaussianWindowPacket:
+    observation, feature = _observation(poses, frame_ids, feature_by_frame=feature_by_frame)
+    return LocalGaussianWindowPacket.from_observation(
+        window_id=window_id,
+        observation=observation,
+        adapter_features=feature,
+        frame_ids=frame_ids,
+        verification_size=feature.shape[-2:],
+    )
+
+
+def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
+    tangent = torch.tensor([0.3, -0.2, 0.1, 0.03, -0.04, 0.02, math.log(1.2)])
+    truth = sim3_exp(tangent)
+    torch.testing.assert_close(sim3_log(truth), tangent, atol=2e-5, rtol=2e-5)
+
+    graph = GlobalSim3FactorGraph(max_iterations=10, pcg_iterations=32)
+    graph.add_node(0, sim3_identity())
+    graph.add_node(1, sim3_exp(tangent + torch.tensor([0.15, 0.0, 0.0, 0.0, 0.02, 0.0, 0.1])))
+    graph.add_edge(
+        Sim3GraphEdge(
+            source=0,
+            target=1,
+            measurement_target_to_source=truth,
+            information_diag=torch.ones(7),
+        )
+    )
+    result = graph.optimize()
+    assert result.accepted
+    assert result.final_objective < result.initial_objective
+    torch.testing.assert_close(graph.transform(1), truth, atol=2e-4, rtol=2e-4)
+
+
+def test_coincident_panorama_factor_corrects_center_rotation_without_scale() -> None:
+    truth_rotation = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.0, 0.35, 0.0]))[:3, :3]
+    initial_rotation = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.0, 0.10, 0.0]))[:3, :3]
+    graph = GlobalSim3FactorGraph(max_iterations=12, pcg_iterations=48)
+    graph.add_node(0, sim3_identity())
+    graph.add_node(
+        1,
+        sim3_from_components(1.4, initial_rotation, torch.tensor([0.3, -0.2, 0.1])),
+    )
+    graph.add_edge(
+        CoincidentPanoramaFactor(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            measured_source_to_target_rotation=truth_rotation,
+            center_weight=10.0,
+            rotation_weight=10.0,
+        )
+    )
+    result = graph.optimize()
+    assert result.final_objective < result.initial_objective
+    scale, rotation, translation = sim3_components(graph.transform(1))
+    assert abs(float(scale) - 1.4) < 1.0e-5
+    assert float(translation.norm()) < 3.0e-3
+    torch.testing.assert_close(rotation, truth_rotation, atol=3e-3, rtol=3e-3)
+
+
+def test_yaw_invariant_retrieval_descriptor_and_shift() -> None:
+    torch.manual_seed(3)
+    feature = torch.randn(1, 24, 8, 16)
+    rolled = torch.roll(feature, shifts=5, dims=-1)
+    first = build_panorama_retrieval_descriptor(feature)
+    second = build_panorama_retrieval_descriptor(rolled)
+    torch.testing.assert_close(first, second, atol=1e-6, rtol=1e-6)
+    shift, score = circular_yaw_shift(feature[0], rolled[0])
+    assert shift in {5, 11}
+    assert math.isfinite(score)
+
+
+def test_rgb_sh_rotation_preserves_directional_value() -> None:
+    torch.manual_seed(5)
+    coefficients = torch.randn(7, 9, 3)
+    rotation = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.2, -0.1, 0.05]))[:3, :3]
+    rotated = rotate_sh_coefficients(coefficients, rotation, degree=2)
+    directions_target = torch.nn.functional.normalize(torch.randn(64, 3), dim=-1)
+    directions_local = directions_target @ rotation
+    expected = torch.einsum("nk,bkc->bnc", real_sh_basis(2, directions_local), coefficients)
+    actual = torch.einsum("nk,bkc->bnc", real_sh_basis(2, directions_target), rotated)
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_stage2_voxel_fusion_keeps_unique_owner_and_moves_all_attributes() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 0.1
+    packet0 = _packet(0, poses, (0, 1))
+    packet1 = _packet(1, poses, (0, 1))
+    config = {
+        "SphericalSelfiGlobalBackend": {"enabled": True, "rgb_sh_degree": 2},
+        "BackendOptimization": {"sh_degree": 2},
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    fusion = Stage2GlobalMapFusion(gaussian_map, voxel_sizes=(0.5,), min_confidence=0.0, min_opacity=0.0)
+    first = fusion.fuse_packet(packet0, sim3_identity())
+    count = gaussian_map.anchor_count()
+    assert 0 < count < first["requested"]
+    fusion.fuse_packet(packet1, sim3_identity())
+    assert gaussian_map.anchor_count() == count
+    assert set(gaussian_map._anchor_owner_window_id.tolist()) == {0}
+
+    xyz_before = gaussian_map.get_xyz.detach().clone()
+    scale_before = gaussian_map.get_scaling.detach().clone()
+    correction = sim3_from_components(
+        2.0,
+        torch.eye(3),
+        torch.tensor([1.0, 0.0, 0.0]),
+    )
+    stats = fusion.apply_owner_corrections({0: sim3_identity()}, {0: correction})
+    assert stats["moved"] == count
+    expected_xyz = apply_sim3(correction, xyz_before)
+    distance = torch.cdist(expected_xyz, gaussian_map.get_xyz)
+    nearest = distance.argmin(dim=1)
+    assert float(distance.detach().min(dim=1).values.max()) < 2e-3
+    torch.testing.assert_close(
+        gaussian_map.get_scaling[nearest],
+        2.0 * scale_before,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_two_overlapping_windows_build_graph_and_global_map() -> None:
+    frame_features = {frame_id: torch.randn(24, 6, 12) for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    packet0 = _packet(0, poses0, (0, 1), feature_by_frame=frame_features)
+    packet1 = _packet(1, poses1, (1, 2), feature_by_frame=frame_features)
+    root_config = {
+        "SphericalSelfiGlobalBackend": {"enabled": True, "rgb_sh_degree": 2},
+        "BackendOptimization": {"sh_degree": 2},
+    }
+    gaussian_map = PanoGaussianMap(config=root_config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map)
+    backend = SphericalSelfiGlobalBackend(
+        gaussian_map,
+        mapper=mapper,
+        config={
+            "enabled": True,
+            "global_graph": {
+                "min_overlap_points": 8,
+                "max_overlap_points": 256,
+                "max_overlap_residual": 0.05,
+                "allow_unaligned_fallback": False,
+            },
+            "loop_closure": {"exclude_recent_windows": 3, "min_matches": 8},
+            "voxel_fusion": {"voxel_sizes": [0.25], "min_confidence": 0.0, "min_opacity": 0.0},
+            "map_optimization": {"steps_per_window": 0, "steps_on_loop": 0, "final_steps": 0},
+        },
+    )
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+    assert result.aligned
+    assert len(backend.graph.nodes) == 2
+    assert gaussian_map.anchor_count() > 0
+    updates = backend.pop_pose_updates()
+    assert set(updates) == {0, 1, 2}
+    assert abs(float(updates[2][0, 3]) - 0.2) < 2e-3
+
+
+def test_frontend_output_contract_remains_unchanged() -> None:
+    from frontend.pano_droid.interfaces import FrontendOutput
+
+    assert tuple(FrontendOutput.__dataclass_fields__) == (
+        "frame_id",
+        "timestamp",
+        "pose_c2w",
+        "relative_pose",
+        "pose_confidence",
+        "inverse_depth",
+        "depth_confidence",
+        "spherical_flow",
+        "keyframe_score",
+        "is_keyframe",
+        "ba_residual",
+        "tracking_status",
+        "world_points",
+        "world_points_confidence",
+        "valid_world_points_mask",
+    )
+
+
+def test_window_packet_compaction_releases_full_resolution_state() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    packet = _packet(0, poses, (0, 1))
+    packet.verification_features = torch.nn.functional.interpolate(
+        packet.verification_features.reshape(2, 24, 6, 12),
+        size=(3, 5),
+        mode="bilinear",
+        align_corners=False,
+    ).reshape(1, 2, 24, 3, 5)
+    compact = packet.compact_for_memory()
+    assert compact.observation.image_size == (3, 5)
+    assert compact.adapter_features.shape[-2:] == (3, 5)
+    assert compact.observation.refined_depth.device.type == "cpu"
+    assert compact.observation.rgb_sh.device.type == "cpu"
+    assert compact.observation.source_uv.shape == (3, 5, 2)
+    assert compact.observation.source_ray.shape == (3, 5, 3)
+
+
+def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: Path) -> None:
+    config = stage2_default_config()
+    config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
+        "local_ba": {"enabled": False},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    for frame_id in range(3):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+    ready = frontend.pop_ready_outputs()
+    packets = frontend.consume_local_gaussian_windows()
+    flushed = frontend.flush()
+    assert [output.frame_id for output in ready + flushed] == [0, 1, 2]
+    assert all(output.inverse_depth is not None for output in ready + flushed)
+    assert all(output.tracking_status == "tracked_spherical_selfi_stage2" for output in ready + flushed)
+    assert len(packets) == 1
+    assert packets[0].frame_ids == (0, 1, 2)
+    assert packets[0].local_poses_c2w[0].equal(torch.eye(4))

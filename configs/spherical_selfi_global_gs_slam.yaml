@@ -1,0 +1,194 @@
+Runtime:
+  mode: sync_mvp
+
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene/DTW/dtw_Raw
+  height: 504
+  width: 1008
+
+Frontend:
+  mode: spherical_selfi_window
+
+image:
+  height: 504
+  width: 1008
+  head_height: 504
+  head_width: 1008
+
+panovggt:
+  synthetic: false
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  model_kwargs: {}
+  freeze: true
+  use_no_grad: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+  pose_convention: c2w
+  depth_convention: euclidean_ray_depth
+  stage_hooks:
+    - aggregator.decoder.8
+    - aggregator.decoder.16
+    - aggregator.decoder.24
+    - aggregator.decoder.34
+  feature_keys: [null, null, null, null]
+  token_hw: [[36, 72], [36, 72], [36, 72], [36, 72]]
+  token_start_idx: [5, 5, 5, 5]
+  in_channels: [1024, 1024, 1024, 1024]
+
+adapter_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2/checkpoints/best_val_angular_error.pt
+  sha256: 95cdbb5404acba8654e868335ede6a00c281451d7ef7c104d3a10f63fc3730b9
+
+stage2_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage2_selfi_joint_gpu03_20260712_20k_r1/stage2_selfi_omniscene_joint_fullres_s4_ddp2_effbs4_20k_gpu03_20260712_r1/checkpoints/best_val_psnr.pt
+
+head:
+  feature_dim: 24
+  channels: [32, 64, 128, 256]
+  mlp_hidden_dim: 64
+  rgb_sh_degree: 2
+  density_sh_degree: 1
+  depth_residual_ratio: 0.25
+  initial_opacity: 0.10
+  min_depth: 1.0e-4
+  min_scale: 1.0e-5
+  max_scale_ratio: 0.25
+  latitude_cos_min: 1.0e-3
+  log_scale_clamp: 5.0
+  render_prune_fraction: 0.30
+  gradient_checkpointing: false
+
+SphericalSelfiRuntime:
+  enabled: true
+  feature_device: cuda:0
+  head_device: cuda:0
+  feature_amp: true
+  window:
+    size: 4
+    stride: 2
+    verification_size: [32, 64]
+    latitude_bands: 8
+  local_ba:
+    enabled: false
+    iterations: 3
+    damping: 1.0e-4
+    huber_delta_deg: 0.5
+    pose_prior_weight: 1.0e-3
+    depth_prior_weight: 1.0e-2
+    max_pose_update_deg: 5.0
+    max_translation_update: 0.05
+    max_logdepth_update: 0.35
+    factor_chunk_size: 2048
+    min_factors: 256
+    min_affine_support: 64
+    min_depth: 0.05
+    max_depth: 20.0
+    matching:
+      num_queries: 2048
+      min_depth: 0.05
+      max_depth: 20.0
+      temperature: 0.07
+      query_chunk_size: 32
+      fibonacci_oversample_factor: 8
+      use_spherical_area_correction: true
+      forward_backward: true
+      fb_tolerance_deg: 1.0
+      min_factor_weight: 0.01
+
+SphericalSelfiGlobalBackend:
+  enabled: true
+  rgb_sh_degree: 2
+  global_graph:
+    iterations: 8
+    damping: 1.0e-4
+    pcg_iterations: 64
+    pcg_tolerance: 1.0e-6
+    recent_windows: 32
+    min_overlap_points: 32
+    max_overlap_points: 4096
+    max_overlap_residual: 0.35
+    min_overlap_inlier_ratio: 0.35
+    max_scale_change: 2.5
+    max_translation_update: 1.0
+    max_rotation_update_deg: 10.0
+    max_log_scale_update: 0.25
+    allow_unaligned_fallback: false
+  loop_closure:
+    top_k: 5
+    exclude_recent_windows: 3
+    min_retrieval_score: 0.35
+    min_match_cosine: 0.45
+    min_matches: 32
+    max_matches: 512
+    min_inlier_ratio: 0.30
+    max_alignment_residual: 0.35
+    max_scale_change: 2.5
+    coincident_translation_threshold: 0.15
+    coincident_rotation_residual_deg: 2.0
+  voxel_fusion:
+    voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+    min_confidence: 0.05
+    min_opacity: 0.02
+    max_total_gaussians: 2000000
+    lifecycle_prune_interval_windows: 8
+    max_stale_frames: 0
+    max_render_error: null
+  map_optimization:
+    lr: 0.002
+    steps_per_window: 4
+    steps_on_loop: 20
+    final_steps: 50
+
+MapRepresentation:
+  mode: anchor_scaffold_panorama
+
+BackendOptimization:
+  enabled: true
+  sh_degree: 2
+  ReSplatGlobal:
+    gaussian_scope: visible
+    pose_refine_enable: false
+    random_observation_per_iter: true
+    sample_observations_per_step: 2
+
+Mapping:
+  lr: 0.002
+  max_seeds_per_keyframe: 0
+  min_depth_confidence: 0.0
+
+Training:
+  panorama_render_mode: pfgs360_gsplat
+  pfgs360_render_mode: RGB+ED
+  pfgs360_rasterize_mode: antialiased
+  pfgs360_packed: false
+  pfgs360_radius_clip: 0.0
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 100000.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+
+Renderer:
+  allow_smoke_fallback: false
+  extra_gsplat360_roots: []
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  mode: online
+  run_name: spherical_selfi_global_gs_slam
+  tags: [spherical-selfi, stage2, sim3-graph, voxel-fusion, panorama]
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+
+Results:
+  save_dir: outputs/spherical_selfi_global_gs_slam
+  kf_render_format: png

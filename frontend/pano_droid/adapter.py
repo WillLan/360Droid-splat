@@ -47,4 +47,8 @@ def build_frontend_from_config(config: dict) -> PanoDROIDFrontend:
         if ckpt:
             adapter.load_checkpoint(ckpt)
         return adapter
+    if mode in {"spherical_selfi", "spherical_selfi_window", "selfi_stage2"}:
+        from frontend.spherical_selfi.runtime import build_spherical_selfi_frontend_from_config
+
+        return build_spherical_selfi_frontend_from_config(config)
     raise ValueError(f"Unsupported Frontend.mode: {frontend_cfg.get('mode')}")

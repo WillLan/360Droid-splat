@@ -557,7 +557,14 @@ def _sha256_file(path: str | Path | None) -> str | None:
     return digest.hexdigest()
 
 
-def _build_match_cache(features: torch.Tensor, depth: torch.Tensor, config: dict[str, Any], *, step: int) -> Stage3MatchCache:
+def _build_match_cache(
+    features: torch.Tensor,
+    depth: torch.Tensor,
+    config: dict[str, Any],
+    *,
+    step: int,
+    static_valid_mask: torch.Tensor | None = None,
+) -> Stage3MatchCache:
     cfg = config["matching"]
     generator = torch.Generator(device=features.device).manual_seed(int(config["train"].get("seed", 1234)) + int(step))
     return build_stage3_match_cache(
@@ -570,6 +577,10 @@ def _build_match_cache(features: torch.Tensor, depth: torch.Tensor, config: dict
         query_chunk_size=int(cfg.get("query_chunk_size", 32)),
         fibonacci_oversample_factor=int(cfg.get("fibonacci_oversample_factor", 8)),
         use_spherical_area_correction=bool(cfg.get("use_spherical_area_correction", True)),
+        forward_backward=bool(cfg.get("forward_backward", True)),
+        fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
+        min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
+        static_valid_mask=static_valid_mask,
         generator=generator,
     )
 
@@ -848,7 +859,13 @@ def _validate(
             enabled=bool(config["train"].get("amp", False)) and train_device.type == "cuda",
         ):
             stage2 = head(features, images, initial_depth, poses, frame_ids=batch["frame_ids"].to(train_device))
-        cache = _build_match_cache(features, stage2.refined_depth, config, step=step + count)
+        cache = _build_match_cache(
+            features,
+            stage2.refined_depth,
+            config,
+            step=step + count,
+            static_valid_mask=stage2.valid_mask,
+        )
         refinement = _inference_snapshots(model, ba, renderer, stage2, features, images, cache)
         metrics, renders = _diagnostic_metrics(
             refinement.snapshot_observations,
@@ -969,7 +986,13 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
             ):
                 stage2 = head(features, images, initial_depth, poses, frame_ids=frame_ids)
             matching_start = time.perf_counter()
-            cache = _build_match_cache(features, stage2.refined_depth, config, step=step + micro)
+            cache = _build_match_cache(
+                features,
+                stage2.refined_depth,
+                config,
+                step=step + micro,
+                static_valid_mask=stage2.valid_mask,
+            )
             if bool(config.get("refiner", {}).get("profile_synchronize_cuda", False)) and train_device.type == "cuda":
                 torch.cuda.synchronize(train_device)
             matching_sec = time.perf_counter() - matching_start

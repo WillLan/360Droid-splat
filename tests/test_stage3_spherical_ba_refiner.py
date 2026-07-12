@@ -20,6 +20,8 @@ from models.spherical_selfi_stage3_ba import (
     all_directed_pairs,
     build_stage3_match_cache,
 )
+from geometry.spherical_erp import build_erp_ray_grid
+from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import default_config, train
 
 
@@ -67,6 +69,26 @@ def test_all_directed_pairs_and_global_match_contract() -> None:
     assert bool(torch.isfinite(cache.entropy).all())
 
 
+def test_match_cache_filters_static_source_and_target_pixels() -> None:
+    feature = torch.randn(1, 2, 8, 4, 8)
+    depth = torch.ones(1, 2, 1, 4, 8)
+    static = torch.ones_like(depth, dtype=torch.bool)
+    static[:, 1] = False
+    cache = build_stage3_match_cache(
+        feature,
+        depth,
+        num_queries=4,
+        query_chunk_size=2,
+        static_valid_mask=static,
+    )
+    assert not bool(cache.source_valid[:, 1].any())
+    edge_to_invalid_target = int(
+        torch.nonzero((cache.edges[:, 0] == 0) & (cache.edges[:, 1] == 1))[0]
+    )
+    assert not bool(cache.target_valid[:, edge_to_invalid_target].any())
+    assert not bool(cache.valid_mask.any())
+
+
 def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:
     source = torch.linspace(1.0, 10.0, 100)
     target = 1.2 * source - 0.3
@@ -92,6 +114,76 @@ def test_block_sparse_ba_returns_finite_dense_contract() -> None:
     assert output.depth_scale.shape == (1, 3)
     assert bool(torch.isfinite(output.dense_depth).all())
     assert bool((output.dense_depth > 0).all())
+
+
+def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:
+    height, width = 6, 12
+    query_count = height * width
+    poses_truth = torch.eye(4).repeat(2, 1, 1)
+    poses_truth[1] = se3_exp(torch.tensor([0.20, -0.03, 0.02, 0.01, 0.08, -0.02]))
+    depth = torch.linspace(1.5, 5.0, query_count).reshape(1, 1, height, width).repeat(2, 1, 1, 1)
+    rays = build_erp_ray_grid(height, width).reshape(query_count, 3)
+    source_ray = rays.view(1, 1, query_count, 3).repeat(1, 2, 1, 1)
+    source_uv = torch.stack(
+        torch.meshgrid(
+            torch.arange(width).float() + 0.5,
+            torch.arange(height).float() + 0.5,
+            indexing="ij",
+        ),
+        dim=-1,
+    ).permute(1, 0, 2).reshape(query_count, 2).view(1, 1, query_count, 2).repeat(1, 2, 1, 1)
+    edges = all_directed_pairs(2)
+    target_rays = []
+    for source, target in edges.tolist():
+        source_depth = depth[source, 0].reshape(-1)
+        source_point = source_depth[:, None] * rays
+        world_point = torch.einsum("ij,nj->ni", poses_truth[source, :3, :3], source_point) + poses_truth[source, :3, 3]
+        target_point = torch.einsum(
+            "ij,nj->ni",
+            poses_truth[target, :3, :3].T,
+            world_point - poses_truth[target, :3, 3],
+        )
+        target_rays.append(torch.nn.functional.normalize(target_point, dim=-1))
+    target_ray = torch.stack(target_rays).unsqueeze(0)
+    cache = Stage3MatchCache(
+        source_uv=source_uv,
+        source_ray=source_ray,
+        source_depth=depth[:, 0].reshape(1, 2, query_count),
+        source_valid=torch.ones(1, 2, query_count, dtype=torch.bool),
+        edges=edges,
+        target_uv=torch.zeros(1, 2, query_count, 2),
+        target_ray=target_ray,
+        top1_cosine=torch.ones(1, 2, query_count),
+        top2_margin=torch.ones(1, 2, query_count),
+        entropy=torch.zeros(1, 2, query_count),
+        valid_mask=torch.ones(1, 2, query_count, dtype=torch.bool),
+        factor_weight=torch.ones(1, 2, query_count),
+    )
+    poses_initial = poses_truth.clone()
+    poses_initial[1] = se3_exp(torch.tensor([0.04, -0.02, 0.01, 0.02, -0.03, 0.015])) @ poses_initial[1]
+    output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1e-6,
+        depth_prior_weight=1e-4,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        min_affine_support=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert bool(output.accepted[0])
+    diagnostics = output.diagnostics[0]
+    assert diagnostics["final_objective"] < diagnostics["initial_objective"]
+    assert diagnostics["final_median_residual_deg"] < 1.0e-3
+    torch.testing.assert_close(
+        output.poses_c2w[0, 1, :3, 3],
+        poses_truth[1, :3, 3],
+        atol=2e-4,
+        rtol=0.0,
+    )
 
 
 def test_block_sparse_ba_rejects_antipodal_factor() -> None:

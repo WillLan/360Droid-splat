@@ -13,6 +13,12 @@ Frontend:
   window_size: 5
   num_updates: null
 
+SphericalSelfiRuntime:
+  enabled: false
+
+SphericalSelfiGlobalBackend:
+  enabled: false
+
 PanoVGGT:
   engine: external
   repo_path: null

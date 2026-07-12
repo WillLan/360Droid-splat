@@ -15,7 +15,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from frontend.pano_droid.spherical_ba import se3_exp, skew, so3_exp
+from frontend.pano_droid.spherical_ba import skew, so3_exp
 from frontend.pano_vggt.spherical_correspondence import spherical_tangent_residual
 from geometry.spherical_erp import (
     build_erp_ray_grid,
@@ -40,6 +40,9 @@ class Stage3MatchCache:
     top2_margin: torch.Tensor  # B,E,Q
     entropy: torch.Tensor  # B,E,Q
     valid_mask: torch.Tensor  # B,E,Q
+    factor_weight: torch.Tensor | None = None  # B,E,Q, confidence used by BA
+    mutual_mask: torch.Tensor | None = None  # B,E,Q
+    target_valid: torch.Tensor | None = None  # B,E,Q
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -76,6 +79,10 @@ def build_stage3_match_cache(
     query_chunk_size: int = 32,
     fibonacci_oversample_factor: int = 8,
     use_spherical_area_correction: bool = True,
+    forward_backward: bool = False,
+    fb_tolerance_deg: float = 1.0,
+    min_factor_weight: float = 0.01,
+    static_valid_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     query_uv: torch.Tensor | None = None,
 ) -> Stage3MatchCache:
@@ -88,6 +95,8 @@ def build_stage3_match_cache(
     batch, views, channels, height, width = (int(value) for value in adapter_features.shape)
     if tuple(depth.shape) != (batch, views, 1, height, width):
         raise ValueError("adapter_features and depth must share B/S/H/W dimensions.")
+    if static_valid_mask is not None and tuple(static_valid_mask.shape) != tuple(depth.shape):
+        raise ValueError("static_valid_mask must have shape BxSx1xHxW matching depth.")
     if views < 2 or channels <= 0:
         raise ValueError("Stage 3 matching requires at least two views and non-empty descriptors.")
 
@@ -118,6 +127,11 @@ def build_stage3_match_cache(
         & (source_depth >= float(min_depth))
         & (source_depth <= float(max_depth))
     )
+    if static_valid_mask is not None:
+        sampled_source_static = sample_erp_with_wrap(
+            static_valid_mask.float(), sampled_uv
+        )[..., 0]
+        source_valid &= sampled_source_static > 0.5
     source_ray = erp_pixel_to_unit_ray(sampled_uv, height, width).float()
     source_feature = sample_erp_with_wrap(features, sampled_uv)
     source_feature = F.normalize(source_feature.float(), dim=-1, eps=1.0e-8)
@@ -130,6 +144,9 @@ def build_stage3_match_cache(
     top2_margin = torch.empty_like(top1_cosine)
     entropy = torch.empty_like(top1_cosine)
     valid = torch.empty(batch, edge_count, count, device=device, dtype=torch.bool)
+    mutual = torch.empty_like(valid)
+    target_depth_valid = torch.empty_like(valid)
+    factor_weight = torch.empty(batch, edge_count, count, device=device, dtype=torch.float32)
 
     rows = torch.arange(height, device=device, dtype=torch.float32) + 0.5
     cos_latitude = torch.cos(math.pi * (rows / float(height) - 0.5)).clamp_min(1.0e-8)
@@ -170,7 +187,49 @@ def build_stage3_match_cache(
                 entropy[batch_idx, edge_idx, start:stop] = -(
                     probability * probability.clamp_min(1.0e-12).log()
                 ).sum(dim=-1)
-            valid[batch_idx, edge_idx] = source_valid[batch_idx, src]
+                if bool(forward_backward):
+                    matched = target[:, best].transpose(0, 1)
+                    reverse_logits = matched @ features[batch_idx, src].flatten(1)
+                    reverse_logits = reverse_logits / tau + log_area
+                    reverse_best = reverse_logits.argmax(dim=-1)
+                    reverse_ray = ray_grid[reverse_best]
+                    reverse_angle = torch.atan2(
+                        torch.cross(
+                            reverse_ray,
+                            source_ray[batch_idx, src, start:stop],
+                            dim=-1,
+                        ).norm(dim=-1),
+                        (reverse_ray * source_ray[batch_idx, src, start:stop]).sum(dim=-1).clamp(-1.0, 1.0),
+                    )
+                    mutual[batch_idx, edge_idx, start:stop] = reverse_angle <= math.radians(float(fb_tolerance_deg))
+                else:
+                    mutual[batch_idx, edge_idx, start:stop] = True
+            sampled_target_depth = sample_erp_with_wrap(
+                depth[batch_idx : batch_idx + 1, tgt],
+                target_uv[batch_idx, edge_idx].unsqueeze(0),
+            )[0, ..., 0]
+            target_depth_valid[batch_idx, edge_idx] = (
+                torch.isfinite(sampled_target_depth)
+                & (sampled_target_depth >= float(min_depth))
+                & (sampled_target_depth <= float(max_depth))
+            )
+            if static_valid_mask is not None:
+                sampled_target_static = sample_erp_with_wrap(
+                    static_valid_mask[batch_idx : batch_idx + 1, tgt].float(),
+                    target_uv[batch_idx, edge_idx].unsqueeze(0),
+                )[0, ..., 0]
+                target_depth_valid[batch_idx, edge_idx] &= sampled_target_static > 0.5
+            normalized_entropy = entropy[batch_idx, edge_idx] / max(math.log(max(2, height * width)), 1.0e-8)
+            cosine_score = ((top1_cosine[batch_idx, edge_idx] + 1.0) * 0.5).clamp(0.0, 1.0)
+            margin_score = torch.sigmoid(top2_margin[batch_idx, edge_idx])
+            entropy_score = (1.0 - normalized_entropy).clamp(0.0, 1.0)
+            factor_weight[batch_idx, edge_idx] = cosine_score * margin_score * entropy_score
+            valid[batch_idx, edge_idx] = (
+                source_valid[batch_idx, src]
+                & target_depth_valid[batch_idx, edge_idx]
+                & mutual[batch_idx, edge_idx]
+                & (factor_weight[batch_idx, edge_idx] >= float(min_factor_weight))
+            )
 
     return Stage3MatchCache(
         source_uv=sampled_uv,
@@ -184,12 +243,19 @@ def build_stage3_match_cache(
         top2_margin=top2_margin,
         entropy=entropy,
         valid_mask=valid,
+        factor_weight=factor_weight,
+        mutual_mask=mutual,
+        target_valid=target_depth_valid,
         metadata={
             "temperature": tau,
             "query_chunk_size": chunk_size,
             "min_depth": float(min_depth),
             "max_depth": float(max_depth),
             "use_spherical_area_correction": bool(use_spherical_area_correction),
+            "forward_backward": bool(forward_backward),
+            "fb_tolerance_deg": float(fb_tolerance_deg),
+            "min_factor_weight": float(min_factor_weight),
+            "static_validity_filter": static_valid_mask is not None,
         },
     )
 
@@ -398,7 +464,12 @@ class BlockSparseSphericalBA:
         src_ray = cache.source_ray[batch_idx].reshape(-1, 3)[depth_index].to(device=device, dtype=torch.float32)
         tgt_ray = cache.target_ray[batch_idx].reshape(-1, 3).to(device=device, dtype=torch.float32)
         valid = cache.valid_mask[batch_idx].reshape(-1).to(device=device)
+        if cache.factor_weight is None:
+            factor_weight = torch.ones_like(valid, dtype=torch.float32)
+        else:
+            factor_weight = cache.factor_weight[batch_idx].reshape(-1).to(device=device, dtype=torch.float32)
         valid &= torch.isfinite(src_ray).all(dim=-1) & torch.isfinite(tgt_ray).all(dim=-1)
+        valid &= torch.isfinite(factor_weight) & (factor_weight > 0.0)
         keep = torch.nonzero(valid, as_tuple=False).flatten()
         if int(keep.numel()) < self.min_factors:
             identity_scale = torch.ones(views, device=device)
@@ -408,11 +479,13 @@ class BlockSparseSphericalBA:
             }
         src, tgt, depth_index = src[keep], tgt[keep], depth_index[keep]
         src_ray, tgt_ray = src_ray[keep], tgt_ray[keep]
+        factor_weight = factor_weight[keep].clamp(0.0, 1.0)
         initial_predicted = self._predicted_bearing(poses, log0, src, tgt, depth_index, src_ray)
         antipodal_ok = (initial_predicted * tgt_ray).sum(dim=-1) > -0.99
         if not antipodal_ok.all():
             src, tgt, depth_index = src[antipodal_ok], tgt[antipodal_ok], depth_index[antipodal_ok]
             src_ray, tgt_ray = src_ray[antipodal_ok], tgt_ray[antipodal_ok]
+            factor_weight = factor_weight[antipodal_ok]
         if int(src.numel()) < self.min_factors:
             identity_scale = torch.ones(views, device=device)
             zero_shift = torch.zeros(views, device=device)
@@ -427,12 +500,41 @@ class BlockSparseSphericalBA:
         pose_dim = max(0, (views - 1) * 6)
         depth_dim = views * query_count
         failed_reason: str | None = None
+        current_damping = max(self.damping, 1.0e-8)
+        accepted_steps = 0
+        initial_objective = self._objective(
+            cur_pose,
+            cur_log,
+            poses,
+            log0,
+            src,
+            tgt,
+            depth_index,
+            src_ray,
+            tgt_ray,
+            factor_weight,
+        )
+        current_objective = initial_objective
 
         for _ in range(max(0, self.iterations)):
-            hpp = torch.eye(pose_dim, device=device, dtype=torch.float32) * (self.pose_prior_weight + self.damping)
-            gp = self.pose_prior_weight * self._pose_prior_vector(cur_pose, poses)
+            hpp = torch.eye(pose_dim, device=device, dtype=torch.float32) * current_damping
+            gp = torch.zeros(pose_dim, device=device, dtype=torch.float32)
+            if pose_dim and self.pose_prior_weight > 0.0:
+                prior_zero = torch.zeros(pose_dim, device=device, dtype=torch.float32)
+
+                def pose_prior_from_delta(delta: torch.Tensor) -> torch.Tensor:
+                    updated = [cur_pose[0]]
+                    for frame_idx in range(1, views):
+                        step = delta[(frame_idx - 1) * 6 : frame_idx * 6]
+                        updated.append(_se3_exp_out_of_place(step) @ cur_pose[frame_idx])
+                    return self._pose_prior_vector(torch.stack(updated, dim=0), poses)
+
+                prior_residual = pose_prior_from_delta(prior_zero)
+                prior_jacobian = torch.func.jacrev(pose_prior_from_delta)(prior_zero)
+                hpp += self.pose_prior_weight * (prior_jacobian.T @ prior_jacobian)
+                gp += self.pose_prior_weight * (prior_jacobian.T @ prior_residual)
             hpd = torch.zeros(depth_dim, pose_dim, device=device, dtype=torch.float32)
-            hdd = torch.full((depth_dim,), self.depth_prior_weight + self.damping, device=device, dtype=torch.float32)
+            hdd = torch.full((depth_dim,), self.depth_prior_weight + current_damping, device=device, dtype=torch.float32)
             gd = self.depth_prior_weight * (cur_log - log0)
 
             for start in range(0, int(src.numel()), self.factor_chunk_size):
@@ -463,7 +565,7 @@ class BlockSparseSphericalBA:
                 )
                 norm = residual.norm(dim=-1)
                 robust = torch.where(norm <= self.huber_delta, torch.ones_like(norm), self.huber_delta / norm.clamp_min(1.0e-8))
-                sqrt_weight = robust.sqrt()
+                sqrt_weight = (robust * factor_weight[start:stop]).clamp_min(0.0).sqrt()
                 residual = residual * sqrt_weight[:, None]
                 jacobian = jacobian * sqrt_weight[:, None, None]
                 jp = torch.zeros(stop - start, 2, pose_dim, device=device, dtype=torch.float32)
@@ -497,18 +599,65 @@ class BlockSparseSphericalBA:
             if not torch.isfinite(delta_depth).all() or not torch.isfinite(delta_pose).all():
                 failed_reason = "non_finite_step"
                 break
-            for frame in range(1, views):
-                update = delta_pose[(frame - 1) * 6 : frame * 6].clone()
-                translation_norm = update[:3].norm().clamp_min(1.0e-8)
-                rotation_norm = update[3:].norm().clamp_min(1.0e-8)
-                update[:3] *= min(1.0, self.max_translation_update / float(translation_norm))
-                update[3:] *= min(1.0, self.max_pose_update / float(rotation_norm))
-                cur_pose[frame] = se3_exp(update) @ cur_pose[frame]
-            cur_log = (cur_log + delta_depth).clamp(log0 - self.max_logdepth_update, log0 + self.max_logdepth_update)
+            delta_pose = delta_pose.reshape(max(0, views - 1), 6)
+            if delta_pose.numel():
+                translation_norm = delta_pose[:, :3].norm(dim=-1).clamp_min(1.0e-8)
+                rotation_norm = delta_pose[:, 3:].norm(dim=-1).clamp_min(1.0e-8)
+                delta_pose[:, :3] *= torch.minimum(
+                    torch.ones_like(translation_norm),
+                    translation_norm.new_tensor(self.max_translation_update) / translation_norm,
+                )[:, None]
+                delta_pose[:, 3:] *= torch.minimum(
+                    torch.ones_like(rotation_norm),
+                    rotation_norm.new_tensor(self.max_pose_update) / rotation_norm,
+                )[:, None]
+            accepted_step = False
+            for step_scale in (1.0, 0.5, 0.25, 0.125):
+                trial_pose = cur_pose.clone()
+                for frame in range(1, views):
+                    trial_pose[frame] = _se3_exp_out_of_place(step_scale * delta_pose[frame - 1]) @ cur_pose[frame]
+                trial_log = (
+                    cur_log + step_scale * delta_depth
+                ).clamp(log0 - self.max_logdepth_update, log0 + self.max_logdepth_update)
+                trial_predicted = self._predicted_bearing(
+                    trial_pose, trial_log, src, tgt, depth_index, src_ray
+                )
+                if not bool(torch.isfinite(trial_predicted).all()):
+                    continue
+                if bool(((trial_predicted * tgt_ray).sum(dim=-1) <= -0.99).any()):
+                    continue
+                trial_objective = self._objective(
+                    trial_pose,
+                    trial_log,
+                    poses,
+                    log0,
+                    src,
+                    tgt,
+                    depth_index,
+                    src_ray,
+                    tgt_ray,
+                    factor_weight,
+                )
+                if bool(torch.isfinite(trial_objective)) and float(trial_objective) < float(current_objective) - 1.0e-10:
+                    cur_pose = trial_pose
+                    cur_log = trial_log
+                    current_objective = trial_objective
+                    current_damping = max(self.damping, current_damping * 0.5)
+                    accepted_steps += 1
+                    accepted_step = True
+                    break
+            if not accepted_step:
+                current_damping *= 10.0
 
         final_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         final_median = float(torch.rad2deg(final_angle).median().detach().cpu())
-        accepted = failed_reason is None and math.isfinite(final_median) and final_median <= initial_median * self.residual_worse_tolerance
+        objective_improved = float(current_objective) <= float(initial_objective) + 1.0e-10
+        accepted = (
+            failed_reason is None
+            and math.isfinite(final_median)
+            and objective_improved
+            and (accepted_steps > 0 or self.iterations == 0 or initial_median <= 1.0e-6)
+        )
         if not accepted:
             cur_pose = poses
             cur_log = log0
@@ -526,7 +675,13 @@ class BlockSparseSphericalBA:
                 scales[frame], shifts[frame] = _weighted_affine_fit(
                     original_depth[frame, mask],
                     optimized_depth[frame, mask],
-                    torch.ones_like(original_depth[frame, mask]),
+                    self._query_weights(
+                        src,
+                        depth_index,
+                        factor_weight,
+                        frame=frame,
+                        query_count=query_count,
+                    )[mask],
                     median_depth=median_depth,
                 )
         return cur_pose, optimized_depth, scales, shifts, accepted, initial_median, final_median, {
@@ -535,7 +690,60 @@ class BlockSparseSphericalBA:
             "num_depth_variables": depth_dim,
             "initial_median_residual_deg": initial_median,
             "final_median_residual_deg": final_median,
+            "initial_objective": float(initial_objective.detach().cpu()),
+            "final_objective": float(current_objective.detach().cpu()),
+            "accepted_steps": int(accepted_steps),
+            "final_damping": float(current_damping),
         }
+
+    def _objective(
+        self,
+        poses: torch.Tensor,
+        log_depth: torch.Tensor,
+        initial_poses: torch.Tensor,
+        initial_log_depth: torch.Tensor,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        depth_index: torch.Tensor,
+        src_ray: torch.Tensor,
+        tgt_ray: torch.Tensor,
+        factor_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        predicted = self._predicted_bearing(poses, log_depth, src, tgt, depth_index, src_ray)
+        residual = spherical_tangent_residual(tgt_ray, predicted)
+        norm = residual.norm(dim=-1)
+        delta = norm.new_tensor(max(self.huber_delta, 1.0e-8))
+        robust = torch.where(
+            norm <= delta,
+            0.5 * norm.square(),
+            delta * (norm - 0.5 * delta),
+        )
+        objective = (factor_weight * robust).sum()
+        if self.pose_prior_weight > 0.0:
+            pose_prior = self._pose_prior_vector(poses, initial_poses)
+            objective = objective + 0.5 * self.pose_prior_weight * pose_prior.square().sum()
+        if self.depth_prior_weight > 0.0:
+            depth_prior = log_depth - initial_log_depth
+            objective = objective + 0.5 * self.depth_prior_weight * depth_prior.square().sum()
+        return objective
+
+    @staticmethod
+    def _query_weights(
+        src: torch.Tensor,
+        depth_index: torch.Tensor,
+        factor_weight: torch.Tensor,
+        *,
+        frame: int,
+        query_count: int,
+    ) -> torch.Tensor:
+        selected = src == int(frame)
+        output = factor_weight.new_zeros(query_count)
+        count = factor_weight.new_zeros(query_count)
+        if bool(selected.any()):
+            local_index = depth_index[selected] - int(frame) * int(query_count)
+            output.index_add_(0, local_index, factor_weight[selected])
+            count.index_add_(0, local_index, torch.ones_like(factor_weight[selected]))
+        return torch.where(count > 0, output / count.clamp_min(1.0), torch.ones_like(output)).clamp_min(1.0e-6)
 
     @staticmethod
     def _angular_residual(

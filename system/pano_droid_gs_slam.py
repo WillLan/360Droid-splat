@@ -1588,6 +1588,20 @@ class PanoDroidGSSlamSystem:
             renderer=self.renderer,
             lr=float(config.get("Mapping", {}).get("lr", 2e-3)),
         )
+        self.spherical_selfi_global_backend = None
+        spherical_global_cfg = config.get("SphericalSelfiGlobalBackend", {})
+        if isinstance(spherical_global_cfg, dict) and bool(spherical_global_cfg.get("enabled", False)):
+            if not isinstance(self.map, PanoGaussianMap):
+                raise ValueError(
+                    "SphericalSelfiGlobalBackend requires MapRepresentation.mode='anchor_scaffold_panorama'."
+                )
+            from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
+
+            self.spherical_selfi_global_backend = SphericalSelfiGlobalBackend(
+                self.map,
+                mapper=self.mapper,
+                config=spherical_global_cfg,
+            )
 
     @staticmethod
     def _apply_feedforward_window_frontend_defaults(config: dict) -> None:
@@ -1794,6 +1808,10 @@ class PanoDroidGSSlamSystem:
             "panoresplat_online",
             "resplat_online",
         }
+        spherical_selfi_global_enabled = bool(
+            self.spherical_selfi_global_backend is not None
+            and getattr(self.spherical_selfi_global_backend, "enabled", False)
+        )
         resplat_global_cfg = backend_cfg.get("ReSplatGlobal", {}) if isinstance(backend_cfg, dict) else {}
         resplat_global_cfg = resplat_global_cfg if isinstance(resplat_global_cfg, dict) else {}
         resplat_global_iters = int(resplat_global_cfg.get("iters", 20))
@@ -2284,7 +2302,7 @@ class PanoDroidGSSlamSystem:
         def optimize_feedforward_after_batch(outputs: list[FrontendOutput]) -> None:
             nonlocal backend_feedback_decision_count, backend_feedback_applied_count, last_feedforward_metrics
             nonlocal last_optimized_frontend_chunk
-            if resplat_direct_fusion_enabled:
+            if resplat_direct_fusion_enabled or spherical_selfi_global_enabled:
                 return
             if not feedforward_window_enabled or not outputs:
                 return
@@ -2417,6 +2435,80 @@ class PanoDroidGSSlamSystem:
                     optimize_sec=optimize_sec,
                 )
 
+        pending_spherical_selfi_pose_updates: dict[int, torch.Tensor] = {}
+
+        def drain_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
+            if not spherical_selfi_global_enabled:
+                return
+            consume = getattr(self.frontend, "consume_local_gaussian_windows", None)
+            if not callable(consume):
+                raise RuntimeError(
+                    "SphericalSelfiGlobalBackend is enabled but the frontend does not expose "
+                    "consume_local_gaussian_windows()."
+                )
+            for packet in consume():
+                section_start = time.perf_counter()
+                result = self.spherical_selfi_global_backend.process_packet(packet)
+                elapsed = float(time.perf_counter() - section_start)
+                write_profile(
+                    "backend_spherical_selfi_window",
+                    window_id=float(result.window_id),
+                    aligned=float(result.aligned),
+                    loops=float(result.loop_accepted),
+                    requested=float(result.fusion.get("requested", 0)),
+                    window_compacted=float(result.fusion.get("window_compacted", 0)),
+                    deduplicated=float(result.fusion.get("deduplicated", 0)),
+                    anchors_after=float(result.fusion.get("anchors_after", self.map.anchor_count())),
+                    moved=float(result.correction.get("moved", 0)),
+                    total_sec=elapsed,
+                )
+                logger._log_wandb_payload(
+                    {
+                        "backend/selfi_window_id": int(result.window_id),
+                        "backend/selfi_loop_accepted": int(result.loop_accepted),
+                        "backend/selfi_window_compacted": int(result.fusion.get("window_compacted", 0)),
+                        "backend/selfi_global_anchors": int(result.fusion.get("anchors_after", self.map.anchor_count())),
+                        "backend/selfi_graph_objective": 0.0 if result.graph is None else float(result.graph.final_objective),
+                    },
+                    step=max(1, int(logger._step) + 1),
+                )
+            graph_pose_updates = self.spherical_selfi_global_backend.pop_pose_updates()
+            # Historical observations must follow graph-loop corrections too;
+            # replacing only the not-yet-emitted FrontendOutput would leave the
+            # photometric replay cameras at stale poses.
+            self.mapper.apply_frontend_pose_updates(graph_pose_updates)
+            pending_spherical_selfi_pose_updates.update(graph_pose_updates)
+            for index, output in enumerate(outputs):
+                pose = pending_spherical_selfi_pose_updates.get(int(output.frame_id))
+                if pose is None:
+                    continue
+                world_points = output.world_points
+                source = frame_cache.get(int(output.frame_id))
+                if output.inverse_depth is not None and source is not None:
+                    world_points = world_points_from_inverse_depth(
+                        output.inverse_depth,
+                        pose,
+                        (int(source.image.shape[-2]), int(source.image.shape[-1])),
+                    ).detach().cpu().float()
+                outputs[index] = replace(output, pose_c2w=pose, world_points=world_points)
+                pending_spherical_selfi_pose_updates.pop(int(output.frame_id), None)
+
+        def optimize_spherical_selfi_windows() -> None:
+            nonlocal last_feedforward_metrics
+            if not spherical_selfi_global_enabled:
+                return
+            section_start = time.perf_counter()
+            metrics = self.spherical_selfi_global_backend.run_pending_map_optimization()
+            if not metrics:
+                return
+            last_feedforward_metrics = dict(metrics)
+            write_profile(
+                "backend_spherical_selfi_map_optimization",
+                optimize_steps=float(metrics.get("steps", 0.0)),
+                optimize_loss=float(metrics.get("loss", 0.0)),
+                total_sec=float(time.perf_counter() - section_start),
+            )
+
         def process_output(out) -> None:
             nonlocal keyframes, last_status, backend_feedback_decision_count, backend_feedback_applied_count
             nonlocal last_profiled_frontend_chunk
@@ -2453,7 +2545,7 @@ class PanoDroidGSSlamSystem:
             output_profile["is_keyframe"] = int(bool(out.is_keyframe))
             sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), backend_image)
             remember_final_frame(out, replace(source_frame, image=backend_image), sky_mask)
-            if (feedforward_window_enabled or resplat_direct_fusion_enabled) and out.inverse_depth is not None:
+            if (feedforward_window_enabled or resplat_direct_fusion_enabled or spherical_selfi_global_enabled) and out.inverse_depth is not None:
                 section_start = time.perf_counter()
                 self.mapper.register_observation(
                     out,
@@ -2481,6 +2573,7 @@ class PanoDroidGSSlamSystem:
             neural_anchor_mode = str(getattr(self.map, "map_mode", "")).lower() == "neural_anchor_scaffold_panorama"
             if (
                 not resplat_direct_fusion_enabled
+                and not spherical_selfi_global_enabled
                 and out.is_keyframe
                 and (out.inverse_depth is not None or (neural_anchor_mode and out.world_points is not None))
             ):
@@ -2789,6 +2882,7 @@ class PanoDroidGSSlamSystem:
                 and non_keyframe_steps > 0
                 and not feedforward_window_enabled
                 and not resplat_direct_fusion_enabled
+                and not spherical_selfi_global_enabled
             ):
                 section_start = time.perf_counter()
                 metrics = self.mapper.optimize_frame_observation(
@@ -3024,8 +3118,10 @@ class PanoDroidGSSlamSystem:
                 section_start = time.perf_counter()
                 outputs = pop_ready() if callable(pop_ready) else [out]
                 pop_ready_sec = float(time.perf_counter() - section_start)
+                drain_spherical_selfi_windows(outputs)
                 for ready in outputs:
                     process_output(ready)
+                optimize_spherical_selfi_windows()
                 drain_resplat_artifacts()
                 for ready in outputs:
                     frame_cache.pop(int(ready.frame_id), None)
@@ -3048,7 +3144,10 @@ class PanoDroidGSSlamSystem:
                 for ready in flush():
                     flushed += 1
                     flushed_outputs.append(ready)
+                drain_spherical_selfi_windows(flushed_outputs)
+                for ready in flushed_outputs:
                     process_output(ready)
+                optimize_spherical_selfi_windows()
                 drain_resplat_artifacts()
                 for ready in flushed_outputs:
                     frame_cache.pop(int(ready.frame_id), None)
@@ -3056,7 +3155,15 @@ class PanoDroidGSSlamSystem:
                 write_profile("frontend_flush", flushed_outputs=float(flushed), total_sec=float(time.perf_counter() - section_start))
 
             section_start = time.perf_counter()
-            final_metrics = self.mapper.finalize_optimization()
+            if spherical_selfi_global_enabled:
+                spherical_final = self.spherical_selfi_global_backend.finalize()
+                final_metrics = {
+                    key: float(value)
+                    for key, value in spherical_final.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            else:
+                final_metrics = self.mapper.finalize_optimization()
             final_metrics["profile_backend_finalize_call_sec"] = float(time.perf_counter() - section_start)
             write_profile("finalize_optimization", **{
                 key: float(value)
@@ -3128,6 +3235,21 @@ class PanoDroidGSSlamSystem:
                 "backend_final_trajectory_png": final_backend_traj,
                 "artifacts": final_artifacts,
                 "dense_ba": dense_ba_summary,
+                "spherical_selfi_runtime_config": (
+                    self.config.get("SphericalSelfiRuntime", {})
+                    if spherical_selfi_global_enabled
+                    else None
+                ),
+                "spherical_selfi_global_backend_config": (
+                    self.config.get("SphericalSelfiGlobalBackend", {})
+                    if spherical_selfi_global_enabled
+                    else None
+                ),
+                "spherical_selfi_processed_windows": (
+                    len(self.spherical_selfi_global_backend.results)
+                    if spherical_selfi_global_enabled
+                    else 0
+                ),
                 **_flatten_dense_ba_summary(dense_ba_summary),
                 "wandb_run_url": logger.run_url,
                 "wandb_mode": logger.wandb_mode,
