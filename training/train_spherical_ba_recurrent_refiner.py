@@ -131,6 +131,7 @@ def default_config() -> dict[str, Any]:
             "query_chunk_size": 32,
             "fibonacci_oversample_factor": 8,
             "use_spherical_area_correction": True,
+            "reliability_keep_fraction": 1.0,
         },
         "ba": {
             "outer_schedule": [True, False, False],
@@ -154,6 +155,8 @@ def default_config() -> dict[str, Any]:
             "lm_damping_min": 1.0e-8,
             "lm_damping_max": 1.0e8,
             "lm_diagonal_floor": 1.0e-6,
+            "max_initial_residual_deg": None,
+            "min_parallax_deg": 0.0,
         },
         "refiner": {
             "adapter_dim": 24,
@@ -601,6 +604,7 @@ def _build_match_cache(
         forward_backward=bool(cfg.get("forward_backward", True)),
         fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
         min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
+        reliability_keep_fraction=float(cfg.get("reliability_keep_fraction", 1.0)),
         static_valid_mask=static_valid_mask,
         generator=generator,
     )

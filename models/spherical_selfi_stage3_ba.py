@@ -83,6 +83,7 @@ def build_stage3_match_cache(
     forward_backward: bool = False,
     fb_tolerance_deg: float = 1.0,
     min_factor_weight: float = 0.01,
+    reliability_keep_fraction: float = 1.0,
     static_valid_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     query_uv: torch.Tensor | None = None,
@@ -165,6 +166,9 @@ def build_stage3_match_cache(
     ray_grid = build_erp_ray_grid(height, width, device=device, dtype=torch.float32).reshape(-1, 3)
     tau = max(float(temperature), 1.0e-8)
     chunk_size = max(1, int(query_chunk_size))
+    keep_fraction = float(reliability_keep_fraction)
+    if not 0.0 < keep_fraction <= 1.0:
+        raise ValueError("reliability_keep_fraction must be in (0, 1].")
 
     for batch_idx in range(batch):
         for edge_idx, pair in enumerate(edges.tolist()):
@@ -231,6 +235,19 @@ def build_stage3_match_cache(
                 & mutual[batch_idx, edge_idx]
                 & (factor_weight[batch_idx, edge_idx] >= float(min_factor_weight))
             )
+            if keep_fraction < 1.0:
+                candidates = torch.nonzero(valid[batch_idx, edge_idx], as_tuple=False).flatten()
+                if int(candidates.numel()) > 0:
+                    keep_count = max(1, int(math.ceil(keep_fraction * int(candidates.numel()))))
+                    ranked = torch.topk(
+                        factor_weight[batch_idx, edge_idx, candidates],
+                        k=keep_count,
+                        largest=True,
+                        sorted=False,
+                    ).indices
+                    reliability_mask = torch.zeros_like(valid[batch_idx, edge_idx])
+                    reliability_mask[candidates[ranked]] = True
+                    valid[batch_idx, edge_idx] &= reliability_mask
 
     return Stage3MatchCache(
         source_uv=sampled_uv,
@@ -256,6 +273,7 @@ def build_stage3_match_cache(
             "forward_backward": bool(forward_backward),
             "fb_tolerance_deg": float(fb_tolerance_deg),
             "min_factor_weight": float(min_factor_weight),
+            "reliability_keep_fraction": keep_fraction,
             "static_validity_filter": static_valid_mask is not None,
         },
     )
@@ -377,6 +395,8 @@ class BlockSparseSphericalBA:
         lm_damping_min: float = 1.0e-8,
         lm_damping_max: float = 1.0e8,
         lm_diagonal_floor: float = 1.0e-6,
+        max_initial_residual_deg: float | None = None,
+        min_parallax_deg: float = 0.0,
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -406,6 +426,12 @@ class BlockSparseSphericalBA:
         self.lm_damping_min = max(0.0, float(lm_damping_min))
         self.lm_damping_max = max(self.lm_damping_min, float(lm_damping_max))
         self.lm_diagonal_floor = max(1.0e-12, float(lm_diagonal_floor))
+        self.max_initial_residual = (
+            None
+            if max_initial_residual_deg is None
+            else math.radians(max(0.0, float(max_initial_residual_deg)))
+        )
+        self.min_parallax = math.radians(max(0.0, float(min_parallax_deg)))
 
     def __call__(
         self,
@@ -517,6 +543,35 @@ class BlockSparseSphericalBA:
             zero_shift = torch.zeros(views, device=device)
             return poses, source_depth.reshape(views, query_count), identity_scale, zero_shift, False, float("inf"), float("inf"), {
                 "reason": "insufficient_non_antipodal_factors", "num_factors": int(src.numel())
+            }
+
+        initial_predicted = self._predicted_bearing(poses, log0, src, tgt, depth_index, src_ray)
+        initial_geometry_residual = torch.atan2(
+            torch.cross(initial_predicted, tgt_ray, dim=-1).norm(dim=-1),
+            (initial_predicted * tgt_ray).sum(dim=-1).clamp(-1.0, 1.0),
+        )
+        source_world_ray = torch.einsum("nij,nj->ni", poses[src, :3, :3], src_ray)
+        target_world_ray = torch.einsum("nij,nj->ni", poses[tgt, :3, :3], initial_predicted)
+        initial_parallax = torch.atan2(
+            torch.cross(source_world_ray, target_world_ray, dim=-1).norm(dim=-1),
+            (source_world_ray * target_world_ray).sum(dim=-1).clamp(-1.0, 1.0),
+        )
+        geometry_keep = torch.ones_like(initial_geometry_residual, dtype=torch.bool)
+        if self.max_initial_residual is not None:
+            geometry_keep &= initial_geometry_residual <= self.max_initial_residual
+        if self.min_parallax > 0.0:
+            geometry_keep &= initial_parallax >= self.min_parallax
+        initial_geometry_residual = initial_geometry_residual[geometry_keep]
+        initial_parallax = initial_parallax[geometry_keep]
+        src, tgt, depth_index = src[geometry_keep], tgt[geometry_keep], depth_index[geometry_keep]
+        src_ray, tgt_ray = src_ray[geometry_keep], tgt_ray[geometry_keep]
+        factor_weight = factor_weight[geometry_keep]
+        if int(src.numel()) < self.min_factors:
+            identity_scale = torch.ones(views, device=device)
+            zero_shift = torch.zeros(views, device=device)
+            return poses, source_depth.reshape(views, query_count), identity_scale, zero_shift, False, float("inf"), float("inf"), {
+                "reason": "insufficient_geometry_gated_factors",
+                "num_factors": int(src.numel()),
             }
 
         cur_pose = poses.clone()
@@ -855,6 +910,14 @@ class BlockSparseSphericalBA:
                 or ("residual_worse" if not residual_acceptable else "objective_not_improved")
             ),
             "num_factors": int(src.numel()),
+            "initial_geometry_residual_p50_deg": float(
+                torch.rad2deg(initial_geometry_residual).median().detach().cpu()
+            ),
+            "initial_geometry_residual_p90_deg": float(
+                torch.rad2deg(initial_geometry_residual).quantile(0.9).detach().cpu()
+            ),
+            "initial_parallax_p10_deg": float(torch.rad2deg(initial_parallax).quantile(0.1).detach().cpu()),
+            "initial_parallax_p50_deg": float(torch.rad2deg(initial_parallax).median().detach().cpu()),
             "num_depth_variables": depth_dim,
             "initial_median_residual_deg": initial_median,
             "final_median_residual_deg": final_median,

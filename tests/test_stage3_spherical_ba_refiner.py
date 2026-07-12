@@ -97,6 +97,26 @@ def test_match_cache_filters_static_source_and_target_pixels() -> None:
     assert not bool(cache.valid_mask.any())
 
 
+def test_match_cache_reliability_fraction_keeps_top_ranked_per_edge() -> None:
+    observation, feature, _ = _observation(views=2, height=4, width=8)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=8,
+        query_chunk_size=2,
+        forward_backward=False,
+        min_factor_weight=0.0,
+        reliability_keep_fraction=0.25,
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert cache.edges.shape[0] == 2
+    assert torch.equal(cache.valid_mask.sum(dim=-1), torch.full((1, 2), 2))
+    for edge in range(2):
+        selected = cache.factor_weight[0, edge][cache.valid_mask[0, edge]]
+        rejected = cache.factor_weight[0, edge][~cache.valid_mask[0, edge]]
+        assert float(selected.min()) >= float(rejected.max())
+
+
 def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:
     source = torch.linspace(1.0, 10.0, 100)
     target = 1.2 * source - 0.3
@@ -340,6 +360,36 @@ def test_block_sparse_ba_rejects_antipodal_factor() -> None:
     )
     assert not bool(output.accepted[0])
     assert output.diagnostics[0]["reason"] == "insufficient_non_antipodal_factors"
+
+
+def test_block_sparse_ba_rejects_zero_parallax_factor_when_gated() -> None:
+    observation, _, _ = _observation(views=2)
+    poses = observation.poses_c2w.clone()
+    poses[:, 1] = poses[:, 0]
+    source_uv = torch.tensor([[[[0.5, 4.5]], [[0.5, 4.5]]]])
+    source_ray = torch.tensor([[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]]])
+    cache = Stage3MatchCache(
+        source_uv=source_uv,
+        source_ray=source_ray,
+        source_depth=torch.full((1, 2, 1), 2.0),
+        source_valid=torch.ones(1, 2, 1, dtype=torch.bool),
+        edges=torch.tensor([[0, 1]]),
+        target_uv=torch.tensor([[[[0.5, 4.5]]]]),
+        target_ray=source_ray[:, :1].clone(),
+        top1_cosine=torch.ones(1, 1, 1),
+        top2_margin=torch.ones(1, 1, 1),
+        entropy=torch.zeros(1, 1, 1),
+        valid_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+        factor_weight=torch.ones(1, 1, 1),
+    )
+    output = BlockSparseSphericalBA(
+        iterations=1,
+        min_factors=1,
+        min_affine_support=1,
+        min_parallax_deg=1.0,
+    )(poses, observation.refined_depth, cache)
+    assert not bool(output.accepted[0])
+    assert output.diagnostics[0]["reason"] == "insufficient_geometry_gated_factors"
 
 
 def test_refiner_zero_initialization_is_identity_and_backward_is_finite() -> None:

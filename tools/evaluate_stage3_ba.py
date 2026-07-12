@@ -198,6 +198,10 @@ def evaluate(config: dict[str, Any], *, max_batches: int) -> dict[str, Any]:
             "gain_ratio_mean",
             "gauge_scale_mean",
             "num_factors",
+            "initial_geometry_residual_p50_deg",
+            "initial_geometry_residual_p90_deg",
+            "initial_parallax_p10_deg",
+            "initial_parallax_p50_deg",
         ):
             values = [float(item[key]) for item in output.diagnostics if key in item]
             finite = [value for value in values if torch.isfinite(torch.tensor(value))]
