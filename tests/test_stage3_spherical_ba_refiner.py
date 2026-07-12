@@ -28,7 +28,8 @@ from models.spherical_selfi_stage3_ba import (
 from geometry.spherical_erp import build_erp_ray_grid
 from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
-from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate
+from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate as generate_ablation_configs
+from tools.generate_stage3_ba_gate_sweep import VARIANTS, generate as generate_gate_sweep
 from tools.summarize_stage3_ba_ablation import summarize_checkpoint
 from tools.evaluate_stage3_ba import evaluate
 
@@ -478,7 +479,7 @@ def test_ba_outer_schedule_is_ba0_only_by_default() -> None:
 def test_ba_ablation_generator_changes_only_declared_solver_axes(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     suite_dir = tmp_path / "suite"
-    manifest = generate(
+    manifest = generate_ablation_configs(
         root / "configs" / "stage3_spherical_ba_recurrent_refiner_omni360.yaml",
         suite_dir,
     )
@@ -494,6 +495,24 @@ def test_ba_ablation_generator_changes_only_declared_solver_axes(tmp_path: Path)
         assert config["train"]["max_steps"] == 200
         assert config["WeightsAndBiases"]["enabled"] is True
         assert config["Visualization"]["enabled"] is True
+
+
+def test_ba_gate_sweep_generator_keeps_solver_fixed(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    suite_dir = tmp_path / "gate_sweep"
+    manifest = generate_gate_sweep(
+        root / "configs" / "stage3_spherical_ba_recurrent_refiner_omni360.yaml",
+        suite_dir,
+    )
+    assert len(manifest["variants"]) == len(VARIANTS)
+    import yaml
+
+    for variant in manifest["variants"]:
+        config = yaml.safe_load(Path(variant["config"]).read_text(encoding="utf-8"))
+        assert config["ba"]["dense_depth_mode"] == "none"
+        assert config["ba"]["gauge_mode"] == "initial_baseline"
+        assert config["ba"]["solver_mode"] == "standard_lm"
+        assert config["matching"]["reliability_keep_fraction"] == variant["keep"]
 
 
 def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
