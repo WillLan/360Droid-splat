@@ -142,7 +142,7 @@ def default_config() -> dict[str, Any]:
             "huber_delta_deg": 0.5,
             "pose_prior_weight": 1.0e-3,
             "depth_prior_weight": 1.0e-2,
-            "max_pose_update_deg": 0.05,
+            "max_pose_update_deg": 0.02,
             "max_translation_update": 0.001,
             "max_logdepth_update": 0.35,
             "factor_chunk_size": 2048,

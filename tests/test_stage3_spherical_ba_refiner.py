@@ -695,7 +695,7 @@ def test_ba_outer_schedule_is_ba0_only_by_default() -> None:
     assert config["matching"]["reliability_keep_fraction"] == 0.10
     assert config["ba"]["pose_update_side"] == "right"
     assert config["ba"]["pose_dof_mode"] == "rotation_only"
-    assert config["ba"]["max_pose_update_deg"] == 0.05
+    assert config["ba"]["max_pose_update_deg"] == 0.02
 
 
 def test_pilot_generator_locks_the_validated_ba_and_training_contract(tmp_path: Path) -> None:
@@ -713,7 +713,7 @@ def test_pilot_generator_locks_the_validated_ba_and_training_contract(tmp_path: 
     assert config["ba"]["solver_mode"] == "standard_lm"
     assert config["ba"]["pose_update_side"] == "right"
     assert config["ba"]["pose_dof_mode"] == "rotation_only"
-    assert config["ba"]["max_pose_update_deg"] == 0.05
+    assert config["ba"]["max_pose_update_deg"] == 0.02
     assert config["matching"]["reliability_keep_fraction"] == 0.10
     assert config["loss"]["dssim"] == 0.0
     assert config["train"]["max_steps"] == 200

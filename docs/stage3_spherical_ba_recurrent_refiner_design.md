@@ -51,7 +51,7 @@ Log_{matched_target_bearing}(predicted_target_bearing) in R^2
 ```
 
 The first pose is fixed. The formal path uses right-local rotation-only updates
-for the other poses, capped at `0.05 degrees` per LM iteration. Camera centers
+for the other poses, capped at `0.02 degrees` per LM iteration. Camera centers
 therefore remain exactly unchanged. Each source query still owns one
 log-inverse-depth nuisance variable shared by its three target factors.
 Huber-weighted LM builds factor-local Jacobians and uses a Schur complement to
@@ -137,13 +137,13 @@ objective but moved poses away from GT. Dense affine propagation also worsened
 depth, while omitting the global gauge allowed scale drift. The formal settings
 therefore combine `dense_depth_mode=none`, `gauge_mode=initial_baseline`,
 `solver_mode=standard_lm`, right-local rotation-only updates, top-10% matches,
-and a `0.05 degree` rotation trust region.
+and a `0.02 degree` rotation trust region.
 
 | validation batches | windows | mean absolute rotation delta | mean RPE rotation delta |
 |---|---:|---:|---:|
-| 32-95 | 64 | -0.01613 deg | -0.00935 deg |
-| 96-223 | 128 | -0.00448 deg | -0.00132 deg |
-| weighted aggregate | 192 | -0.00836 deg | -0.00400 deg |
+| 32-95 | 64 | -0.01176 deg | -0.00755 deg |
+| 96-223 | 128 | -0.00523 deg | -0.00396 deg |
+| weighted aggregate | 192 | -0.00741 deg | -0.00515 deg |
 
 Translation metrics are exactly invariant in the formal mode by construction.
 GT is used only for this audit and checkpoint diagnostics, never by matching,

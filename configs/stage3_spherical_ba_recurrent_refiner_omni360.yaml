@@ -104,7 +104,7 @@ ba:
   depth_prior_weight: 1.0e-2
   # PanoVGGT is already within a fraction of a degree. Larger limits let BA
   # chase descriptor quantization noise and consistently damage the pose.
-  max_pose_update_deg: 0.05
+  max_pose_update_deg: 0.02
   max_translation_update: 0.001
   max_logdepth_update: 0.35
   factor_chunk_size: 2048

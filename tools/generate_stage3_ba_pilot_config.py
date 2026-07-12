@@ -36,7 +36,7 @@ def generate(
             "gauge_mode": "initial_baseline",
             "pose_update_side": "right",
             "pose_dof_mode": "rotation_only",
-            "max_pose_update_deg": 0.05,
+            "max_pose_update_deg": 0.02,
             "max_translation_update": 0.001,
             "min_initial_median_residual_deg": 0.0,
         }
@@ -58,7 +58,7 @@ def generate(
             "mode": "online",
             "run_name": run_name,
             "tags": list(config["WeightsAndBiases"].get("tags", []))
-            + ["stage3-ba-useful-pilot-200", "rotation-only-trust005"],
+            + ["stage3-ba-useful-pilot-200", "rotation-only-trust002"],
         }
     )
     config["Visualization"]["enabled"] = True
