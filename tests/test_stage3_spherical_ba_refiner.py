@@ -412,6 +412,22 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         rtol=0.0,
     )
 
+    gated_output = BlockSparseSphericalBA(
+        iterations=8,
+        min_factors=8,
+        factor_chunk_size=128,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        min_initial_median_residual_deg=180.0,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert not bool(gated_output.accepted[0])
+    assert gated_output.diagnostics[0]["reason"] == "below_min_initial_median_residual"
+    torch.testing.assert_close(gated_output.poses_c2w[0], poses_initial)
+    torch.testing.assert_close(
+        gated_output.initial_median_residual_deg,
+        gated_output.final_median_residual_deg,
+    )
+
 
 def test_block_sparse_ba_rejects_antipodal_factor() -> None:
     observation, _, _ = _observation(views=2)

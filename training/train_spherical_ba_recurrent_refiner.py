@@ -159,6 +159,7 @@ def default_config() -> dict[str, Any]:
             "min_parallax_deg": 0.0,
             "pose_update_side": "left",
             "pose_dof_mode": "se3",
+            "min_initial_median_residual_deg": 0.0,
         },
         "refiner": {
             "adapter_dim": 24,

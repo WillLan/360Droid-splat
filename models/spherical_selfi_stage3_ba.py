@@ -406,6 +406,7 @@ class BlockSparseSphericalBA:
         min_parallax_deg: float = 0.0,
         pose_update_side: str = "left",
         pose_dof_mode: str = "se3",
+        min_initial_median_residual_deg: float = 0.0,
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -452,6 +453,9 @@ class BlockSparseSphericalBA:
                 "pose_dof_mode='rotation_only' requires pose_update_side='right' so "
                 "camera centers remain fixed under a pure local rotation."
             )
+        self.min_initial_median_residual_deg = max(
+            0.0, float(min_initial_median_residual_deg)
+        )
 
     def __call__(
         self,
@@ -598,6 +602,34 @@ class BlockSparseSphericalBA:
         cur_log = log0.clone()
         initial_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         initial_median = float(torch.rad2deg(initial_angle).median().detach().cpu())
+        if initial_median < self.min_initial_median_residual_deg:
+            identity_scale = torch.ones(views, device=device)
+            zero_shift = torch.zeros(views, device=device)
+            return (
+                poses,
+                source_depth.reshape(views, query_count),
+                identity_scale,
+                zero_shift,
+                False,
+                initial_median,
+                initial_median,
+                {
+                    "reason": "below_min_initial_median_residual",
+                    "num_factors": int(src.numel()),
+                    "initial_geometry_residual_p50_deg": float(
+                        torch.rad2deg(initial_geometry_residual).quantile(0.5).detach().cpu()
+                    ),
+                    "initial_geometry_residual_p90_deg": float(
+                        torch.rad2deg(initial_geometry_residual).quantile(0.9).detach().cpu()
+                    ),
+                    "initial_parallax_p10_deg": float(
+                        torch.rad2deg(initial_parallax).quantile(0.1).detach().cpu()
+                    ),
+                    "initial_parallax_p50_deg": float(
+                        torch.rad2deg(initial_parallax).quantile(0.5).detach().cpu()
+                    ),
+                },
+            )
         pose_dim = max(0, (views - 1) * 6)
         if self.pose_dof_mode == "rotation_only":
             active_pose_index = torch.tensor(
@@ -998,6 +1030,7 @@ class BlockSparseSphericalBA:
             "gauge_mode": self.gauge_mode,
             "pose_update_side": self.pose_update_side,
             "pose_dof_mode": self.pose_dof_mode,
+            "min_initial_median_residual_deg": self.min_initial_median_residual_deg,
             "gain_ratio_mean": float(sum(gain_ratios) / len(gain_ratios)) if gain_ratios else float("nan"),
             "gauge_scale_mean": float(sum(gauge_scales) / len(gauge_scales)) if gauge_scales else 1.0,
             "gauge_scale_min": min(gauge_scales) if gauge_scales else 1.0,

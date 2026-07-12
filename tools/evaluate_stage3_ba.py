@@ -77,7 +77,12 @@ def _resize_gt_depth(
     return depth, valid
 
 
-def evaluate(config: dict[str, Any], *, max_batches: int) -> dict[str, Any]:
+def evaluate(
+    config: dict[str, Any],
+    *,
+    max_batches: int,
+    start_batch: int = 0,
+) -> dict[str, Any]:
     if not bool(config.get("stage3", {}).get("enabled", False)):
         raise ValueError("Stage 3 must be enabled for BA evaluation.")
     train_cfg = config["train"]
@@ -117,7 +122,9 @@ def evaluate(config: dict[str, Any], *, max_batches: int) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     wall_start = time.perf_counter()
     for index, batch in enumerate(loader):
-        if index >= int(max_batches):
+        if index < int(start_batch):
+            continue
+        if len(records) >= int(max_batches):
             break
         batch_start = time.perf_counter()
         features, images, initial_depth, poses = extract_frozen_inputs(
@@ -216,7 +223,7 @@ def evaluate(config: dict[str, Any], *, max_batches: int) -> dict[str, Any]:
                 "metrics": metrics,
             }
         )
-        print(f"evaluated BA batch {index + 1}/{max_batches}", flush=True)
+        print(f"evaluated BA batch {len(records)}/{max_batches} (dataset batch {index})", flush=True)
 
     count = len(records)
     if count == 0:
@@ -243,10 +250,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--max-batches", type=int, default=32)
+    parser.add_argument("--start-batch", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = load_config(args.config)
-    result = evaluate(config, max_batches=max(1, int(args.max_batches)))
+    result = evaluate(
+        config,
+        max_batches=max(1, int(args.max_batches)),
+        start_batch=max(0, int(args.start_batch)),
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     print(json.dumps(result["mean"], indent=2, allow_nan=False))

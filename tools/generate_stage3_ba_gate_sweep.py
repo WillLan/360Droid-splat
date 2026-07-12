@@ -70,6 +70,16 @@ CYCLE_CONSISTENCY_VARIANTS: dict[str, dict[str, Any]] = {
     "c7_se3_fb025_trans001": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "fb": 0.25, "translation": 0.001},
 }
 
+RESIDUAL_TRIGGER_VARIANTS: dict[str, dict[str, Any]] = {
+    "g0_se3_reliable10_gate0": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.0},
+    "g1_se3_reliable10_gate026": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.26},
+    "g2_se3_reliable10_gate028": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.28},
+    "g3_se3_reliable10_gate030": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.30},
+    "g4_rotation_reliable10_gate026": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.26},
+    "g5_rotation_reliable10_gate028": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.28},
+    "g6_rotation_reliable10_gate030": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.30},
+}
+
 
 def generate(
     base_path: Path,
@@ -110,6 +120,8 @@ def generate(
         if "fb" in variant:
             config["matching"]["forward_backward"] = True
             config["matching"]["fb_tolerance_deg"] = variant["fb"]
+        if "trigger" in variant:
+            config["ba"]["min_initial_median_residual_deg"] = variant["trigger"]
         config["matching"]["reliability_keep_fraction"] = variant["keep"]
         config_path = config_dir / f"{name}.yaml"
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -134,7 +146,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -144,6 +156,7 @@ def main() -> None:
         "trust_region": TRUST_REGION_VARIANTS,
         "rotation_only": ROTATION_ONLY_VARIANTS,
         "cycle_consistency": CYCLE_CONSISTENCY_VARIANTS,
+        "residual_trigger": RESIDUAL_TRIGGER_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
