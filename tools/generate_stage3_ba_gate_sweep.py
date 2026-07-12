@@ -106,6 +106,10 @@ ROTATION_TRUST_VARIANTS: dict[str, dict[str, Any]] = {
     "q6_se3_reliable05_rot01": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.1},
     "q7_se3_reliable05_rot005": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.05},
     "q8_se3_reliable10_rot01": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.1},
+    "q9_rotation_reliable10_rot02": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.2},
+    "q10_rotation_reliable10_rot01": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.1},
+    "q11_rotation_reliable10_rot005": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.05},
+    "q12_rotation_reliable10_rot002": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "rotation": 0.02},
 }
 
 SUBPIXEL_VARIANTS: dict[str, dict[str, Any]] = {
