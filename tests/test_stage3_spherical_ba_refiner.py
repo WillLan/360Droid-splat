@@ -124,6 +124,40 @@ def test_match_cache_reliability_fraction_keeps_top_ranked_per_edge() -> None:
         assert float(selected.min()) >= float(rejected.max())
 
 
+def test_match_cache_distinctiveness_margin_excludes_the_local_peak() -> None:
+    height, width = 8, 16
+    smooth = build_erp_ray_grid(height, width).permute(2, 0, 1)
+    feature = smooth.view(1, 1, 3, height, width).repeat(1, 2, 1, 1, 1)
+    depth = torch.full((1, 2, 1, height, width), 2.0)
+    query_uv = torch.tensor(
+        [[[[0.5, 2.5], [4.5, 2.5], [8.5, 4.5], [12.5, 4.5]]] * 2],
+        dtype=torch.float32,
+    )
+    local_margin = build_stage3_match_cache(
+        feature,
+        depth,
+        num_queries=4,
+        query_chunk_size=2,
+        query_uv=query_uv,
+        forward_backward=False,
+        use_spherical_area_correction=False,
+        distinctiveness_exclusion_deg=0.0,
+    )
+    independent_margin = build_stage3_match_cache(
+        feature,
+        depth,
+        num_queries=4,
+        query_chunk_size=2,
+        query_uv=query_uv,
+        forward_backward=False,
+        use_spherical_area_correction=False,
+        distinctiveness_exclusion_deg=45.0,
+    )
+    torch.testing.assert_close(independent_margin.target_uv, local_margin.target_uv)
+    assert bool((independent_margin.top2_margin >= local_margin.top2_margin).all())
+    assert bool((independent_margin.top2_margin > local_margin.top2_margin).any())
+
+
 def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:
     source = torch.linspace(1.0, 10.0, 100)
     target = 1.2 * source - 0.3

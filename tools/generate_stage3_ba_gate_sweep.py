@@ -84,6 +84,18 @@ RESIDUAL_TRIGGER_VARIANTS: dict[str, dict[str, Any]] = {
     "g10_se3_reliable05_gate028": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.28},
 }
 
+DISTINCTIVENESS_VARIANTS: dict[str, dict[str, Any]] = {
+    "d0_rotation_reliable05_exclusion0": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 0.0},
+    "d1_rotation_reliable05_exclusion1": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 1.0},
+    "d2_rotation_reliable05_exclusion2": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 2.0},
+    "d3_rotation_reliable05_exclusion5": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 5.0},
+    "d4_rotation_reliable05_exclusion10": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 10.0},
+    "d5_rotation_reliable10_exclusion2": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 2.0},
+    "d6_rotation_reliable10_exclusion5": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "exclusion": 5.0},
+    "d7_se3_reliable05_exclusion2": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "exclusion": 2.0},
+    "d8_se3_reliable05_exclusion5": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "exclusion": 5.0},
+}
+
 
 def generate(
     base_path: Path,
@@ -126,6 +138,8 @@ def generate(
             config["matching"]["fb_tolerance_deg"] = variant["fb"]
         if "trigger" in variant:
             config["ba"]["min_initial_median_residual_deg"] = variant["trigger"]
+        if "exclusion" in variant:
+            config["matching"]["distinctiveness_exclusion_deg"] = variant["exclusion"]
         config["matching"]["reliability_keep_fraction"] = variant["keep"]
         config_path = config_dir / f"{name}.yaml"
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -150,7 +164,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -161,6 +175,7 @@ def main() -> None:
         "rotation_only": ROTATION_ONLY_VARIANTS,
         "cycle_consistency": CYCLE_CONSISTENCY_VARIANTS,
         "residual_trigger": RESIDUAL_TRIGGER_VARIANTS,
+        "distinctiveness": DISTINCTIVENESS_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 

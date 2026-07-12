@@ -84,6 +84,7 @@ def build_stage3_match_cache(
     fb_tolerance_deg: float = 1.0,
     min_factor_weight: float = 0.01,
     reliability_keep_fraction: float = 1.0,
+    distinctiveness_exclusion_deg: float = 0.0,
     static_valid_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     query_uv: torch.Tensor | None = None,
@@ -169,6 +170,10 @@ def build_stage3_match_cache(
     keep_fraction = float(reliability_keep_fraction)
     if not 0.0 < keep_fraction <= 1.0:
         raise ValueError("reliability_keep_fraction must be in (0, 1].")
+    exclusion_deg = float(distinctiveness_exclusion_deg)
+    if not 0.0 <= exclusion_deg < 180.0:
+        raise ValueError("distinctiveness_exclusion_deg must be in [0, 180).")
+    exclusion_cosine = math.cos(math.radians(exclusion_deg))
 
     for batch_idx in range(batch):
         for edge_idx, pair in enumerate(edges.tolist()):
@@ -186,7 +191,20 @@ def build_stage3_match_cache(
                 target_ray[batch_idx, edge_idx, start:stop] = ray_grid[best]
                 top1_cosine[batch_idx, edge_idx, start:stop] = cosine.gather(1, best[:, None])[:, 0]
                 if int(values.shape[1]) > 1:
-                    top2_margin[batch_idx, edge_idx, start:stop] = values[:, 0] - values[:, 1]
+                    if exclusion_deg > 0.0:
+                        best_ray = ray_grid[best]
+                        inside_peak = (best_ray @ ray_grid.T) >= exclusion_cosine
+                        independent_second = logits.masked_fill(inside_peak, -torch.inf).amax(dim=-1)
+                        independent_second = torch.where(
+                            torch.isfinite(independent_second),
+                            independent_second,
+                            values[:, 1],
+                        )
+                        top2_margin[batch_idx, edge_idx, start:stop] = (
+                            values[:, 0] - independent_second
+                        )
+                    else:
+                        top2_margin[batch_idx, edge_idx, start:stop] = values[:, 0] - values[:, 1]
                 else:
                     top2_margin[batch_idx, edge_idx, start:stop] = values[:, 0]
                 entropy[batch_idx, edge_idx, start:stop] = -(
@@ -274,6 +292,7 @@ def build_stage3_match_cache(
             "fb_tolerance_deg": float(fb_tolerance_deg),
             "min_factor_weight": float(min_factor_weight),
             "reliability_keep_fraction": keep_fraction,
+            "distinctiveness_exclusion_deg": exclusion_deg,
             "static_validity_filter": static_valid_mask is not None,
         },
     )
