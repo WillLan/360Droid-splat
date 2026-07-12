@@ -8,6 +8,7 @@ the dense global Jacobian used by the older correctness-first solver.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import math
 from typing import Any
@@ -504,14 +505,24 @@ class BlockSparseSphericalBA:
         if self.pose_update_side not in {"left", "right"}:
             raise ValueError("pose_update_side must be 'left' or 'right'.")
         self.pose_dof_mode = str(pose_dof_mode).lower()
-        if self.pose_dof_mode not in {"se3", "rotation_only", "translation_only"}:
+        if self.pose_dof_mode not in {
+            "se3",
+            "rotation_only",
+            "translation_only",
+            "rotation_then_translation",
+        }:
             raise ValueError(
-                "pose_dof_mode must be 'se3', 'rotation_only', or 'translation_only'."
+                "pose_dof_mode must be 'se3', 'rotation_only', 'translation_only', "
+                "or 'rotation_then_translation'."
             )
         if self.pose_dof_mode != "se3" and self.pose_update_side != "right":
             raise ValueError(
                 f"pose_dof_mode='{self.pose_dof_mode}' requires pose_update_side='right' "
                 "for an unambiguous camera-local reduced-DOF update."
+            )
+        if self.pose_dof_mode == "rotation_then_translation" and self.dense_depth_mode != "none":
+            raise ValueError(
+                "pose_dof_mode='rotation_then_translation' requires dense_depth_mode='none'."
             )
         self.min_initial_median_residual_deg = max(
             0.0, float(min_initial_median_residual_deg)
@@ -530,6 +541,12 @@ class BlockSparseSphericalBA:
         batch, views = int(poses_c2w.shape[0]), int(poses_c2w.shape[1])
         if cache.batch_size != batch or cache.num_views != views:
             raise ValueError("BA inputs and match cache must share batch/view dimensions.")
+        if self.pose_dof_mode == "rotation_then_translation":
+            return self._run_rotation_then_translation(
+                poses_c2w,
+                dense_depth,
+                cache,
+            )
 
         output_poses: list[torch.Tensor] = []
         scales: list[torch.Tensor] = []
@@ -576,6 +593,55 @@ class BlockSparseSphericalBA:
             accepted=accepted_tensor,
             initial_median_residual_deg=torch.stack(initial_residuals),
             final_median_residual_deg=torch.stack(final_residuals),
+            diagnostics=diagnostics,
+        )
+
+    def _run_rotation_then_translation(
+        self,
+        poses_c2w: torch.Tensor,
+        dense_depth: torch.Tensor,
+        cache: Stage3MatchCache,
+    ) -> Stage3BAOutput:
+        rotation_solver = copy.copy(self)
+        rotation_solver.pose_dof_mode = "rotation_only"
+        translation_solver = copy.copy(self)
+        translation_solver.pose_dof_mode = "translation_only"
+        rotation = rotation_solver(poses_c2w, dense_depth, cache)
+        translation = translation_solver(rotation.poses_c2w, rotation.dense_depth, cache)
+        diagnostics: list[dict[str, Any]] = []
+        for index, (rotation_diag, translation_diag) in enumerate(
+            zip(rotation.diagnostics, translation.diagnostics, strict=True)
+        ):
+            combined = dict(translation_diag)
+            combined.update(
+                {
+                    "pose_dof_mode": "rotation_then_translation",
+                    "rotation_stage": rotation_diag,
+                    "translation_stage": translation_diag,
+                    "rotation_accepted": bool(rotation.accepted[index]),
+                    "translation_accepted": bool(translation.accepted[index]),
+                    "initial_objective": rotation_diag.get("initial_objective", float("nan")),
+                    "final_objective": translation_diag.get("final_objective", float("nan")),
+                    "accepted_steps": float(rotation_diag.get("accepted_steps", 0.0))
+                    + float(translation_diag.get("accepted_steps", 0.0)),
+                    "rotation_final_residual_deg": float(
+                        rotation.final_median_residual_deg[index].detach().cpu()
+                    ),
+                    "translation_final_residual_deg": float(
+                        translation.final_median_residual_deg[index].detach().cpu()
+                    ),
+                }
+            )
+            diagnostics.append(combined)
+        return Stage3BAOutput(
+            poses_c2w=translation.poses_c2w,
+            dense_depth=translation.dense_depth,
+            sparse_depth=translation.sparse_depth,
+            depth_scale=translation.depth_scale,
+            depth_shift=translation.depth_shift,
+            accepted=rotation.accepted | translation.accepted,
+            initial_median_residual_deg=rotation.initial_median_residual_deg,
+            final_median_residual_deg=translation.final_median_residual_deg,
             diagnostics=diagnostics,
         )
 

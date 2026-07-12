@@ -130,6 +130,14 @@ TRANSLATION_ONLY_VARIANTS: dict[str, dict[str, Any]] = {
     "u4_translation_reliable05_trans0005": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "translation_only", "translation": 0.0005},
 }
 
+STAGED_POSE_VARIANTS: dict[str, dict[str, Any]] = {
+    "m0_staged_reliable10_rot005_trans001": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_then_translation", "rotation": 0.05, "translation": 0.001},
+    "m1_staged_reliable10_rot005_trans0005": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_then_translation", "rotation": 0.05, "translation": 0.0005},
+    "m2_staged_reliable10_rot002_trans001": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_then_translation", "rotation": 0.02, "translation": 0.001},
+    "m3_staged_reliable05_rot005_trans001": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_then_translation", "rotation": 0.05, "translation": 0.001},
+    "m4_staged_reliable10_rot01_trans001": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_then_translation", "rotation": 0.10, "translation": 0.001},
+}
+
 
 def generate(
     base_path: Path,
@@ -202,7 +210,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust", "subpixel", "translation_only"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust", "subpixel", "translation_only", "staged_pose"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -217,6 +225,7 @@ def main() -> None:
         "rotation_trust": ROTATION_TRUST_VARIANTS,
         "subpixel": SUBPIXEL_VARIANTS,
         "translation_only": TRANSLATION_ONLY_VARIANTS,
+        "staged_pose": STAGED_POSE_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 

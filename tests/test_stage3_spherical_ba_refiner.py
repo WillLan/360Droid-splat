@@ -512,6 +512,31 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         rtol=0.0,
     )
 
+    staged_output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1e-6,
+        depth_prior_weight=1e-4,
+        max_pose_update_deg=0.05,
+        max_translation_update=0.001,
+        min_factors=8,
+        min_affine_support=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        gauge_mode="initial_baseline",
+        pose_update_side="right",
+        pose_dof_mode="rotation_then_translation",
+        lm_max_trials=8,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert bool(staged_output.accepted[0])
+    assert staged_output.diagnostics[0]["pose_dof_mode"] == "rotation_then_translation"
+    assert "rotation_stage" in staged_output.diagnostics[0]
+    assert "translation_stage" in staged_output.diagnostics[0]
+    assert bool(torch.isfinite(staged_output.poses_c2w).all())
+
     gated_output = BlockSparseSphericalBA(
         iterations=8,
         min_factors=8,
