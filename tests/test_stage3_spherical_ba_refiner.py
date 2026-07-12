@@ -26,7 +26,7 @@ from models.spherical_selfi_stage3_ba import (
     all_directed_pairs,
     build_stage3_match_cache,
 )
-from geometry.spherical_erp import build_erp_ray_grid
+from geometry.spherical_erp import build_erp_ray_grid, erp_pixel_to_unit_ray
 from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate as generate_ablation_configs
@@ -156,6 +156,43 @@ def test_match_cache_distinctiveness_margin_excludes_the_local_peak() -> None:
     torch.testing.assert_close(independent_margin.target_uv, local_margin.target_uv)
     assert bool((independent_margin.top2_margin >= local_margin.top2_margin).all())
     assert bool((independent_margin.top2_margin > local_margin.top2_margin).any())
+
+
+def test_match_cache_subpixel_refinement_reduces_smooth_bearing_quantization() -> None:
+    height, width = 16, 32
+    smooth = build_erp_ray_grid(height, width).permute(2, 0, 1)
+    feature = smooth.view(1, 1, 3, height, width).repeat(1, 2, 1, 1, 1)
+    depth = torch.full((1, 2, 1, height, width), 2.0)
+    query_uv = torch.tensor([[[[4.2, 6.2]], [[4.2, 6.2]]]], dtype=torch.float32)
+    discrete = build_stage3_match_cache(
+        feature,
+        depth,
+        num_queries=1,
+        query_chunk_size=1,
+        query_uv=query_uv,
+        forward_backward=False,
+        use_spherical_area_correction=False,
+        subpixel_refine_radius=0,
+    )
+    refined = build_stage3_match_cache(
+        feature,
+        depth,
+        num_queries=1,
+        query_chunk_size=1,
+        query_uv=query_uv,
+        forward_backward=False,
+        use_spherical_area_correction=False,
+        subpixel_refine_radius=1,
+    )
+    expected_ray = erp_pixel_to_unit_ray(query_uv[:, :1], height, width)[0, 0, 0]
+    discrete_error = torch.acos(
+        (discrete.target_ray[0, 0, 0] * expected_ray).sum().clamp(-1.0, 1.0)
+    )
+    refined_error = torch.acos(
+        (refined.target_ray[0, 0, 0] * expected_ray).sum().clamp(-1.0, 1.0)
+    )
+    assert float(refined_error) < float(discrete_error)
+    assert 0.0 <= float(refined.target_uv[0, 0, 0, 0]) < width
 
 
 def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:

@@ -22,6 +22,7 @@ from geometry.spherical_erp import (
     build_erp_ray_grid,
     erp_pixel_to_unit_ray,
     sample_erp_with_wrap,
+    unit_ray_to_erp_pixel,
 )
 from geometry.spherical_pseudo_correspondence import _sample_depth_filtered_fibonacci_uv
 
@@ -85,6 +86,7 @@ def build_stage3_match_cache(
     min_factor_weight: float = 0.01,
     reliability_keep_fraction: float = 1.0,
     distinctiveness_exclusion_deg: float = 0.0,
+    subpixel_refine_radius: int = 0,
     static_valid_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     query_uv: torch.Tensor | None = None,
@@ -174,6 +176,17 @@ def build_stage3_match_cache(
     if not 0.0 <= exclusion_deg < 180.0:
         raise ValueError("distinctiveness_exclusion_deg must be in [0, 180).")
     exclusion_cosine = math.cos(math.radians(exclusion_deg))
+    refine_radius = int(subpixel_refine_radius)
+    if refine_radius < 0 or refine_radius > 4:
+        raise ValueError("subpixel_refine_radius must be in [0, 4].")
+    if refine_radius > 0:
+        offset_y, offset_x = torch.meshgrid(
+            torch.arange(-refine_radius, refine_radius + 1, device=device),
+            torch.arange(-refine_radius, refine_radius + 1, device=device),
+            indexing="ij",
+        )
+        local_offset_y = offset_y.reshape(1, -1)
+        local_offset_x = offset_x.reshape(1, -1)
 
     for batch_idx in range(batch):
         for edge_idx, pair in enumerate(edges.tolist()):
@@ -187,8 +200,33 @@ def build_stage3_match_cache(
                 probability = torch.softmax(logits, dim=-1)
                 values, indices = torch.topk(logits, k=min(2, int(logits.shape[-1])), dim=-1)
                 best = indices[:, 0]
-                target_uv[batch_idx, edge_idx, start:stop] = uv_grid[best]
-                target_ray[batch_idx, edge_idx, start:stop] = ray_grid[best]
+                if refine_radius > 0:
+                    best_row = torch.div(best, width, rounding_mode="floor")[:, None]
+                    best_col = (best % width)[:, None]
+                    raw_row = best_row + local_offset_y
+                    local_valid = (raw_row >= 0) & (raw_row < height)
+                    local_row = raw_row.clamp(0, height - 1)
+                    local_col = (best_col + local_offset_x).remainder(width)
+                    local_index = local_row * width + local_col
+                    local_logits = logits.gather(1, local_index).masked_fill(
+                        ~local_valid,
+                        -torch.inf,
+                    )
+                    local_weight = torch.softmax(local_logits, dim=-1)
+                    refined_ray = F.normalize(
+                        (local_weight[..., None] * ray_grid[local_index]).sum(dim=1),
+                        dim=-1,
+                        eps=1.0e-8,
+                    )
+                    target_ray[batch_idx, edge_idx, start:stop] = refined_ray
+                    target_uv[batch_idx, edge_idx, start:stop] = unit_ray_to_erp_pixel(
+                        refined_ray,
+                        height,
+                        width,
+                    )
+                else:
+                    target_uv[batch_idx, edge_idx, start:stop] = uv_grid[best]
+                    target_ray[batch_idx, edge_idx, start:stop] = ray_grid[best]
                 top1_cosine[batch_idx, edge_idx, start:stop] = cosine.gather(1, best[:, None])[:, 0]
                 if int(values.shape[1]) > 1:
                     if exclusion_deg > 0.0:
@@ -293,6 +331,7 @@ def build_stage3_match_cache(
             "min_factor_weight": float(min_factor_weight),
             "reliability_keep_fraction": keep_fraction,
             "distinctiveness_exclusion_deg": exclusion_deg,
+            "subpixel_refine_radius": refine_radius,
             "static_validity_filter": static_valid_mask is not None,
         },
     )

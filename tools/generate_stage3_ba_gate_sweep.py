@@ -108,6 +108,16 @@ ROTATION_TRUST_VARIANTS: dict[str, dict[str, Any]] = {
     "q8_se3_reliable10_rot01": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "rotation": 0.1},
 }
 
+SUBPIXEL_VARIANTS: dict[str, dict[str, Any]] = {
+    "s0_rotation_reliable05_radius0": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "subpixel": 0},
+    "s1_rotation_reliable05_radius1": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "subpixel": 1},
+    "s2_rotation_reliable05_radius2": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "subpixel": 2},
+    "s3_rotation_reliable10_radius1": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "subpixel": 1},
+    "s4_rotation_reliable10_radius2": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "subpixel": 2},
+    "s5_se3_reliable05_radius1": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "subpixel": 1},
+    "s6_se3_reliable05_radius2": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "subpixel": 2},
+}
+
 
 def generate(
     base_path: Path,
@@ -154,6 +164,8 @@ def generate(
             config["ba"]["min_initial_median_residual_deg"] = variant["trigger"]
         if "exclusion" in variant:
             config["matching"]["distinctiveness_exclusion_deg"] = variant["exclusion"]
+        if "subpixel" in variant:
+            config["matching"]["subpixel_refine_radius"] = variant["subpixel"]
         config["matching"]["reliability_keep_fraction"] = variant["keep"]
         config_path = config_dir / f"{name}.yaml"
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -178,7 +190,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency", "residual_trigger", "distinctiveness", "rotation_trust", "subpixel"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -191,6 +203,7 @@ def main() -> None:
         "residual_trigger": RESIDUAL_TRIGGER_VARIANTS,
         "distinctiveness": DISTINCTIVENESS_VARIANTS,
         "rotation_trust": ROTATION_TRUST_VARIANTS,
+        "subpixel": SUBPIXEL_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 

@@ -133,6 +133,7 @@ def default_config() -> dict[str, Any]:
             "use_spherical_area_correction": True,
             "reliability_keep_fraction": 1.0,
             "distinctiveness_exclusion_deg": 0.0,
+            "subpixel_refine_radius": 0,
         },
         "ba": {
             "outer_schedule": [True, False, False],
@@ -610,6 +611,7 @@ def _build_match_cache(
         min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
         reliability_keep_fraction=float(cfg.get("reliability_keep_fraction", 1.0)),
         distinctiveness_exclusion_deg=float(cfg.get("distinctiveness_exclusion_deg", 0.0)),
+        subpixel_refine_radius=int(cfg.get("subpixel_refine_radius", 0)),
         static_valid_mask=static_valid_mask,
         generator=generator,
     )

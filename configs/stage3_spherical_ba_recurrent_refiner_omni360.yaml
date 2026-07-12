@@ -90,6 +90,7 @@ matching:
   min_factor_weight: 0.01
   reliability_keep_fraction: 1.0
   distinctiveness_exclusion_deg: 0.0
+  subpixel_refine_radius: 0
 
 ba:
   outer_schedule: [true, false, false]
