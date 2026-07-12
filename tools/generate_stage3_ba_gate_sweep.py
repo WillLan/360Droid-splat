@@ -59,6 +59,17 @@ ROTATION_ONLY_VARIANTS: dict[str, dict[str, Any]] = {
     "r5_rotation_reliable05": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
 }
 
+CYCLE_CONSISTENCY_VARIANTS: dict[str, dict[str, Any]] = {
+    "c0_rotation_fb1": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 1.0},
+    "c1_rotation_fb05": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 0.5},
+    "c2_rotation_fb025": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 0.25},
+    "c3_rotation_fb01": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 0.1},
+    "c4_rotation_fb05_reliable50": {"keep": 0.5, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 0.5},
+    "c5_rotation_fb025_reliable50": {"keep": 0.5, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "fb": 0.25},
+    "c6_se3_fb05_trans001": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "fb": 0.5, "translation": 0.001},
+    "c7_se3_fb025_trans001": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "fb": 0.25, "translation": 0.001},
+}
+
 
 def generate(
     base_path: Path,
@@ -96,6 +107,9 @@ def generate(
             config["ba"]["max_translation_update"] = variant["translation"]
         if "iterations" in variant:
             config["ba"]["iterations"] = variant["iterations"]
+        if "fb" in variant:
+            config["matching"]["forward_backward"] = True
+            config["matching"]["fb_tolerance_deg"] = variant["fb"]
         config["matching"]["reliability_keep_fraction"] = variant["keep"]
         config_path = config_dir / f"{name}.yaml"
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -120,7 +134,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region", "rotation_only"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only", "cycle_consistency"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -129,6 +143,7 @@ def main() -> None:
         "high_parallax": HIGH_PARALLAX_VARIANTS,
         "trust_region": TRUST_REGION_VARIANTS,
         "rotation_only": ROTATION_ONLY_VARIANTS,
+        "cycle_consistency": CYCLE_CONSISTENCY_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
