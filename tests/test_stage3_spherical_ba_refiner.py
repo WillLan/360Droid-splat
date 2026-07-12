@@ -29,7 +29,11 @@ from geometry.spherical_erp import build_erp_ray_grid
 from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate as generate_ablation_configs
-from tools.generate_stage3_ba_gate_sweep import VARIANTS, generate as generate_gate_sweep
+from tools.generate_stage3_ba_gate_sweep import (
+    HIGH_PARALLAX_VARIANTS,
+    VARIANTS,
+    generate as generate_gate_sweep,
+)
 from tools.summarize_stage3_ba_ablation import summarize_checkpoint
 from tools.evaluate_stage3_ba import evaluate
 
@@ -513,6 +517,15 @@ def test_ba_gate_sweep_generator_keeps_solver_fixed(tmp_path: Path) -> None:
         assert config["ba"]["gauge_mode"] == "initial_baseline"
         assert config["ba"]["solver_mode"] == "standard_lm"
         assert config["matching"]["reliability_keep_fraction"] == variant["keep"]
+
+    parallax_suite = tmp_path / "parallax_sweep"
+    parallax_manifest = generate_gate_sweep(
+        root / "configs" / "stage3_spherical_ba_recurrent_refiner_omni360.yaml",
+        parallax_suite,
+        variants=HIGH_PARALLAX_VARIANTS,
+    )
+    assert len(parallax_manifest["variants"]) == len(HIGH_PARALLAX_VARIANTS)
+    assert all(float(variant["parallax"]) >= 2.0 for variant in parallax_manifest["variants"])
 
 
 def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
