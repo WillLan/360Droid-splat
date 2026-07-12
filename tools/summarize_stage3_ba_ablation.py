@@ -36,7 +36,7 @@ def _number(metrics: dict[str, Any], key: str) -> float | None:
 def summarize_checkpoint(checkpoint: Path, *, name: str) -> dict[str, Any]:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     metrics = dict(payload.get("metrics", {}))
-    config = dict(payload.get("config", {}))
+    config = dict(payload.get("training_config", payload.get("config", {})))
     ba_config = dict(config.get("ba", {}))
     row: dict[str, Any] = {
         "name": name,

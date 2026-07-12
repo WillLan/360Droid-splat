@@ -401,7 +401,7 @@ def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
     torch.save(
         {
             "global_step": 200,
-            "config": {
+            "training_config": {
                 "ba": {
                     "dense_depth_mode": "none",
                     "gauge_mode": "initial_baseline",
