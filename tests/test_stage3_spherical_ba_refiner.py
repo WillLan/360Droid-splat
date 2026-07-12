@@ -29,6 +29,7 @@ from geometry.spherical_erp import build_erp_ray_grid
 from frontend.pano_droid.spherical_ba import se3_exp
 from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate
+from tools.summarize_stage3_ba_ablation import summarize_checkpoint
 
 
 def _observation(*, views: int = 3, height: int = 8, width: int = 16):
@@ -393,6 +394,36 @@ def test_ba_ablation_generator_changes_only_declared_solver_axes(tmp_path: Path)
         assert config["train"]["max_steps"] == 200
         assert config["WeightsAndBiases"]["enabled"] is True
         assert config["Visualization"]["enabled"] is True
+
+
+def test_ba_ablation_summary_uses_validation_snapshots(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "latest.pt"
+    torch.save(
+        {
+            "global_step": 200,
+            "config": {
+                "ba": {
+                    "dense_depth_mode": "none",
+                    "gauge_mode": "initial_baseline",
+                    "solver_mode": "standard_lm",
+                }
+            },
+            "metrics": {
+                "val/initial/pose_scale_aligned_ate": 0.10,
+                "val/ba0/pose_scale_aligned_ate": 0.08,
+                "val/refine3/pose_scale_aligned_ate": 0.08,
+                "val/initial/loo_psnr": 10.0,
+                "val/ba0/loo_psnr": 10.2,
+                "val/refine3/loo_psnr": 11.0,
+            },
+        },
+        checkpoint,
+    )
+    row = summarize_checkpoint(checkpoint, name="combined")
+    assert row["step"] == 200
+    assert row["dense_depth_mode"] == "none"
+    assert abs(row["ba0_delta_pose_scale_aligned_ate"] + 0.02) < 1.0e-8
+    assert abs(row["ba0_delta_loo_psnr"] - 0.2) < 1.0e-8
 
 
 def test_pose_metric_is_zero_for_identical_poses() -> None:
