@@ -78,6 +78,10 @@ RESIDUAL_TRIGGER_VARIANTS: dict[str, dict[str, Any]] = {
     "g4_rotation_reliable10_gate026": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.26},
     "g5_rotation_reliable10_gate028": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.28},
     "g6_rotation_reliable10_gate030": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.30},
+    "g7_rotation_reliable05_gate026": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.26},
+    "g8_rotation_reliable05_gate028": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.28},
+    "g9_rotation_reliable05_gate030": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only", "trigger": 0.30},
+    "g10_se3_reliable05_gate028": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "se3", "translation": 0.001, "trigger": 0.28},
 }
 
 
