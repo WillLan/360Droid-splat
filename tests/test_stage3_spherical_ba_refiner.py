@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from losses.spherical_stage3_refinement_loss import (
@@ -255,6 +256,11 @@ def test_right_local_rotation_keeps_camera_center_fixed() -> None:
     assert not torch.allclose(left_updated[:3, 3], pose[:3, 3])
 
 
+def test_rotation_only_ba_requires_right_local_updates() -> None:
+    with pytest.raises(ValueError, match="requires pose_update_side='right'"):
+        BlockSparseSphericalBA(pose_update_side="left", pose_dof_mode="rotation_only")
+
+
 def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:
     height, width = 6, 12
     query_count = height * width
@@ -378,6 +384,33 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
     assert right_output.diagnostics[0]["final_objective"] < right_output.diagnostics[0]["initial_objective"]
     right_baseline = (right_output.poses_c2w[0, 1, :3, 3] - right_output.poses_c2w[0, 0, :3, 3]).norm()
     torch.testing.assert_close(right_baseline, initial_baseline, atol=2e-6, rtol=0.0)
+
+    rotation_only_output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1e-6,
+        depth_prior_weight=1e-4,
+        max_pose_update_deg=10.0,
+        min_factors=8,
+        min_affine_support=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        gauge_mode="initial_baseline",
+        pose_update_side="right",
+        pose_dof_mode="rotation_only",
+        lm_max_trials=8,
+    )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
+    assert bool(rotation_only_output.accepted[0])
+    assert rotation_only_output.diagnostics[0]["final_objective"] < rotation_only_output.diagnostics[0]["initial_objective"]
+    torch.testing.assert_close(
+        rotation_only_output.poses_c2w[0, :, :3, 3],
+        poses_initial[:, :3, 3],
+        atol=1e-7,
+        rtol=0.0,
+    )
 
 
 def test_block_sparse_ba_rejects_antipodal_factor() -> None:

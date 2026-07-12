@@ -405,6 +405,7 @@ class BlockSparseSphericalBA:
         max_initial_residual_deg: float | None = None,
         min_parallax_deg: float = 0.0,
         pose_update_side: str = "left",
+        pose_dof_mode: str = "se3",
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -443,6 +444,14 @@ class BlockSparseSphericalBA:
         self.pose_update_side = str(pose_update_side).lower()
         if self.pose_update_side not in {"left", "right"}:
             raise ValueError("pose_update_side must be 'left' or 'right'.")
+        self.pose_dof_mode = str(pose_dof_mode).lower()
+        if self.pose_dof_mode not in {"se3", "rotation_only"}:
+            raise ValueError("pose_dof_mode must be 'se3' or 'rotation_only'.")
+        if self.pose_dof_mode == "rotation_only" and self.pose_update_side != "right":
+            raise ValueError(
+                "pose_dof_mode='rotation_only' requires pose_update_side='right' so "
+                "camera centers remain fixed under a pure local rotation."
+            )
 
     def __call__(
         self,
@@ -590,6 +599,14 @@ class BlockSparseSphericalBA:
         initial_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         initial_median = float(torch.rad2deg(initial_angle).median().detach().cpu())
         pose_dim = max(0, (views - 1) * 6)
+        if self.pose_dof_mode == "rotation_only":
+            active_pose_index = torch.tensor(
+                [frame * 6 + axis for frame in range(max(0, views - 1)) for axis in range(3, 6)],
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            active_pose_index = torch.arange(pose_dim, device=device, dtype=torch.long)
         depth_dim = views * query_count
         failed_reason: str | None = None
         current_damping = min(
@@ -707,38 +724,57 @@ class BlockSparseSphericalBA:
             gauge_jacobian = self._baseline_gauge_jacobian(cur_pose, poses)
 
             def solve_step(damping: float, *, diagonal: bool) -> tuple[torch.Tensor, torch.Tensor] | None:
-                if pose_dim:
+                active_pose_dim = int(active_pose_index.numel())
+                if active_pose_dim:
+                    active_hpp = hpp.index_select(0, active_pose_index).index_select(1, active_pose_index)
+                    active_gp = gp.index_select(0, active_pose_index)
+                    active_hpd = hpd.index_select(1, active_pose_index)
+                    active_pose_diagonal = pose_diagonal.index_select(0, active_pose_index)
                     if diagonal:
-                        damped_hpp = hpp + torch.diag(pose_diagonal * float(damping))
+                        damped_hpp = active_hpp + torch.diag(active_pose_diagonal * float(damping))
                     else:
-                        damped_hpp = hpp + torch.eye(pose_dim, device=device) * float(damping)
+                        damped_hpp = active_hpp + torch.eye(active_pose_dim, device=device) * float(damping)
                 else:
-                    damped_hpp = hpp
+                    damped_hpp = hpp.new_zeros((0, 0))
+                    active_gp = gp.new_zeros(0)
+                    active_hpd = hpd.new_zeros((depth_dim, 0))
                 damped_hdd = hdd + (
                     depth_diagonal * float(damping)
                     if diagonal
                     else torch.full_like(hdd, float(damping))
                 )
                 inv_hdd = damped_hdd.clamp_min(1.0e-12).reciprocal()
-                schur = damped_hpp - hpd.transpose(0, 1) @ (inv_hdd[:, None] * hpd)
-                rhs = gp - hpd.transpose(0, 1) @ (inv_hdd * gd)
+                schur = damped_hpp - active_hpd.transpose(0, 1) @ (inv_hdd[:, None] * active_hpd)
+                rhs = active_gp - active_hpd.transpose(0, 1) @ (inv_hdd * gd)
+                active_gauge_jacobian = None
+                if gauge_jacobian is not None and active_pose_dim:
+                    candidate_gauge = gauge_jacobian.index_select(0, active_pose_index)
+                    if float(candidate_gauge.norm()) > 1.0e-10:
+                        active_gauge_jacobian = candidate_gauge
                 try:
-                    if pose_dim and gauge_jacobian is not None:
+                    if active_pose_dim and active_gauge_jacobian is not None:
                         kkt = torch.zeros(
-                            pose_dim + 1,
-                            pose_dim + 1,
+                            active_pose_dim + 1,
+                            active_pose_dim + 1,
                             device=device,
                             dtype=torch.float32,
                         )
-                        kkt[:pose_dim, :pose_dim] = schur
-                        kkt[:pose_dim, pose_dim] = gauge_jacobian
-                        kkt[pose_dim, :pose_dim] = gauge_jacobian
+                        kkt[:active_pose_dim, :active_pose_dim] = schur
+                        kkt[:active_pose_dim, active_pose_dim] = active_gauge_jacobian
+                        kkt[active_pose_dim, :active_pose_dim] = active_gauge_jacobian
                         kkt_rhs = torch.cat([-rhs, rhs.new_zeros(1)], dim=0)
-                        pose_step = torch.linalg.solve(kkt, kkt_rhs)[:pose_dim]
+                        active_pose_step = torch.linalg.solve(kkt, kkt_rhs)[:active_pose_dim]
                     else:
-                        pose_step = -torch.linalg.solve(schur, rhs) if pose_dim else torch.zeros(0, device=device)
+                        active_pose_step = (
+                            -torch.linalg.solve(schur, rhs)
+                            if active_pose_dim
+                            else torch.zeros(0, device=device)
+                        )
                 except RuntimeError:
                     return None
+                pose_step = torch.zeros(pose_dim, device=device, dtype=torch.float32)
+                if active_pose_dim:
+                    pose_step.index_copy_(0, active_pose_index, active_pose_step)
                 depth_step = -(gd + hpd @ pose_step) * inv_hdd
                 if not torch.isfinite(depth_step).all() or not torch.isfinite(pose_step).all():
                     return None
@@ -961,6 +997,7 @@ class BlockSparseSphericalBA:
             "dense_depth_mode": self.dense_depth_mode,
             "gauge_mode": self.gauge_mode,
             "pose_update_side": self.pose_update_side,
+            "pose_dof_mode": self.pose_dof_mode,
             "gain_ratio_mean": float(sum(gain_ratios) / len(gain_ratios)) if gain_ratios else float("nan"),
             "gauge_scale_mean": float(sum(gauge_scales) / len(gauge_scales)) if gauge_scales else 1.0,
             "gauge_scale_min": min(gauge_scales) if gauge_scales else 1.0,

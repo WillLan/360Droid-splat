@@ -50,6 +50,15 @@ TRUST_REGION_VARIANTS: dict[str, dict[str, Any]] = {
     "t12_right_reliable10_iter1": {"keep": 0.1, "residual": None, "parallax": 0.0, "side": "right", "translation": 0.05, "iterations": 1},
 }
 
+ROTATION_ONLY_VARIANTS: dict[str, dict[str, Any]] = {
+    "r0_rotation_all": {"keep": 1.0, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+    "r1_rotation_reliable75": {"keep": 0.75, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+    "r2_rotation_reliable50": {"keep": 0.50, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+    "r3_rotation_reliable25": {"keep": 0.25, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+    "r4_rotation_reliable10": {"keep": 0.10, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+    "r5_rotation_reliable05": {"keep": 0.05, "residual": None, "parallax": 0.0, "side": "right", "dof": "rotation_only"},
+}
+
 
 def generate(
     base_path: Path,
@@ -81,6 +90,8 @@ def generate(
         )
         if "side" in variant:
             config["ba"]["pose_update_side"] = variant["side"]
+        if "dof" in variant:
+            config["ba"]["pose_dof_mode"] = variant["dof"]
         if "translation" in variant:
             config["ba"]["max_translation_update"] = variant["translation"]
         if "iterations" in variant:
@@ -109,7 +120,7 @@ def main() -> None:
     parser.add_argument("--suite-dir", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=("reliability", "high_parallax", "trust_region"),
+        choices=("reliability", "high_parallax", "trust_region", "rotation_only"),
         default="reliability",
     )
     args = parser.parse_args()
@@ -117,6 +128,7 @@ def main() -> None:
         "reliability": VARIANTS,
         "high_parallax": HIGH_PARALLAX_VARIANTS,
         "trust_region": TRUST_REGION_VARIANTS,
+        "rotation_only": ROTATION_ONLY_VARIANTS,
     }[args.profile]
     print(json.dumps(generate(args.base, args.suite_dir, variants=variants), indent=2))
 
