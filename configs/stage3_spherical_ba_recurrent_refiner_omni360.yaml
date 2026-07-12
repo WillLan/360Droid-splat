@@ -1,0 +1,169 @@
+stage: 3
+task: spherical_ba_recurrent_gaussian_refiner
+experiment_name: stage3_spherical_ba_recurrent_refiner_omni360_fullres_20k
+
+stage3:
+  enabled: true
+
+image:
+  height: 504
+  width: 1008
+  head_height: 504
+  head_width: 1008
+
+panovggt:
+  synthetic: false
+  repo_path: /mnt/disk1/lanboyang/Project/PanoVGGT
+  config_path: /mnt/disk1/lanboyang/Project/PanoVGGT/training/config/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/PanoVGGT/checkpoints/model.pt
+  class_path: panovggt.models.panovggt_model.PanoVGGTModel
+  model_kwargs: {}
+  freeze: true
+  use_no_grad: true
+  strict_checkpoint: false
+  skip_dinov2_pretrain: true
+  pose_convention: c2w
+  depth_convention: euclidean_ray_depth
+  stage_hooks:
+    - aggregator.decoder.8
+    - aggregator.decoder.16
+    - aggregator.decoder.24
+    - aggregator.decoder.34
+  feature_keys: [null, null, null, null]
+  token_hw: [[36, 72], [36, 72], [36, 72], [36, 72]]
+  token_start_idx: [5, 5, 5, 5]
+  in_channels: [1024, 1024, 1024, 1024]
+
+adapter_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage1_selfi_adapter_airsim_dtw_nyc_fullres_spherical_ce_depth20_ddp2/checkpoints/best_val_angular_error.pt
+  sha256: 95cdbb5404acba8654e868335ede6a00c281451d7ef7c104d3a10f63fc3730b9
+  strict: true
+
+stage2_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage2_selfi_joint_gpu03_20260712_20k_r1/stage2_selfi_omniscene_joint_fullres_s4_ddp2_effbs4_20k_gpu03_20260712_r1/checkpoints/best_val_psnr.pt
+  sha256: ab9aaa0a301fe8d601dde43ed7b0cedb37fbf1e3cf1b58c75f7bcc76227be850
+  required: true
+
+head:
+  feature_dim: 24
+  channels: [32, 64, 128, 256]
+  mlp_hidden_dim: 64
+  rgb_sh_degree: 2
+  density_sh_degree: 1
+  depth_residual_ratio: 0.25
+  initial_opacity: 0.10
+  min_depth: 1.0e-4
+  min_scale: 1.0e-5
+  max_scale_ratio: 0.25
+  latitude_cos_min: 1.0e-3
+  log_scale_clamp: 5.0
+  render_prune_fraction: 0.30
+  gradient_checkpointing: true
+
+dataset:
+  synthetic: false
+  root: /mnt/disk1/lanboyang/Datasets/Airsim360/Omni360-Scene
+  pose_root: /mnt/disk1/lanboyang/Datasets/Airsim360/UE_Raw_sample_pts
+  scenes: [DTW, NYC]
+  views_per_sample: 4
+  stride_min: 2
+  stride_max: 6
+  validation_fraction: 0.10
+  depth_format: euclidean_range
+  depth_scale: 1.0
+  depth_invalid_value: 1000.0
+  pose_coordinate_system: ue_airsim
+  pose_translation_scale: 0.01
+  max_train_samples: null
+  max_val_samples: 1000
+
+matching:
+  num_queries: 2048
+  min_depth: 0.05
+  max_depth: 20.0
+  temperature: 0.07
+  query_chunk_size: 32
+  fibonacci_oversample_factor: 8
+  use_spherical_area_correction: true
+
+ba:
+  iterations: 3
+  damping: 1.0e-4
+  huber_delta_deg: 0.5
+  pose_prior_weight: 1.0e-3
+  depth_prior_weight: 1.0e-2
+  max_pose_update_deg: 5.0
+  max_translation_update: 0.05
+  max_logdepth_update: 0.35
+  factor_chunk_size: 2048
+  min_factors: 256
+  residual_worse_tolerance: 1.05
+  min_affine_support: 64
+
+refiner:
+  adapter_dim: 24
+  hidden_dim: 32
+  use_resnet_error: true
+  pretrained_resnet: true
+  alpha_threshold: 0.05
+  depth_abs_threshold: 0.10
+  depth_rel_threshold: 0.05
+  profile_synchronize_cuda: false
+
+loss:
+  stage_weights: [0.64, 0.80, 1.0]
+  dssim: 0.2
+  geometry: 0.05
+  depth_anchor: 1.0e-3
+  update_regularization: 1.0e-4
+
+renderer:
+  backend: gsplat360
+  extra_gsplat360_roots: []
+
+train:
+  batch_size: 1
+  gradient_accumulation_steps: 2
+  ddp: true
+  ddp_backend: nccl
+  num_workers: 4
+  feature_device: auto
+  train_device: auto
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 20000
+  amp: true
+  grad_clip: 1.0
+  diagnostics_interval: 200
+  log_interval: 50
+  val_interval: 1000
+  max_val_batches: 8
+  save_interval: 1000
+  output_dir: outputs/stage3_spherical_ba_recurrent_refiner_omni360_fullres_20k
+  resume: null
+  seed: 1234
+
+Training:
+  pfgs360_packed: false
+  pfgs360_render_mode: RGB+ED
+  pfgs360_near_plane: 0.01
+  pfgs360_far_plane: 1.0e5
+  pfgs360_radius_clip: 0.0
+  pfgs360_absgrad: true
+  pfgs360_distloss: false
+  pfgs360_rasterize_mode: antialiased
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  entity: null
+  run_name: stage3_spherical_ba_recurrent_refiner_omni360_fullres_20k
+  mode: online
+  log_every: 50
+  tags: [stage3, spherical-ba, resplat-style, per-pixel-gaussian, omni360]
+
+Visualization:
+  enabled: true
+  interval: 200
+  save_dir: visualizations

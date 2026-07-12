@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+from losses.spherical_stage3_refinement_loss import aligned_pose_metrics, build_ba_support_map
+from models.spherical_recurrent_gaussian_refiner import (
+    ReSplatErrorEncoder,
+    SphericalErrorRouter,
+    SphericalRecurrentGaussianRefiner,
+    quaternion_exp_map,
+    quaternion_log_map,
+)
+from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
+from models.spherical_selfi_stage3_ba import (
+    BlockSparseSphericalBA,
+    Stage3MatchCache,
+    _weighted_affine_fit,
+    all_directed_pairs,
+    build_stage3_match_cache,
+)
+from training.train_spherical_ba_recurrent_refiner import default_config, train
+
+
+def _observation(*, views: int = 3, height: int = 8, width: int = 16):
+    torch.manual_seed(4)
+    feature = torch.randn(1, views, 24, height, width)
+    image = torch.rand(1, views, 3, height, width)
+    depth = torch.ones(1, views, 1, height, width) * 2.0
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, views, 1, 1)
+    poses[0, :, 0, 3] = torch.arange(views).float() * 0.05
+    head = SphericalSelfiGaussianHead(channels=(8, 16, 24, 32), mlp_hidden_dim=16)
+    return head(feature, image, depth, poses), feature, image
+
+
+def test_observation_functional_update_preserves_provenance_and_recomputes_confidence() -> None:
+    observation, _, _ = _observation()
+    density = observation.density_sh.clone()
+    density[:, :, 0] += 1.0
+    updated = observation.with_updates(
+        refined_depth=observation.refined_depth * 1.1,
+        density_sh=density,
+    )
+    assert updated.source_uv.data_ptr() == observation.source_uv.data_ptr()
+    assert updated.source_ray.data_ptr() == observation.source_ray.data_ptr()
+    assert updated.frame_ids.data_ptr() == observation.frame_ids.data_ptr()
+    assert updated.canonical_count == observation.canonical_count
+    assert bool((updated.confidence > observation.confidence).all())
+
+
+def test_all_directed_pairs_and_global_match_contract() -> None:
+    observation, feature, _ = _observation(views=4, height=4, width=8)
+    query_uv = torch.tensor([[[[0.5, 0.5], [3.5, 2.5]]] * 4], dtype=torch.float32)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=2,
+        query_chunk_size=1,
+        query_uv=query_uv,
+    )
+    assert cache.edges.shape == (12, 2)
+    assert torch.equal(cache.edges, all_directed_pairs(4))
+    assert cache.target_uv.shape == (1, 12, 2, 2)
+    assert cache.source_uv.shape == (1, 4, 2, 2)
+    assert cache.num_factors == 24
+    assert bool(torch.isfinite(cache.entropy).all())
+
+
+def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:
+    source = torch.linspace(1.0, 10.0, 100)
+    target = 1.2 * source - 0.3
+    target[-1] = 50.0
+    scale, shift = _weighted_affine_fit(source, target, torch.ones_like(source), median_depth=5.5)
+    torch.testing.assert_close(scale, torch.tensor(1.2), atol=2e-2, rtol=0.0)
+    torch.testing.assert_close(shift, torch.tensor(-0.3), atol=8e-2, rtol=0.0)
+
+
+def test_block_sparse_ba_returns_finite_dense_contract() -> None:
+    observation, feature, _ = _observation(views=3)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=3,
+        query_chunk_size=2,
+        generator=torch.Generator().manual_seed(1),
+    )
+    solver = BlockSparseSphericalBA(iterations=1, min_factors=1, min_affine_support=2, factor_chunk_size=4)
+    output = solver(observation.poses_c2w, observation.refined_depth, cache)
+    assert output.dense_depth.shape == observation.refined_depth.shape
+    assert output.sparse_depth.shape == (1, 3, 3)
+    assert output.depth_scale.shape == (1, 3)
+    assert bool(torch.isfinite(output.dense_depth).all())
+    assert bool((output.dense_depth > 0).all())
+
+
+def test_block_sparse_ba_rejects_antipodal_factor() -> None:
+    observation, _, _ = _observation(views=2)
+    source_uv = torch.tensor([[[[0.5, 4.5]], [[0.5, 4.5]]]])
+    source_ray = torch.tensor([[[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]]])
+    cache = Stage3MatchCache(
+        source_uv=source_uv,
+        source_ray=source_ray,
+        source_depth=torch.full((1, 2, 1), 2.0),
+        source_valid=torch.ones(1, 2, 1, dtype=torch.bool),
+        edges=torch.tensor([[0, 1]]),
+        target_uv=torch.tensor([[[[8.5, 4.5]]]]),
+        target_ray=torch.tensor([[[[0.0, 0.0, -1.0]]]]),
+        top1_cosine=torch.ones(1, 1, 1),
+        top2_margin=torch.ones(1, 1, 1),
+        entropy=torch.zeros(1, 1, 1),
+        valid_mask=torch.ones(1, 1, 1, dtype=torch.bool),
+    )
+    output = BlockSparseSphericalBA(iterations=1, min_factors=1, min_affine_support=1)(
+        observation.poses_c2w,
+        observation.refined_depth,
+        cache,
+    )
+    assert not bool(output.accepted[0])
+    assert output.diagnostics[0]["reason"] == "insufficient_non_antipodal_factors"
+
+
+def test_refiner_zero_initialization_is_identity_and_backward_is_finite() -> None:
+    observation, feature, image = _observation()
+    refiner = SphericalRecurrentGaussianRefiner()
+    output = refiner(
+        observation,
+        observation,
+        feature,
+        image,
+        torch.randn(1, 3, 32, 8, 16),
+        iteration_index=0,
+    )
+    torch.testing.assert_close(output.observation.refined_depth, observation.refined_depth)
+    torch.testing.assert_close(output.observation.local_quaternion, observation.local_quaternion)
+    torch.testing.assert_close(output.observation.rgb_sh, observation.rgb_sh)
+    loss = output.observation.rgb_sh.mean() + output.observation.refined_depth.mean()
+    loss.backward()
+    gradients = [parameter.grad for parameter in refiner.parameters() if parameter.grad is not None]
+    assert gradients and all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+
+
+def test_refiner_geometry_gate_freezes_far_pixels_but_updates_appearance() -> None:
+    observation, feature, image = _observation(views=2)
+    far = observation.with_updates(refined_depth=torch.full_like(observation.refined_depth, 25.0))
+    refiner = SphericalRecurrentGaussianRefiner()
+    with torch.no_grad():
+        refiner.geometry_head[-1].bias.fill_(1.0)
+        refiner.appearance_head[-1].bias.fill_(1.0)
+    output = refiner(far, observation, feature, image, torch.zeros(1, 2, 32, 8, 16), iteration_index=0)
+    torch.testing.assert_close(output.observation.refined_depth, far.refined_depth)
+    torch.testing.assert_close(output.observation.local_quaternion, far.local_quaternion)
+    torch.testing.assert_close(output.observation.log_scale_multiplier, far.log_scale_multiplier)
+    assert not torch.equal(output.observation.rgb_sh, far.rgb_sh)
+    assert not torch.equal(output.observation.density_sh, far.density_sh)
+
+
+def test_quaternion_log_exp_round_trip() -> None:
+    rotation = torch.tensor([[0.1, -0.2, 0.05]])
+    reconstructed = quaternion_log_map(quaternion_exp_map(rotation))
+    torch.testing.assert_close(reconstructed, rotation, atol=1e-6, rtol=1e-5)
+
+
+def test_error_encoder_and_router_shapes_without_optional_resnet() -> None:
+    observation, _, image = _observation()
+    encoder = ReSplatErrorEncoder(use_resnet=False)
+    flat = image.reshape(3, 3, 8, 16)
+    reference = encoder.encode_reference(flat)
+    error = encoder(flat * 0.9, reference).reshape(1, 3, 32, 2, 4)
+    router = SphericalErrorRouter()
+    routed = router(
+        observation,
+        error,
+        torch.full((1, 3, 1, 8, 16), 2.0),
+        torch.ones(1, 3, 1, 8, 16),
+    )
+    assert routed.shape == (1, 3, 32, 8, 16)
+    assert bool(torch.isfinite(routed).all())
+
+
+def test_support_map_has_floor_and_query_peaks() -> None:
+    observation, feature, _ = _observation()
+    cache = build_stage3_match_cache(feature, observation.refined_depth, num_queries=2, query_chunk_size=1)
+    support = build_ba_support_map(cache, height=8, width=16, floor=0.1, dilation_kernel=1)
+    assert abs(float(support.min()) - 0.1) < 1.0e-6
+    assert float(support.max()) == 1.0
+
+
+def test_pose_metric_is_zero_for_identical_poses() -> None:
+    observation, _, _ = _observation()
+    metrics = aligned_pose_metrics(observation.poses_c2w[0], observation.poses_c2w[0])
+    assert metrics["rotation_mean_deg"] == 0.0
+    assert metrics["scale_aligned_ate"] < 1.0e-7
+
+
+def test_stage3_modules_do_not_import_forbidden_frontends() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = "\n".join(
+        (root / path).read_text(encoding="utf-8")
+        for path in (
+            "models/spherical_selfi_stage3_ba.py",
+            "models/spherical_recurrent_gaussian_refiner.py",
+            "training/train_spherical_ba_recurrent_refiner.py",
+        )
+    ).lower()
+    for forbidden in ("anchor_splat", "point_transformer", "voxel_compactor", "recurrent_updater", "rae"):
+        assert forbidden not in source
+
+
+def test_synthetic_stage3_one_step_and_checkpoint(tmp_path: Path) -> None:
+    config = default_config()
+    config["stage3"]["enabled"] = True
+    config["matching"].update({"num_queries": 2, "query_chunk_size": 1})
+    config["ba"].update({"iterations": 0, "min_factors": 1, "min_affine_support": 2, "factor_chunk_size": 4})
+    config["dataset"]["max_train_samples"] = 1
+    config["train"].update(
+        {
+            "max_steps": 1,
+            "save_interval": 1,
+            "diagnostics_interval": 100,
+            "val_interval": 100,
+            "output_dir": str(tmp_path / "stage3"),
+        }
+    )
+    result = train(config)
+    checkpoint = Path(result["checkpoint"])
+    assert checkpoint.is_file()
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["format"] == "spherical_ba_recurrent_gaussian_refiner_v1"
+    assert payload["global_step"] == 1
+    assert "model" in payload and "optimizer" in payload and "scheduler" in payload

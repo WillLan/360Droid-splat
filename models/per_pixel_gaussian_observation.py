@@ -290,6 +290,72 @@ class PerPixelGaussianObservation:
             depth_residual=depth - self.initial_depth.to(device=depth.device, dtype=depth.dtype),
         )
 
+    def source_view_confidence(self, density_sh: torch.Tensor | None = None) -> torch.Tensor:
+        """Evaluate density SH in each Gaussian's immutable source-ray direction."""
+
+        coefficients = self.density_sh if density_sh is None else density_sh
+        if tuple(coefficients.shape) != tuple(self.density_sh.shape):
+            raise ValueError("Replacement density_sh must match density_sh shape.")
+        ray = self.source_ray.to(device=coefficients.device, dtype=coefficients.dtype)
+        basis = real_sh_basis(self.density_sh_degree, ray).permute(2, 0, 1)
+        logits = (coefficients * basis.view(1, 1, *basis.shape)).sum(dim=2, keepdim=True)
+        return torch.sigmoid(logits)
+
+    def with_updates(
+        self,
+        *,
+        poses_c2w: torch.Tensor | None = None,
+        refined_depth: torch.Tensor | None = None,
+        local_quaternion: torch.Tensor | None = None,
+        log_scale_multiplier: torch.Tensor | None = None,
+        rgb_sh: torch.Tensor | None = None,
+        density_sh: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> "PerPixelGaussianObservation":
+        """Return a parameter-updated observation while preserving provenance.
+
+        Stage 3 uses this functional update instead of mutating canonical
+        observations.  Pixel coordinates, rays, frame ids, and initial depth
+        remain immutable so later BA passes can always rebuild geometry.
+        """
+
+        poses = self.poses_c2w if poses_c2w is None else poses_c2w
+        depth = self.refined_depth if refined_depth is None else refined_depth
+        quaternion = self.local_quaternion if local_quaternion is None else local_quaternion
+        log_scale = self.log_scale_multiplier if log_scale_multiplier is None else log_scale_multiplier
+        rgb = self.rgb_sh if rgb_sh is None else rgb_sh
+        density = self.density_sh if density_sh is None else density_sh
+        mask = self.valid_mask if valid_mask is None else valid_mask
+        confidence = self.confidence if density_sh is None else self.source_view_confidence(density)
+        return replace(
+            self,
+            poses_c2w=poses,
+            refined_depth=depth,
+            depth_residual=depth - self.initial_depth.to(device=depth.device, dtype=depth.dtype),
+            local_quaternion=normalize_quaternion(quaternion.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3),
+            log_scale_multiplier=log_scale,
+            rgb_sh=rgb,
+            density_sh=density,
+            confidence=confidence,
+            valid_mask=mask,
+        )
+
+    def detach_parameters(self) -> "PerPixelGaussianObservation":
+        """Detach the mutable Stage 3 state while retaining canonical metadata."""
+
+        return replace(
+            self,
+            depth_residual=self.depth_residual.detach(),
+            refined_depth=self.refined_depth.detach(),
+            poses_c2w=self.poses_c2w.detach(),
+            local_quaternion=self.local_quaternion.detach(),
+            log_scale_multiplier=self.log_scale_multiplier.detach(),
+            rgb_sh=self.rgb_sh.detach(),
+            density_sh=self.density_sh.detach(),
+            confidence=self.confidence.detach(),
+            valid_mask=self.valid_mask.detach(),
+        )
+
     def materialize(self, camera: Any) -> ExplicitPerPixelGaussianSet:
         """Renderer hook for the common ``B=1`` training/inference case."""
 
