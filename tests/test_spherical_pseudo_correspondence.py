@@ -3,8 +3,10 @@ import math
 import torch
 
 from geometry.spherical_pseudo_correspondence import (
+    JointValidFibonacciSampleSet,
     SphericalCorrespondence,
     generate_spherical_pseudo_correspondence,
+    sample_joint_valid_fibonacci_uv,
 )
 
 
@@ -177,3 +179,55 @@ def test_fibonacci_depth_filtered_sampling_prefers_finite_source_depth():
     rows = corr.src_uv[0, :, 1]
     assert (rows >= float(height // 2)).float().mean() > 0.9
     assert corr.valid_mask.float().mean() > 0.9
+
+
+def test_joint_fibonacci_uses_same_uv_and_never_fills_invalid_support():
+    height, width = 17, 31
+    source_depth = torch.full((1, height, width), 2.0)
+    target_depth = torch.full_like(source_depth, 3.0)
+    source_valid = torch.ones_like(source_depth, dtype=torch.bool)
+    target_valid = torch.ones_like(source_valid)
+    sky_source = torch.zeros_like(source_depth)
+    sky_target = torch.zeros_like(target_depth)
+    source_valid[:, : height // 2] = False
+    target_valid[:, :, : width // 2] = False
+    sky_target[:, height // 2 : height // 2 + 2] = 1.0
+    first = sample_joint_valid_fibonacci_uv(
+        source_depth,
+        target_depth,
+        count=128,
+        oversample_factor=4,
+        source_valid=source_valid,
+        target_valid=target_valid,
+        source_sky_probability=sky_source,
+        target_sky_probability=sky_target,
+        seed=19,
+    )
+    second = sample_joint_valid_fibonacci_uv(
+        source_depth,
+        target_depth,
+        count=128,
+        oversample_factor=4,
+        source_valid=source_valid,
+        target_valid=target_valid,
+        source_sky_probability=sky_source,
+        target_sky_probability=sky_target,
+        seed=19,
+    )
+    assert isinstance(first, JointValidFibonacciSampleSet)
+    torch.testing.assert_close(first.uv, second.uv)
+    assert first.uv.shape[0] <= 128
+    assert first.valid.all()
+    torch.testing.assert_close(first.source_depth, torch.full_like(first.source_depth, 2.0))
+    torch.testing.assert_close(first.target_depth, torch.full_like(first.target_depth, 3.0))
+
+    empty = sample_joint_valid_fibonacci_uv(
+        source_depth,
+        target_depth,
+        count=64,
+        source_valid=torch.zeros_like(source_valid),
+        target_valid=target_valid,
+        seed=19,
+    )
+    assert empty.uv.shape == (0, 2)
+    assert empty.valid.numel() == 0

@@ -1287,6 +1287,7 @@ class PanoGaussianMapper:
         *,
         frame_ids: list[int] | tuple[int, ...],
         iters: int = 20,
+        settings: dict | None = None,
     ) -> dict[str, float]:
         """Run Gaussian-only global refinement after one ReSplat local window."""
 
@@ -1297,20 +1298,41 @@ class PanoGaussianMapper:
         resplat_cfg = self.optim_cfg.get("ReSplatGlobal", {}) if isinstance(self.optim_cfg, dict) else {}
         if not isinstance(resplat_cfg, dict):
             resplat_cfg = {}
+        effective_cfg = dict(resplat_cfg)
+        effective_cfg.update(dict(settings or {}))
         old_enabled = self.optim_cfg.get("enabled", None)
         old_pose = self.optim_cfg.get("pose_refine_enable", None)
         old_ff = self.optim_cfg.get("FeedForwardWindow", None)
         old_early = self.optim_cfg.get("early_stop", None)
         old_opt_after_chunk = self.optim_cfg.get("optimize_after_every_chunk", None)
+        overridden_root = {
+            key: self.optim_cfg.get(key, None)
+            for key in (
+                "pose_lr",
+                "pose_prior_weight",
+                "pose_grad_clip",
+                "gaussian_lr",
+                "fixed_pose_frame_ids",
+            )
+        }
         ff_cfg = dict(old_ff) if isinstance(old_ff, dict) else {}
         ff_cfg["enabled"] = True
         ff_cfg["steps"] = steps
-        ff_cfg["gaussian_scope"] = str(resplat_cfg.get("gaussian_scope", "all"))
+        ff_cfg["gaussian_scope"] = str(effective_cfg.get("gaussian_scope", "all"))
+        if "active_owner_window_id" in effective_cfg:
+            ff_cfg["active_owner_window_id"] = int(effective_cfg["active_owner_window_id"])
+        ff_cfg["visible_neighbor_lr_scale"] = float(effective_cfg.get("visible_neighbor_lr_scale", 0.1))
         ff_cfg["optimize_non_keyframe_observations"] = True
-        ff_cfg["random_observation_per_iter"] = bool(resplat_cfg.get("random_observation_per_iter", False))
-        ff_cfg["sample_observations_per_step"] = int(resplat_cfg.get("sample_observations_per_step", len(ids)))
+        ff_cfg["random_observation_per_iter"] = bool(effective_cfg.get("random_observation_per_iter", False))
+        ff_cfg["sample_observations_per_step"] = int(effective_cfg.get("sample_observations_per_step", len(ids)))
+        ff_cfg["sampler"] = str(effective_cfg.get("sampler", "random"))
+        ff_cfg["sampler_seed"] = int(effective_cfg.get("sampler_seed", 123))
+        ff_cfg["skip_prune"] = bool(effective_cfg.get("skip_prune", False))
         self.optim_cfg["enabled"] = True
-        self.optim_cfg["pose_refine_enable"] = bool(resplat_cfg.get("pose_refine_enable", False))
+        self.optim_cfg["pose_refine_enable"] = bool(effective_cfg.get("pose_refine_enable", False))
+        for key in overridden_root:
+            if key in effective_cfg:
+                self.optim_cfg[key] = effective_cfg[key]
         self.optim_cfg["optimize_after_every_chunk"] = False
         self.optim_cfg["FeedForwardWindow"] = ff_cfg
         self.optim_cfg["early_stop"] = {"enabled": False}
@@ -1342,10 +1364,103 @@ class PanoGaussianMapper:
                 self.optim_cfg.pop("optimize_after_every_chunk", None)
             else:
                 self.optim_cfg["optimize_after_every_chunk"] = old_opt_after_chunk
+            for key, value in overridden_root.items():
+                if value is None:
+                    self.optim_cfg.pop(key, None)
+                else:
+                    self.optim_cfg[key] = value
         out = dict(metrics)
         out["resplat_global_steps"] = float(out.get("steps", 0.0))
         out["resplat_global_configured_steps"] = float(steps)
         return out
+
+    def optimize_spherical_selfi_window(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        iters: int = 20,
+        settings: dict | None = None,
+        extra_loss_fn=None,
+    ) -> dict[str, float]:
+        """Jointly refine one spherical-Selfi owner window and its SE(3) poses."""
+
+        cfg = dict(settings or {})
+        cfg.update(
+            {
+                "gaussian_scope": "owner_window_visible",
+                "active_owner_window_id": int(window_id),
+                "pose_refine_enable": True,
+                "random_observation_per_iter": True,
+                "sample_observations_per_step": 1,
+                "sampler": "shuffled_cycle",
+                "skip_prune": True,
+            }
+        )
+        parameter_snapshot = {
+            name: value.detach().clone()
+            for name, value in self.map.named_parameters()
+        }
+        pose_snapshot = {
+            int(frame_id): self.pose_deltas[int(frame_id)].delta.detach().clone()
+            for frame_id in frame_ids
+            if int(frame_id) in self.pose_deltas
+        }
+        previous_extra_loss_fn = getattr(self, "_spherical_selfi_extra_loss_fn", None)
+        self._spherical_selfi_extra_loss_fn = extra_loss_fn
+        try:
+            metrics = self.optimize_resplat_global_window(
+                frame_ids=frame_ids,
+                iters=iters,
+                settings=cfg,
+            )
+        finally:
+            self._spherical_selfi_extra_loss_fn = previous_extra_loss_fn
+        if float(metrics.get("non_finite_window", 0.0)) > 0.0:
+            with torch.no_grad():
+                for name, value in self.map.named_parameters():
+                    saved = parameter_snapshot.get(name)
+                    if saved is not None and tuple(saved.shape) == tuple(value.shape):
+                        value.copy_(saved.to(value))
+                for frame_id, saved in pose_snapshot.items():
+                    if frame_id in self.pose_deltas:
+                        self.pose_deltas[frame_id].delta.copy_(saved.to(self.pose_deltas[frame_id].delta))
+            metrics["steps"] = 0.0
+            metrics["window_rollback"] = 1.0
+        metrics["spherical_selfi_window_id"] = float(window_id)
+        return metrics
+
+    def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
+        """Promote registered RGB/depth observations without inserting legacy seeds."""
+
+        prepared = 0
+        device, dtype = self.map.get_xyz.device, self.map.get_xyz.dtype
+        for frame_id in (int(value) for value in frame_ids):
+            observation = self.observations.get(frame_id)
+            if observation is None:
+                continue
+            # The overlap frame must reuse its unique PoseDelta rather than
+            # being reinitialized when the next window arrives.
+            if frame_id not in self.pose_deltas:
+                self.pose_deltas[frame_id] = PoseDelta(
+                    observation.pose_c2w.to(device=device, dtype=dtype)
+                ).to(device=device)
+            observation.is_keyframe = True
+            record = MapperKeyframe(
+                frame_id=frame_id,
+                image=observation.image.detach().cpu().float(),
+                gaussian_start=0,
+                gaussian_end=self.map.anchor_count(),
+                sky_mask=None if observation.sky_mask is None else observation.sky_mask.detach().cpu().bool(),
+                target_depth=None if observation.target_depth is None else observation.target_depth.detach().cpu().float(),
+                depth_confidence=None if observation.depth_confidence is None else observation.depth_confidence.detach().cpu().float(),
+            )
+            self.keyframes = [value for value in self.keyframes if int(value.frame_id) != frame_id]
+            self.keyframes.append(record)
+            prepared += 1
+        self.keyframes.sort(key=lambda value: int(value.frame_id))
+        self.stats.n_keyframes = len(self.keyframes)
+        return prepared
 
     def set_frontend_graph_window_ids(self, frame_ids) -> None:
         ids: list[int] = []
@@ -3240,14 +3355,31 @@ class PanoGaussianMapper:
         renderer_profile_calls = 0
         sky_pruned_total = 0
         chunk_compacted = 0
+        sampling_schedule: list[MapperObservation] | None = None
+        sampled_frame_counts: dict[int, int] = {}
+        if str(cfg.get("sampler", "")).lower() == "shuffled_cycle":
+            rng = random.Random(int(cfg.get("sampler_seed", 123)) + sum(int(obs.frame_id) for obs in observations))
+            sampling_schedule = []
+            while len(sampling_schedule) < max(0, steps):
+                cycle = list(observations)
+                rng.shuffle(cycle)
+                sampling_schedule.extend(cycle)
+            sampling_schedule = sampling_schedule[: max(0, steps)]
+        non_finite_window = False
         for step_idx in range(max(0, steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
             section_start = time.perf_counter()
-            sampled = self._sample_observations_for_step(observations)
+            sampled = (
+                [sampling_schedule[step_idx]]
+                if sampling_schedule is not None
+                else self._sample_observations_for_step(observations)
+            )
             sample_sec += time.perf_counter() - section_start
             last_sampled_ids = [int(obs.frame_id) for obs in sampled]
+            for frame_id in last_sampled_ids:
+                sampled_frame_counts[frame_id] = sampled_frame_counts.get(frame_id, 0) + 1
             section_start = time.perf_counter()
             for obs in sampled:
                 target = obs.image.to(device=device, dtype=dtype)
@@ -3292,12 +3424,47 @@ class PanoGaussianMapper:
             if pose_params and pose_prior_weight > 0.0:
                 prior = torch.stack([param.square().mean() for param in pose_params]).mean()
                 loss = loss + pose_prior_weight * prior
+            extra_loss_fn = getattr(self, "_spherical_selfi_extra_loss_fn", None)
+            if callable(extra_loss_fn):
+                extra_loss = extra_loss_fn(trainable_pose_ids)
+                if torch.is_tensor(extra_loss):
+                    loss = loss + extra_loss.to(loss)
+                    metric_accum.setdefault("graph_factor_loss", []).append(extra_loss.detach())
+            if not bool(torch.isfinite(loss).detach().cpu()):
+                non_finite_window = True
+                break
             if loss.requires_grad:
                 section_start = time.perf_counter()
                 loss.backward()
                 if gaussian_enabled and gaussian_scales is not None:
                     self._apply_gaussian_grad_scales(gaussian_scales)
+                pose_grad_clip = float(self.optim_cfg.get("pose_grad_clip", 0.0))
+                if pose_params and pose_grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(pose_params, max_norm=pose_grad_clip)
+                gradients_finite = all(
+                    value.grad is None or bool(torch.isfinite(value.grad).all().detach().cpu())
+                    for group in param_groups
+                    for value in group["params"]
+                )
+                if not gradients_finite:
+                    non_finite_window = True
+                    break
                 optimizer.step()
+                with torch.no_grad():
+                    if hasattr(self.map, "rotation") and torch.is_tensor(self.map.rotation):
+                        self.map.rotation.copy_(F.normalize(self.map.rotation, dim=-1, eps=1.0e-8))
+                    if hasattr(self.map, "scaling") and torch.is_tensor(self.map.scaling):
+                        self.map.scaling.clamp_(-20.0, 20.0)
+                    if hasattr(self.map, "opacity_logit") and torch.is_tensor(self.map.opacity_logit):
+                        self.map.opacity_logit.clamp_(-12.0, 12.0)
+                parameters_finite = all(
+                    bool(torch.isfinite(value).all().detach().cpu())
+                    for group in param_groups
+                    for value in group["params"]
+                )
+                if not parameters_finite:
+                    non_finite_window = True
+                    break
                 if self.pfgs360_replace_fuse_enabled:
                     self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
@@ -3323,7 +3490,7 @@ class PanoGaussianMapper:
             active_mask = self._active_anchor_mask_for_keyframes(active_keyframe_ids_for_update)
         prune_stats = (
             {"opacity_resets": 0, "pruned": 0}
-            if self.pfgs360_replace_fuse_enabled
+            if self.pfgs360_replace_fuse_enabled or bool(cfg.get("skip_prune", False))
             else self._maybe_prune_feedforward_window(
                 observations,
                 active_mask=active_mask,
@@ -3337,6 +3504,9 @@ class PanoGaussianMapper:
         pose_norm = self._pose_delta_norm(trainable_pose_ids)
         total_sec = float(time.perf_counter() - total_start)
         last["steps"] = float(actual_steps)
+        last["non_finite_window"] = float(non_finite_window)
+        for frame_id, count in sampled_frame_counts.items():
+            last[f"sample_count_frame_{int(frame_id)}"] = float(count)
         last["pose_delta_norm"] = pose_norm
         last["window_size"] = float(len(observations))
         last["feedforward_window_size"] = float(len(observations))
@@ -3468,7 +3638,12 @@ class PanoGaussianMapper:
     def _feedforward_trainable_pose_ids(self, current_keyframe_ids: list[int], *, pose_enabled: bool) -> set[int]:
         if not pose_enabled:
             return set()
-        return {int(fid) for fid in current_keyframe_ids if int(fid) in self.pose_deltas}
+        fixed = {int(fid) for fid in self.optim_cfg.get("fixed_pose_frame_ids", [])}
+        return {
+            int(fid)
+            for fid in current_keyframe_ids
+            if int(fid) in self.pose_deltas and int(fid) not in fixed
+        }
 
     def _active_anchor_mask_for_keyframes(self, keyframe_ids: list[int]) -> torch.Tensor:
         n = self.map.anchor_count()
@@ -3531,6 +3706,15 @@ class PanoGaussianMapper:
             scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
             return scales
         scope = str(cfg.get("gaussian_scope", "selected_birth_keyframes")).lower()
+        if scope == "owner_window_visible":
+            owner_window_id = cfg.get("active_owner_window_id")
+            owner = getattr(self.map, "_anchor_owner_window_id", None)
+            if owner_window_id is None or not torch.is_tensor(owner) or int(owner.numel()) != n:
+                return scales
+            scales.fill_(float(cfg.get("visible_neighbor_lr_scale", 0.1)))
+            owner_mask = owner.to(device=device, dtype=torch.long) == int(owner_window_id)
+            scales[owner_mask] = float(cfg.get("gaussian_lr_scale", 1.0))
+            return scales
         if scope == "all":
             scales.fill_(float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("existing_gaussian_lr_scale", 0.1))))
             return scales

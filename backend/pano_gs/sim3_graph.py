@@ -48,7 +48,28 @@ class CoincidentPanoramaFactor:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-GraphFactor = Sim3GraphEdge | CoincidentPanoramaFactor
+@dataclass
+class DenseSphericalFactorBlock:
+    """Correspondence-level spherical/depth constraints between two windows."""
+
+    source: int
+    target: int
+    source_local_pose: torch.Tensor
+    target_local_pose: torch.Tensor
+    source_bearing: torch.Tensor
+    target_bearing: torch.Tensor
+    source_depth: torch.Tensor
+    target_depth: torch.Tensor
+    factor_weight: torch.Tensor
+    depth_factor_weight: float = 0.1
+    s2_huber_delta_deg: float = 1.0
+    use_depth: bool = True
+    robust_delta: float = float("inf")
+    edge_type: str = "dense_spherical"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+GraphFactor = Sim3GraphEdge | CoincidentPanoramaFactor | DenseSphericalFactorBlock
 
 
 @dataclass
@@ -66,6 +87,39 @@ def _so3_residual(rotation: torch.Tensor) -> torch.Tensor:
     transform = sim3_identity(device=rotation.device, dtype=rotation.dtype)
     transform[:3, :3] = rotation
     return sim3_log(transform)[3:6]
+
+
+def s2_log_tangent_coordinates(base: torch.Tensor, point: torch.Tensor) -> torch.Tensor:
+    """Return ``Log_base(point)`` in a deterministic two-vector tangent basis."""
+
+    b = base / torch.linalg.norm(base, dim=-1, keepdim=True).clamp_min(1.0e-8)
+    p = point / torch.linalg.norm(point, dim=-1, keepdim=True).clamp_min(1.0e-8)
+    dot = (b * p).sum(dim=-1).clamp(-1.0, 1.0)
+    orthogonal = p - dot[..., None] * b
+    sine = torch.linalg.norm(orthogonal, dim=-1)
+    angle = torch.atan2(sine, dot)
+    tangent = orthogonal * (angle / sine.clamp_min(1.0e-8))[..., None]
+    tangent = torch.where((sine > 1.0e-7)[..., None], tangent, torch.zeros_like(tangent))
+
+    x_axis = torch.zeros_like(b)
+    x_axis[..., 0] = 1.0
+    y_axis = torch.zeros_like(b)
+    y_axis[..., 1] = 1.0
+    reference = torch.where((b[..., 0].abs() < 0.9)[..., None], x_axis, y_axis)
+    basis_1 = torch.cross(reference, b, dim=-1)
+    basis_1 = basis_1 / torch.linalg.norm(basis_1, dim=-1, keepdim=True).clamp_min(1.0e-8)
+    basis_2 = torch.cross(b, basis_1, dim=-1)
+    coordinates = torch.stack(
+        [(tangent * basis_1).sum(dim=-1), (tangent * basis_2).sum(dim=-1)], dim=-1
+    )
+    # Log is not unique at the antipode.  Returning zero would make a 180°
+    # mismatch look perfect, so choose the deterministic first tangent basis
+    # and retain the correct geodesic magnitude pi.
+    antipodal = (sine <= 1.0e-7) & (dot < 0.0)
+    antipodal_value = torch.stack(
+        [torch.full_like(angle, math.pi), torch.zeros_like(angle)], dim=-1
+    )
+    return torch.where(antipodal[..., None], antipodal_value, coordinates)
 
 
 class GlobalSim3FactorGraph:
@@ -113,6 +167,17 @@ class GlobalSim3FactorGraph:
                 raise ValueError("Sim3GraphEdge measurement must be 4x4")
             if edge.information_diag.numel() != 7:
                 raise ValueError("Sim3GraphEdge information_diag must have seven entries")
+        if isinstance(edge, DenseSphericalFactorBlock):
+            count = int(edge.source_depth.numel())
+            if count < 1:
+                raise ValueError("DenseSphericalFactorBlock must contain at least one correspondence")
+            if tuple(edge.source_bearing.shape) != (count, 3) or tuple(edge.target_bearing.shape) != (count, 3):
+                raise ValueError("Dense spherical bearings must have shape Nx3")
+            for value in (edge.target_depth, edge.factor_weight):
+                if int(value.numel()) != count:
+                    raise ValueError("Dense spherical depth/weight arrays must share correspondence count")
+            if edge.source_local_pose.shape != (4, 4) or edge.target_local_pose.shape != (4, 4):
+                raise ValueError("Dense spherical local poses must be 4x4")
         self.edges.append(edge)
 
     def transform(self, node_id: int) -> torch.Tensor:
@@ -134,6 +199,45 @@ class GlobalSim3FactorGraph:
             residual = sim3_log(error)
             information = factor.information_diag.to(device=residual.device, dtype=residual.dtype).clamp_min(0.0)
             return residual, information
+
+        if isinstance(factor, DenseSphericalFactorBlock):
+            source_pose = factor.source_local_pose.to(source_transform)
+            target_pose = factor.target_local_pose.to(target_transform)
+            source_bearing = factor.source_bearing.to(source_transform)
+            target_bearing = factor.target_bearing.to(source_transform)
+            source_depth = factor.source_depth.to(source_transform).reshape(-1)
+            target_depth = factor.target_depth.to(source_transform).reshape(-1)
+            weight = factor.factor_weight.to(source_transform).reshape(-1).clamp_min(0.0)
+
+            source_camera = source_bearing * source_depth[:, None]
+            source_anchor = source_camera @ source_pose[:3, :3].transpose(0, 1) + source_pose[:3, 3]
+            global_points = apply_sim3(source_transform, source_anchor)
+            target_anchor = apply_sim3(sim3_inverse(target_transform), global_points)
+            target_camera = (target_anchor - target_pose[:3, 3]) @ target_pose[:3, :3]
+            predicted_depth = torch.linalg.norm(target_camera, dim=-1).clamp_min(1.0e-8)
+            predicted_bearing = target_camera / predicted_depth[:, None]
+            s2 = s2_log_tangent_coordinates(target_bearing, predicted_bearing)
+
+            s2_norm = torch.linalg.norm(s2, dim=-1)
+            s2_delta = math.radians(max(float(factor.s2_huber_delta_deg), 1.0e-6))
+            s2_robust = torch.minimum(
+                torch.ones_like(s2_norm),
+                s2_norm.new_tensor(s2_delta) / s2_norm.clamp_min(1.0e-8),
+            ).detach()
+            residual_parts = [s2.reshape(-1)]
+            information_parts = [(weight * s2_robust).repeat_interleave(2)]
+            if factor.use_depth:
+                depth_residual = torch.log(predicted_depth / target_depth.clamp_min(1.0e-8))
+                depth_delta = 0.25
+                depth_robust = torch.minimum(
+                    torch.ones_like(depth_residual),
+                    depth_residual.new_tensor(depth_delta) / depth_residual.abs().clamp_min(1.0e-8),
+                ).detach()
+                residual_parts.append(depth_residual)
+                information_parts.append(
+                    weight * depth_robust * max(float(factor.depth_factor_weight), 0.0)
+                )
+            return torch.cat(residual_parts), torch.cat(information_parts).clamp_min(0.0)
 
         source_pose = factor.source_local_pose.to(source_transform)
         target_pose = factor.target_local_pose.to(target_transform)
@@ -202,7 +306,11 @@ class GlobalSim3FactorGraph:
 
         zero = source.new_zeros(7 * len(endpoint_ids))
         weighted_residual = residual_from_delta(zero)
-        jacobian = torch.func.jacrev(residual_from_delta)(zero)
+        jacobian = (
+            torch.func.jacfwd(residual_from_delta)(zero)
+            if isinstance(factor, DenseSphericalFactorBlock)
+            else torch.func.jacrev(residual_from_delta)(zero)
+        )
         if isinstance(factor, CoincidentPanoramaFactor):
             # A same-center panorama observation contains no scale evidence.
             # Under left-multiplicative Sim(3) perturbations the scale column

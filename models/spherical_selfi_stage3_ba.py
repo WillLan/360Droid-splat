@@ -25,7 +25,7 @@ from geometry.spherical_erp import (
     sample_erp_with_wrap,
     unit_ray_to_erp_pixel,
 )
-from geometry.spherical_pseudo_correspondence import _sample_depth_filtered_fibonacci_uv
+from geometry.spherical_pseudo_correspondence import sample_depth_filtered_fibonacci_uv
 
 
 @dataclass
@@ -135,7 +135,7 @@ def build_stage3_match_cache(
     flat_depth = depth.detach().float().reshape(batch * views, 1, height, width)
     count = max(1, min(int(num_queries), height * width))
     if query_uv is None:
-        sampled_uv = _sample_depth_filtered_fibonacci_uv(
+        sampled_uv = sample_depth_filtered_fibonacci_uv(
             flat_depth,
             height=height,
             width=width,

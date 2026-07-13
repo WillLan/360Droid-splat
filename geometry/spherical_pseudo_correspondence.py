@@ -10,6 +10,7 @@ import torch
 from .spherical_erp import (
     DEFAULT_ERP_HEIGHT,
     DEFAULT_ERP_WIDTH,
+    erp_pixel_to_unit_ray,
     sample_erp_with_wrap,
 )
 from .spherical_projection import project_source_to_target_erp
@@ -28,6 +29,37 @@ class SphericalCorrespondence:
     valid_mask: torch.Tensor
     visibility: torch.Tensor
     weight: torch.Tensor
+
+
+@dataclass(frozen=True)
+class FibonacciSampleSet:
+    """Depth-filtered, equal-area ERP queries from one source panorama."""
+
+    uv: torch.Tensor
+    bearing: torch.Tensor
+    depth: torch.Tensor
+    valid: torch.Tensor
+    sky_probability: torch.Tensor
+    confidence: torch.Tensor
+    seed: int
+    longitude_phase: float
+
+
+@dataclass(frozen=True)
+class JointValidFibonacciSampleSet:
+    """Same-UV Fibonacci samples that are valid in two panorama estimates."""
+
+    uv: torch.Tensor
+    bearing: torch.Tensor
+    source_depth: torch.Tensor
+    target_depth: torch.Tensor
+    source_sky_probability: torch.Tensor
+    target_sky_probability: torch.Tensor
+    source_confidence: torch.Tensor
+    target_confidence: torch.Tensor
+    valid: torch.Tensor
+    seed: int
+    longitude_phase: float
 
 
 def _normalize_depth(depth: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -125,7 +157,7 @@ def _sample_query_uv(
     return torch.stack([u, v], dim=-1)
 
 
-def _fibonacci_erp_candidates(
+def fibonacci_erp_candidates(
     *,
     count: int,
     height: int,
@@ -149,7 +181,12 @@ def _fibonacci_erp_candidates(
     return torch.stack([torch.remainder(u, float(width)), v.clamp(0.0, float(height))], dim=-1)
 
 
-def _sample_depth_filtered_fibonacci_uv(
+# Kept as a private alias for older callers while the public geometry API is
+# adopted by Stage 1, local BA, and the global backend.
+_fibonacci_erp_candidates = fibonacci_erp_candidates
+
+
+def sample_depth_filtered_fibonacci_uv(
     src_depth_maps: torch.Tensor,
     *,
     height: int,
@@ -165,7 +202,7 @@ def _sample_depth_filtered_fibonacci_uv(
     sample_count = max(1, int(count))
     factor = max(1, int(oversample_factor))
     candidate_count = max(sample_count, sample_count * factor)
-    candidates = _fibonacci_erp_candidates(
+    candidates = fibonacci_erp_candidates(
         count=candidate_count,
         height=height,
         width=width,
@@ -203,6 +240,139 @@ def _sample_depth_filtered_fibonacci_uv(
             selected = fallback
         sampled[map_idx] = candidates[selected.to(device=candidates.device)]
     return sampled
+
+
+_sample_depth_filtered_fibonacci_uv = sample_depth_filtered_fibonacci_uv
+
+
+def _as_scalar_erp_map(value: torch.Tensor | None, reference: torch.Tensor, default: float) -> torch.Tensor:
+    if value is None:
+        return torch.full_like(reference, float(default))
+    result = value.to(device=reference.device, dtype=reference.dtype)
+    if result.ndim == 2:
+        result = result.unsqueeze(0)
+    if result.ndim != 3 or int(result.shape[0]) != 1:
+        raise ValueError(f"Expected a scalar ERP map with shape HxW or 1xHxW, got {tuple(result.shape)}")
+    if tuple(result.shape[-2:]) != tuple(reference.shape[-2:]):
+        raise ValueError("Joint Fibonacci maps must share the same ERP resolution")
+    return result
+
+
+def sample_joint_valid_fibonacci_uv(
+    source_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    *,
+    count: int = 4096,
+    oversample_factor: int = 8,
+    min_depth: float = 0.05,
+    max_depth: float = 20.0,
+    source_valid: torch.Tensor | None = None,
+    target_valid: torch.Tensor | None = None,
+    source_sky_probability: torch.Tensor | None = None,
+    target_sky_probability: torch.Tensor | None = None,
+    source_confidence: torch.Tensor | None = None,
+    target_confidence: torch.Tensor | None = None,
+    source_points: torch.Tensor | None = None,
+    target_points: torch.Tensor | None = None,
+    sky_threshold: float = 0.5,
+    seed: int = 0,
+    generator: torch.Generator | None = None,
+) -> JointValidFibonacciSampleSet:
+    """Sample identical equal-area UVs and jointly filter two ERP estimates.
+
+    Valid candidates are retained in Fibonacci order and evenly thinned when
+    there are more than ``count``.  The function deliberately returns fewer
+    samples when support is insufficient; it never fills missing entries with
+    invalid fallback pixels.
+    """
+
+    src = source_depth.float() if not source_depth.is_floating_point() else source_depth
+    tgt = target_depth.to(device=src.device, dtype=src.dtype)
+    if src.ndim == 2:
+        src = src.unsqueeze(0)
+    if tgt.ndim == 2:
+        tgt = tgt.unsqueeze(0)
+    if src.ndim != 3 or tgt.ndim != 3 or int(src.shape[0]) != 1 or int(tgt.shape[0]) != 1:
+        raise ValueError("source_depth and target_depth must have shape HxW or 1xHxW")
+    if tuple(src.shape) != tuple(tgt.shape):
+        raise ValueError("Joint Fibonacci depth maps must have identical shapes")
+    height, width = int(src.shape[-2]), int(src.shape[-1])
+    if generator is None:
+        generator = torch.Generator(device=src.device)
+        generator.manual_seed(int(seed))
+    candidate_count = max(1, int(count)) * max(1, int(oversample_factor))
+    candidates = fibonacci_erp_candidates(
+        count=candidate_count,
+        height=height,
+        width=width,
+        device=src.device,
+        dtype=src.dtype,
+        generator=generator,
+    )
+
+    def sampled(value: torch.Tensor | None, default: float) -> torch.Tensor:
+        scalar = _as_scalar_erp_map(value, src, default)
+        return sample_erp_with_wrap(scalar, candidates)[..., 0]
+
+    src_depth = sample_erp_with_wrap(src, candidates)[..., 0]
+    tgt_depth = sample_erp_with_wrap(tgt, candidates)[..., 0]
+    src_valid = sampled(source_valid, 1.0) >= 0.5
+    tgt_valid = sampled(target_valid, 1.0) >= 0.5
+    src_sky = sampled(source_sky_probability, 0.0).clamp(0.0, 1.0)
+    tgt_sky = sampled(target_sky_probability, 0.0).clamp(0.0, 1.0)
+    src_conf = sampled(source_confidence, 1.0).clamp_min(0.0)
+    tgt_conf = sampled(target_confidence, 1.0).clamp_min(0.0)
+    valid = (
+        src_valid
+        & tgt_valid
+        & torch.isfinite(src_depth)
+        & torch.isfinite(tgt_depth)
+        & (src_depth >= float(min_depth))
+        & (tgt_depth >= float(min_depth))
+        & (src_depth <= float(max_depth))
+        & (tgt_depth <= float(max_depth))
+        & (src_sky < float(sky_threshold))
+        & (tgt_sky < float(sky_threshold))
+    )
+    for points in (source_points, target_points):
+        if points is None:
+            continue
+        value = points.to(device=src.device, dtype=src.dtype)
+        if value.ndim == 3 and int(value.shape[0]) == 3:
+            pass
+        elif value.ndim == 3 and int(value.shape[-1]) == 3:
+            value = value.permute(2, 0, 1)
+        else:
+            raise ValueError("source_points/target_points must have shape 3xHxW or HxWx3")
+        if tuple(value.shape[-2:]) != (height, width):
+            raise ValueError("Joint Fibonacci point maps must share the depth resolution")
+        valid &= torch.isfinite(sample_erp_with_wrap(value, candidates)).all(dim=-1)
+
+    valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+    if int(valid_indices.numel()) > int(count):
+        keep = torch.linspace(
+            0,
+            int(valid_indices.numel()) - 1,
+            steps=int(count),
+            device=src.device,
+        ).round().long()
+        valid_indices = valid_indices[keep]
+    uv = candidates[valid_indices]
+    longitude = 2.0 * math.pi * (candidates[0, 0] / float(width) - 0.5)
+    phase = float(torch.remainder(longitude + math.pi, 2.0 * math.pi).detach().cpu())
+    return JointValidFibonacciSampleSet(
+        uv=uv,
+        bearing=erp_pixel_to_unit_ray(uv, height, width),
+        source_depth=src_depth[valid_indices],
+        target_depth=tgt_depth[valid_indices],
+        source_sky_probability=src_sky[valid_indices],
+        target_sky_probability=tgt_sky[valid_indices],
+        source_confidence=src_conf[valid_indices],
+        target_confidence=tgt_conf[valid_indices],
+        valid=torch.ones(int(valid_indices.numel()), device=src.device, dtype=torch.bool),
+        seed=int(seed),
+        longitude_phase=phase,
+    )
 
 
 def _normalize_query_uv(

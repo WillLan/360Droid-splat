@@ -1,0 +1,28 @@
+base_config: spherical_selfi_global_gs_slam.yaml
+
+Dataset:
+  synthetic: false
+  type: ob3d
+  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D
+  scene: sponza
+  split: NonEgocentric
+  erp_resize_height: 504
+  erp_resize_width: 1008
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  mode: online
+  run_name: spherical_selfi_global_ob3d_sponza_nonegocentric
+  tags: [spherical-selfi, stage2, sim3-graph, fibonacci, ob3d, sponza, non-egocentric]
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+
+Results:
+  save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric
+  kf_render_format: png

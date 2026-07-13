@@ -69,9 +69,23 @@ SphericalSelfiRuntime:
   feature_amp: true
   window:
     size: 4
-    stride: 2
+    stride: 3
+    expected_overlap_frames: 1
+    enforce_exact_overlap: true
     verification_size: [32, 64]
     latitude_bands: 8
+  sky:
+    enabled: true
+    required: true
+    checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/panovggt_m3_sphere_omni360_sky_ddp_b4_10k_dtw_nyc_20260604_0845/checkpoints/sky_head.pt
+    threshold: 0.5
+    strict: true
+  fibonacci:
+    mode: depth_filtered
+    oversample_factor: 8
+    seed: 123
+    min_depth: 0.05
+    max_depth: 20.0
   local_ba:
     enabled: false
     iterations: 3
@@ -103,11 +117,34 @@ SphericalSelfiGlobalBackend:
   enabled: true
   rgb_sh_degree: 2
   global_graph:
+    factor_mode: dense_spherical
+    sampling: fibonacci_depth_filtered
     iterations: 8
     damping: 1.0e-4
     pcg_iterations: 64
     pcg_tolerance: 1.0e-6
     recent_windows: 32
+    expected_overlap_frames: 1
+    enforce_exact_overlap: true
+    overlap_num_queries: 4096
+    factor_queries_per_direction: 2048
+    max_dense_factors_per_edge: 4096
+    min_dense_factors: 32
+    fibonacci_oversample_factor: 8
+    fibonacci_seed: 123
+    min_depth: 0.05
+    max_depth: 20.0
+    sky_threshold: 0.5
+    min_match_cosine: 0.45
+    min_match_margin: 0.01
+    max_match_entropy: 0.95
+    min_factor_weight: 0.01
+    forward_backward: true
+    fb_tolerance_deg: 1.0
+    target_area_correction: true
+    source_area_reweight: false
+    s2_huber_delta_deg: 1.0
+    depth_factor_weight: 0.1
     min_overlap_points: 32
     max_overlap_points: 4096
     max_overlap_residual: 0.35
@@ -138,10 +175,20 @@ SphericalSelfiGlobalBackend:
     max_stale_frames: 0
     max_render_error: null
   map_optimization:
-    lr: 0.002
-    steps_per_window: 4
-    steps_on_loop: 20
-    final_steps: 50
+    renderer: gsplat360
+    steps_per_window: 20
+    sample_observations_per_step: 1
+    sampler: shuffled_cycle
+    gaussian_lr: 0.002
+    pose_lr: 0.001
+    pose_prior_weight: 0.0
+    pose_grad_clip: 0.001
+    s2_loss_weight: 0.1
+    match_depth_loss_weight: 0.01
+    visible_neighbor_lr_scale: 0.1
+    extra_steps_on_loop: 0
+    final_steps: 0
+    seed: 123
 
 MapRepresentation:
   mode: anchor_scaffold_panorama
@@ -150,15 +197,17 @@ BackendOptimization:
   enabled: true
   sh_degree: 2
   ReSplatGlobal:
-    gaussian_scope: visible
-    pose_refine_enable: false
+    gaussian_scope: owner_window_visible
+    pose_refine_enable: true
     random_observation_per_iter: true
-    sample_observations_per_step: 2
+    sample_observations_per_step: 1
 
 Mapping:
   lr: 0.002
   max_seeds_per_keyframe: 0
   min_depth_confidence: 0.0
+  sky_mask_enable: true
+  sky_mask_source: panovggt_head
 
 Training:
   panorama_render_mode: pfgs360_gsplat

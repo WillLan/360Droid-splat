@@ -10,10 +10,19 @@ import torch
 from frontend.pano_vggt.alignment import SubmapAligner
 from frontend.spherical_selfi.panorama_loop import PanoramaLoopDetector, PanoramaLoopVerification
 from frontend.spherical_selfi.window_packet import LocalGaussianWindowPacket
+from geometry.spherical_pseudo_correspondence import sample_joint_valid_fibonacci_uv
+from geometry.spherical_erp import sample_erp_with_wrap
 from geometry.sim3 import sim3_identity
 
 from .mapper import PanoGaussianMap, PanoGaussianMapper
-from .sim3_graph import GlobalSim3FactorGraph, Sim3GraphEdge, Sim3GraphOptimizeResult
+from .sim3_graph import (
+    CoincidentPanoramaFactor,
+    DenseSphericalFactorBlock,
+    GlobalSim3FactorGraph,
+    Sim3GraphEdge,
+    Sim3GraphOptimizeResult,
+    s2_log_tangent_coordinates,
+)
 from .stage2_global_fusion import Stage2GlobalMapFusion
 
 
@@ -46,10 +55,24 @@ class SphericalSelfiGlobalBackend:
         optimize_cfg = dict(self.config.get("map_optimization", {}) or {})
         self.enabled = bool(self.config.get("enabled", False))
         self.allow_unaligned_fallback = bool(graph_cfg.get("allow_unaligned_fallback", False))
+        self.expected_overlap_frames = int(graph_cfg.get("expected_overlap_frames", 1))
+        self.enforce_exact_overlap = bool(graph_cfg.get("enforce_exact_overlap", True))
+        self.fibonacci_seed = int(graph_cfg.get("fibonacci_seed", 123))
+        self.fibonacci_oversample_factor = max(1, int(graph_cfg.get("fibonacci_oversample_factor", 8)))
+        self.fibonacci_min_depth = float(graph_cfg.get("min_depth", 0.05))
+        self.fibonacci_max_depth = float(graph_cfg.get("max_depth", 20.0))
+        self.sky_threshold = float(graph_cfg.get("sky_threshold", 0.5))
+        self.depth_factor_weight = float(graph_cfg.get("depth_factor_weight", 0.1))
+        self.s2_huber_delta_deg = float(graph_cfg.get("s2_huber_delta_deg", 1.0))
+        self.min_match_cosine = float(graph_cfg.get("min_match_cosine", 0.45))
         self.recent_optimization_windows = max(2, int(graph_cfg.get("recent_windows", 32)))
         self.map_steps_per_window = max(0, int(optimize_cfg.get("steps_per_window", 0)))
-        self.map_steps_on_loop = max(0, int(optimize_cfg.get("steps_on_loop", 0)))
+        self.map_steps_on_loop = max(
+            0,
+            int(optimize_cfg.get("extra_steps_on_loop", optimize_cfg.get("steps_on_loop", 0))),
+        )
         self.final_map_steps = max(0, int(optimize_cfg.get("final_steps", 0)))
+        self.map_optimize_config = optimize_cfg
         self.lifecycle_prune_interval = max(
             0, int(fusion_cfg.get("lifecycle_prune_interval_windows", 0))
         )
@@ -75,7 +98,10 @@ class SphericalSelfiGlobalBackend:
             min_points=int(graph_cfg.get("min_overlap_points", 32)),
             return_rejected_transform=True,
         )
-        self.max_overlap_points = max(32, int(graph_cfg.get("max_overlap_points", 4096)))
+        self.max_overlap_points = max(
+            32,
+            int(graph_cfg.get("overlap_num_queries", graph_cfg.get("max_overlap_points", 4096))),
+        )
         self.loop_detector = PanoramaLoopDetector(
             top_k=int(loop_cfg.get("top_k", 5)),
             exclude_recent_windows=int(loop_cfg.get("exclude_recent_windows", 3)),
@@ -88,6 +114,20 @@ class SphericalSelfiGlobalBackend:
             max_scale_change=float(loop_cfg.get("max_scale_change", 2.5)),
             coincident_translation_threshold=float(loop_cfg.get("coincident_translation_threshold", 0.15)),
             coincident_rotation_residual_deg=float(loop_cfg.get("coincident_rotation_residual_deg", 2.0)),
+            factor_queries_per_direction=int(graph_cfg.get("factor_queries_per_direction", 2048)),
+            fibonacci_oversample_factor=self.fibonacci_oversample_factor,
+            fibonacci_seed=self.fibonacci_seed,
+            min_depth=self.fibonacci_min_depth,
+            max_depth=self.fibonacci_max_depth,
+            sky_threshold=self.sky_threshold,
+            min_match_margin=float(graph_cfg.get("min_match_margin", 0.01)),
+            max_match_entropy=float(graph_cfg.get("max_match_entropy", 0.95)),
+            forward_backward=bool(graph_cfg.get("forward_backward", True)),
+            fb_tolerance_deg=float(graph_cfg.get("fb_tolerance_deg", 1.0)),
+            min_factor_weight=float(graph_cfg.get("min_factor_weight", 0.01)),
+            target_area_correction=bool(graph_cfg.get("target_area_correction", True)),
+            depth_factor_weight=self.depth_factor_weight,
+            s2_huber_delta_deg=self.s2_huber_delta_deg,
         )
         self.fusion = Stage2GlobalMapFusion(
             gaussian_map,
@@ -101,74 +141,152 @@ class SphericalSelfiGlobalBackend:
         self.window_order: list[int] = []
         self.frame_owner_window: dict[int, int] = {}
         self._pose_updates: dict[int, torch.Tensor] = {}
-        self._pending_map_optimization: list[tuple[tuple[int, ...], int]] = []
+        self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
+        self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
         self.results: list[GlobalWindowBackendResult] = []
 
     def _overlap_edge(
         self,
         source: LocalGaussianWindowPacket,
         target: LocalGaussianWindowPacket,
-    ) -> tuple[Sim3GraphEdge | None, dict[str, Any]]:
+    ) -> tuple[
+        Sim3GraphEdge | None,
+        DenseSphericalFactorBlock | None,
+        CoincidentPanoramaFactor | None,
+        dict[str, Any],
+    ]:
         overlap = sorted(set(source.frame_ids) & set(target.frame_ids))
-        source_parts, target_parts, weight_parts = [], [], []
-        for frame_id in overlap:
-            source_index = source.frame_index(frame_id)
-            target_index = target.frame_index(frame_id)
-            source_points = source.local_points(source_index).detach()
-            target_points = target.local_points(target_index).detach().to(source_points)
-            if source_points.shape != target_points.shape:
-                continue
-            source_conf = source.observation.confidence[0, source_index, 0].detach().to(source_points)
-            target_conf = target.observation.confidence[0, target_index, 0].detach().to(source_points)
-            source_valid = source.valid_mask[0, source_index, 0].to(source_points.device)
-            target_valid = target.valid_mask[0, target_index, 0].to(source_points.device)
-            height = int(source_points.shape[0])
-            rows = torch.arange(height, device=source_points.device, dtype=source_points.dtype) + 0.5
-            area = torch.cos(torch.pi * (rows / float(height) - 0.5)).clamp_min(1.0e-4)
-            weight = source_conf * target_conf * area[:, None]
-            valid = (
-                source_valid
-                & target_valid
-                & torch.isfinite(source_points).all(dim=-1)
-                & torch.isfinite(target_points).all(dim=-1)
-                & torch.isfinite(weight)
-                & (weight > 0.0)
-            )
-            source_parts.append(source_points[valid])
-            target_parts.append(target_points[valid])
-            weight_parts.append(weight[valid])
-        if not source_parts:
-            return None, {"reason": "no_compatible_overlap", "overlap_frame_ids": overlap}
-        source_points = torch.cat(source_parts, dim=0)
-        target_points = torch.cat(target_parts, dim=0)
-        weights = torch.cat(weight_parts, dim=0)
-        if int(weights.numel()) > self.max_overlap_points:
-            selected = torch.topk(weights, k=self.max_overlap_points, largest=True).indices
-            source_points, target_points, weights = source_points[selected], target_points[selected], weights[selected]
+        if self.enforce_exact_overlap and len(overlap) != self.expected_overlap_frames:
+            return None, None, None, {
+                "reason": "unexpected_overlap_count",
+                "overlap_frame_ids": overlap,
+                "expected_overlap_frames": self.expected_overlap_frames,
+            }
+        if len(overlap) != 1:
+            return None, None, None, {"reason": "single_overlap_required", "overlap_frame_ids": overlap}
+        frame_id = int(overlap[0])
+        source_index = source.frame_index(frame_id)
+        target_index = target.frame_index(frame_id)
+        source_depth = source.observation.refined_depth[0, source_index].detach()
+        target_depth = target.observation.refined_depth[0, target_index].detach().to(source_depth)
+        edge_seed = (
+            self.fibonacci_seed
+            + 1_000_003 * int(source.window_id)
+            + 10_007 * int(target.window_id)
+            + 101 * frame_id
+        ) & 0x7FFFFFFF
+        samples = sample_joint_valid_fibonacci_uv(
+            source_depth,
+            target_depth,
+            count=self.max_overlap_points,
+            oversample_factor=self.fibonacci_oversample_factor,
+            min_depth=self.fibonacci_min_depth,
+            max_depth=self.fibonacci_max_depth,
+            source_valid=source.finite_gaussian_mask[0, source_index].detach(),
+            target_valid=target.finite_gaussian_mask[0, target_index].detach().to(source_depth.device),
+            source_sky_probability=source.sky_prob[0, source_index].detach(),
+            target_sky_probability=target.sky_prob[0, target_index].detach().to(source_depth.device),
+            source_confidence=source.observation.confidence[0, source_index].detach(),
+            target_confidence=target.observation.confidence[0, target_index].detach().to(source_depth.device),
+            sky_threshold=self.sky_threshold,
+            seed=edge_seed,
+        )
+        if int(samples.uv.shape[0]) < self.overlap_aligner.min_points:
+            return None, None, None, {
+                "reason": "insufficient_joint_fibonacci_support",
+                "overlap_frame_ids": overlap,
+                "overlap_points": int(samples.uv.shape[0]),
+                "fibonacci_seed": edge_seed,
+            }
+        source_pose = source.local_poses_c2w[source_index].to(samples.bearing)
+        target_pose = target.local_poses_c2w[target_index].to(samples.bearing)
+        source_camera = samples.bearing * samples.source_depth[:, None]
+        target_camera = samples.bearing * samples.target_depth[:, None]
+        source_points = source_camera @ source_pose[:3, :3].transpose(0, 1) + source_pose[:3, 3]
+        target_points = target_camera @ target_pose[:3, :3].transpose(0, 1) + target_pose[:3, 3]
+        source_feature = source.adapter_features[0, source_index].detach().to(samples.bearing)
+        target_feature = target.adapter_features[0, target_index].detach().to(samples.bearing)
+
+        def feature_uv(feature: torch.Tensor, observation_hw: tuple[int, int]) -> torch.Tensor:
+            feature_h, feature_w = int(feature.shape[-2]), int(feature.shape[-1])
+            image_h, image_w = observation_hw
+            uv = samples.uv.clone()
+            uv[:, 0] *= float(feature_w) / float(image_w)
+            uv[:, 1] *= float(feature_h) / float(image_h)
+            return uv
+
+        source_descriptor = torch.nn.functional.normalize(
+            sample_erp_with_wrap(source_feature, feature_uv(source_feature, source.observation.image_size)),
+            dim=-1,
+            eps=1.0e-8,
+        )
+        target_descriptor = torch.nn.functional.normalize(
+            sample_erp_with_wrap(target_feature, feature_uv(target_feature, target.observation.image_size)),
+            dim=-1,
+            eps=1.0e-8,
+        )
+        descriptor_cosine = (source_descriptor * target_descriptor).sum(dim=-1).clamp(-1.0, 1.0)
+        descriptor_consistency = torch.sigmoid(10.0 * (descriptor_cosine - self.min_match_cosine))
+        weights = (
+            samples.source_confidence
+            * samples.target_confidence
+            * (1.0 - samples.source_sky_probability)
+            * (1.0 - samples.target_sky_probability)
+            * descriptor_consistency
+        ).clamp_min(0.0)
         # Measurement maps target anchor coordinates into source anchor coordinates.
         alignment = self.overlap_aligner.align(target_points, source_points, weights)
         diagnostics = {
             "overlap_frame_ids": overlap,
+            "source_frame_id": frame_id,
+            "target_frame_id": frame_id,
             "overlap_points": int(weights.numel()),
             "overlap_residual": float(alignment.residual),
             "overlap_inlier_ratio": float(alignment.inlier_ratio),
+            "fibonacci_seed": int(samples.seed),
+            "fibonacci_longitude_phase": float(samples.longitude_phase),
+            "mean_overlap_descriptor_cosine": float(descriptor_cosine.mean().detach().cpu()),
         }
         if not alignment.accepted:
             diagnostics["reason"] = "overlap_alignment_rejected"
-            return None, diagnostics
+            return None, None, None, diagnostics
         information = source_points.new_tensor([1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.75])
         information *= max(1.0, float(weights.numel()) * float(alignment.inlier_ratio))
-        return (
-            Sim3GraphEdge(
+        sim3_edge = Sim3GraphEdge(
                 source=int(source.window_id),
                 target=int(target.window_id),
                 measurement_target_to_source=alignment.as_matrix().detach(),
                 information_diag=information.detach(),
                 edge_type="overlap",
                 metadata=diagnostics,
-            ),
-            diagnostics,
+            )
+        dense_factor = DenseSphericalFactorBlock(
+            source=int(source.window_id),
+            target=int(target.window_id),
+            source_local_pose=source_pose.detach(),
+            target_local_pose=target_pose.detach(),
+            source_bearing=samples.bearing.detach(),
+            target_bearing=samples.bearing.detach(),
+            source_depth=samples.source_depth.detach(),
+            target_depth=samples.target_depth.detach(),
+            factor_weight=weights.detach(),
+            depth_factor_weight=self.depth_factor_weight,
+            s2_huber_delta_deg=self.s2_huber_delta_deg,
+            edge_type="overlap_dense_spherical",
+            metadata=diagnostics,
         )
+        shared_pose_factor = CoincidentPanoramaFactor(
+            source=int(source.window_id),
+            target=int(target.window_id),
+            source_local_pose=source_pose.detach(),
+            target_local_pose=target_pose.detach(),
+            measured_source_to_target_rotation=torch.eye(3, device=source_pose.device, dtype=source_pose.dtype),
+            center_weight=max(1.0, float(weights.numel()) * 0.25),
+            rotation_weight=max(1.0, float(weights.numel()) * 0.25),
+            edge_type="shared_frame_pose_consistency",
+            metadata=diagnostics,
+        )
+        return sim3_edge, dense_factor, shared_pose_factor, diagnostics
 
     def _initial_transform(
         self,
@@ -196,17 +314,137 @@ class SphericalSelfiGlobalBackend:
         self._pose_updates.clear()
         return updates
 
-    def _run_map_optimization(self, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
+    def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
             return {}
         self.mapper.optimizer = self.map.make_optimizer(
             lr=float(self.config.get("map_optimization", {}).get("lr", 2.0e-3))
         )
         try:
-            return self.mapper.optimize_resplat_global_window(frame_ids=list(frame_ids), iters=int(steps))
+            live_packet = self._optimization_packets.get(int(window_id))
+            if live_packet is not None:
+                from geometry.sim3 import sim3_components
+
+                window_scale, _, _ = sim3_components(self.graph.transform(int(window_id)))
+                for frame_index, frame_id in enumerate(live_packet.frame_ids):
+                    observation = self.mapper.observations.get(int(frame_id))
+                    if observation is None:
+                        continue
+                    observation.target_depth = (
+                        window_scale.detach().cpu().float()
+                        * live_packet.observation.refined_depth[0, frame_index].detach().cpu().float()
+                    )
+                    observation.depth_confidence = (
+                        live_packet.observation.confidence[0, frame_index].detach().cpu().float()
+                        * live_packet.finite_gaussian_mask[0, frame_index].detach().cpu().float()
+                    )
+                    observation.sky_mask = live_packet.sky_mask[0, frame_index].detach().cpu().bool()
+            prepared = self.mapper.prepare_spherical_selfi_window(frame_ids)
+            if prepared != len(frame_ids):
+                raise RuntimeError(
+                    f"window {window_id} has {prepared}/{len(frame_ids)} registered RGB observations"
+                )
+            fixed_frame_ids = [int(self.packets[self.window_order[0]].frame_ids[0])] if self.window_order else []
+            settings = {
+                "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
+                "pose_lr": float(self.map_optimize_config.get("pose_lr", 1.0e-3)),
+                "pose_prior_weight": float(self.map_optimize_config.get("pose_prior_weight", 0.0)),
+                "pose_grad_clip": float(self.map_optimize_config.get("pose_grad_clip", 1.0e-3)),
+                "visible_neighbor_lr_scale": float(self.map_optimize_config.get("visible_neighbor_lr_scale", 0.1)),
+                "sampler_seed": int(self.map_optimize_config.get("seed", 123)) + int(window_id),
+                "fixed_pose_frame_ids": fixed_frame_ids,
+            }
+            metrics = self.mapper.optimize_spherical_selfi_window(
+                window_id=int(window_id),
+                frame_ids=list(frame_ids),
+                iters=int(steps),
+                settings=settings,
+                extra_loss_fn=lambda trainable_pose_ids: self._joint_graph_pose_loss(
+                    int(window_id), trainable_pose_ids
+                ),
+            )
+            if float(metrics.get("window_rollback", 0.0)) == 0.0:
+                self._synchronize_joint_optimized_window(int(window_id))
+            return metrics
         except (RuntimeError, ValueError) as exc:
             self.mapper.stats.notes.append(f"spherical-Selfi map optimization skipped: {exc!r}")
             return {"steps": 0.0, "loss": 0.0}
+        finally:
+            self._optimization_packets.pop(int(window_id), None)
+
+    def _joint_graph_pose_loss(self, window_id: int, trainable_pose_ids: set[int]) -> torch.Tensor:
+        """Evaluate dense graph correspondences on differentiable SE(3) camera poses."""
+
+        if self.mapper is None:
+            return self.map.get_xyz.new_zeros(())
+        device, dtype = self.map.get_xyz.device, self.map.get_xyz.dtype
+        lambda_s2 = float(self.map_optimize_config.get("s2_loss_weight", 0.1))
+        lambda_depth = float(self.map_optimize_config.get("match_depth_loss_weight", 0.01))
+        costs: list[torch.Tensor] = []
+
+        def camera_pose(frame_id: int) -> torch.Tensor | None:
+            pose_delta = self.mapper.pose_deltas.get(int(frame_id))
+            if pose_delta is None:
+                return None
+            pose = pose_delta()
+            return pose if int(frame_id) in trainable_pose_ids else pose.detach()
+
+        for factor in self.graph.edges:
+            if not isinstance(factor, DenseSphericalFactorBlock):
+                continue
+            if int(factor.source) != int(window_id) and int(factor.target) != int(window_id):
+                continue
+            source_frame_id = factor.metadata.get("source_frame_id")
+            target_frame_id = factor.metadata.get("target_frame_id")
+            if source_frame_id is None or target_frame_id is None:
+                continue
+            source_pose = camera_pose(int(source_frame_id))
+            target_pose = camera_pose(int(target_frame_id))
+            if source_pose is None or target_pose is None:
+                continue
+            from geometry.sim3 import sim3_components
+
+            source_scale, _, _ = sim3_components(self.graph.transform(int(factor.source)).detach())
+            target_scale, _, _ = sim3_components(self.graph.transform(int(factor.target)).detach())
+            source_bearing = factor.source_bearing.to(device=device, dtype=dtype)
+            target_bearing = factor.target_bearing.to(device=device, dtype=dtype)
+            source_depth = factor.source_depth.to(device=device, dtype=dtype) * source_scale.to(device=device, dtype=dtype)
+            expected_target_depth = factor.target_depth.to(device=device, dtype=dtype) * target_scale.to(device=device, dtype=dtype)
+            weight = factor.factor_weight.to(device=device, dtype=dtype).clamp_min(0.0)
+            source_pose = source_pose.to(device=device, dtype=dtype)
+            target_pose = target_pose.to(device=device, dtype=dtype)
+            source_camera = source_bearing * source_depth[:, None]
+            world = source_camera @ source_pose[:3, :3].transpose(0, 1) + source_pose[:3, 3]
+            target_camera = (world - target_pose[:3, 3]) @ target_pose[:3, :3]
+            predicted_depth = torch.linalg.norm(target_camera, dim=-1).clamp_min(1.0e-8)
+            predicted_bearing = target_camera / predicted_depth[:, None]
+            s2 = s2_log_tangent_coordinates(target_bearing, predicted_bearing)
+            s2_norm = torch.linalg.norm(s2, dim=-1)
+            s2_delta = torch.as_tensor(
+                torch.pi * float(factor.s2_huber_delta_deg) / 180.0,
+                device=device,
+                dtype=dtype,
+            ).clamp_min(1.0e-8)
+            s2_huber = torch.where(
+                s2_norm <= s2_delta,
+                0.5 * s2_norm.square(),
+                s2_delta * (s2_norm - 0.5 * s2_delta),
+            )
+            factor_loss = lambda_s2 * (weight * s2_huber).sum() / weight.sum().clamp_min(1.0e-8)
+            if factor.use_depth and lambda_depth > 0.0:
+                depth_residual = torch.log(predicted_depth / expected_target_depth.clamp_min(1.0e-8))
+                depth_delta = depth_residual.new_tensor(0.25)
+                depth_abs = depth_residual.abs()
+                depth_huber = torch.where(
+                    depth_abs <= depth_delta,
+                    0.5 * depth_residual.square(),
+                    depth_delta * (depth_abs - 0.5 * depth_delta),
+                )
+                factor_loss = factor_loss + lambda_depth * (
+                    weight * depth_huber
+                ).sum() / weight.sum().clamp_min(1.0e-8)
+            costs.append(factor_loss)
+        return torch.stack(costs).mean() if costs else torch.zeros((), device=device, dtype=dtype)
 
     def run_pending_map_optimization(self) -> dict[str, float]:
         """Run low-rate map updates after the system registered window images."""
@@ -216,9 +454,67 @@ class SphericalSelfiGlobalBackend:
         pending = list(self._pending_map_optimization)
         self._pending_map_optimization.clear()
         last_metrics: dict[str, float] = {}
-        for frame_ids, steps in pending:
-            last_metrics = self._run_map_optimization(frame_ids, steps)
+        for window_id, frame_ids, steps in pending:
+            last_metrics = self._run_map_optimization(window_id, frame_ids, steps)
         return last_metrics
+
+    def _synchronize_joint_optimized_window(self, window_id: int) -> None:
+        """Rebase a window on optimized SE(3) camera poses, preserving graph scale."""
+
+        if self.mapper is None or int(window_id) not in self.packets:
+            return
+        packet = self.packets[int(window_id)]
+        optimized = []
+        for frame_id in packet.frame_ids:
+            pose = self.mapper.refined_pose_c2w(int(frame_id))
+            if pose is None:
+                return
+            optimized.append(pose.float())
+        poses_global = torch.stack(optimized).to(packet.local_poses_c2w)
+        anchor_pose = poses_global[0]
+        current_sim3 = self.graph.transform(int(window_id))
+        from geometry.sim3 import sim3_components
+
+        scale, _, _ = sim3_components(current_sim3)
+        rebased = current_sim3.clone()
+        rebased[:3, :3] = scale * anchor_pose[:3, :3].to(rebased)
+        rebased[:3, 3] = anchor_pose[:3, 3].to(rebased)
+        self.graph.nodes[int(window_id)] = rebased.detach()
+        anchor_inverse = torch.linalg.inv(anchor_pose)
+        local_poses = anchor_inverse.view(1, 4, 4) @ poses_global
+        local_poses[0] = torch.eye(4, device=local_poses.device, dtype=local_poses.dtype)
+        packet.local_poses_c2w = local_poses.detach().cpu() if packet.local_poses_c2w.device.type == "cpu" else local_poses.detach()
+        packet.observation = packet.observation.with_geometry(
+            poses_c2w=packet.local_poses_c2w.unsqueeze(0).to(packet.observation.poses_c2w)
+        )
+        if self._last_full_packet is not None and int(self._last_full_packet.window_id) == int(window_id):
+            self._last_full_packet.local_poses_c2w = local_poses.detach().to(self._last_full_packet.local_poses_c2w)
+            self._last_full_packet.observation = self._last_full_packet.observation.with_geometry(
+                poses_c2w=self._last_full_packet.local_poses_c2w.unsqueeze(0).to(self._last_full_packet.observation.poses_c2w)
+            )
+        for frame_id, pose in zip(packet.frame_ids, poses_global):
+            self._pose_updates[int(frame_id)] = pose.detach().cpu().float()
+            self.frame_owner_window[int(frame_id)] = int(window_id)
+
+        # Dense factors store local camera poses.  Refresh every endpoint of
+        # this window before the recent-subgraph solve.
+        for factor in self.graph.edges:
+            if not isinstance(factor, (DenseSphericalFactorBlock, CoincidentPanoramaFactor)):
+                continue
+            if int(factor.source) == int(window_id):
+                frame_id = int(factor.metadata.get("source_frame_id", packet.frame_ids[0]))
+                if frame_id in packet.frame_ids:
+                    factor.source_local_pose = packet.local_poses_c2w[packet.frame_index(frame_id)].detach()
+            if int(factor.target) == int(window_id):
+                frame_id = int(factor.metadata.get("target_frame_id", packet.frame_ids[0]))
+                if frame_id in packet.frame_ids:
+                    factor.target_local_pose = packet.local_poses_c2w[packet.frame_index(frame_id)].detach()
+
+        old_transforms = {node: value.clone() for node, value in self.graph.nodes.items()}
+        active = self.window_order[-self.recent_optimization_windows :]
+        self.graph.optimize(active)
+        self.fusion.apply_owner_corrections(old_transforms, self.graph.nodes)
+        self._refresh_pose_updates()
 
     def process_packet(self, packet: LocalGaussianWindowPacket) -> GlobalWindowBackendResult:
         if not self.enabled:
@@ -228,6 +524,9 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(f"Duplicate local Gaussian window id {window_id}")
 
         sequential_edge = None
+        sequential_dense_factor = None
+        shared_pose_factor = None
+        sequential_extra_factors: tuple[DenseSphericalFactorBlock, ...] = ()
         alignment_diagnostics: dict[str, Any] = {}
         if not self.window_order:
             initial = sim3_identity(device=packet.local_poses_c2w.device)
@@ -237,7 +536,7 @@ class SphericalSelfiGlobalBackend:
             previous_packet = self._last_full_packet
             if previous_packet is None or int(previous_packet.window_id) != int(previous_id):
                 raise RuntimeError("The previous full-resolution window packet is unavailable")
-            sequential_edge, alignment_diagnostics = self._overlap_edge(previous_packet, packet)
+            sequential_edge, sequential_dense_factor, shared_pose_factor, alignment_diagnostics = self._overlap_edge(previous_packet, packet)
             if sequential_edge is None:
                 fallback = self.loop_detector.verify_pair(
                     previous_packet,
@@ -247,6 +546,7 @@ class SphericalSelfiGlobalBackend:
                 )
                 if isinstance(fallback.factor, Sim3GraphEdge) and fallback.accepted:
                     sequential_edge = fallback.factor
+                    sequential_extra_factors = fallback.dense_factors
                     alignment_diagnostics["fallback"] = fallback.reason
                 elif not self.allow_unaligned_fallback:
                     raise RuntimeError(
@@ -259,11 +559,19 @@ class SphericalSelfiGlobalBackend:
         self.graph.add_node(window_id, initial)
         if sequential_edge is not None:
             self.graph.add_edge(sequential_edge)
+        if sequential_dense_factor is not None:
+            self.graph.add_edge(sequential_dense_factor)
+        if shared_pose_factor is not None:
+            self.graph.add_edge(shared_pose_factor)
+        for factor in sequential_extra_factors:
+            self.graph.add_edge(factor)
 
         loop_results = self.loop_detector.detect(packet)
         accepted_loops = [result for result in loop_results if result.accepted and result.factor is not None]
         for result in accepted_loops:
             self.graph.add_edge(result.factor)
+            for dense_factor in result.dense_factors:
+                self.graph.add_edge(dense_factor)
 
         old_transforms = {node: value.clone() for node, value in self.graph.nodes.items()}
         if accepted_loops:
@@ -288,9 +596,10 @@ class SphericalSelfiGlobalBackend:
             )
         self.loop_detector.add(compact_packet)
         self._refresh_pose_updates()
-        map_steps = self.map_steps_on_loop if accepted_loops else self.map_steps_per_window
+        map_steps = self.map_steps_per_window + (self.map_steps_on_loop if accepted_loops else 0)
         if map_steps > 0:
-            self._pending_map_optimization.append((packet.frame_ids, map_steps))
+            self._pending_map_optimization.append((window_id, packet.frame_ids, map_steps))
+            self._optimization_packets[window_id] = packet
         map_metrics: dict[str, float] = {}
         if self.mapper is not None:
             self.mapper.optimizer = self.map.make_optimizer(
@@ -336,7 +645,9 @@ class SphericalSelfiGlobalBackend:
         graph_result = self.graph.optimize()
         correction = self.fusion.apply_owner_corrections(old_transforms, self.graph.nodes)
         self._refresh_pose_updates()
-        map_metrics = self._run_map_optimization(tuple(self.frame_owner_window), self.final_map_steps)
+        map_metrics = self._run_map_optimization(
+            int(self.window_order[-1]), tuple(self.frame_owner_window), self.final_map_steps
+        )
         if not map_metrics:
             map_metrics = pending_metrics
         return {

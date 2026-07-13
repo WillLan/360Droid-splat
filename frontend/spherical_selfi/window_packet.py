@@ -41,10 +41,33 @@ def _normalize_mask(
     return value.bool()
 
 
+def _normalize_probability(
+    probability: torch.Tensor | None,
+    reference: torch.Tensor,
+    *,
+    default: float,
+) -> torch.Tensor:
+    if probability is None:
+        return torch.full_like(reference, float(default), dtype=torch.float32)
+    value = probability.to(device=reference.device, dtype=torch.float32)
+    if value.ndim == 4:
+        value = value.unsqueeze(2)
+    if value.shape[:3] != reference.shape[:3]:
+        raise ValueError("Window probability maps must share B/S/channel dimensions with observation validity")
+    if tuple(value.shape[-2:]) != tuple(reference.shape[-2:]):
+        batch, views = int(value.shape[0]), int(value.shape[1])
+        value = erp_bilinear_resize(
+            value.reshape(batch * views, 1, *value.shape[-2:]),
+            tuple(reference.shape[-2:]),
+        ).reshape_as(reference.float())
+    return value.clamp(0.0, 1.0)
+
+
 def build_panorama_retrieval_descriptor(
     features: torch.Tensor,
     *,
     latitude_bands: int = 8,
+    spatial_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build a yaw-invariant, spherical-area-weighted descriptor.
 
@@ -62,8 +85,19 @@ def build_panorama_retrieval_descriptor(
     batch, views, channels, height, width = (int(v) for v in value.shape)
     rows = torch.arange(height, device=value.device, dtype=value.dtype) + 0.5
     area = torch.cos(math.pi * (rows / float(height) - 0.5)).clamp_min(1.0e-6)
-    area = area.view(1, 1, 1, height, 1)
-    global_mean = (value * area).sum(dim=(-2, -1)) / (area.sum() * float(width)).clamp_min(1.0e-8)
+    area = area.view(1, 1, 1, height, 1).expand(1, 1, 1, height, width)
+    if spatial_weight is not None:
+        weight = spatial_weight.to(device=value.device, dtype=value.dtype)
+        if weight.ndim == 4:
+            weight = weight.unsqueeze(0)
+        if weight.ndim != 5 or tuple(weight.shape[:2]) != (batch, views):
+            raise ValueError("spatial_weight must have shape Sx1xHxW or BxSx1xHxW")
+        if tuple(weight.shape[-2:]) != (height, width):
+            weight = erp_bilinear_resize(
+                weight.reshape(batch * views, 1, *weight.shape[-2:]), (height, width)
+            ).reshape(batch, views, 1, height, width)
+        area = area * weight.clamp(0.0, 1.0)
+    global_mean = (value * area).sum(dim=(-2, -1)) / area.sum(dim=(-2, -1)).clamp_min(1.0e-8)
     parts = [global_mean]
     band_count = max(1, min(int(latitude_bands), height))
     boundaries = torch.linspace(0, height, band_count + 1, device=value.device).round().long()
@@ -72,8 +106,8 @@ def build_panorama_retrieval_descriptor(
         stop = max(start + 1, stop)
         band_area = area[..., start:stop, :]
         band_value = value[..., start:stop, :]
-        pooled = (band_value * band_area).sum(dim=(-2, -1)) / (
-            band_area.sum() * float(width)
+        pooled = (band_value * band_area).sum(dim=(-2, -1)) / band_area.sum(
+            dim=(-2, -1)
         ).clamp_min(1.0e-8)
         parts.append(pooled)
     descriptor = torch.cat(parts, dim=-1)
@@ -102,7 +136,9 @@ class LocalGaussianWindowPacket:
     adapter_features: torch.Tensor  # 1xSxCxHxW
     retrieval_descriptors: torch.Tensor  # SxD
     verification_features: torch.Tensor  # 1xSxCxHvxWv
-    valid_mask: torch.Tensor  # 1xSx1xHxW
+    valid_mask: torch.Tensor  # compatibility alias for finite_gaussian_mask
+    finite_gaussian_mask: torch.Tensor  # 1xSx1xHxW
+    sky_prob: torch.Tensor
     sky_mask: torch.Tensor
     static_mask: torch.Tensor
     geometry_consistency: torch.Tensor
@@ -123,9 +159,11 @@ class LocalGaussianWindowPacket:
         if not torch.allclose(self.local_poses_c2w[0], identity, atol=1.0e-4, rtol=1.0e-4):
             raise ValueError("The first local pose must be identity")
         expected = tuple(self.observation.valid_mask.shape)
-        for name in ("valid_mask", "sky_mask", "static_mask", "geometry_consistency"):
+        for name in ("valid_mask", "finite_gaussian_mask", "sky_prob", "sky_mask", "static_mask", "geometry_consistency"):
             if tuple(getattr(self, name).shape) != expected:
                 raise ValueError(f"{name} must have shape {expected}")
+        if not torch.equal(self.valid_mask.bool(), self.finite_gaussian_mask.bool()):
+            raise ValueError("valid_mask must equal finite_gaussian_mask for backend compatibility")
 
     @classmethod
     def from_observation(
@@ -137,7 +175,9 @@ class LocalGaussianWindowPacket:
         frame_ids: list[int] | tuple[int, ...] | None = None,
         verification_size: tuple[int, int] | None = (32, 64),
         latitude_bands: int = 8,
+        sky_prob: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
+        sky_threshold: float = 0.5,
         static_mask: torch.Tensor | None = None,
         geometry_consistency: torch.Tensor | None = None,
         match_quality: dict[str, torch.Tensor] | None = None,
@@ -169,13 +209,20 @@ class LocalGaussianWindowPacket:
             poses_c2w=local_poses.unsqueeze(0).to(observation.poses_c2w)
         )
         valid = local_observation.valid_mask.bool()
-        sky = _normalize_mask(sky_mask, valid, default=False)
+        probability = _normalize_probability(sky_prob, valid, default=0.0)
+        sky = (
+            _normalize_mask(sky_mask, valid, default=False)
+            if sky_mask is not None
+            else probability >= float(sky_threshold)
+        )
         static = _normalize_mask(static_mask, valid, default=True)
         consistent = _normalize_mask(geometry_consistency, valid, default=True)
         valid = valid & ~sky & static & consistent
         normalized_features = F.normalize(adapter_features.float(), dim=2, eps=1.0e-8)
         retrieval = build_panorama_retrieval_descriptor(
-            normalized_features[0], latitude_bands=latitude_bands
+            normalized_features[0],
+            latitude_bands=latitude_bands,
+            spatial_weight=(1.0 - probability[0]).clamp(0.0, 1.0),
         )
         verification = _verification_features(normalized_features, verification_size)
         return cls(
@@ -188,6 +235,8 @@ class LocalGaussianWindowPacket:
             retrieval_descriptors=retrieval,
             verification_features=verification,
             valid_mask=valid,
+            finite_gaussian_mask=valid,
+            sky_prob=probability,
             sky_mask=sky,
             static_mask=static,
             geometry_consistency=consistent,
@@ -274,6 +323,9 @@ class LocalGaussianWindowPacket:
         def compact_mask(value: torch.Tensor) -> torch.Tensor:
             return resize_channels(value.float(), 1, nearest=True).bool()
 
+        def compact_probability(value: torch.Tensor) -> torch.Tensor:
+            return resize_channels(value.float(), 1).clamp(0.0, 1.0)
+
         verification = self.verification_features.detach().cpu().float()
         return LocalGaussianWindowPacket(
             window_id=int(self.window_id),
@@ -285,6 +337,8 @@ class LocalGaussianWindowPacket:
             retrieval_descriptors=self.retrieval_descriptors.detach().cpu().float(),
             verification_features=verification,
             valid_mask=compact_mask(self.valid_mask),
+            finite_gaussian_mask=compact_mask(self.finite_gaussian_mask),
+            sky_prob=compact_probability(self.sky_prob),
             sky_mask=compact_mask(self.sky_mask),
             static_mask=compact_mask(self.static_mask),
             geometry_consistency=compact_mask(self.geometry_consistency),

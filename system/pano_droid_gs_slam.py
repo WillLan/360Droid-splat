@@ -26,9 +26,27 @@ from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
+def _deep_merge_config(base: dict, override: dict) -> dict:
+    output = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(output.get(key), dict):
+            output[key] = _deep_merge_config(output[key], value)
+        else:
+            output[key] = value
+    return output
+
+
 def load_config(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    config_path = Path(path).resolve()
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    base_path = config.pop("base_config", None)
+    if base_path is None:
+        return config
+    resolved_base = Path(base_path)
+    if not resolved_base.is_absolute():
+        resolved_base = config_path.parent / resolved_base
+    return _deep_merge_config(load_config(resolved_base), config)
 
 
 def _se3_log(T: torch.Tensor) -> torch.Tensor:
@@ -1597,6 +1615,28 @@ class PanoDroidGSSlamSystem:
                 )
             from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
 
+            # Runtime Fibonacci/window/sky settings are the shared source of
+            # truth.  Backend-local values remain valid explicit overrides.
+            spherical_global_cfg = dict(spherical_global_cfg)
+            graph_cfg = dict(spherical_global_cfg.get("global_graph", {}) or {})
+            runtime_cfg = dict(config.get("SphericalSelfiRuntime", {}) or {})
+            fibonacci_cfg = dict(runtime_cfg.get("fibonacci", {}) or {})
+            window_cfg = dict(runtime_cfg.get("window", {}) or {})
+            sky_cfg = dict(runtime_cfg.get("sky", {}) or {})
+            inherited = {
+                "fibonacci_seed": fibonacci_cfg.get("seed"),
+                "fibonacci_oversample_factor": fibonacci_cfg.get("oversample_factor"),
+                "min_depth": fibonacci_cfg.get("min_depth"),
+                "max_depth": fibonacci_cfg.get("max_depth"),
+                "expected_overlap_frames": window_cfg.get("expected_overlap_frames"),
+                "enforce_exact_overlap": window_cfg.get("enforce_exact_overlap"),
+                "sky_threshold": sky_cfg.get("threshold"),
+            }
+            for key, value in inherited.items():
+                if value is not None:
+                    graph_cfg.setdefault(key, value)
+            spherical_global_cfg["global_graph"] = graph_cfg
+
             self.spherical_selfi_global_backend = SphericalSelfiGlobalBackend(
                 self.map,
                 mapper=self.mapper,
@@ -2477,7 +2517,14 @@ class PanoDroidGSSlamSystem:
             # replacing only the not-yet-emitted FrontendOutput would leave the
             # photometric replay cameras at stale poses.
             self.mapper.apply_frontend_pose_updates(graph_pose_updates)
-            pending_spherical_selfi_pose_updates.update(graph_pose_updates)
+            ready_ids = {int(output.frame_id) for output in outputs}
+            pending_spherical_selfi_pose_updates.update(
+                {
+                    int(frame_id): pose
+                    for frame_id, pose in graph_pose_updates.items()
+                    if int(frame_id) in ready_ids
+                }
+            )
             for index, output in enumerate(outputs):
                 pose = pending_spherical_selfi_pose_updates.get(int(output.frame_id))
                 if pose is None:
@@ -2501,6 +2548,9 @@ class PanoDroidGSSlamSystem:
             metrics = self.spherical_selfi_global_backend.run_pending_map_optimization()
             if not metrics:
                 return
+            joint_pose_updates = self.spherical_selfi_global_backend.pop_pose_updates()
+            if joint_pose_updates:
+                self.mapper.apply_frontend_pose_updates(joint_pose_updates)
             last_feedforward_metrics = dict(metrics)
             write_profile(
                 "backend_spherical_selfi_map_optimization",

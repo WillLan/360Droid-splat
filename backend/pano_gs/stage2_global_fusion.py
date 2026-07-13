@@ -142,9 +142,6 @@ class Stage2GlobalMapFusion:
         target_sh_count = int(self.map.sh_rest.shape[1]) + 1
         parts: list[GlobalExplicitGaussianBatch] = []
         height, width = observation.image_size
-        rows = torch.arange(height, device=device, dtype=dtype) + 0.5
-        spherical_area = torch.cos(math.pi * (rows / float(height) - 0.5)).clamp_min(1.0e-4)
-        spherical_area = spherical_area[:, None].expand(height, width)
 
         centers_camera = observation.centers_camera()[0].to(device=device, dtype=dtype)
         scale_camera = observation.scales()[0].permute(0, 2, 3, 1).to(device=device, dtype=dtype)
@@ -158,7 +155,9 @@ class Stage2GlobalMapFusion:
             device=device, dtype=dtype
         )
         geometry_confidence = observation.confidence[0, :, 0].to(device=device, dtype=dtype)
-        valid = packet.valid_mask[0, :, 0].to(device=device)
+        valid = packet.finite_gaussian_mask[0, :, 0].to(device=device)
+        non_sky_probability = (1.0 - packet.sky_prob[0, :, 0].to(device=device, dtype=dtype)).clamp(0.0, 1.0)
+        consistency = packet.geometry_consistency[0, :, 0].to(device=device, dtype=dtype)
 
         for view in range(observation.num_source_views):
             pose = packet.local_poses_c2w[view].to(device=device, dtype=dtype)
@@ -180,7 +179,16 @@ class Stage2GlobalMapFusion:
                 resized[..., :copy_count, :] = coefficients[..., :copy_count, :]
                 coefficients = resized
             confidence = geometry_confidence[view]
-            quality = confidence * opacity[view, ..., 0] * spherical_area
+            # Stage-2 Gaussians are dense ERP predictions, but voxel quality is
+            # an observation-quality score rather than an integration measure.
+            # Fibonacci handles source-sphere area for graph sampling, so a
+            # second cos(latitude) term here would suppress polar geometry twice.
+            quality = (
+                confidence
+                * opacity[view, ..., 0]
+                * non_sky_probability[view]
+                * consistency[view]
+            )
             keep = (
                 valid[view]
                 & torch.isfinite(center_global).all(dim=-1)

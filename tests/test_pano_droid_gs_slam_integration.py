@@ -907,6 +907,60 @@ def test_mapper_feedforward_window_uses_history_and_non_keyframes():
     assert renderer.frame_ids == [2, 3, 10, 11]
 
 
+def test_spherical_selfi_window_runs_twenty_balanced_steps_and_reuses_overlap_pose():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": True,
+            "pose_prior_weight": 0.0,
+            "final_global_steps": 0,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {"enabled": True, "prune": {"enabled": False}},
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    renderer = _CountingRenderer()
+    mapper = PanoGaussianMapper(gaussian_map, renderer=renderer)
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.2),
+    )
+    gaussian_map._anchor_owner_window_id[:] = 0
+    for frame_id in (1, 2, 3):
+        mapper.register_observation(
+            _small_frontend_output(frame_id),
+            torch.full((3, 4, 8), 0.2 + 0.01 * frame_id),
+            is_keyframe=True,
+        )
+    assert mapper.prepare_spherical_selfi_window((0, 1, 2, 3)) == 4
+    overlap_pose_delta = mapper.pose_deltas[3]
+    metrics = mapper.optimize_spherical_selfi_window(
+        window_id=0,
+        frame_ids=(0, 1, 2, 3),
+        iters=20,
+        settings={
+            "fixed_pose_frame_ids": [0],
+            "pose_grad_clip": 1.0e-3,
+            "sampler_seed": 17,
+        },
+    )
+    assert metrics["steps"] == 20.0
+    assert renderer.calls == 20
+    assert [metrics[f"sample_count_frame_{frame_id}"] for frame_id in range(4)] == [5.0] * 4
+
+    for frame_id in (4, 5, 6):
+        mapper.register_observation(
+            _small_frontend_output(frame_id),
+            torch.full((3, 4, 8), 0.25),
+            is_keyframe=True,
+        )
+    assert mapper.prepare_spherical_selfi_window((3, 4, 5, 6)) == 4
+    assert mapper.pose_deltas[3] is overlap_pose_delta
+
+
 def test_replace_fuse_chunk_optimizer_samples_current_chunk_and_recent_keyframes():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

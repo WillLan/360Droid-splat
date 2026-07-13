@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -8,8 +9,10 @@ import torch
 from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.sim3_graph import (
     CoincidentPanoramaFactor,
+    DenseSphericalFactorBlock,
     GlobalSim3FactorGraph,
     Sim3GraphEdge,
+    s2_log_tangent_coordinates,
 )
 from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
 from backend.pano_gs.stage2_global_fusion import (
@@ -32,6 +35,7 @@ from geometry.sim3 import (
     sim3_log,
     sim3_components,
 )
+from geometry.spherical_erp import erp_pixel_to_unit_ray
 from models.per_pixel_gaussian_observation import real_sh_basis
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from training.train_spherical_selfi_gaussian_head import default_config as stage2_default_config
@@ -136,6 +140,48 @@ def test_coincident_panorama_factor_corrects_center_rotation_without_scale() -> 
     torch.testing.assert_close(rotation, truth_rotation, atol=3e-3, rtol=3e-3)
 
 
+def test_dense_spherical_depth_factor_recovers_window_scale() -> None:
+    height, width = 8, 16
+    row, column = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32) + 0.5,
+        torch.arange(width, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    uv = torch.stack([column, row], dim=-1).reshape(-1, 2)[::2]
+    bearing = erp_pixel_to_unit_ray(uv, height, width)
+    graph = GlobalSim3FactorGraph(max_iterations=12, pcg_iterations=48)
+    graph.add_node(0, sim3_identity())
+    graph.add_node(1, sim3_from_components(1.25, torch.eye(3), torch.zeros(3)))
+    graph.add_edge(
+        DenseSphericalFactorBlock(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            source_bearing=bearing,
+            target_bearing=bearing,
+            source_depth=torch.full((bearing.shape[0],), 2.0),
+            target_depth=torch.full((bearing.shape[0],), 1.0),
+            factor_weight=torch.ones(bearing.shape[0]),
+            depth_factor_weight=1.0,
+        )
+    )
+    result = graph.optimize()
+    assert result.accepted
+    scale, rotation, translation = sim3_components(graph.transform(1))
+    assert abs(float(scale) - 2.0) < 2.0e-3
+    torch.testing.assert_close(rotation, torch.eye(3), atol=2e-4, rtol=2e-4)
+    assert float(translation.norm()) < 2.0e-4
+
+
+def test_s2_log_antipodal_is_finite_and_not_zero() -> None:
+    base = torch.tensor([[0.0, 0.0, 1.0]])
+    antipode = -base
+    residual = s2_log_tangent_coordinates(base, antipode)
+    assert torch.isfinite(residual).all()
+    torch.testing.assert_close(residual.norm(dim=-1), torch.tensor([math.pi]))
+
+
 def test_yaw_invariant_retrieval_descriptor_and_shift() -> None:
     torch.manual_seed(3)
     feature = torch.randn(1, 24, 8, 16)
@@ -197,6 +243,37 @@ def test_stage2_voxel_fusion_keeps_unique_owner_and_moves_all_attributes() -> No
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_voxel_quality_does_not_apply_latitude_weight_twice() -> None:
+    poses = torch.eye(4).repeat(1, 1, 1)
+    observation, feature = _observation(poses, (0,), height=10, width=20)
+    observation = replace(
+        observation,
+        confidence=torch.ones_like(observation.confidence),
+        density_sh=torch.zeros_like(observation.density_sh),
+        valid_mask=torch.ones_like(observation.valid_mask),
+    )
+    packet = LocalGaussianWindowPacket.from_observation(
+        window_id=0,
+        observation=observation,
+        adapter_features=feature,
+        frame_ids=(0,),
+        verification_size=feature.shape[-2:],
+    )
+    gaussian_map = PanoGaussianMap(
+        config={"SphericalSelfiGlobalBackend": {"enabled": True, "rgb_sh_degree": 2}},
+        device="cpu",
+    )
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(1.0e-4,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    batch = fusion.packet_to_global_batch(packet, sim3_identity())
+    assert len(batch) == 10 * 20
+    torch.testing.assert_close(batch.quality, torch.full_like(batch.quality, 0.5))
 
 
 def test_two_overlapping_windows_build_graph_and_global_map() -> None:
@@ -318,3 +395,74 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
     assert len(packets) == 1
     assert packets[0].frame_ids == (0, 1, 2)
     assert packets[0].local_poses_c2w[0].equal(torch.eye(4))
+
+
+def test_window_scheduler_has_exact_one_frame_overlap_and_partial_flush(tmp_path: Path) -> None:
+    config = stage2_default_config()
+    config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_stride3.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {
+            "size": 4,
+            "stride": 3,
+            "expected_overlap_frames": 1,
+            "enforce_exact_overlap": True,
+            "verification_size": [4, 8],
+        },
+        "local_ba": {"enabled": False},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    packets = []
+    for frame_id in range(9):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+        frontend.pop_ready_outputs()
+        packets.extend(frontend.consume_local_gaussian_windows())
+    frontend.flush()
+    packets.extend(frontend.consume_local_gaussian_windows())
+    frontend.flush()
+    assert frontend.consume_local_gaussian_windows() == []
+    assert [packet.frame_ids for packet in packets] == [
+        (0, 1, 2, 3),
+        (3, 4, 5, 6),
+        (6, 7, 8),
+    ]
+    assert all(torch.equal(packet.local_poses_c2w[0], torch.eye(4)) for packet in packets)
+    assert set(packets[0].frame_ids) & set(packets[1].frame_ids) == {3}
+    assert set(packets[1].frame_ids) & set(packets[2].frame_ids) == {6}
+
+
+def test_packet_hard_sky_defines_finite_gaussian_mask() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    observation, feature = _observation(poses, (0, 1))
+    sky_prob = torch.zeros_like(observation.valid_mask, dtype=torch.float32)
+    sky_prob[..., :2, :] = 0.9
+    packet = LocalGaussianWindowPacket.from_observation(
+        window_id=0,
+        observation=observation,
+        adapter_features=feature,
+        frame_ids=(0, 1),
+        verification_size=feature.shape[-2:],
+        sky_prob=sky_prob,
+        sky_threshold=0.5,
+    )
+    assert packet.sky_mask[..., :2, :].all()
+    assert not packet.finite_gaussian_mask[..., :2, :].any()
+    assert torch.equal(packet.valid_mask, packet.finite_gaussian_mask)
