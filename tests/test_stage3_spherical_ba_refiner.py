@@ -25,10 +25,17 @@ from models.spherical_selfi_stage3_ba import (
     _weighted_affine_fit,
     all_directed_pairs,
     build_stage3_match_cache,
+    directed_pairs_for_topology,
 )
 from geometry.spherical_erp import build_erp_ray_grid, erp_pixel_to_unit_ray
 from frontend.pano_droid.spherical_ba import se3_exp
-from training.train_spherical_ba_recurrent_refiner import _ba_outer_schedule, default_config, train
+from training.train_spherical_ba_recurrent_refiner import (
+    SyntheticDifferentiableRenderer,
+    _ba_outer_schedule,
+    default_config,
+    render_all_source_group,
+    train,
+)
 from tools.generate_stage3_ba_ablation_configs import EXPERIMENTS, generate as generate_ablation_configs
 from tools.generate_stage3_ba_gate_sweep import (
     HIGH_PARALLAX_VARIANTS,
@@ -83,6 +90,24 @@ def test_all_directed_pairs_and_global_match_contract() -> None:
     assert cache.source_uv.shape == (1, 4, 2, 2)
     assert cache.num_factors == 24
     assert bool(torch.isfinite(cache.entropy).all())
+
+
+def test_star_forward_match_cache_uses_anchor_edges_only() -> None:
+    observation, feature, _ = _observation(views=4, height=4, width=8)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=4,
+        query_chunk_size=2,
+        edge_topology="star_forward",
+        forward_backward=False,
+    )
+    expected = torch.tensor([[0, 1], [0, 2], [0, 3]])
+    assert torch.equal(cache.edges.cpu(), expected)
+    assert torch.equal(directed_pairs_for_topology(4, "star_forward"), expected)
+    assert cache.target_uv.shape == (1, 3, 4, 2)
+    assert cache.num_factors == 12
+    assert cache.metadata["edge_topology"] == "star_forward"
 
 
 def test_match_cache_filters_static_source_and_target_pixels() -> None:
@@ -669,6 +694,65 @@ def test_error_encoder_and_router_shapes_without_optional_resnet() -> None:
     assert bool(torch.isfinite(routed).all())
 
 
+def test_error_router_routes_self_visibility() -> None:
+    observation, _, _ = _observation(views=3)
+    router = SphericalErrorRouter()
+    with torch.no_grad():
+        router.output_projection.weight.zero_()
+        router.output_projection.bias.zero_()
+        router.output_projection.weight[0, 0, 0, 0] = 1.0
+    error = torch.ones(1, 3, 32, 2, 4)
+    visibility = torch.zeros(1, 3, 3, 1, 8, 16, dtype=torch.bool)
+    for view in range(3):
+        visibility[:, view, view] = True
+    routed = router(
+        observation,
+        error,
+        observation.refined_depth.clone(),
+        torch.ones_like(observation.refined_depth),
+        target_source_visibility=visibility,
+    )
+    torch.testing.assert_close(routed[:, :, 0], torch.ones_like(routed[:, :, 0]))
+    assert bool(observation.valid_mask.all())
+
+
+def test_synthetic_render_group_includes_every_source_for_every_target() -> None:
+    observation, _, _ = _observation(views=4)
+    group = render_all_source_group(SyntheticDifferentiableRenderer(), observation)
+    assert group.rendered.shape == (1, 4, 3, 8, 16)
+    assert group.source_visibility.shape == (1, 4, 4, 1, 8, 16)
+    assert bool(group.source_visibility.all())
+
+
+def test_real_render_group_uses_one_four_camera_call_and_shared_gaussians() -> None:
+    observation, _, _ = _observation(views=4)
+    observation.render_prune_fraction = 0.0
+
+    class FakeBatchedRenderer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def render_cameras(self, cameras, explicit):
+            self.calls += 1
+            assert len(cameras) == 4
+            assert explicit.features.shape[:2] == (4, explicit.xyz.shape[0])
+            height, width = observation.image_size
+            return {
+                "render": torch.zeros(4, 3, height, width),
+                "depth": torch.ones(4, 1, height, width) * 2.0,
+                "alpha": torch.ones(4, 1, height, width),
+                "visibility_filter": torch.ones(4, explicit.xyz.shape[0], dtype=torch.bool),
+                "profile_renderer_batched_cameras": 4.0,
+            }
+
+    renderer = FakeBatchedRenderer()
+    group = render_all_source_group(renderer, observation)
+    assert renderer.calls == 1
+    assert group.rendered.shape == (1, 4, 3, 8, 16)
+    assert bool(group.source_visibility.all())
+    assert group.profiles["profile_renderer_batched_cameras"] == 4.0
+
+
 def test_support_map_has_floor_and_query_peaks() -> None:
     observation, feature, _ = _observation()
     cache = build_stage3_match_cache(feature, observation.refined_depth, num_queries=2, query_chunk_size=1)
@@ -714,7 +798,11 @@ def test_pilot_generator_locks_the_validated_ba_and_training_contract(tmp_path: 
     assert config["ba"]["pose_update_side"] == "right"
     assert config["ba"]["pose_dof_mode"] == "rotation_only"
     assert config["ba"]["max_pose_update_deg"] == 0.02
-    assert config["matching"]["reliability_keep_fraction"] == 0.10
+    assert config["matching"]["edge_topology"] == "star_forward"
+    assert config["matching"]["reliability_keep_fraction"] == 0.40
+    assert config["renderer"]["batched_targets"] is True
+    assert config["renderer"]["include_self_source"] is True
+    assert config["renderer"]["shared_source_opacity"] is True
     assert config["loss"]["dssim"] == 0.0
     assert config["train"]["max_steps"] == 200
     assert config["WeightsAndBiases"]["mode"] == "online"

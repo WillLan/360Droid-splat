@@ -91,6 +91,40 @@ def _blank_package(camera: PanoRenderCamera, gaussians, background: torch.Tensor
     }
 
 
+def _blank_batched_package(
+    cameras: list[PanoRenderCamera],
+    gaussians,
+    background: torch.Tensor,
+) -> RenderPackage:
+    if not cameras:
+        raise ValueError("At least one camera is required.")
+    count = len(cameras)
+    height, width = int(cameras[0].image_height), int(cameras[0].image_width)
+    total = int(gaussians.get_xyz.shape[0])
+    device, dtype = gaussians.get_xyz.device, gaussians.get_xyz.dtype
+    bg = background.to(device=device, dtype=dtype)
+    if bg.ndim == 1:
+        bg = bg.view(1, 3).expand(count, -1)
+    render = bg[:, :, None, None].expand(count, 3, height, width).clone()
+    depth = torch.zeros(count, 1, height, width, device=device, dtype=dtype)
+    alpha = torch.zeros_like(depth)
+    return {
+        "render": render,
+        "gs_only": render,
+        "sky_bg_only": torch.zeros_like(render),
+        "sky_bg_alpha": torch.zeros_like(alpha),
+        "depth": depth,
+        "opacity": alpha,
+        "alpha": alpha,
+        "render_distort": None,
+        "radii": torch.zeros(count, total, device=device, dtype=torch.int32),
+        "n_touched": torch.zeros(count, total, device=device, dtype=torch.int32),
+        "accum_metric_counts": None,
+        "viewspace_points": torch.zeros(count, total, 2, device=device, dtype=dtype),
+        "visibility_filter": torch.zeros(count, total, device=device, dtype=torch.bool),
+    }
+
+
 class PFGS360Renderer:
     """Render ``anchor_scaffold_panorama`` maps through gsplat360 when available."""
 
@@ -110,7 +144,9 @@ class PFGS360Renderer:
         return cfg.get("Training", {}) if isinstance(cfg, dict) else {}
 
     def _sync_for_profile(self, device: torch.device) -> None:
-        cfg = self.config.get("Renderer", {}) if isinstance(self.config, dict) else {}
+        cfg = {}
+        if isinstance(self.config, dict):
+            cfg = self.config.get("renderer", self.config.get("Renderer", {}))
         if not bool(cfg.get("profile_synchronize_cuda", False)):
             return
         if device.type == "cuda" and torch.cuda.is_available():
@@ -196,6 +232,75 @@ class PFGS360Renderer:
         profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
         profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
         return self._attach_profile(pkg, profile)
+
+    def render_cameras(
+        self,
+        cameras: list[PanoRenderCamera] | tuple[PanoRenderCamera, ...],
+        gaussians,
+        *,
+        background: torch.Tensor | None = None,
+    ) -> RenderPackage:
+        """Rasterize shared geometry into all target cameras in one CUDA call."""
+
+        camera_list = list(cameras)
+        if not camera_list:
+            raise ValueError("render_cameras requires at least one camera.")
+        height, width = int(camera_list[0].image_height), int(camera_list[0].image_width)
+        if any(
+            (int(camera.image_height), int(camera.image_width)) != (height, width)
+            for camera in camera_list
+        ):
+            raise ValueError("All batched cameras must share image dimensions.")
+        total_start = time.perf_counter()
+        profile: dict[str, float] = {
+            "profile_renderer_materialize_sec": 0.0,
+            "profile_renderer_rasterize_sec": 0.0,
+            "profile_renderer_postprocess_sec": 0.0,
+            "profile_renderer_skybox_sec": 0.0,
+            "profile_renderer_total_sec": 0.0,
+            "profile_renderer_materialized_gaussians": 0.0,
+            "profile_renderer_batched_cameras": float(len(camera_list)),
+        }
+        if hasattr(gaussians, "materialize_batched"):
+            section_start = time.perf_counter()
+            gaussians = gaussians.materialize_batched(camera_list, batch_index=0)
+            self._sync_for_profile(gaussians.get_xyz.device)
+            profile["profile_renderer_materialize_sec"] = float(
+                time.perf_counter() - section_start
+            )
+        profile["profile_renderer_materialized_gaussians"] = float(
+            int(gaussians.get_xyz.shape[0])
+        )
+        if background is None:
+            background = torch.zeros(
+                len(camera_list),
+                3,
+                device=gaussians.get_xyz.device,
+                dtype=gaussians.get_xyz.dtype,
+            )
+        if int(gaussians.get_xyz.shape[0]) == 0:
+            package = _blank_batched_package(camera_list, gaussians, background)
+            profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
+            return self._attach_profile(package, profile)
+
+        rasterization = _optional_gsplat360(self.extra_gsplat360_roots)
+        if rasterization is None:
+            raise ImportError(
+                "Batched Stage 3 rendering requires the gsplat360 CUDA extension."
+            )
+        section_start = time.perf_counter()
+        package = self._render_gsplat360_cameras(
+            rasterization,
+            camera_list,
+            gaussians,
+            background,
+        )
+        self._sync_for_profile(gaussians.get_xyz.device)
+        profile["profile_renderer_rasterize_sec"] = float(
+            time.perf_counter() - section_start
+        )
+        profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
+        return self._attach_profile(package, profile)
 
     def _postprocess_materialized(self, source_gaussians, materialized, pkg: RenderPackage) -> RenderPackage:
         if materialized is None or not hasattr(source_gaussians, "postprocess_render_package"):
@@ -303,6 +408,119 @@ class PFGS360Renderer:
             "opacity": opacity,
             "alpha": opacity,
             "render_distort": render_distort[0] if render_distort is not None else None,
+            "radii": radii,
+            "n_touched": n_touched,
+            "accum_metric_counts": None,
+            "viewspace_points": means2d,
+            "visibility_filter": visibility_filter,
+        }
+
+    def _render_gsplat360_cameras(
+        self,
+        rasterization,
+        cameras: list[PanoRenderCamera],
+        gaussians,
+        background: torch.Tensor,
+    ) -> RenderPackage:
+        """Unpacked multi-camera PFGS360 call with shared opacity/geometry."""
+
+        height, width = int(cameras[0].image_height), int(cameras[0].image_width)
+        xyz = gaussians.get_xyz
+        device, dtype = xyz.device, xyz.dtype
+        training_cfg = self._training_cfg(gaussians)
+        if bool(training_cfg.get("pfgs360_packed", False)):
+            raise NotImplementedError(
+                "The confirmed Stage 3 batched renderer uses pfgs360_packed=False."
+            )
+        render_mode = str(training_cfg.get("pfgs360_render_mode", "RGB+ED"))
+        if render_mode != "RGB+ED":
+            raise NotImplementedError(
+                "PFGS360 batched rendering expects pfgs360_render_mode='RGB+ED'."
+            )
+        camera_count = len(cameras)
+        viewmats = torch.stack(
+            [camera.w2c.to(device=device, dtype=dtype) for camera in cameras], dim=0
+        )
+        intrinsic = torch.tensor(
+            [
+                [width / 2.0, 0.0, (width - 1.0) / 2.0],
+                [0.0, height / 2.0, (height - 1.0) / 2.0],
+                [0.0, 0.0, 1.0],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        intrinsics = intrinsic.unsqueeze(0).expand(camera_count, -1, -1)
+        features = gaussians.get_features
+        if features.ndim == 2:
+            features = features.unsqueeze(0).expand(camera_count, -1, -1)
+        if tuple(features.shape[:2]) != (camera_count, int(xyz.shape[0])):
+            raise ValueError("Batched Gaussian RGB must have shape CxNx3.")
+        colors_sh = ((features - 0.5) / SH_C0).unsqueeze(-2)
+        backgrounds = background.to(device=device, dtype=dtype)
+        if backgrounds.ndim == 1:
+            backgrounds = backgrounds.view(1, 3).expand(camera_count, -1)
+        if tuple(backgrounds.shape) != (camera_count, 3):
+            raise ValueError("Batched backgrounds must have shape Cx3.")
+
+        render, alpha, render_distort, info = rasterization(
+            means=xyz,
+            quats=gaussians.get_rotation,
+            scales=gaussians.get_scaling,
+            opacities=gaussians.get_opacity.squeeze(-1),
+            colors=colors_sh,
+            viewmats=viewmats,
+            Ks=intrinsics,
+            width=width,
+            height=height,
+            packed=False,
+            backgrounds=backgrounds,
+            near_plane=float(training_cfg.get("pfgs360_near_plane", 0.01)),
+            far_plane=float(training_cfg.get("pfgs360_far_plane", 1.0e5)),
+            radius_clip=float(training_cfg.get("pfgs360_radius_clip", 0.0)),
+            render_mode=render_mode,
+            sh_degree=0,
+            sparse_grad=False,
+            absgrad=bool(training_cfg.get("pfgs360_absgrad", True)),
+            distloss=bool(training_cfg.get("pfgs360_distloss", False)),
+            rasterize_mode=str(
+                training_cfg.get("pfgs360_rasterize_mode", "antialiased")
+            ),
+            camera_model="equirectangular",
+            ret_visible=True,
+        )
+        rgb = render[..., :3].permute(0, 3, 1, 2).contiguous()
+        depth = render[..., 3:4].permute(0, 3, 1, 2).contiguous()
+        opacity = alpha.permute(0, 3, 1, 2).contiguous()
+        means2d = info["means2d"]
+        if means2d.requires_grad:
+            means2d.retain_grad()
+        radii = info["radii"]
+        if tuple(radii.shape) != (camera_count, int(xyz.shape[0])):
+            raise RuntimeError(
+                "Unpacked gsplat360 radii must have shape CxN for batched visibility."
+            )
+        accumulated_visibility = info.get("accum_visible")
+        if torch.is_tensor(accumulated_visibility):
+            if tuple(accumulated_visibility.shape) != tuple(radii.shape):
+                raise RuntimeError("gsplat360 accum_visible must have shape CxN.")
+            visibility_filter = accumulated_visibility > 0
+        else:
+            visibility_filter = radii > 0
+        n_touched = info.get("accum_times")
+        if n_touched is not None:
+            n_touched = n_touched.to(device=device, dtype=torch.int32)
+        else:
+            n_touched = visibility_filter.to(dtype=torch.int32)
+        return {
+            "render": rgb,
+            "gs_only": rgb,
+            "sky_bg_only": torch.zeros_like(rgb),
+            "sky_bg_alpha": torch.zeros_like(opacity),
+            "depth": depth,
+            "opacity": opacity,
+            "alpha": opacity,
+            "render_distort": render_distort,
             "radii": radii,
             "n_touched": n_touched,
             "accum_metric_counts": None,

@@ -152,6 +152,73 @@ class ExplicitPerPixelGaussianSet:
 
 
 @dataclass
+class BatchedExplicitPerPixelGaussianSet:
+    """One shared Gaussian geometry rendered by multiple target cameras.
+
+    Geometry, opacity, pruning, and provenance are shared across cameras.
+    ``features`` contains target-conditioned RGB values with shape ``CxNx3``.
+    """
+
+    xyz: torch.Tensor
+    scaling: torch.Tensor
+    rotation: torch.Tensor
+    opacity: torch.Tensor
+    features: torch.Tensor
+    confidence: torch.Tensor
+    source_frame_index: torch.Tensor
+    source_pixel_uv: torch.Tensor
+    source_ray: torch.Tensor
+    source_depth: torch.Tensor
+    config: dict[str, Any] | None = None
+    active_sh_degree: int = 0
+    max_sh_degree: int = 0
+
+    def __post_init__(self) -> None:
+        count = int(self.xyz.shape[0])
+        if tuple(self.xyz.shape) != (count, 3):
+            raise ValueError("xyz must have shape Nx3.")
+        if self.features.ndim != 3 or tuple(self.features.shape[1:]) != (count, 3):
+            raise ValueError("Batched features must have shape CxNx3.")
+        for name, tensor, width in (
+            ("scaling", self.scaling, 3),
+            ("rotation", self.rotation, 4),
+            ("opacity", self.opacity, 1),
+            ("confidence", self.confidence, 1),
+            ("source_pixel_uv", self.source_pixel_uv, 2),
+            ("source_ray", self.source_ray, 3),
+            ("source_depth", self.source_depth, 1),
+        ):
+            if tuple(tensor.shape) != (count, width):
+                raise ValueError(f"{name} must have shape {(count, width)}.")
+        if tuple(self.source_frame_index.shape) != (count,):
+            raise ValueError("source_frame_index must have shape N.")
+
+    @property
+    def num_cameras(self) -> int:
+        return int(self.features.shape[0])
+
+    @property
+    def get_xyz(self) -> torch.Tensor:
+        return self.xyz
+
+    @property
+    def get_scaling(self) -> torch.Tensor:
+        return self.scaling
+
+    @property
+    def get_rotation(self) -> torch.Tensor:
+        return self.rotation
+
+    @property
+    def get_opacity(self) -> torch.Tensor:
+        return self.opacity
+
+    @property
+    def get_features(self) -> torch.Tensor:
+        return self.features
+
+
+@dataclass
 class PerPixelGaussianObservation:
     """Canonical dense Gaussian predictions with immutable pixel provenance."""
 
@@ -469,6 +536,162 @@ class PerPixelGaussianObservation:
             config=self.config,
         )
 
+    def materialize_batched(
+        self,
+        cameras: Iterable[Any],
+        *,
+        batch_index: int,
+        source_indices: Iterable[int] | torch.Tensor | None = None,
+        prune_fraction: float | None = None,
+    ) -> BatchedExplicitPerPixelGaussianSet:
+        """Materialize shared geometry and target-conditioned RGB once per group.
+
+        Density SH is evaluated along each immutable source ray through the
+        canonical ``confidence`` field. Consequently opacity and the global
+        top-k pruning mask are shared by every target camera, which is required
+        by gsplat360's multi-camera rasterization contract.
+        """
+
+        camera_list = list(cameras)
+        if not camera_list:
+            raise ValueError("materialize_batched requires at least one target camera.")
+        batch = int(batch_index)
+        if batch < 0 or batch >= self.batch_size:
+            raise IndexError(f"batch_index {batch} is outside [0, {self.batch_size}).")
+        height, width = self.image_size
+        for camera in camera_list:
+            if (int(camera.image_height), int(camera.image_width)) != (height, width):
+                raise ValueError("All batched cameras must match the observation image size.")
+
+        device = self.refined_depth.device
+        dtype = (
+            torch.float32
+            if self.refined_depth.dtype in {torch.float16, torch.bfloat16}
+            else self.refined_depth.dtype
+        )
+        if source_indices is None:
+            source_index = torch.arange(self.num_source_views, device=device, dtype=torch.long)
+        else:
+            source_index = torch.as_tensor(
+                list(source_indices) if not torch.is_tensor(source_indices) else source_indices,
+                device=device,
+                dtype=torch.long,
+            ).view(-1)
+        if source_index.numel() == 0:
+            return self._empty_materialized_batched(
+                num_cameras=len(camera_list), device=device, dtype=dtype
+            )
+        if int(source_index.min()) < 0 or int(source_index.max()) >= self.num_source_views:
+            raise IndexError("source_indices contain values outside the source-view range.")
+
+        # Target-independent geometry is constructed exactly once for the
+        # entire camera group.
+        centers = self.centers_world()[batch].index_select(0, source_index).to(dtype=dtype)
+        scale = (
+            self.scales()[batch]
+            .index_select(0, source_index)
+            .permute(0, 2, 3, 1)
+            .to(dtype=dtype)
+        )
+        local_quaternion = (
+            self.local_quaternion[batch]
+            .index_select(0, source_index)
+            .permute(0, 2, 3, 1)
+            .to(dtype=dtype)
+        )
+        poses = self.poses_c2w[batch].index_select(0, source_index).to(device=device, dtype=dtype)
+        pose_quaternion = matrix_to_quaternion(poses[:, :3, :3]).view(-1, 1, 1, 4)
+        world_quaternion = normalize_quaternion(
+            quaternion_multiply(pose_quaternion, local_quaternion)
+        )
+        valid = self.valid_mask[batch].index_select(0, source_index)[:, 0].bool()
+        confidence = self.confidence[batch].index_select(0, source_index)[:, 0].to(dtype=dtype)
+        source_depth = self.refined_depth[batch].index_select(0, source_index)[:, 0].to(dtype=dtype)
+        rgb_coefficients = (
+            self.rgb_sh[batch]
+            .index_select(0, source_index)
+            .permute(0, 3, 4, 1, 2)
+            .to(dtype=dtype)
+        )
+
+        frame_index = self.frame_ids[batch].index_select(0, source_index)
+        uv = self.source_uv.to(device=device, dtype=dtype).view(1, height, width, 2).expand(
+            source_index.numel(), -1, -1, -1
+        )
+        ray = self.source_ray.to(device=device, dtype=dtype).view(1, height, width, 3).expand(
+            source_index.numel(), -1, -1, -1
+        )
+        frame_map = frame_index.view(-1, 1, 1).expand(-1, height, width)
+        source_slot_map = torch.arange(
+            int(source_index.numel()), device=device, dtype=torch.long
+        ).view(-1, 1, 1).expand(-1, height, width)
+
+        mask = valid.reshape(-1)
+        xyz = centers.reshape(-1, 3)[mask]
+        scaling = scale.reshape(-1, 3)[mask]
+        rotation = world_quaternion.reshape(-1, 4)[mask]
+        opacity = confidence.reshape(-1, 1)[mask]
+        confidence_flat = opacity
+        source_frame_flat = frame_map.reshape(-1)[mask]
+        uv_flat = uv.reshape(-1, 2)[mask]
+        ray_flat = ray.reshape(-1, 3)[mask]
+        depth_flat = source_depth.reshape(-1, 1)[mask]
+        coefficient_flat = rgb_coefficients.reshape(-1, rgb_coefficients.shape[-2], 3)[mask]
+        source_slot_flat = source_slot_map.reshape(-1)[mask]
+
+        fraction = self.render_prune_fraction if prune_fraction is None else float(prune_fraction)
+        if not 0.0 <= fraction < 1.0:
+            raise ValueError("prune_fraction must be in [0, 1).")
+        if fraction > 0.0 and int(opacity.shape[0]) > 1:
+            keep_count = max(1, int(math.ceil(float(opacity.shape[0]) * (1.0 - fraction))))
+            keep = torch.topk(
+                opacity[:, 0], k=keep_count, largest=True, sorted=False
+            ).indices.sort().values
+            xyz = xyz.index_select(0, keep)
+            scaling = scaling.index_select(0, keep)
+            rotation = rotation.index_select(0, keep)
+            opacity = opacity.index_select(0, keep)
+            confidence_flat = confidence_flat.index_select(0, keep)
+            source_frame_flat = source_frame_flat.index_select(0, keep)
+            uv_flat = uv_flat.index_select(0, keep)
+            ray_flat = ray_flat.index_select(0, keep)
+            depth_flat = depth_flat.index_select(0, keep)
+            coefficient_flat = coefficient_flat.index_select(0, keep)
+            source_slot_flat = source_slot_flat.index_select(0, keep)
+
+        if int(xyz.shape[0]) == 0:
+            return self._empty_materialized_batched(
+                num_cameras=len(camera_list), device=device, dtype=dtype
+            )
+
+        target_centers = torch.stack(
+            [camera.c2w[:3, 3].to(device=device, dtype=dtype) for camera in camera_list],
+            dim=0,
+        )
+        direction_world = F.normalize(
+            xyz.unsqueeze(0) - target_centers[:, None, :], dim=-1, eps=1.0e-8
+        )
+        source_rotation = poses[:, :3, :3].index_select(0, source_slot_flat)
+        direction_local = torch.einsum("nij,cni->cnj", source_rotation, direction_world)
+        rgb_basis = real_sh_basis(self.rgb_sh_degree, direction_local)
+        rgb = (
+            0.5 + torch.einsum("cnk,nkd->cnd", rgb_basis, coefficient_flat)
+        ).clamp(0.0, 1.0)
+
+        return BatchedExplicitPerPixelGaussianSet(
+            xyz=xyz,
+            scaling=scaling,
+            rotation=rotation,
+            opacity=opacity,
+            features=rgb,
+            confidence=confidence_flat,
+            source_frame_index=source_frame_flat,
+            source_pixel_uv=uv_flat,
+            source_ray=ray_flat,
+            source_depth=depth_flat,
+            config=self.config,
+        )
+
     def _empty_materialized(self, *, device: torch.device, dtype: torch.dtype) -> ExplicitPerPixelGaussianSet:
         return ExplicitPerPixelGaussianSet(
             xyz=torch.zeros(0, 3, device=device, dtype=dtype),
@@ -476,6 +699,27 @@ class PerPixelGaussianObservation:
             rotation=torch.zeros(0, 4, device=device, dtype=dtype),
             opacity=torch.zeros(0, 1, device=device, dtype=dtype),
             features=torch.zeros(0, 3, device=device, dtype=dtype),
+            confidence=torch.zeros(0, 1, device=device, dtype=dtype),
+            source_frame_index=torch.zeros(0, device=device, dtype=torch.long),
+            source_pixel_uv=torch.zeros(0, 2, device=device, dtype=dtype),
+            source_ray=torch.zeros(0, 3, device=device, dtype=dtype),
+            source_depth=torch.zeros(0, 1, device=device, dtype=dtype),
+            config=self.config,
+        )
+
+    def _empty_materialized_batched(
+        self,
+        *,
+        num_cameras: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> BatchedExplicitPerPixelGaussianSet:
+        return BatchedExplicitPerPixelGaussianSet(
+            xyz=torch.zeros(0, 3, device=device, dtype=dtype),
+            scaling=torch.zeros(0, 3, device=device, dtype=dtype),
+            rotation=torch.zeros(0, 4, device=device, dtype=dtype),
+            opacity=torch.zeros(0, 1, device=device, dtype=dtype),
+            features=torch.zeros(int(num_cameras), 0, 3, device=device, dtype=dtype),
             confidence=torch.zeros(0, 1, device=device, dtype=dtype),
             source_frame_index=torch.zeros(0, device=device, dtype=torch.long),
             source_pixel_uv=torch.zeros(0, 2, device=device, dtype=dtype),

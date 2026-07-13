@@ -24,10 +24,11 @@ point/voxel attention, free XYZ update, or depth probability volume.
 
 ## Adapter matches
 
-Each four-frame window caches matches once. Every source frame samples 2048
-query pixels with the Stage 1 `fibonacci_depth_filtered` sampler in the
-`[0.05, 20] m` range. A query is matched independently into all three other
-views with the exact Stage 1 prediction score:
+Each four-frame window caches matches once. The formal path uses the validated
+`star_forward` graph: frame 0 samples 2048 query pixels with the Stage 1
+`fibonacci_depth_filtered` sampler in the `[0.05, 20] m` range, and every query
+is matched independently into frames 1, 2, and 3 with the exact Stage 1
+prediction score:
 
 ```text
 cosine(normalized_query, normalized_target) / 0.07 + log(cos(target_latitude))
@@ -35,10 +36,12 @@ cosine(normalized_query, normalized_target) / 0.07 + log(cos(target_latitude))
 
 The target is the global argmax over the full `504 x 1008` ERP. Computation is
 chunked by 32 queries, but does not use pose windows or approximate candidate
-search. Four frames produce at most 8192 shared sparse-depth variables and
-24576 directed factors. Forward-backward consistency is enabled, then the
-formal path retains the top 10% factors per directed pair by cached feature
-reliability. The same cache is reused by the single BA0 call.
+search. The three star edges produce at most 2048 shared sparse-depth variables
+and 6144 raw directed factors. Forward-backward consistency is enabled, then
+the formal path retains the top 40% factors per edge by cached feature
+reliability. This approximately matches the factor budget of top 10% over all
+12 directed edges while avoiding nine full-resolution match matrices. The same
+cache is reused by the single BA0 call.
 
 ## Spherical BA and dense depth shift
 
@@ -79,19 +82,30 @@ or under-constrained solve returns the input pose/depth.
 
 ## ReSplat-style feedback and Refiner
 
-Every feedback group renders each target from the other three source
-observations. The target image and detached render are compared by RGB
+Every feedback group renders all four target cameras from all four source
+observations, including each target's own Gaussians. The target image and
+detached render are compared by RGB
 pixel-unshuffle and frozen ERP-padded ResNet18 features at 1/2, 1/4, and 1/8
 resolution. Their trainable projection produces a 32D quarter-resolution error
 map.
 
-Current Gaussian centers are projected into the three other cameras. Target
-error is sampled with periodic longitude and accepted only when the Gaussian
-survived target-conditioned opacity pruning, was rasterizer-visible, has alpha
-above 0.05, and agrees with rendered Euclidean depth. Signed mean, absolute
-mean, coverage, and an area-weighted global token are projected back to a 32D
-full-resolution source-pixel error feature. This is error transport only; it is
-not RAE or precise per-source compositing responsibility.
+Within one group, center, physical scale, world quaternion, source-view
+density-SH opacity, provenance, and the global top-30% pruning mask are
+materialized once and shared by all target cameras. RGB-SH is still evaluated
+for each target direction, so colors have shape `4 x N x 3` while geometry and
+opacity remain `N`-indexed. gsplat360 receives the four cameras in one
+`packed=false` call.
+
+Current Gaussian centers are projected into all four cameras, including their
+own source camera. Target error is sampled with periodic longitude and accepted
+only when the Gaussian survived the shared pruning mask, was rasterizer-visible,
+has alpha above 0.05, and agrees with rendered Euclidean depth. Signed mean,
+absolute mean, coverage, and an area-weighted global token are projected back
+to a 32D full-resolution source-pixel error feature. This is error transport
+only; it is not RAE or precise per-source compositing responsibility. Including
+self observations intentionally follows the confirmed training protocol but
+retains a copy-reconstruction risk, so cross-view/pose diagnostics remain
+necessary.
 
 The Refiner encodes:
 
@@ -109,10 +123,12 @@ but may update appearance.
 
 ## Training and gradient path
 
-Four render groups are used per step: feedback after BA0, loss/feedback after
-Refine1, loss/feedback after Refine2, and final loss after Refine3. This is 16
-target rasterizations for a four-frame window. The error branch consumes
-detached renders, while the render loss uses the non-detached tensors. Refine1
+Four render groups are used per microbatch: feedback after BA0, loss/feedback
+after Refine1, loss/feedback after Refine2, and final loss after Refine3. Each
+group is one four-camera rasterizer invocation, reducing 16 sequential calls to
+four batched calls without removing the BA0 error signal (`E0`). The error
+branch consumes detached renders, while the render loss uses the non-detached
+tensors. Refine1
 and Refine2 observations and hidden states are detached after their stage
 loss; the shared network accumulates gradients from all three stages and
 performs one optimizer step.
@@ -123,12 +139,14 @@ regularization. Periodic DSSIM remains configurable but defaults to zero and
 is not evaluated in that mode. GT pose/depth never enter the loss.
 
 Every 200 steps, diagnostics render Initial, BA0, Refine1, Refine2, and
-Refine3. They log leave-one-out rendering metrics, scale-aligned pose error,
+Refine3. They log all-source rendering metrics, scale-aligned pose error,
 raw/scale-aligned depth metrics, BA residual/objective, LM gain ratio and
 damping, gauge normalization, and update statistics. Refiner snapshots are
 asserted to preserve the preceding BA0 pose.
-Validation runs every 1000 steps and writes latest, best final LOO PSNR, and
-best final pose ATE checkpoints.
+Validation runs every 1000 steps and writes latest, best final all-source PSNR,
+and best final pose ATE checkpoints. Historical `loo_*` metric keys and the
+legacy checkpoint filename are retained as compatibility aliases, but their
+values now use the all-source protocol.
 
 ## BA validation audit
 
@@ -136,7 +154,8 @@ The original `5 degree / 0.05 translation` update limits reduced the spherical
 objective but moved poses away from GT. Dense affine propagation also worsened
 depth, while omitting the global gauge allowed scale drift. The formal settings
 therefore combine `dense_depth_mode=none`, `gauge_mode=initial_baseline`,
-`solver_mode=standard_lm`, right-local rotation-only updates, top-10% matches,
+`solver_mode=standard_lm`, right-local rotation-only updates, star top-40%
+matches,
 and a `0.02 degree` rotation trust region.
 
 | validation batches | windows | mean absolute rotation delta | mean RPE rotation delta |
@@ -169,6 +188,8 @@ component profiling and writes `smoke_summary.json` without changing the
 formal training config.
 The real config refuses the CPU fallback renderer. A full-resolution gate must
 record peak allocated/reserved GPU memory, RAM/swap, matcher/BA/rasterizer
-times, 16-render step time, and leave safe GPU memory headroom. Remote launch
+times, four batched-render group time, and leave safe GPU memory headroom. The
+direct `packed=false` camera batch allocates camera-by-Gaussian intermediates,
+so the full-resolution CUDA smoke remains a hard OOM gate. Remote launch
 must separately follow the project tmux, W&B, visualization, GPU ownership,
 and resource-safety rules.

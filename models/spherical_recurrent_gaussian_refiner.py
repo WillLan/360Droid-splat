@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from geometry.spherical_erp import sample_erp_with_wrap, unit_ray_to_erp_pixel
 from .per_pixel_gaussian_observation import (
+    BatchedExplicitPerPixelGaussianSet,
     SH_C0,
     ExplicitPerPixelGaussianSet,
     PerPixelGaussianObservation,
@@ -276,6 +277,48 @@ def scatter_materialized_visibility(
     return out
 
 
+def scatter_batched_materialized_visibility(
+    materialized: BatchedExplicitPerPixelGaussianSet,
+    visibility_filter: torch.Tensor,
+    *,
+    frame_ids: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Scatter ``CxN`` visibility to ``CxSx1xHxW`` source pixels."""
+
+    device = materialized.xyz.device
+    camera_count = materialized.num_cameras
+    visible = visibility_filter.to(device=device).bool()
+    expected = (camera_count, int(materialized.source_frame_index.numel()))
+    if tuple(visible.shape) != expected:
+        raise ValueError(f"visibility_filter must have shape {expected}.")
+    output = torch.zeros(
+        camera_count,
+        int(frame_ids.numel()),
+        1,
+        int(height),
+        int(width),
+        device=device,
+        dtype=torch.bool,
+    )
+    if not visible.any():
+        return output
+    ids = materialized.source_frame_index
+    uv = materialized.source_pixel_uv
+    x = torch.floor(uv[:, 0]).long().remainder(int(width))
+    y = torch.floor(uv[:, 1]).long().clamp(0, int(height) - 1)
+    for camera in range(camera_count):
+        camera_visible = visible[camera]
+        if not camera_visible.any():
+            continue
+        for local, frame_id in enumerate(frame_ids.tolist()):
+            mask = camera_visible & (ids == int(frame_id))
+            if mask.any():
+                output[camera, local, 0, y[mask], x[mask]] = True
+    return output
+
+
 class SphericalErrorRouter(nn.Module):
     """Project target-view error maps back to their contributing source pixels."""
 
@@ -323,8 +366,6 @@ class SphericalErrorRouter(nn.Module):
             rotation = pose[:, :3, :3]
             translation = pose[:, :3, 3]
             for source in range(views):
-                if source == target:
-                    continue
                 point_target = torch.einsum(
                     "bij,bhwj->bhwi",
                     rotation.transpose(1, 2),
@@ -339,7 +380,9 @@ class SphericalErrorRouter(nn.Module):
                 sampled_error = sample_erp_with_wrap(target_error_maps[:, target], low_uv).permute(0, 3, 1, 2)
                 sampled_depth = sample_erp_with_wrap(rendered_depth[:, target], uv)[..., 0]
                 sampled_alpha = sample_erp_with_wrap(rendered_alpha[:, target], uv)[..., 0]
-                valid = observation.valid_mask[:, source, 0].bool()
+                # Clone before the in-place gates below; slicing the canonical
+                # mask returns a view and must never mutate observation state.
+                valid = observation.valid_mask[:, source, 0].bool().clone()
                 valid &= torch.isfinite(distance) & torch.isfinite(sampled_depth) & torch.isfinite(sampled_alpha)
                 valid &= sampled_alpha > float(alpha_threshold)
                 valid &= (sampled_depth - distance).abs() <= float(depth_abs_threshold) + float(depth_rel_threshold) * distance
@@ -353,12 +396,9 @@ class SphericalErrorRouter(nn.Module):
         denom = count.clamp_min(1.0)
         signed_mean = signed_sum / denom
         absolute_mean = absolute_sum / denom
-        coverage = (count / max(1, views - 1)).clamp(0.0, 1.0)
-        source_global = []
-        for source in range(views):
-            others = [target for target in range(views) if target != source]
-            source_global.append(global_token[:, others].mean(dim=1))
-        global_map = torch.stack(source_global, dim=1)[:, :, :, None, None].expand(-1, -1, -1, height, width)
+        coverage = (count / max(1, views)).clamp(0.0, 1.0)
+        source_global = global_token.mean(dim=1, keepdim=True).expand(-1, views, -1)
+        global_map = source_global[:, :, :, None, None].expand(-1, -1, -1, height, width)
         flat = torch.cat([signed_mean, absolute_mean, coverage, global_map], dim=2)
         return self.output_projection(flat.reshape(batch * views, flat.shape[2], height, width)).reshape(
             batch, views, self.error_dim, height, width

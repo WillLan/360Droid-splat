@@ -70,6 +70,29 @@ def all_directed_pairs(num_views: int, *, device: torch.device | str | None = No
     return torch.tensor(pairs, dtype=torch.long, device=device)
 
 
+def directed_pairs_for_topology(
+    num_views: int,
+    topology: str = "all_directed",
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Build the configured pose-independent directed matching graph."""
+
+    views = int(num_views)
+    value = str(topology).lower()
+    if value == "all_directed":
+        return all_directed_pairs(views, device=device)
+    if value == "star_forward":
+        if views < 2:
+            raise ValueError("star_forward matching requires at least two views.")
+        return torch.tensor(
+            [(0, target) for target in range(1, views)],
+            dtype=torch.long,
+            device=device,
+        )
+    raise ValueError("edge_topology must be 'all_directed' or 'star_forward'.")
+
+
 @torch.no_grad()
 def build_stage3_match_cache(
     adapter_features: torch.Tensor,
@@ -88,6 +111,7 @@ def build_stage3_match_cache(
     reliability_keep_fraction: float = 1.0,
     distinctiveness_exclusion_deg: float = 0.0,
     subpixel_refine_radius: int = 0,
+    edge_topology: str = "all_directed",
     static_valid_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     query_uv: torch.Tensor | None = None,
@@ -142,7 +166,7 @@ def build_stage3_match_cache(
     source_feature = sample_erp_with_wrap(features, sampled_uv)
     source_feature = F.normalize(source_feature.float(), dim=-1, eps=1.0e-8)
 
-    edges = all_directed_pairs(views, device=device)
+    edges = directed_pairs_for_topology(views, edge_topology, device=device)
     edge_count = int(edges.shape[0])
     target_uv = torch.empty(batch, edge_count, count, 2, device=device, dtype=torch.float32)
     target_ray = torch.empty(batch, edge_count, count, 3, device=device, dtype=torch.float32)
@@ -333,6 +357,7 @@ def build_stage3_match_cache(
             "reliability_keep_fraction": keep_fraction,
             "distinctiveness_exclusion_deg": exclusion_deg,
             "subpixel_refine_radius": refine_radius,
+            "edge_topology": str(edge_topology).lower(),
             "static_validity_filter": static_valid_mask is not None,
         },
     )

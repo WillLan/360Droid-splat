@@ -78,6 +78,9 @@ dataset:
   max_val_samples: 1000
 
 matching:
+  # The validated equal-budget star uses only anchor-frame queries and avoids
+  # computing the other nine directed full-resolution match matrices.
+  edge_topology: star_forward
   num_queries: 2048
   min_depth: 0.05
   max_depth: 20.0
@@ -88,10 +91,10 @@ matching:
   forward_backward: true
   fb_tolerance_deg: 1.0
   min_factor_weight: 0.01
-  # Full-resolution matches are highly redundant. The top 10% was the first
-  # setting to improve both absolute and relative rotation on two disjoint
-  # validation holdouts.
-  reliability_keep_fraction: 0.10
+  # Top 40% over three star edges approximately matches the factor budget of
+  # top 10% over all twelve edges and preserved rotation accuracy on 192
+  # validation windows.
+  reliability_keep_fraction: 0.40
   distinctiveness_exclusion_deg: 0.0
   subpixel_refine_radius: 0
 
@@ -148,6 +151,13 @@ loss:
 renderer:
   backend: gsplat360
   extra_gsplat360_roots: []
+  # One unpacked CUDA rasterization handles all four target cameras. Geometry,
+  # source-view opacity, and the global pruning mask are shared; RGB remains
+  # target-conditioned. Every target includes all four sources, including self.
+  batched_targets: true
+  include_self_source: true
+  shared_source_opacity: true
+  profile_synchronize_cuda: false
 
 train:
   batch_size: 1

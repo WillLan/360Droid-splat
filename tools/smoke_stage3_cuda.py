@@ -39,7 +39,7 @@ def main() -> None:
         )
         config["dataset"]["max_train_samples"] = 1
         config["refiner"]["profile_synchronize_cuda"] = True
-        config.setdefault("Renderer", {})["profile_synchronize_cuda"] = True
+        config["renderer"]["profile_synchronize_cuda"] = True
         config["WeightsAndBiases"]["run_name"] = f"{config['WeightsAndBiases'].get('run_name', 'stage3')}_smoke_{text}"
         config["image"]["head_height"] = height
         config["image"]["head_width"] = width

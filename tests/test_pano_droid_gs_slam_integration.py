@@ -7,6 +7,7 @@ from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
+from models.per_pixel_gaussian_observation import BatchedExplicitPerPixelGaussianSet
 from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, _se3_blend_pose
 
 
@@ -1360,6 +1361,69 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     assert torch.allclose(seen["colors"], expected_sh)
     assert seen["sh_degree"] == gaussian_map.active_sh_degree
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
+
+
+def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
+    camera_count, gaussian_count = 4, 3
+    config = {
+        "Training": {
+            "pfgs360_packed": False,
+            "pfgs360_render_mode": "RGB+ED",
+            "pfgs360_rasterize_mode": "antialiased",
+        }
+    }
+    explicit = BatchedExplicitPerPixelGaussianSet(
+        xyz=torch.randn(gaussian_count, 3),
+        scaling=torch.full((gaussian_count, 3), 0.1),
+        rotation=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).expand(gaussian_count, -1).clone(),
+        opacity=torch.full((gaussian_count, 1), 0.2),
+        features=torch.rand(camera_count, gaussian_count, 3),
+        confidence=torch.full((gaussian_count, 1), 0.2),
+        source_frame_index=torch.arange(gaussian_count),
+        source_pixel_uv=torch.zeros(gaussian_count, 2),
+        source_ray=torch.tensor([[0.0, 0.0, 1.0]]).expand(gaussian_count, -1).clone(),
+        source_depth=torch.ones(gaussian_count, 1),
+        config=config,
+    )
+    cameras = [PanoRenderCamera(4, 8, torch.eye(4)) for _ in range(camera_count)]
+    calls: list[dict] = []
+
+    def fake_rasterization(**kwargs):
+        calls.append(kwargs)
+        height, width = int(kwargs["height"]), int(kwargs["width"])
+        render = torch.zeros(camera_count, height, width, 4)
+        alpha = torch.ones(camera_count, height, width, 1)
+        info = {
+            "means2d": torch.zeros(camera_count, gaussian_count, 2),
+            "radii": torch.ones(camera_count, gaussian_count, dtype=torch.int32),
+            "accum_times": torch.ones(camera_count, gaussian_count, dtype=torch.int32),
+            "accum_visible": torch.tensor(
+                [[1.0, 0.0, 1.0]] * camera_count,
+                dtype=torch.float32,
+            ),
+        }
+        return render, alpha, None, info
+
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    package = renderer._render_gsplat360_cameras(
+        fake_rasterization,
+        cameras,
+        explicit,
+        torch.zeros(camera_count, 3),
+    )
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["packed"] is False
+    assert call["viewmats"].shape == (camera_count, 4, 4)
+    assert call["Ks"].shape == (camera_count, 3, 3)
+    assert call["colors"].shape == (camera_count, gaussian_count, 1, 3)
+    assert call["opacities"].shape == (gaussian_count,)
+    assert package["render"].shape == (camera_count, 3, 4, 8)
+    assert package["visibility_filter"].shape == (camera_count, gaussian_count)
+    assert torch.equal(
+        package["visibility_filter"],
+        torch.tensor([[True, False, True]] * camera_count),
+    )
 
 
 def test_pfgs360_renderer_uses_configured_sh_degree_two_coefficients():

@@ -207,6 +207,7 @@ def evaluate_star(
     )
     ba = build_ba(config)
     raw_config = copy.deepcopy(config)
+    raw_config["matching"]["edge_topology"] = "all_directed"
     raw_config["matching"]["reliability_keep_fraction"] = 1.0
     aggregate: dict[str, float] = {}
     records: list[dict[str, Any]] = []

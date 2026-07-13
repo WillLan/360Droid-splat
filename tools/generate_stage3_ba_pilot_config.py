@@ -23,7 +23,8 @@ def generate(
     config["experiment_name"] = run_name
     config["matching"].update(
         {
-            "reliability_keep_fraction": 0.10,
+            "edge_topology": "star_forward",
+            "reliability_keep_fraction": 0.40,
             "distinctiveness_exclusion_deg": 0.0,
             "subpixel_refine_radius": 0,
         }
@@ -58,7 +59,7 @@ def generate(
             "mode": "online",
             "run_name": run_name,
             "tags": list(config["WeightsAndBiases"].get("tags", []))
-            + ["stage3-ba-useful-pilot-200", "rotation-only-trust002"],
+            + ["stage3-ba-useful-pilot-200", "rotation-only-trust002", "star-top40"],
         }
     )
     config["Visualization"]["enabled"] = True

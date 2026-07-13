@@ -102,6 +102,46 @@ def test_target_conditioned_sh_and_pruning_keep_canonical_dense_count() -> None:
     assert float(full.opacity.std()) > 0.0
 
 
+def test_batched_materialization_shares_geometry_opacity_and_global_pruning() -> None:
+    observation = _observation(views=2)
+    observation.rgb_sh[:, :, 3, 0] = 0.25
+    second_pose = observation.poses_c2w[0, 1].clone()
+    second_pose[0, 3] = 0.5
+    cameras = [
+        PanoRenderCamera(*observation.image_size, observation.poses_c2w[0, 0]),
+        PanoRenderCamera(*observation.image_size, second_pose),
+    ]
+    before = observation.canonical_count
+    full = observation.materialize_batched(
+        cameras,
+        batch_index=0,
+        source_indices=range(2),
+        prune_fraction=0.0,
+    )
+    pruned = observation.materialize_batched(
+        cameras,
+        batch_index=0,
+        source_indices=range(2),
+    )
+    assert full.xyz.shape == (before, 3)
+    assert full.features.shape == (2, before, 3)
+    assert pruned.xyz.shape[0] == math.ceil(before * 0.7)
+    assert pruned.features.shape[1] == pruned.xyz.shape[0]
+    torch.testing.assert_close(full.opacity, torch.full_like(full.opacity, 0.2))
+    for target, camera in enumerate(cameras):
+        single = observation.materialize_batch(
+            camera,
+            batch_index=0,
+            source_indices=range(2),
+            prune_fraction=0.0,
+        )
+        torch.testing.assert_close(full.xyz, single.xyz)
+        torch.testing.assert_close(full.scaling, single.scaling)
+        torch.testing.assert_close(full.rotation, single.rotation)
+        torch.testing.assert_close(full.features[target], single.features)
+    assert observation.canonical_count == before
+
+
 def test_invalid_pixels_preserve_metadata_order_for_valid_entries() -> None:
     observation = _observation(views=1)
     observation.valid_mask[0, 0, 0, 0, 0] = False

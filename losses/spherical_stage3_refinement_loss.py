@@ -23,7 +23,7 @@ class Stage3LossWeights:
     update_regularization: float = 1.0e-4
 
 
-def leave_one_out_render_loss(
+def all_source_render_loss(
     rendered: torch.Tensor,
     target: torch.Tensor,
     *,
@@ -42,6 +42,17 @@ def leave_one_out_render_loss(
     l1 = torch.stack(l1_values).mean()
     dssim = torch.stack(dssim_values).mean() if dssim_values else l1.new_zeros(())
     return l1 + float(dssim_weight) * dssim, {"l1": l1.detach(), "dssim": dssim.detach()}
+
+
+def leave_one_out_render_loss(
+    rendered: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dssim_weight: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compatibility alias for checkpoints/tests using the historical name."""
+
+    return all_source_render_loss(rendered, target, dssim_weight=dssim_weight)
 
 
 def spherical_match_geometry_loss(
@@ -141,7 +152,7 @@ def stage3_loss(
     anchor_valid_mask: torch.Tensor | None = None,
     weights: Stage3LossWeights = Stage3LossWeights(),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    render, render_parts = leave_one_out_render_loss(rendered, target, dssim_weight=weights.dssim)
+    render, render_parts = all_source_render_loss(rendered, target, dssim_weight=weights.dssim)
     geometry = spherical_match_geometry_loss(observation, cache)
     anchor = ba_depth_anchor_loss(
         observation.refined_depth if anchor_prediction is None else anchor_prediction,

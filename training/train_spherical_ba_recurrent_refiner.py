@@ -49,7 +49,7 @@ from models.spherical_recurrent_gaussian_refiner import (
     SphericalRecurrentGaussianRefiner,
     Stage3RefinementResult,
     Stage3RefinerOutput,
-    scatter_materialized_visibility,
+    scatter_batched_materialized_visibility,
 )
 from models.spherical_selfi_stage3_ba import (
     BlockSparseSphericalBA,
@@ -124,6 +124,7 @@ def default_config() -> dict[str, Any]:
             "max_val_samples": 1,
         },
         "matching": {
+            "edge_topology": "all_directed",
             "num_queries": 2048,
             "min_depth": 0.05,
             "max_depth": 20.0,
@@ -180,7 +181,13 @@ def default_config() -> dict[str, Any]:
             "depth_anchor": 1.0e-3,
             "update_regularization": 1.0e-4,
         },
-        "renderer": {"backend": "synthetic", "extra_gsplat360_roots": []},
+        "renderer": {
+            "backend": "synthetic",
+            "extra_gsplat360_roots": [],
+            "batched_targets": True,
+            "include_self_source": True,
+            "shared_source_opacity": True,
+        },
         "train": {
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
@@ -283,19 +290,18 @@ class SyntheticDifferentiableRenderer:
         dc = observation.rgb_sh[:, :, 0]
         color = (0.5 + float(SH_C0) * dc).clamp(0.0, 1.0)
         opacity = observation.confidence
-        rendered, depths, alphas = [], [], []
-        visibility = torch.zeros(batch, views, views, 1, height, width, device=color.device, dtype=torch.bool)
-        for target in range(views):
-            sources = [source for source in range(views) if source != target]
-            weights = opacity[:, sources].clamp_min(1.0e-4)
-            rendered.append((color[:, sources] * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0e-4))
-            depths.append((observation.refined_depth[:, sources] * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0e-4))
-            alphas.append(weights.mean(dim=1).clamp(0.0, 1.0))
-            visibility[:, target, sources] = observation.valid_mask[:, sources]
+        weights = opacity.clamp_min(1.0e-4)
+        rendered_once = (color * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0e-4)
+        depth_once = (
+            (observation.refined_depth * weights).sum(dim=1)
+            / weights.sum(dim=1).clamp_min(1.0e-4)
+        )
+        alpha_once = weights.mean(dim=1).clamp(0.0, 1.0)
+        visibility = observation.valid_mask[:, None].expand(-1, views, -1, -1, -1, -1).clone()
         return RenderGroup(
-            rendered=torch.stack(rendered, dim=1),
-            depth=torch.stack(depths, dim=1),
-            alpha=torch.stack(alphas, dim=1),
+            rendered=rendered_once[:, None].expand(-1, views, -1, -1, -1).clone(),
+            depth=depth_once[:, None].expand(-1, views, -1, -1, -1).clone(),
+            alpha=alpha_once[:, None].expand(-1, views, -1, -1, -1).clone(),
             source_visibility=visibility,
             profiles={"materialized_gaussians": float(observation.canonical_count)},
         )
@@ -310,7 +316,9 @@ class RenderGroup:
     profiles: dict[str, float]
 
 
-def render_leave_one_out_group(renderer: Any, observation: PerPixelGaussianObservation) -> RenderGroup:
+def render_all_source_group(renderer: Any, observation: PerPixelGaussianObservation) -> RenderGroup:
+    """Render all source Gaussians, including self, into all targets in one call."""
+
     if isinstance(renderer, SyntheticDifferentiableRenderer):
         return renderer.render_group(observation)
     batch, views = observation.batch_size, observation.num_source_views
@@ -324,39 +332,46 @@ def render_leave_one_out_group(renderer: Any, observation: PerPixelGaussianObser
     total_gaussians = 0.0
     profile_sums: dict[str, float] = {}
     for batch_idx in range(batch):
-        rendered_batch, depth_batch, alpha_batch = [], [], []
-        for target in range(views):
-            camera = PanoRenderCamera(height, width, observation.poses_c2w[batch_idx, target].float())
-            sources = [source for source in range(views) if source != target]
-            explicit = observation.materialize_batch(camera, batch_index=batch_idx, source_indices=sources)
-            package = renderer.render(camera, explicit)
-            rendered_batch.append(package["render"])
-            depth_batch.append(package["depth"])
-            alpha_batch.append(package["alpha"])
-            visibility[batch_idx, target] = scatter_materialized_visibility(
-                explicit,
-                package["visibility_filter"],
-                frame_ids=observation.frame_ids[batch_idx],
-                height=height,
-                width=width,
-            )
-            total_gaussians += float(explicit.xyz.shape[0])
-            for key, value in package.items():
-                if str(key).startswith("profile_renderer_") and isinstance(value, (float, int)):
-                    profile_sums[str(key)] = profile_sums.get(str(key), 0.0) + float(value)
-        rendered.append(torch.stack(rendered_batch, dim=0))
-        depth.append(torch.stack(depth_batch, dim=0))
-        alpha.append(torch.stack(alpha_batch, dim=0))
+        cameras = [
+            PanoRenderCamera(height, width, observation.poses_c2w[batch_idx, target].float())
+            for target in range(views)
+        ]
+        explicit = observation.materialize_batched(
+            cameras,
+            batch_index=batch_idx,
+            source_indices=range(views),
+        )
+        package = renderer.render_cameras(cameras, explicit)
+        rendered.append(package["render"])
+        depth.append(package["depth"])
+        alpha.append(package["alpha"])
+        visibility[batch_idx] = scatter_batched_materialized_visibility(
+            explicit,
+            package["visibility_filter"],
+            frame_ids=observation.frame_ids[batch_idx],
+            height=height,
+            width=width,
+        )
+        total_gaussians += float(explicit.xyz.shape[0])
+        for key, value in package.items():
+            if str(key).startswith("profile_renderer_") and isinstance(value, (float, int)):
+                profile_sums[str(key)] = profile_sums.get(str(key), 0.0) + float(value)
     return RenderGroup(
         rendered=torch.stack(rendered, dim=0),
         depth=torch.stack(depth, dim=0),
         alpha=torch.stack(alpha, dim=0),
         source_visibility=visibility,
         profiles={
-            "materialized_gaussians": total_gaussians / max(1, batch * views),
-            **{key: value / max(1, batch * views) for key, value in profile_sums.items()},
+            "materialized_gaussians": total_gaussians / max(1, batch),
+            **{key: value / max(1, batch) for key, value in profile_sums.items()},
         },
     )
+
+
+def render_leave_one_out_group(renderer: Any, observation: PerPixelGaussianObservation) -> RenderGroup:
+    """Compatibility alias; Stage 3 now renders all sources including self."""
+
+    return render_all_source_group(renderer, observation)
 
 
 class Stage3TrainableModel(nn.Module):
@@ -472,6 +487,11 @@ def build_renderer(config: dict[str, Any]):
         return SyntheticDifferentiableRenderer()
     if backend != "gsplat360":
         raise ValueError(f"Unsupported Stage 3 renderer backend: {backend!r}.")
+    for key in ("batched_targets", "include_self_source", "shared_source_opacity"):
+        if not bool(cfg.get(key, True)):
+            raise ValueError(
+                f"Stage 3's confirmed all-source batched renderer requires renderer.{key}=true."
+            )
     if not torch.cuda.is_available():
         raise RuntimeError("Real Stage 3 training requires the CUDA gsplat360 renderer.")
     return PFGS360Renderer(
@@ -612,6 +632,7 @@ def _build_match_cache(
         reliability_keep_fraction=float(cfg.get("reliability_keep_fraction", 1.0)),
         distinctiveness_exclusion_deg=float(cfg.get("distinctiveness_exclusion_deg", 0.0)),
         subpixel_refine_radius=int(cfg.get("subpixel_refine_radius", 0)),
+        edge_topology=str(cfg.get("edge_topology", "all_directed")),
         static_valid_mask=static_valid_mask,
         generator=generator,
     )
@@ -653,7 +674,8 @@ def _train_microbatch(
 
     current, ba0 = _apply_ba(stage2_observation, ba, cache)
     snapshots["ba0"] = current.detach_parameters()
-    feedback = render_leave_one_out_group(renderer, current)
+    # BA0 feedback is intentionally retained: E0 conditions Refine1.
+    feedback = render_all_source_group(renderer, current)
     hidden: torch.Tensor | None = None
     ba_metrics: list[tuple[int, Stage3BAOutput]] = [(0, ba0)]
     for iteration in range(3):
@@ -683,7 +705,7 @@ def _train_microbatch(
             else:
                 current = refined.observation
                 ba_output = None
-            render = render_leave_one_out_group(renderer, current)
+            render = render_all_source_group(renderer, current)
             for key, value in render.profiles.items():
                 metrics[f"profile/stage{iteration + 1}_{key}"] = float(value)
             loss, parts = stage3_loss(
@@ -766,7 +788,7 @@ def _diagnostic_metrics(
             mode="nearest",
         ).reshape(batch, views, 1, *target_size) > 0.5
     for name, observation in snapshots.items():
-        render = render_leave_one_out_group(renderer, observation)
+        render = render_all_source_group(renderer, observation)
         rendered_snapshots[name] = render.rendered.detach()
         l1_values, psnr_values, ssim_values = [], [], []
         for batch in range(observation.batch_size):
@@ -774,9 +796,17 @@ def _diagnostic_metrics(
                 l1_values.append(spherical_weighted_l1(render.rendered[batch, view], images[batch, view]))
                 psnr_values.append(spherical_psnr(render.rendered[batch, view], images[batch, view]))
                 ssim_values.append(1.0 - 2.0 * spherical_dssim(render.rendered[batch, view], images[batch, view]))
-        result[f"{name}/loo_l1"] = float(torch.stack(l1_values).mean().cpu())
-        result[f"{name}/loo_psnr"] = float(torch.stack(psnr_values).mean().cpu())
-        result[f"{name}/loo_ssim"] = float(torch.stack(ssim_values).mean().cpu())
+        all_source_l1 = float(torch.stack(l1_values).mean().cpu())
+        all_source_psnr = float(torch.stack(psnr_values).mean().cpu())
+        all_source_ssim = float(torch.stack(ssim_values).mean().cpu())
+        result[f"{name}/all_source_l1"] = all_source_l1
+        result[f"{name}/all_source_psnr"] = all_source_psnr
+        result[f"{name}/all_source_ssim"] = all_source_ssim
+        # Preserve historical keys for old dashboards/checkpoint readers. Their
+        # values now follow the confirmed all-source rendering protocol.
+        result[f"{name}/loo_l1"] = all_source_l1
+        result[f"{name}/loo_psnr"] = all_source_psnr
+        result[f"{name}/loo_ssim"] = all_source_ssim
         for batch in range(observation.batch_size):
             for key, value in aligned_pose_metrics(observation.poses_c2w[batch], gt_poses[batch]).items():
                 result.setdefault(f"{name}/pose_{key}", 0.0)
@@ -851,7 +881,7 @@ def _inference_snapshots(
             ba_outputs.append(ba_output)
             current = current.detach_parameters()
             snapshots[f"ba{iteration}"] = current
-        feedback = render_leave_one_out_group(renderer, current)
+        feedback = render_all_source_group(renderer, current)
         with torch.no_grad():
             refined = model(
                 current,
@@ -1124,15 +1154,18 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                     )
                     metrics.update(val_metrics)
                     if val_metrics:
-                        metrics["val/final_loo_psnr_delta"] = (
-                            val_metrics.get("val/refine3/loo_psnr", 0.0)
-                            - val_metrics.get("val/initial/loo_psnr", 0.0)
+                        metrics["val/final_all_source_psnr_delta"] = (
+                            val_metrics.get("val/refine3/all_source_psnr", 0.0)
+                            - val_metrics.get("val/initial/all_source_psnr", 0.0)
                         )
+                        metrics["val/final_loo_psnr_delta"] = metrics[
+                            "val/final_all_source_psnr_delta"
+                        ]
                         metrics["val/final_pose_ate_delta"] = (
                             val_metrics.get("val/refine3/pose_scale_aligned_ate", 0.0)
                             - val_metrics.get("val/initial/pose_scale_aligned_ate", 0.0)
                         )
-                        if metrics["val/final_loo_psnr_delta"] > 0.0 and metrics["val/final_pose_ate_delta"] > 0.0:
+                        if metrics["val/final_all_source_psnr_delta"] > 0.0 and metrics["val/final_pose_ate_delta"] > 0.0:
                             print(
                                 "WARNING: validation rendering improved while pose ATE worsened; "
                                 "do not claim geometric refinement without the remaining geometry metrics.",
@@ -1153,7 +1186,7 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                             import wandb
 
                             wandb_run.log({"validation/stage3_ba_refiner": wandb.Image(str(val_path))}, step=step)
-                    final_psnr = val_metrics.get("val/refine3/loo_psnr")
+                    final_psnr = val_metrics.get("val/refine3/all_source_psnr")
                     final_ate = val_metrics.get("val/refine3/pose_scale_aligned_ate")
                     if final_psnr is not None and final_psnr > best_val_psnr:
                         best_val_psnr = final_psnr
