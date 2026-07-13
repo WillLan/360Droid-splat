@@ -454,6 +454,12 @@ _COMPACT_SLAM_WANDB_KEYS = frozenset(
         "backend/kf_opt_psnr",
         "backend/kf_render_opt",
         "backend/kf_depth_opt",
+        "backend/post_opt_window_frames",
+        "backend/post_opt_window_depths",
+        "backend/post_opt_window_id",
+        "backend/post_opt_frame_count",
+        "backend/post_opt_mean_loss",
+        "backend/post_opt_mean_psnr",
         "backend/sky_pruned",
         "m3/chunk",
         "m3/ba_success",
@@ -483,6 +489,8 @@ class SlamRuntimeLogger:
         self.save_kf_opt = bool(vis_cfg.get("save_kf_opt", True))
         self.kf_opt_log_every = max(1, int(vis_cfg.get("kf_opt_log_every", 1)))
         self.kf_opt_max_width = max(320, int(vis_cfg.get("kf_opt_max_width", 1920)))
+        self.post_opt_all_frames = bool(vis_cfg.get("post_opt_all_frames", False))
+        self.post_opt_log_depth = bool(vis_cfg.get("post_opt_log_depth", False))
         self.log_keyframes = bool(wb_cfg.get("log_keyframes", True))
         self.results_cfg = config.get("Results", {})
         self.runtime_log_preset = str(
@@ -754,6 +762,85 @@ class SlamRuntimeLogger:
             if depth_path is not None:
                 image_payload["backend/kf_depth_opt_png"] = str(depth_path)
             self._log_wandb_payload(image_payload, step=log_step)
+
+    def observe_post_optimized_window(
+        self,
+        diagnostics: list,
+        *,
+        window_id: int,
+        step: int | None = None,
+    ) -> None:
+        """Log every frame rendered after a successful spherical window update."""
+
+        if not self.post_opt_all_frames:
+            return
+        valid = [diagnostic for diagnostic in diagnostics if diagnostic is not None]
+        if not valid:
+            return
+
+        log_step = self._wandb_step(step)
+        render_media = []
+        depth_media = []
+        losses: list[float] = []
+        psnrs: list[float] = []
+        for diagnostic in valid:
+            frame_id = int(getattr(diagnostic, "frame_id"))
+            loss = float(getattr(diagnostic, "loss", 0.0))
+            psnr = float(getattr(diagnostic, "psnr", 0.0))
+            losses.append(loss)
+            psnrs.append(psnr)
+            caption = (
+                f"window={int(window_id)} frame={frame_id} "
+                f"loss={loss:.4f} PSNR={psnr:.2f}dB "
+                f"anchors={int(getattr(diagnostic, 'anchor_count', 0))}"
+            )
+
+            render_panel = self._make_keyframe_opt_render_panel(diagnostic)
+            render_path = None
+            if self.save_local:
+                render_path = self._save_post_opt_window_image(
+                    render_panel,
+                    window_id=int(window_id),
+                    frame_id=frame_id,
+                    suffix="render_vs_gt",
+                )
+            if self.run is not None and self._wandb is not None:
+                render_media.append(
+                    self._wandb.Image(
+                        str(render_path) if render_path is not None else render_panel,
+                        caption=caption,
+                    )
+                )
+
+            if self.post_opt_log_depth:
+                depth_panel = self._make_keyframe_opt_depth_panel(diagnostic)
+                depth_path = None
+                if self.save_local:
+                    depth_path = self._save_post_opt_window_image(
+                        depth_panel,
+                        window_id=int(window_id),
+                        frame_id=frame_id,
+                        suffix="depth",
+                    )
+                if self.run is not None and self._wandb is not None:
+                    depth_media.append(
+                        self._wandb.Image(
+                            str(depth_path) if depth_path is not None else depth_panel,
+                            caption=caption,
+                        )
+                    )
+
+        payload: dict[str, object] = {
+            "backend/post_opt_window_id": int(window_id),
+            "backend/post_opt_frame_count": int(len(valid)),
+            "backend/post_opt_mean_loss": float(np.mean(losses)),
+            "backend/post_opt_mean_psnr": float(np.mean(psnrs)),
+        }
+        if render_media:
+            payload["backend/post_opt_window_frames"] = render_media
+        if depth_media:
+            payload["backend/post_opt_window_depths"] = depth_media
+        self._log_wandb_payload(payload, step=log_step)
 
     def observe_keyframe_inserted_gaussians(
         self,
@@ -1187,6 +1274,20 @@ class SlamRuntimeLogger:
             image.convert("RGB").save(path, quality=quality)
         else:
             image.save(path)
+        return path
+
+    def _save_post_opt_window_image(
+        self,
+        image: Image.Image,
+        *,
+        window_id: int,
+        frame_id: int,
+        suffix: str,
+    ) -> Path:
+        directory = self.visualization_dir / "post_opt" / f"window_{int(window_id):06d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"frame_{int(frame_id):06d}_{suffix}.png"
+        image.save(path)
         return path
 
     def _save_m3_debug_images(self, m3_debug: dict, *, chunk_index: int) -> dict[str, Path | None]:
@@ -2612,6 +2713,26 @@ class PanoDroidGSSlamSystem:
             joint_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
             apply_spherical_selfi_geometry_updates(joint_geometry_updates, outputs)
             last_feedforward_metrics = dict(metrics)
+            successful_steps = float(metrics.get("steps", 0.0))
+            rolled_back = float(metrics.get("window_rollback", 0.0)) > 0.0
+            if logger.post_opt_all_frames and successful_steps > 0.0 and not rolled_back:
+                window_id = int(metrics.get("spherical_selfi_window_id", -1))
+                diagnostics = []
+                for frame_id in self.mapper.stats.last_window_observations:
+                    try:
+                        diagnostic = self.mapper.render_keyframe_diagnostic(int(frame_id))
+                    except Exception as exc:
+                        self.mapper.stats.notes.append(
+                            f"window {window_id} frame {int(frame_id)}: post-opt render failed: {exc!r}"
+                        )
+                        continue
+                    if diagnostic is not None:
+                        diagnostics.append(diagnostic)
+                logger.observe_post_optimized_window(
+                    diagnostics,
+                    window_id=window_id,
+                    step=max(1, int(logger._step)),
+                )
             write_profile(
                 "backend_spherical_selfi_map_optimization",
                 optimize_steps=float(metrics.get("steps", 0.0)),

@@ -253,6 +253,8 @@ Visualization:
   log_every: 5
   save_kf_opt: true
   kf_opt_log_every: 1
+  post_opt_all_frames: true
+  post_opt_log_depth: false
 
 Results:
   save_dir: outputs/spherical_selfi_global_gs_slam

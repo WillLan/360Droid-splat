@@ -1569,6 +1569,87 @@ def test_slam_logger_can_disable_keyframe_opt_file_saves(tmp_path):
     assert not (tmp_path / "kf_depths_opt").exists()
 
 
+def test_slam_logger_logs_every_post_optimized_window_frame_and_preserves_overlap(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value, caption=None):
+            return ("image", value, caption)
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"mode": "disabled", "runtime_log_preset": "compact_slam"},
+            "Visualization": {
+                "save_local": True,
+                "post_opt_all_frames": True,
+                "post_opt_log_depth": False,
+            },
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+
+    def diagnostic(frame_id: int, loss: float, psnr: float):
+        return SimpleNamespace(
+            frame_id=frame_id,
+            target=torch.rand(3, 4, 8),
+            render=torch.rand(3, 4, 8),
+            depth=torch.rand(1, 4, 8).clamp_min(0.1),
+            target_depth=torch.rand(1, 4, 8).clamp_min(0.1),
+            loss=loss,
+            psnr=psnr,
+            anchor_count=42,
+            phase="feedforward_window",
+        )
+
+    logger.observe_post_optimized_window(
+        [diagnostic(0, 0.2, 18.0), diagnostic(3, 0.1, 20.0)],
+        window_id=0,
+        step=4,
+    )
+    logger.observe_post_optimized_window(
+        [diagnostic(3, 0.08, 21.0), diagnostic(4, 0.07, 22.0)],
+        window_id=1,
+        step=7,
+    )
+
+    first_overlap = (
+        tmp_path
+        / "visualizations"
+        / "post_opt"
+        / "window_000000"
+        / "frame_000003_render_vs_gt.png"
+    )
+    second_overlap = (
+        tmp_path
+        / "visualizations"
+        / "post_opt"
+        / "window_000001"
+        / "frame_000003_render_vs_gt.png"
+    )
+    assert first_overlap.is_file()
+    assert second_overlap.is_file()
+    assert not list((tmp_path / "visualizations" / "post_opt").rglob("*_depth.png"))
+
+    media_payloads = [
+        (payload, step)
+        for payload, step in logger.run.logged
+        if "backend/post_opt_window_frames" in payload
+    ]
+    assert [step for _, step in media_payloads] == [4, 7]
+    assert [len(payload["backend/post_opt_window_frames"]) for payload, _ in media_payloads] == [2, 2]
+    assert "window=0 frame=3" in media_payloads[0][0]["backend/post_opt_window_frames"][1][2]
+    assert "window=1 frame=3" in media_payloads[1][0]["backend/post_opt_window_frames"][0][2]
+    assert media_payloads[0][0]["backend/post_opt_frame_count"] == 2
+
+
 def test_slam_logger_saves_new_gaussian_insertion_visualization(tmp_path):
     logger = SlamRuntimeLogger(
         {
