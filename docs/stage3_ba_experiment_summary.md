@@ -171,3 +171,27 @@ eight LM iterations and a `0.5 degree` per-iteration rotation limit.  The
 formal arm measures deployed behavior; the diagnostic arm prevents the formal
 `3 x 0.02 degree` trust limit from hiding the solver's capture range.  GT is
 strictly diagnostic and is not imported by the training or runtime BA path.
+
+## Star-graph BA validation protocol
+
+`tools/evaluate_stage3_ba_star.py` isolates BA graph topology from Adapter
+matching randomness. Every validation window first creates one unpruned cache
+containing the same sampled queries, all 12 directed Adapter matches, target
+bearings, and confidence scores. Four masks are then derived without rerunning
+the matcher:
+
+| Arm | Directed edges | Per-edge retention | Expected relative factor budget |
+|---|---|---:|---:|
+| A | all 12 pairs | top 10% | 1.0x |
+| B | `0 -> {1,2,3}` | top 10% | 0.25x |
+| C | `0 -> {1,2,3}` | top 40% | approximately 1.0x |
+| D | `0 <-> {1,2,3}` | top 20% | approximately 1.0x |
+
+All arms use the frozen formal rotation-only BA: frame 0 fixed, three standard
+LM iterations, a `0.02 degree` per-iteration trust limit, and no dense-depth
+propagation. A/B distinguishes an efficient star from the all-pair graph; B/C
+separates topology from factor count; A/C tests whether reverse and
+target-to-target edges add useful redundancy or noise; C/D tests the value of
+reverse source-depth constraints. The evaluator reports GT pose/RPE deltas,
+accepted ratio, tangent residual/objective, factor counts, and component time.
+Translation and ATE must remain numerically invariant in rotation-only mode.

@@ -297,7 +297,7 @@ def evaluate_oracle(
         if len(records) >= int(max_batches):
             break
         batch_start = time.perf_counter()
-        features, images, initial_depth, _poses = extract_frozen_inputs(
+        features, images, initial_depth, poses = extract_frozen_inputs(
             wrapper,
             adapter,
             batch["images"],
