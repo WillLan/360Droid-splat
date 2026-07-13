@@ -4,6 +4,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 from PIL import Image
+import torch
 
 from data.stage1_pano_sequence_dataset import (
     Stage1PanoSequenceDataset,
@@ -102,6 +103,42 @@ def test_stage1_dataset_loads_h5_depth(tmp_path: Path):
     assert sample["depths"].shape == (4, 1, 8, 16)
     assert sample["depths"][0].mean().item() == 1.0
     assert sample["depths"][3].mean().item() == 4.0
+
+
+def test_stage1_dataset_converts_configured_w2c_poses(tmp_path: Path):
+    records = []
+    for idx in range(4):
+        image_path = tmp_path / f"pose_frame_{idx:03d}.png"
+        pose_path = tmp_path / f"pose_{idx:03d}.npy"
+        _write_image(image_path, (idx, 10, 100))
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[0, 3] = float(idx + 1)
+        np.save(pose_path, w2c)
+        records.append(
+            {
+                "scene_id": "pose_scene",
+                "sequence_id": "seq_000",
+                "frame_id": idx,
+                "rgb_path": str(image_path),
+                "pose_path": str(pose_path),
+                "split": "train",
+                "domain": "indoor",
+            }
+        )
+    manifest = tmp_path / "poses.json"
+    manifest.write_text(json.dumps(records), encoding="utf-8")
+
+    sample = Stage1PanoSequenceDataset(
+        manifest,
+        image_height=8,
+        image_width=16,
+        pose_convention="w2c",
+    )[0]
+
+    assert sample["poses_c2w"] is not None
+    torch.testing.assert_close(
+        sample["poses_c2w"][:, 0, 3], torch.tensor([-1.0, -2.0, -3.0, -4.0])
+    )
 
 
 def test_manifest_builder_and_overlap_checker(tmp_path: Path):

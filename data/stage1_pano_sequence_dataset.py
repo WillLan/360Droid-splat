@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from geometry.pose import convert_pose_convention
+
 
 REQUIRED_FIELDS = ("scene_id", "sequence_id", "frame_id", "rgb_path", "split", "domain")
 VALID_DOMAINS = {"indoor", "outdoor"}
@@ -224,6 +226,7 @@ class Stage1PanoSequenceDataset(Dataset):
         image_width: int = 1008,
         pair_mode: str = "adjacent_and_skip",
         max_temporal_gap: int | None = 10,
+        pose_convention: str = "c2w",
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest_dir = self.manifest_path.parent
@@ -231,6 +234,11 @@ class Stage1PanoSequenceDataset(Dataset):
         self.views_per_sample = int(views_per_sample)
         self.resize = (int(image_height), int(image_width))
         self.pair_mode = str(pair_mode)
+        self.pose_convention = str(pose_convention).strip().lower()
+        if self.pose_convention not in {"c2w", "w2c"}:
+            raise ValueError(
+                f"pose_convention must be 'c2w' or 'w2c', got {pose_convention!r}."
+            )
         self.windows = build_stage1_windows(
             self.records,
             views_per_sample=self.views_per_sample,
@@ -265,7 +273,12 @@ class Stage1PanoSequenceDataset(Dataset):
         ]
         pose_values = [_load_optional_tensor(_resolve_path(record.pose_path, self.manifest_dir)) for record in window]
         depths = torch.stack([value if value.ndim == 3 else value.unsqueeze(0) for value in depth_values], dim=0) if all(value is not None for value in depth_values) else None
-        poses = torch.stack([value.reshape(4, 4) for value in pose_values], dim=0) if all(value is not None for value in pose_values) else None
+        poses = None
+        if all(value is not None for value in pose_values):
+            raw_poses = torch.stack([value.reshape(4, 4) for value in pose_values], dim=0)
+            if not bool(torch.isfinite(raw_poses).all()):
+                raise ValueError("Stage 1 pose tensors must be finite.")
+            poses = convert_pose_convention(raw_poses, self.pose_convention)
         return {
             "images": images,
             "depths": depths,

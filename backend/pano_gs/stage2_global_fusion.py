@@ -99,6 +99,8 @@ class Stage2GlobalMapFusion:
         self.min_confidence = float(min_confidence)
         self.min_opacity = float(min_opacity)
         self.max_total_gaussians = max(0, int(max_total_gaussians))
+        self.last_pre_cap_count = 0
+        self.last_saturated = False
 
     def _levels_and_grid(self, xyz: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sizes = xyz.new_tensor(self.voxel_sizes)
@@ -293,6 +295,8 @@ class Stage2GlobalMapFusion:
 
     def _winner_take_global_voxel(self, batch: GlobalExplicitGaussianBatch) -> GlobalExplicitGaussianBatch:
         if len(batch) == 0:
+            self.last_pre_cap_count = 0
+            self.last_saturated = False
             return batch
         level, grid = self._levels_and_grid(batch.xyz, batch.scale)
         batch.level, batch.grid_coord = level, grid
@@ -312,10 +316,46 @@ class Stage2GlobalMapFusion:
         winner.scatter_reduce_(0, inverse, candidate, reduce="amin", include_self=True)
         winner = winner[winner < len(batch)]
         result = batch.index(winner)
+        self.last_pre_cap_count = len(result)
+        self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
         if self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians:
             selected = torch.topk(result.quality, k=self.max_total_gaussians, largest=True).indices
             result = result.index(selected)
         return result
+
+    @staticmethod
+    def _distribution(prefix: str, value: torch.Tensor) -> dict[str, float]:
+        finite = value.detach().float().reshape(-1)
+        if finite.numel() > 65536:
+            stride = max(1, int(math.ceil(finite.numel() / 65536)))
+            finite = finite[::stride][:65536]
+        finite = finite[torch.isfinite(finite)]
+        if finite.numel() == 0:
+            return {f"{prefix}_{name}": 0.0 for name in ("min", "mean", "median", "max")}
+        return {
+            f"{prefix}_min": float(finite.min().cpu()),
+            f"{prefix}_mean": float(finite.mean().cpu()),
+            f"{prefix}_median": float(finite.median().cpu()),
+            f"{prefix}_max": float(finite.max().cpu()),
+        }
+
+    def _quality_diagnostics(
+        self, packet: LocalGaussianWindowPacket, incoming: GlobalExplicitGaussianBatch
+    ) -> dict[str, float]:
+        observation = packet.observation
+        mask = packet.finite_gaussian_mask[0, :, 0].bool()
+        opacity = observation.source_view_confidence()[0, :, 0]
+        components = {
+            "quality_geom_conf": observation.confidence[0, :, 0][mask],
+            "quality_opacity": opacity[mask],
+            "quality_non_sky": (1.0 - packet.sky_prob[0, :, 0]).clamp(0.0, 1.0)[mask],
+            "quality_consistency": packet.geometry_consistency[0, :, 0].float()[mask],
+            "quality_product": incoming.quality,
+        }
+        diagnostics: dict[str, float] = {}
+        for prefix, value in components.items():
+            diagnostics.update(self._distribution(prefix, value))
+        return diagnostics
 
     def _batch_from_map(self) -> GlobalExplicitGaussianBatch:
         device, dtype = self.map.xyz.device, self.map.xyz.dtype
@@ -397,17 +437,26 @@ class Stage2GlobalMapFusion:
         existing = self._batch_from_map()
         combined = incoming if len(existing) == 0 else self._concatenate([existing, incoming])
         compacted = self._winner_take_global_voxel(combined)
+        pre_cap_count = int(self.last_pre_cap_count)
+        saturated = bool(self.last_saturated)
         self._write_map(compacted)
         after = len(compacted)
         inserted_or_replaced = max(0, after - before)
-        return {
+        stats: dict[str, int | float] = {
             "requested": len(incoming_raw),
             "window_compacted": len(incoming),
             "inserted": inserted_or_replaced,
             "deduplicated": max(0, len(combined) - after),
             "anchors_before": before,
             "anchors_after": after,
+            "anchors_before_safety_cap": pre_cap_count,
+            "map_saturated": int(saturated),
         }
+        stats.update(self._quality_diagnostics(packet, incoming_raw))
+        for level in range(len(self.voxel_sizes)):
+            stats[f"incoming_level_{level}"] = int((incoming.level == level).sum().detach().cpu())
+            stats[f"global_level_{level}"] = int((compacted.level == level).sum().detach().cpu())
+        return stats
 
     def apply_owner_corrections(
         self,
@@ -451,7 +500,10 @@ class Stage2GlobalMapFusion:
         batch = self._batch_from_map()
         if len(batch) == 0:
             return 0
-        prune = (batch.opacity[:, 0] < self.min_opacity) | (batch.quality < self.min_confidence * 1.0e-2)
+        mean_confidence = batch.confidence_accum / batch.observation_count.clamp_min(1).to(
+            batch.confidence_accum
+        )
+        prune = (batch.opacity[:, 0] < self.min_opacity) | (mean_confidence < self.min_confidence)
         if int(max_stale_frames) > 0:
             prune |= (
                 (int(current_frame) - batch.last_seen_frame) > int(max_stale_frames)

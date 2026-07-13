@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
-from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
+from backend.pano_gs.mapper import MapperObservation, PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.sim3_graph import (
     CoincidentPanoramaFactor,
     DenseSphericalFactorBlock,
@@ -29,6 +30,7 @@ from frontend.spherical_selfi.window_packet import (
 )
 from geometry.sim3 import (
     apply_sim3,
+    apply_sim3_to_c2w,
     sim3_exp,
     sim3_from_components,
     sim3_identity,
@@ -357,6 +359,38 @@ def test_voxel_quality_does_not_apply_latitude_weight_twice() -> None:
     torch.testing.assert_close(batch.quality, torch.full_like(batch.quality, 0.5))
 
 
+def test_low_multiplicative_quality_alone_does_not_prune_gaussian() -> None:
+    packet = _packet(0, torch.eye(4).repeat(1, 1, 1), (0,))
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.5,),
+        min_confidence=0.05,
+        min_opacity=0.02,
+    )
+    stats = fusion.fuse_packet(packet, sim3_identity())
+    assert stats["anchors_after"] > 0
+    gaussian_map._anchor_quality.fill_(1.0e-12)
+    removed = fusion.prune_lifecycle(current_frame=1)
+    assert removed == 0
+
+
+def test_voxel_safety_cap_is_reported_as_saturation() -> None:
+    packet = _packet(0, torch.eye(4).repeat(1, 1, 1), (0,))
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(1.0e-4,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        max_total_gaussians=1,
+    )
+    stats = fusion.fuse_packet(packet, sim3_identity())
+    assert stats["map_saturated"] == 1
+    assert stats["anchors_before_safety_cap"] > 1
+    assert stats["anchors_after"] == 1
+
+
 def test_two_overlapping_windows_build_graph_and_global_map() -> None:
     frame_features = {frame_id: torch.randn(24, 6, 12) for frame_id in range(3)}
     poses0 = torch.eye(4).repeat(2, 1, 1)
@@ -396,6 +430,121 @@ def test_two_overlapping_windows_build_graph_and_global_map() -> None:
     updates = backend.pop_pose_updates()
     assert set(updates) == {0, 1, 2}
     assert abs(float(updates[2][0, 3]) - 0.2) < 2e-3
+
+
+def test_joint_pose_sync_rebases_scale_and_updates_both_overlap_packets() -> None:
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 2.0
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 2.0
+    poses1[1, 0, 3] = 4.0
+    packet0 = _packet(0, poses0, (0, 1))
+    packet1 = _packet(1, poses1, (1, 2))
+
+    optimized = {
+        1: torch.eye(4),
+        2: torch.eye(4),
+    }
+    optimized[1][0, 3] = 2.2
+    optimized[2][0, 3] = 4.4
+
+    class _Mapper:
+        def refined_pose_c2w(self, frame_id: int):
+            return optimized.get(int(frame_id))
+
+    gaussian_map = PanoGaussianMap(
+        config={"SphericalSelfiGlobalBackend": {"enabled": True, "rgb_sh_degree": 2}},
+        device="cpu",
+    )
+    backend = SphericalSelfiGlobalBackend(
+        gaussian_map,
+        mapper=_Mapper(),  # type: ignore[arg-type]
+        config={
+            "enabled": True,
+            "geometry_validation": {"enabled": True, "tolerance": 1.0e-6},
+            "voxel_fusion": {"voxel_sizes": [0.2], "min_confidence": 0.0, "min_opacity": 0.0},
+            "map_optimization": {"steps_per_window": 0},
+        },
+    )
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(
+        1, sim3_from_components(2.0, torch.eye(3), torch.tensor([2.0, 0.0, 0.0]))
+    )
+    backend.packets = {0: packet0, 1: packet1}
+    backend.window_order = [0, 1]
+    backend.frame_windows = {0: {0}, 1: {0, 1}, 2: {1}}
+
+    backend._synchronize_joint_optimized_window(1)
+
+    torch.testing.assert_close(packet1.local_poses_c2w[0], torch.eye(4))
+    assert abs(float(packet1.local_poses_c2w[1, 0, 3]) - 1.1) < 1.0e-6
+    assert abs(float(packet0.local_poses_c2w[1, 0, 3]) - 2.2) < 1.0e-6
+    for frame_id, packet, index in ((1, packet0, 1), (1, packet1, 0), (2, packet1, 1)):
+        reconstructed = apply_sim3_to_c2w(
+            backend.graph.transform(packet.window_id), packet.local_poses_c2w[index]
+        )
+        torch.testing.assert_close(reconstructed, optimized[frame_id], atol=1.0e-6, rtol=1.0e-6)
+    geometry = backend.pop_frame_geometry_updates()
+    assert geometry[1].owner_window_id == 1
+    assert geometry[1].depth_owner_window_id == 0
+    assert geometry[1].depth_scale == 1.0
+    assert geometry[1].depth_scales_by_window == {0: 1.0, 1: 2.0}
+
+
+def test_mapper_geometry_updates_materialize_depth_from_immutable_local_value() -> None:
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map)
+    mapper.observations[5] = MapperObservation(
+        frame_id=5,
+        image=torch.zeros(3, 4, 8),
+        pose_c2w=torch.eye(4),
+        target_depth=torch.full((1, 4, 8), 2.0),
+    )
+    update = SimpleNamespace(
+        pose_c2w=torch.eye(4),
+        depth_scale=2.0,
+        owner_window_id=1,
+        depth_owner_window_id=1,
+        depth_scales_by_window={1: 2.0},
+    )
+    mapper.apply_frontend_geometry_updates({5: update})
+    torch.testing.assert_close(
+        mapper.observations[5].target_depth, torch.full((1, 4, 8), 4.0)
+    )
+    update.depth_scale = 3.0
+    update.depth_scales_by_window = {1: 3.0}
+    mapper.apply_frontend_geometry_updates({5: update})
+    torch.testing.assert_close(
+        mapper.observations[5].target_depth, torch.full((1, 4, 8), 6.0)
+    )
+    torch.testing.assert_close(
+        mapper.observations[5].target_depth_local, torch.full((1, 4, 8), 2.0)
+    )
+
+
+def test_overlap_pose_owner_does_not_rescale_depth_from_another_window() -> None:
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map)
+    mapper.observations[3] = MapperObservation(
+        frame_id=3,
+        image=torch.zeros(3, 4, 8),
+        pose_c2w=torch.eye(4),
+        target_depth=torch.full((1, 4, 8), 2.0),
+        target_depth_local=torch.full((1, 4, 8), 2.0),
+        owner_window_id=0,
+    )
+    update = SimpleNamespace(
+        pose_c2w=torch.eye(4),
+        depth_scale=1.0,
+        owner_window_id=1,
+        depth_owner_window_id=0,
+        depth_scales_by_window={0: 1.0, 1: 2.0},
+    )
+    mapper.apply_frontend_geometry_updates({3: update})
+    assert mapper.observations[3].owner_window_id == 0
+    torch.testing.assert_close(
+        mapper.observations[3].target_depth, torch.full((1, 4, 8), 2.0)
+    )
 
 
 def test_frontend_output_contract_remains_unchanged() -> None:

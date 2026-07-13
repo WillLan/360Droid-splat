@@ -13,8 +13,8 @@ WeightsAndBiases:
   enabled: true
   project: 360Droid-splat
   mode: online
-  run_name: spherical_selfi_global_ob3d_sponza_nonegocentric
-  tags: [spherical-selfi, stage2, sim3-graph, fibonacci, ob3d, sponza, non-egocentric]
+  run_name: spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_voxel020
+  tags: [spherical-selfi, stage2, sim3-graph, fibonacci, posefix, voxel020, ob3d, sponza, non-egocentric]
 
 Visualization:
   enabled: true
@@ -24,5 +24,5 @@ Visualization:
   kf_opt_log_every: 1
 
 Results:
-  save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric
+  save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_voxel020
   kf_render_format: png

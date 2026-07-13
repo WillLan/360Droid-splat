@@ -23,6 +23,7 @@ from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
+from geometry.pose import relative_c2w
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
@@ -2475,7 +2476,63 @@ class PanoDroidGSSlamSystem:
                     optimize_sec=optimize_sec,
                 )
 
-        pending_spherical_selfi_pose_updates: dict[int, torch.Tensor] = {}
+        pending_spherical_selfi_geometry_updates: dict[int, object] = {}
+        spherical_selfi_local_inverse_depth: dict[int, torch.Tensor] = {}
+        spherical_selfi_global_pose: dict[int, torch.Tensor] = {}
+        spherical_selfi_geometry_by_frame: dict[int, object] = {}
+
+        def apply_spherical_selfi_geometry_updates(
+            updates: dict[int, object], outputs: list[FrontendOutput]
+        ) -> None:
+            if not updates:
+                return
+            self.mapper.apply_frontend_geometry_updates(updates)
+            for frame_id, update in updates.items():
+                spherical_selfi_geometry_by_frame[int(frame_id)] = update
+                spherical_selfi_global_pose[int(frame_id)] = torch.as_tensor(
+                    getattr(update, "pose_c2w")
+                ).detach().cpu().float()
+            ready_ids = {int(output.frame_id) for output in outputs}
+            pending_spherical_selfi_geometry_updates.update(
+                {
+                    int(frame_id): update
+                    for frame_id, update in updates.items()
+                    if int(frame_id) in ready_ids
+                }
+            )
+            for index, output in enumerate(outputs):
+                frame_id = int(output.frame_id)
+                update = pending_spherical_selfi_geometry_updates.get(frame_id)
+                if update is None:
+                    continue
+                pose = torch.as_tensor(getattr(update, "pose_c2w")).detach().cpu().float()
+                depth_scale = float(getattr(update, "depth_scale"))
+                inverse_depth = output.inverse_depth
+                if output.inverse_depth is not None:
+                    spherical_selfi_local_inverse_depth.setdefault(
+                        frame_id, output.inverse_depth.detach().cpu().float().clone()
+                    )
+                    inverse_depth = spherical_selfi_local_inverse_depth[frame_id] / depth_scale
+                world_points = output.world_points
+                source = frame_cache.get(frame_id)
+                if inverse_depth is not None and source is not None:
+                    world_points = world_points_from_inverse_depth(
+                        inverse_depth,
+                        pose,
+                        (int(source.image.shape[-2]), int(source.image.shape[-1])),
+                    ).detach().cpu().float()
+                relative_pose = output.relative_pose
+                previous_pose = spherical_selfi_global_pose.get(frame_id - 1)
+                if previous_pose is not None:
+                    relative_pose = relative_c2w(previous_pose, pose).detach().cpu().float()
+                outputs[index] = replace(
+                    output,
+                    pose_c2w=pose,
+                    relative_pose=relative_pose,
+                    inverse_depth=inverse_depth,
+                    world_points=world_points,
+                )
+                pending_spherical_selfi_geometry_updates.pop(frame_id, None)
 
         def drain_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
             if not spherical_selfi_global_enabled:
@@ -2490,6 +2547,16 @@ class PanoDroidGSSlamSystem:
                 section_start = time.perf_counter()
                 result = self.spherical_selfi_global_backend.process_packet(packet)
                 elapsed = float(time.perf_counter() - section_start)
+                fusion_profile = {
+                    f"fusion_{key}": float(value)
+                    for key, value in result.fusion.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+                gpu_memory_mb = (
+                    float(torch.cuda.memory_allocated(self.map.get_xyz.device) / (1024.0 * 1024.0))
+                    if self.map.get_xyz.device.type == "cuda"
+                    else 0.0
+                )
                 write_profile(
                     "backend_spherical_selfi_window",
                     window_id=float(result.window_id),
@@ -2500,47 +2567,41 @@ class PanoDroidGSSlamSystem:
                     deduplicated=float(result.fusion.get("deduplicated", 0)),
                     anchors_after=float(result.fusion.get("anchors_after", self.map.anchor_count())),
                     moved=float(result.correction.get("moved", 0)),
+                    gpu_memory_mb=gpu_memory_mb,
                     total_sec=elapsed,
+                    **fusion_profile,
                 )
-                logger._log_wandb_payload(
-                    {
+                wandb_payload = {
                         "backend/selfi_window_id": int(result.window_id),
                         "backend/selfi_loop_accepted": int(result.loop_accepted),
                         "backend/selfi_window_compacted": int(result.fusion.get("window_compacted", 0)),
                         "backend/selfi_global_anchors": int(result.fusion.get("anchors_after", self.map.anchor_count())),
                         "backend/selfi_graph_objective": 0.0 if result.graph is None else float(result.graph.final_objective),
-                    },
+                        "backend/selfi_graph_iterations": 0 if result.graph is None else int(result.graph.iterations),
+                        "backend/selfi_graph_pcg_iterations": 0 if result.graph is None else int(result.graph.pcg_iterations),
+                        "backend/selfi_graph_pcg_relative_residual": 0.0 if result.graph is None else float(result.graph.pcg_relative_residual),
+                        "backend/selfi_graph_reason": "none" if result.graph is None else str(result.graph.reason),
+                        "backend/selfi_map_saturated": int(result.fusion.get("map_saturated", 0)),
+                        "backend/selfi_gpu_memory_mb": gpu_memory_mb,
+                    }
+                wandb_payload.update(
+                    {
+                        f"backend/selfi_{key}": float(value)
+                        for key, value in result.fusion.items()
+                        if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    }
+                )
+                logger._log_wandb_payload(
+                    wandb_payload,
                     step=max(1, int(logger._step) + 1),
                 )
-            graph_pose_updates = self.spherical_selfi_global_backend.pop_pose_updates()
+            graph_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
             # Historical observations must follow graph-loop corrections too;
             # replacing only the not-yet-emitted FrontendOutput would leave the
             # photometric replay cameras at stale poses.
-            self.mapper.apply_frontend_pose_updates(graph_pose_updates)
-            ready_ids = {int(output.frame_id) for output in outputs}
-            pending_spherical_selfi_pose_updates.update(
-                {
-                    int(frame_id): pose
-                    for frame_id, pose in graph_pose_updates.items()
-                    if int(frame_id) in ready_ids
-                }
-            )
-            for index, output in enumerate(outputs):
-                pose = pending_spherical_selfi_pose_updates.get(int(output.frame_id))
-                if pose is None:
-                    continue
-                world_points = output.world_points
-                source = frame_cache.get(int(output.frame_id))
-                if output.inverse_depth is not None and source is not None:
-                    world_points = world_points_from_inverse_depth(
-                        output.inverse_depth,
-                        pose,
-                        (int(source.image.shape[-2]), int(source.image.shape[-1])),
-                    ).detach().cpu().float()
-                outputs[index] = replace(output, pose_c2w=pose, world_points=world_points)
-                pending_spherical_selfi_pose_updates.pop(int(output.frame_id), None)
+            apply_spherical_selfi_geometry_updates(graph_geometry_updates, outputs)
 
-        def optimize_spherical_selfi_windows() -> None:
+        def optimize_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
             nonlocal last_feedforward_metrics
             if not spherical_selfi_global_enabled:
                 return
@@ -2548,9 +2609,8 @@ class PanoDroidGSSlamSystem:
             metrics = self.spherical_selfi_global_backend.run_pending_map_optimization()
             if not metrics:
                 return
-            joint_pose_updates = self.spherical_selfi_global_backend.pop_pose_updates()
-            if joint_pose_updates:
-                self.mapper.apply_frontend_pose_updates(joint_pose_updates)
+            joint_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
+            apply_spherical_selfi_geometry_updates(joint_geometry_updates, outputs)
             last_feedforward_metrics = dict(metrics)
             write_profile(
                 "backend_spherical_selfi_map_optimization",
@@ -2603,6 +2663,24 @@ class PanoDroidGSSlamSystem:
                     is_keyframe=bool(out.is_keyframe),
                     sky_mask=sky_mask,
                 )
+                if spherical_selfi_global_enabled:
+                    geometry_update = spherical_selfi_geometry_by_frame.get(int(out.frame_id))
+                    local_inverse = spherical_selfi_local_inverse_depth.get(int(out.frame_id))
+                    if geometry_update is not None and local_inverse is not None:
+                        self.mapper.set_spherical_selfi_observation_geometry(
+                            int(out.frame_id),
+                            target_depth_local=local_inverse.clamp_min(1.0e-6).reciprocal(),
+                            depth_scale=float(getattr(geometry_update, "depth_scale")),
+                            owner_window_id=int(
+                                getattr(
+                                    geometry_update,
+                                    "depth_owner_window_id",
+                                    getattr(geometry_update, "owner_window_id"),
+                                )
+                            ),
+                            depth_confidence=out.depth_confidence,
+                            sky_mask=sky_mask,
+                        )
                 output_profile["mapper_register_observation_sec"] = float(time.perf_counter() - section_start)
             output_wandb_step = max(1, int(logger._step) + 1)
             logger.observe_sky_mask(frame_id=int(out.frame_id), sky_mask=sky_mask, step=output_wandb_step)
@@ -3171,7 +3249,7 @@ class PanoDroidGSSlamSystem:
                 drain_spherical_selfi_windows(outputs)
                 for ready in outputs:
                     process_output(ready)
-                optimize_spherical_selfi_windows()
+                optimize_spherical_selfi_windows(outputs)
                 drain_resplat_artifacts()
                 for ready in outputs:
                     frame_cache.pop(int(ready.frame_id), None)
@@ -3197,7 +3275,7 @@ class PanoDroidGSSlamSystem:
                 drain_spherical_selfi_windows(flushed_outputs)
                 for ready in flushed_outputs:
                     process_output(ready)
-                optimize_spherical_selfi_windows()
+                optimize_spherical_selfi_windows(flushed_outputs)
                 drain_resplat_artifacts()
                 for ready in flushed_outputs:
                     frame_cache.pop(int(ready.frame_id), None)
@@ -3207,6 +3285,8 @@ class PanoDroidGSSlamSystem:
             section_start = time.perf_counter()
             if spherical_selfi_global_enabled:
                 spherical_final = self.spherical_selfi_global_backend.finalize()
+                final_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
+                apply_spherical_selfi_geometry_updates(final_geometry_updates, [])
                 final_metrics = {
                     key: float(value)
                     for key, value in spherical_final.items()
@@ -3244,6 +3324,15 @@ class PanoDroidGSSlamSystem:
                 "last_tracking_status": last_status,
                 "map_mode": self.map.map_mode,
                 "renderer": self.config.get("Training", {}).get("panorama_render_mode", "pfgs360_gsplat"),
+                "pose_conventions": {
+                    "dataset_input": (
+                        "w2c"
+                        if str(self.config.get("Dataset", {}).get("type", "")).lower() == "ob3d"
+                        else str(self.config.get("Dataset", {}).get("pose_convention", "c2w"))
+                    ),
+                    "internal": "c2w",
+                    "camera_axes": "+X right, +Y down, +Z forward",
+                },
                 "backend_last_loss": self.mapper.stats.last_loss,
                 "backend_last_phase": self.mapper.stats.last_phase,
                 "backend_optimization_steps": self.mapper.stats.optimization_steps,

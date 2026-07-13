@@ -81,6 +81,8 @@ class Sim3GraphOptimizeResult:
     max_update_norm: float
     optimized_node_ids: tuple[int, ...]
     reason: str
+    pcg_iterations: int = 0
+    pcg_relative_residual: float = 0.0
 
 
 def _so3_residual(rotation: torch.Tensor) -> torch.Tensor:
@@ -146,6 +148,8 @@ class GlobalSim3FactorGraph:
         self.max_rotation_update = math.radians(float(max_rotation_update_deg))
         self.max_log_scale_update = float(max_log_scale_update)
         self.fixed_node_id: int | None = None
+        self._last_pcg_iterations = 0
+        self._last_pcg_relative_residual = 0.0
 
     def add_node(self, node_id: int, transform_anchor_to_global: torch.Tensor) -> None:
         node = int(node_id)
@@ -366,7 +370,9 @@ class GlobalSim3FactorGraph:
         direction = preconditioned.clone()
         rz = (residual * preconditioned).sum()
         rhs_norm = rhs.norm().clamp_min(1.0e-12)
-        for _ in range(self.pcg_iterations):
+        iterations = 0
+        for iteration in range(self.pcg_iterations):
+            iterations = iteration + 1
             product = matvec(direction)
             alpha = rz / (direction * product).sum().clamp_min(1.0e-12)
             solution = solution + alpha * direction
@@ -382,6 +388,8 @@ class GlobalSim3FactorGraph:
             direction = next_preconditioned + beta * direction
             preconditioned = next_preconditioned
             rz = next_rz
+        self._last_pcg_iterations = iterations
+        self._last_pcg_relative_residual = float((residual.norm() / rhs_norm).detach().cpu())
         return solution
 
     def optimize(self, active_node_ids: Iterable[int] | None = None) -> Sim3GraphOptimizeResult:
@@ -400,6 +408,7 @@ class GlobalSim3FactorGraph:
         accepted_any = False
         max_update = 0.0
         actual_iterations = 0
+        termination_reason = "max_iterations"
         trainable = {node_id: idx for idx, node_id in enumerate(trainable_ids)}
 
         for iteration in range(self.max_iterations):
@@ -411,6 +420,7 @@ class GlobalSim3FactorGraph:
             if not bool(torch.isfinite(gradient).all()):
                 return Sim3GraphOptimizeResult(accepted_any, actual_iterations, initial, last, max_update, tuple(trainable_ids), "non_finite_gradient")
             if float(gradient.norm()) < 1.0e-9:
+                termination_reason = "converged_gradient"
                 break
             update = self._pcg(linearized, trainable_ids, gradient)
             if not bool(torch.isfinite(update).all()):
@@ -428,6 +438,9 @@ class GlobalSim3FactorGraph:
             )[:, None]
             update[:, 6].clamp_(-self.max_log_scale_update, self.max_log_scale_update)
             max_update = max(max_update, float(update.norm(dim=-1).max().detach().cpu()))
+            if float(update.norm()) < 1.0e-9:
+                termination_reason = "converged_step"
+                break
 
             accepted = False
             for step_scale in (1.0, 0.5, 0.25, 0.125):
@@ -444,6 +457,7 @@ class GlobalSim3FactorGraph:
                     actual_iterations = iteration + 1
                     break
             if not accepted:
+                termination_reason = "line_search_no_descent"
                 break
 
         return Sim3GraphOptimizeResult(
@@ -453,7 +467,9 @@ class GlobalSim3FactorGraph:
             last,
             max_update,
             tuple(trainable_ids),
-            "accepted" if accepted_any else "no_descent_step",
+            "accepted" if accepted_any else termination_reason,
+            pcg_iterations=int(self._last_pcg_iterations),
+            pcg_relative_residual=float(self._last_pcg_relative_residual),
         )
 
     def corrected_camera_poses(self, local_poses_by_node: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:

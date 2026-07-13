@@ -1,0 +1,14 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric.yaml
+
+WeightsAndBiases:
+  run_name: spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_graph30
+  tags: [spherical-selfi, posefix, voxel020, graph-only, diagnostic30, ob3d, sponza, non-egocentric]
+
+Results:
+  save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_graph30
+
+SphericalSelfiGlobalBackend:
+  map_optimization:
+    steps_per_window: 0
+    extra_steps_on_loop: 0
+    final_steps: 0

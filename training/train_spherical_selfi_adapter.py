@@ -214,6 +214,7 @@ def build_dataset(config: dict[str, Any], *, split: str) -> Stage1PanoSequenceDa
         image_width=int(cfg.get("image_width", config.get("image", {}).get("width", 1008))),
         pair_mode=str(cfg.get("pair_mode", "adjacent_and_skip")),
         max_temporal_gap=cfg.get("max_temporal_gap", 10),
+        pose_convention=str(cfg.get("pose_convention", "c2w")),
     )
 
 

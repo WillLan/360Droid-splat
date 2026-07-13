@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from geometry.pose import relative_c2w
+
 from frontend.pano_droid.interfaces import FrontendOutput, PanoDROIDFrontend, PanoFrame, ensure_chw_image, identity_pose
 from frontend.pano_vggt.matching_adapter import (
     extract_features_with_hook,
@@ -301,7 +303,10 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             valid = packet.finite_gaussian_mask[0, index].detach().cpu().bool()
             previous_pose = None
             if index > 0:
-                previous_pose = torch.linalg.inv(observation.poses_c2w[0, index - 1]) @ observation.poses_c2w[0, index]
+                previous_pose = relative_c2w(
+                    observation.poses_c2w[0, index - 1],
+                    observation.poses_c2w[0, index],
+                )
                 previous_pose = previous_pose.detach().cpu().float()
             residual = None
             if ba_result is not None:

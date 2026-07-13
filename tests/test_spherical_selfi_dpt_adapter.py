@@ -41,6 +41,15 @@ class _DummyPanoVGGT(nn.Module):
         return {"depth": depth, "poses_c2w": poses}
 
 
+class _DummyPanoVGGTExtrinsics(_DummyPanoVGGT):
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        output = super().forward(images)
+        w2c = output.pop("poses_c2w")
+        w2c[:, :, 0, 3] = 2.0
+        output["extrinsics"] = w2c
+        return output
+
+
 class _TokenStage(nn.Module):
     def __init__(self, channels: int, token_count: int, register_count: int = 5) -> None:
         super().__init__()
@@ -94,6 +103,17 @@ def test_panovggt_feature_wrapper_freezes_model_and_captures_four_stages():
     assert out.init_depth is not None and out.init_depth.shape == (1, 2, 1, 32, 64)
     assert out.init_poses is not None and out.init_poses.shape == (1, 2, 4, 4)
     assert all(not feature.requires_grad for feature in out.stage_features)
+
+
+def test_panovggt_feature_wrapper_converts_extrinsics_to_c2w():
+    wrapper = PanoVGGTFeatureWrapper(
+        _DummyPanoVGGTExtrinsics(),
+        stage_hooks=["stage1", "stage2", "stage3", "stage4"],
+    )
+    out = wrapper(torch.rand(1, 2, 3, 8, 16))
+    assert out.pose_convention == "c2w"
+    assert out.init_poses is not None
+    torch.testing.assert_close(out.init_poses[0, :, 0, 3], torch.full((2,), -2.0))
 
 
 def test_panovggt_feature_wrapper_drops_register_tokens_before_grid_reshape():

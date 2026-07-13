@@ -9,7 +9,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from geometry.sim3 import apply_sim3_to_pose
+from geometry.pose import relative_c2w
+from geometry.sim3 import apply_sim3_to_c2w
 from geometry.spherical_erp import erp_pixel_to_unit_ray
 from models.per_pixel_gaussian_observation import (
     PerPixelGaussianObservation,
@@ -202,8 +203,7 @@ class LocalGaussianWindowPacket:
             raise ValueError("frame_ids must match the observation view count")
 
         poses = observation.poses_c2w[0].float()
-        anchor_inverse = torch.linalg.inv(poses[0])
-        local_poses = anchor_inverse.view(1, 4, 4) @ poses
+        local_poses = relative_c2w(poses, poses[0].view(1, 4, 4))
         local_poses[0] = torch.eye(4, device=local_poses.device, dtype=local_poses.dtype)
         local_observation = observation.with_geometry(
             poses_c2w=local_poses.unsqueeze(0).to(observation.poses_c2w)
@@ -258,7 +258,7 @@ class LocalGaussianWindowPacket:
 
     def global_poses(self, anchor_to_global: torch.Tensor) -> torch.Tensor:
         transform = anchor_to_global.to(self.local_poses_c2w)
-        return apply_sim3_to_pose(
+        return apply_sim3_to_c2w(
             transform.view(1, 4, 4).expand(len(self.frame_ids), -1, -1),
             self.local_poses_c2w,
         )

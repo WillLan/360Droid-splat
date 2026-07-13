@@ -1451,6 +1451,19 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
 
 
+def test_cpu_erp_fallback_keeps_front_and_back_hemispheres():
+    class _Gaussians:
+        get_xyz = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+        get_features = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        get_opacity = torch.ones(2, 1)
+
+    renderer = PFGS360Renderer(config={}, allow_fallback=True)
+    camera = PanoRenderCamera(image_height=8, image_width=16, c2w=torch.eye(4))
+    pkg = renderer._render_fallback(camera, _Gaussians(), torch.zeros(3))
+    assert int(pkg["visibility_filter"].sum()) == 2
+    assert int((pkg["alpha"] > 0).sum()) == 2
+
+
 def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
     camera_count, gaussian_count = 4, 3
     config = {

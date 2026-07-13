@@ -100,9 +100,12 @@ def load_ob3d_camera_c2w(image_path: str | Path) -> np.ndarray | None:
     translation = np.asarray(extrinsics.get("translation"), dtype=np.float32)
     if rotation.shape != (3, 3) or translation.shape not in {(3,), (3, 1)}:
         return None
+    # OB3D stores OpenCV/ERP world-to-camera extrinsics.  The project keeps
+    # camera-to-world poses internally, without an OpenGL axis remap.
+    rotation_c2w = rotation.T
     c2w = np.eye(4, dtype=np.float32)
-    c2w[:3, :3] = rotation
-    c2w[:3, 3] = translation.reshape(3)
+    c2w[:3, :3] = rotation_c2w
+    c2w[:3, 3] = -rotation_c2w @ translation.reshape(3)
     return c2w
 
 

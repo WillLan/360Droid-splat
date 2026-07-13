@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from geometry.pose import invert_c2w
+
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame, ensure_chw_image
 from mapping.gaussian_initializer import GaussianInitializer
 
@@ -176,9 +178,10 @@ class LegacyViewpointAdapter:
         pose_c2w = output.pose_c2w.detach().cpu().float()
         if tuple(pose_c2w.shape) != (4, 4):
             raise ValueError(f"Expected pose_c2w as 4x4, got {tuple(pose_c2w.shape)}")
-        pose_w2c = torch.linalg.inv(pose_c2w)
+        pose_w2c = invert_c2w(pose_c2w)
         gt = frame.meta.get("gt_c2w") if isinstance(frame.meta, dict) else None
-        gt_T = gt.detach().cpu().float() if isinstance(gt, torch.Tensor) else pose_c2w
+        gt_c2w = gt.detach().cpu().float() if isinstance(gt, torch.Tensor) else pose_c2w
+        gt_T = invert_c2w(gt_c2w)
 
         viewpoint = self._make_viewpoint(
             frame_id=int(output.frame_id),

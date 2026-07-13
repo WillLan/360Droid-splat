@@ -1,0 +1,8 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric.yaml
+
+WeightsAndBiases:
+  run_name: spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_joint30
+  tags: [spherical-selfi, posefix, voxel020, joint20, diagnostic30, ob3d, sponza, non-egocentric]
+
+Results:
+  save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_joint30

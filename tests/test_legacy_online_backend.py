@@ -57,6 +57,8 @@ def test_legacy_viewpoint_adapter_pose_depth_and_sky_mask():
     assert torch.allclose(bundle.pose_w2c, torch.linalg.inv(pose))
     assert torch.allclose(bundle.viewpoint.R, bundle.pose_w2c[:3, :3])
     assert torch.allclose(bundle.viewpoint.T, bundle.pose_w2c[:3, 3])
+    assert torch.allclose(bundle.viewpoint.R_gt, bundle.pose_w2c[:3, :3])
+    assert torch.allclose(bundle.viewpoint.T_gt, bundle.pose_w2c[:3, 3])
 
 
 def test_legacy_viewpoint_adapter_real_camera_uses_numpy_mono_depth():

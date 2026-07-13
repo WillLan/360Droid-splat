@@ -22,6 +22,7 @@ from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from backend.pano_gs.pose_param import PoseDelta
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
+from geometry.pose import invert_c2w
 from mapping.gaussian_initializer import GaussianSeedBatch
 
 
@@ -106,6 +107,9 @@ class MapperObservation:
     sky_mask: torch.Tensor | None = None
     target_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
+    target_depth_local: torch.Tensor | None = None
+    target_depth_scale: float = 1.0
+    owner_window_id: int | None = None
 
 
 @dataclass
@@ -1054,6 +1058,7 @@ class PanoGaussianMapper:
         self.keyframes: list[MapperKeyframe] = []
         self.observations: dict[int, MapperObservation] = {}
         self.pose_deltas: dict[int, PoseDelta] = {}
+        self._spherical_selfi_rollback_state: tuple[dict[str, torch.Tensor], dict[int, torch.Tensor]] | None = None
         self.last_inserted_range: tuple[int, int] = (0, 0)
         self.last_requested_source_flat_idx: torch.Tensor | None = None
         self.last_inserted_source_flat_idx: torch.Tensor | None = None
@@ -1406,6 +1411,7 @@ class PanoGaussianMapper:
             for frame_id in frame_ids
             if int(frame_id) in self.pose_deltas
         }
+        self._spherical_selfi_rollback_state = (parameter_snapshot, pose_snapshot)
         previous_extra_loss_fn = getattr(self, "_spherical_selfi_extra_loss_fn", None)
         self._spherical_selfi_extra_loss_fn = extra_loss_fn
         try:
@@ -1417,18 +1423,32 @@ class PanoGaussianMapper:
         finally:
             self._spherical_selfi_extra_loss_fn = previous_extra_loss_fn
         if float(metrics.get("non_finite_window", 0.0)) > 0.0:
-            with torch.no_grad():
-                for name, value in self.map.named_parameters():
-                    saved = parameter_snapshot.get(name)
-                    if saved is not None and tuple(saved.shape) == tuple(value.shape):
-                        value.copy_(saved.to(value))
-                for frame_id, saved in pose_snapshot.items():
-                    if frame_id in self.pose_deltas:
-                        self.pose_deltas[frame_id].delta.copy_(saved.to(self.pose_deltas[frame_id].delta))
+            self.rollback_spherical_selfi_window()
             metrics["steps"] = 0.0
             metrics["window_rollback"] = 1.0
         metrics["spherical_selfi_window_id"] = float(window_id)
         return metrics
+
+    def commit_spherical_selfi_window(self) -> None:
+        self._spherical_selfi_rollback_state = None
+
+    def rollback_spherical_selfi_window(self) -> bool:
+        state = self._spherical_selfi_rollback_state
+        self._spherical_selfi_rollback_state = None
+        if state is None:
+            return False
+        parameter_snapshot, pose_snapshot = state
+        with torch.no_grad():
+            for name, value in self.map.named_parameters():
+                saved = parameter_snapshot.get(name)
+                if saved is not None and tuple(saved.shape) == tuple(value.shape):
+                    value.copy_(saved.to(value))
+            for frame_id, saved in pose_snapshot.items():
+                if frame_id in self.pose_deltas:
+                    self.pose_deltas[frame_id].delta.copy_(saved.to(self.pose_deltas[frame_id].delta))
+        lr = float(self.optimizer.param_groups[0].get("lr", 2.0e-3)) if self.optimizer.param_groups else 2.0e-3
+        self.optimizer = self.map.make_optimizer(lr=lr)
+        return True
 
     def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
         """Promote registered RGB/depth observations without inserting legacy seeds."""
@@ -2384,7 +2404,7 @@ class PanoGaussianMapper:
                 return 0
         xyz = self.map.get_xyz.detach()
         c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
-        w2c = torch.linalg.inv(c2w)
+        w2c = invert_c2w(c2w)
         xyz_h = torch.cat([xyz, torch.ones(n, 1, device=device, dtype=dtype)], dim=1)
         cam = (w2c @ xyz_h.T).T[:, :3]
         dist = torch.linalg.norm(cam, dim=-1)
@@ -2770,7 +2790,7 @@ class PanoGaussianMapper:
         dtype = self.map.get_xyz.dtype
         xyz = self.map.get_xyz.detach()
         c2w = frontend_output.pose_c2w.detach().to(device=device, dtype=dtype)
-        w2c = torch.linalg.inv(c2w)
+        w2c = invert_c2w(c2w)
         xyz_h = torch.cat([xyz, torch.ones(n, 1, device=device, dtype=dtype)], dim=1)
         cam = (w2c @ xyz_h.T).T[:, :3]
         dist = torch.linalg.norm(cam, dim=-1)
@@ -3026,6 +3046,70 @@ class PanoGaussianMapper:
             applied += 1
         if applied > 0:
             self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
+        return applied
+
+    def set_spherical_selfi_observation_geometry(
+        self,
+        frame_id: int,
+        *,
+        target_depth_local: torch.Tensor,
+        depth_scale: float,
+        owner_window_id: int,
+        depth_confidence: torch.Tensor | None = None,
+        sky_mask: torch.Tensor | None = None,
+    ) -> bool:
+        """Register immutable local depth and materialize its current global scale."""
+
+        observation = self.observations.get(int(frame_id))
+        if observation is None:
+            return False
+        local = target_depth_local.detach().cpu().float()
+        scale = float(depth_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"Invalid spherical-Selfi depth scale {scale!r} for frame {frame_id}")
+        observation.target_depth_local = local
+        observation.target_depth_scale = scale
+        observation.owner_window_id = int(owner_window_id)
+        observation.target_depth = local * scale
+        if depth_confidence is not None:
+            observation.depth_confidence = depth_confidence.detach().cpu().float()
+        if sky_mask is not None:
+            observation.sky_mask = sky_mask.detach().cpu().bool()
+        return True
+
+    def apply_frontend_geometry_updates(self, updates: dict[int, object]) -> int:
+        """Apply global c2w and graph depth scale without rescaling depth twice."""
+
+        if not updates:
+            return 0
+        pose_updates = {
+            int(frame_id): torch.as_tensor(getattr(update, "pose_c2w"))
+            for frame_id, update in updates.items()
+        }
+        applied = self.apply_frontend_pose_updates(pose_updates)
+        for frame_id, update in updates.items():
+            observation = self.observations.get(int(frame_id))
+            if observation is None:
+                continue
+            depth_owner = int(
+                observation.owner_window_id
+                if observation.owner_window_id is not None
+                else getattr(update, "depth_owner_window_id", getattr(update, "owner_window_id"))
+            )
+            scales_by_window = dict(getattr(update, "depth_scales_by_window", {}) or {})
+            scale = float(scales_by_window.get(depth_owner, getattr(update, "depth_scale")))
+            if not math.isfinite(scale) or scale <= 0.0:
+                continue
+            if observation.target_depth_local is None and observation.target_depth is not None:
+                observation.target_depth_local = observation.target_depth.detach().cpu().float().clone()
+            observation.target_depth_scale = scale
+            if observation.owner_window_id is None:
+                observation.owner_window_id = depth_owner
+            if observation.target_depth_local is not None:
+                observation.target_depth = observation.target_depth_local * scale
+                for keyframe in self.keyframes:
+                    if int(keyframe.frame_id) == int(frame_id):
+                        keyframe.target_depth = observation.target_depth.detach().cpu().float()
         return applied
 
     def render_view(
@@ -3781,7 +3865,7 @@ class PanoGaussianMapper:
         if rows.numel() == 0:
             return None
         xyz = self.map.get_xyz.detach()
-        w2c = torch.linalg.inv(c2w.detach().to(device=device, dtype=dtype))
+        w2c = invert_c2w(c2w.detach().to(device=device, dtype=dtype))
         xyz_h = torch.cat([xyz.index_select(0, rows), torch.ones(rows.numel(), 1, device=device, dtype=dtype)], dim=1)
         cam = (w2c @ xyz_h.T).T[:, :3]
         dist = torch.linalg.norm(cam, dim=-1)
@@ -3967,7 +4051,7 @@ class PanoGaussianMapper:
         if rows.numel() == 0:
             return
         xyz = self.map.get_xyz.detach()
-        w2c = torch.linalg.inv(c2w)
+        w2c = invert_c2w(c2w)
         xyz_h = torch.cat([xyz.index_select(0, rows), torch.ones(rows.numel(), 1, device=device, dtype=dtype)], dim=1)
         cam = (w2c @ xyz_h.T).T[:, :3]
         dist = torch.linalg.norm(cam, dim=-1)

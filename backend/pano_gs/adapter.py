@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
+from geometry.pose import invert_c2w
 
 
 @dataclass
@@ -26,7 +27,7 @@ class PanoRenderCamera:
 
     @property
     def w2c(self) -> torch.Tensor:
-        return torch.linalg.inv(self.c2w)
+        return invert_c2w(self.c2w)
 
 
 RenderPackage = dict[str, torch.Tensor | None]
@@ -556,7 +557,8 @@ class PFGS360Renderer:
         w2c = camera.w2c.to(device=device, dtype=dtype)
         xyz_h = torch.cat([xyz, torch.ones(xyz.shape[0], 1, device=device, dtype=dtype)], dim=1)
         cam = (w2c @ xyz_h.T).T[:, :3]
-        valid = cam[:, 2] > 1e-4
+        distance = torch.linalg.norm(cam, dim=-1)
+        valid = torch.isfinite(cam).all(dim=-1) & torch.isfinite(distance) & (distance > 1.0e-4)
         if not bool(valid.any()):
             return _blank_package(camera, gaussians, background)
 
@@ -566,7 +568,7 @@ class PFGS360Renderer:
         pixels = bearing_to_erp_pixel(cam_v, H, W)
         ui = pixels[:, 0].round().long().remainder(W)
         vi = pixels[:, 1].round().long().clamp(0, H - 1)
-        dist = torch.linalg.norm(cam_v, dim=-1)
+        dist = distance[valid]
         for row in range(cam_v.shape[0]):
             a = opacity[row]
             u = int(ui[row])

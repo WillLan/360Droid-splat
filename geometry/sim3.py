@@ -130,7 +130,7 @@ def apply_sim3(transform: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
     return torch.einsum("...ij,...j->...i", linear, points) + translation
 
 
-def apply_sim3_to_pose(transform: torch.Tensor, pose_c2w: torch.Tensor) -> torch.Tensor:
+def apply_sim3_to_c2w(transform: torch.Tensor, pose_c2w: torch.Tensor) -> torch.Tensor:
     """Apply a Sim(3) frame transform to an SE(3) camera-to-world pose."""
 
     scale, rotation, translation = sim3_components(transform)
@@ -139,6 +139,31 @@ def apply_sim3_to_pose(transform: torch.Tensor, pose_c2w: torch.Tensor) -> torch
     out[..., :3, 3] = scale[..., None] * torch.einsum(
         "...ij,...j->...i", rotation, pose_c2w[..., :3, 3]
     ) + translation
+    return out
+
+
+def apply_sim3_to_pose(transform: torch.Tensor, pose_c2w: torch.Tensor) -> torch.Tensor:
+    """Backward-compatible alias for :func:`apply_sim3_to_c2w`."""
+
+    return apply_sim3_to_c2w(transform, pose_c2w)
+
+
+def rebase_c2w_to_sim3_anchor(transform: torch.Tensor, pose_c2w: torch.Tensor) -> torch.Tensor:
+    """Express a global c2w pose in the local anchor of ``transform``.
+
+    The returned SE(3) pose is the exact inverse of
+    :func:`apply_sim3_to_c2w`, including the required ``1 / scale`` in its
+    translation.
+    """
+
+    if pose_c2w.shape[-2:] != (4, 4):
+        raise ValueError(f"pose_c2w must end in 4x4, got {tuple(pose_c2w.shape)}")
+    scale, rotation, translation = sim3_components(transform)
+    rotation_t = rotation.transpose(-1, -2)
+    out = pose_c2w.clone()
+    out[..., :3, :3] = rotation_t @ pose_c2w[..., :3, :3]
+    centered = pose_c2w[..., :3, 3] - translation
+    out[..., :3, 3] = torch.einsum("...ij,...j->...i", rotation_t, centered) / scale[..., None]
     return out
 
 

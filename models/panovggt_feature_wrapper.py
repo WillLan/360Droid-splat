@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from geometry.pose import convert_pose_convention
+
 
 def _import_attr(path: str) -> Any:
     module_name, attr = str(path).rsplit(".", 1)
@@ -164,6 +166,8 @@ def _as_dict(output: Any) -> dict[str, Any]:
         "camera_poses",
         "init_poses",
         "poses_c2w",
+        "extrinsics",
+        "extrinsic",
         "world_points",
         "point_maps",
         "points",
@@ -334,7 +338,11 @@ class PanoVGGTFeatureWrapper(nn.Module):
         if len(self.feature_keys) != 4 or len(self.token_hw) != 4 or len(self.token_start_idx) != 4:
             raise ValueError("feature_keys, token_hw, and token_start_idx must each contain 4 entries when provided.")
         self.use_no_grad = bool(use_no_grad)
-        self.pose_convention = str(pose_convention)
+        self.pose_convention = str(pose_convention).strip().lower()
+        if self.pose_convention not in {"c2w", "w2c"}:
+            raise ValueError(
+                f"pose_convention must be 'c2w' or 'w2c', got {pose_convention!r}."
+            )
         self.depth_convention = str(depth_convention)
         self.freeze_panovggt()
 
@@ -409,16 +417,41 @@ class PanoVGGTFeatureWrapper(nn.Module):
         stage_features = [captured[idx] for idx in range(4)]
         out_dict = _as_dict(output)
         depth = _first_present(out_dict, ("init_depth", "depth", "depths"))
-        poses = _first_present(out_dict, ("init_poses", "poses_c2w", "camera_poses", "poses"))
+        pose_key = next(
+            (
+                key
+                for key in (
+                    "init_poses",
+                    "poses_c2w",
+                    "camera_poses",
+                    "poses",
+                    "extrinsics",
+                    "extrinsic",
+                )
+                if out_dict.get(key) is not None
+            ),
+            None,
+        )
+        poses = None if pose_key is None else out_dict[pose_key]
+        if poses is not None:
+            pose_tensor = torch.as_tensor(poses, device=model_images.device)
+            source_convention = (
+                "w2c"
+                if pose_key in {"extrinsics", "extrinsic"}
+                else "c2w"
+                if pose_key in {"poses_c2w", "camera_poses"}
+                else self.pose_convention
+            )
+            poses = convert_pose_convention(pose_tensor, source_convention)
         world_points = _first_present(out_dict, ("world_points", "point_maps", "points", "global_points"))
         return PanoVGGTFeatureOutput(
             images=model_images,
             init_depth=None if depth is None else torch.as_tensor(depth, device=model_images.device),
-            init_poses=None if poses is None else torch.as_tensor(poses, device=model_images.device),
+            init_poses=None if poses is None else poses,
             stage_features=stage_features,
             optional_world_points=None if world_points is None else torch.as_tensor(world_points, device=model_images.device),
             feature_shapes=[tuple(feature.shape) for feature in stage_features],
             hook_names=list(self.stage_hooks),
-            pose_convention=self.pose_convention,
+            pose_convention="c2w",
             depth_convention=self.depth_convention,
         )
