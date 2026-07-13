@@ -150,3 +150,24 @@ W&B online, and the following stop conditions:
 
 At the measured pilot throughput, 20k steps are expected to take about 26-28
 hours on two RTX 5090 GPUs, including periodic diagnostics and validation.
+
+## GT-correspondence oracle protocol
+
+`tools/evaluate_stage3_ba_oracle.py` isolates solver correctness from Adapter
+matching quality.  It preserves each real validation window's Stage 3 source
+queries, selected factor positions, and confidence weights, while replacing
+the target bearing with a continuous projection computed from GT Euclidean-ray
+depth and GT c2w poses.  GT target depth consistency removes invalid and
+occluded projections.
+
+The evaluator runs three matched arms:
+
+1. Adapter correspondence plus Stage 2 depth;
+2. GT correspondence plus Stage 2 depth;
+3. GT correspondence plus GT depth.
+
+All arms use both the formal solver and a diagnostic rotation-only solver with
+eight LM iterations and a `0.5 degree` per-iteration rotation limit.  The
+formal arm measures deployed behavior; the diagnostic arm prevents the formal
+`3 x 0.02 degree` trust limit from hiding the solver's capture range.  GT is
+strictly diagnostic and is not imported by the training or runtime BA path.
