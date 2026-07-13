@@ -1377,7 +1377,7 @@ def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
         scaling=torch.full((gaussian_count, 3), 0.1),
         rotation=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).expand(gaussian_count, -1).clone(),
         opacity=torch.full((gaussian_count, 1), 0.2),
-        features=torch.rand(camera_count, gaussian_count, 3),
+        features=torch.rand(camera_count, gaussian_count, 3, dtype=torch.bfloat16),
         confidence=torch.full((gaussian_count, 1), 0.2),
         source_frame_index=torch.arange(gaussian_count),
         source_pixel_uv=torch.zeros(gaussian_count, 2),
@@ -1417,6 +1417,7 @@ def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
     assert call["viewmats"].shape == (camera_count, 4, 4)
     assert call["Ks"].shape == (camera_count, 3, 3)
     assert call["colors"].shape == (camera_count, gaussian_count, 1, 3)
+    assert call["colors"].dtype == torch.float32
     assert call["opacities"].shape == (gaussian_count,)
     assert package["render"].shape == (camera_count, 3, 4, 8)
     assert package["visibility_filter"].shape == (camera_count, gaussian_count)

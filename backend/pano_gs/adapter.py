@@ -451,7 +451,10 @@ class PFGS360Renderer:
             dtype=dtype,
         )
         intrinsics = intrinsic.unsqueeze(0).expand(camera_count, -1, -1)
-        features = gaussians.get_features
+        # Autocast may produce BF16 target-conditioned RGB even though Stage 3
+        # materializes geometry in FP32. gsplat360's SH kernel requires colors
+        # and view directions to share a scalar type.
+        features = gaussians.get_features.to(device=device, dtype=dtype)
         if features.ndim == 2:
             features = features.unsqueeze(0).expand(camera_count, -1, -1)
         if tuple(features.shape[:2]) != (camera_count, int(xyz.shape[0])):
