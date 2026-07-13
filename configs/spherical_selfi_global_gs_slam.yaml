@@ -166,6 +166,7 @@ SphericalSelfiGlobalBackend:
     max_scale_change: 2.5
     coincident_translation_threshold: 0.15
     coincident_rotation_residual_deg: 2.0
+    rotation_ransac_iterations: 128
   voxel_fusion:
     voxel_sizes: [0.04, 0.08, 0.16, 0.32]
     min_confidence: 0.05
@@ -208,6 +209,17 @@ Mapping:
   min_depth_confidence: 0.0
   sky_mask_enable: true
   sky_mask_source: panovggt_head
+
+SkyBox:
+  enabled: true
+  type: cubemap
+  resolution: 512
+  init_from_first_keyframe: true
+  optimize: true
+  optimization_mask_enable: true
+  force_sky_render: true
+  init_fallback_to_full_image: false
+  lr: 0.01
 
 Training:
   panorama_render_mode: pfgs360_gsplat

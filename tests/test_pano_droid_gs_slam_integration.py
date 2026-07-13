@@ -961,6 +961,40 @@ def test_spherical_selfi_window_runs_twenty_balanced_steps_and_reuses_overlap_po
     assert mapper.pose_deltas[3] is overlap_pose_delta
 
 
+def test_spherical_selfi_window_initializes_cubemap_from_head_sky_mask():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 4,
+            "optimize": True,
+            "force_sky_render": True,
+            "init_fallback_to_full_image": False,
+        },
+        "BackendOptimization": {
+            "enabled": True,
+            "FeedForwardWindow": {"enabled": True},
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_CountingRenderer())
+    sky_mask = torch.zeros(1, 4, 8, dtype=torch.bool)
+    sky_mask[:, :2] = True
+    image = torch.zeros(3, 4, 8)
+    image[:, :2] = torch.tensor([0.2, 0.4, 0.8]).view(3, 1, 1)
+    mapper.register_observation(
+        _small_frontend_output(0),
+        image,
+        is_keyframe=True,
+        sky_mask=sky_mask,
+    )
+
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    assert gaussian_map._skybox_initialized
+    assert gaussian_map.get_skybox_faces is not None
+    assert float(gaussian_map.get_skybox_faces.detach().mean()) > 0.0
+
+
 def test_replace_fuse_chunk_optimizer_samples_current_chunk_and_recent_keyframes():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},

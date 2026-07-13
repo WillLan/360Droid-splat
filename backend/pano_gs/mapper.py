@@ -1439,6 +1439,12 @@ class PanoGaussianMapper:
             observation = self.observations.get(frame_id)
             if observation is None:
                 continue
+            if self.map.has_skybox and not bool(getattr(self.map, "_skybox_initialized", False)):
+                self.map.initialize_skybox_from_image(
+                    observation.image,
+                    observation.pose_c2w,
+                    sky_mask=observation.sky_mask,
+                )
             # The overlap frame must reuse its unique PoseDelta rather than
             # being reinitialized when the next window arrives.
             if frame_id not in self.pose_deltas:

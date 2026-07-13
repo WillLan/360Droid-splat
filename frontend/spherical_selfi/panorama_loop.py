@@ -58,6 +58,91 @@ def circular_yaw_shift(source: torch.Tensor, target: torch.Tensor) -> tuple[int,
     return shift, score
 
 
+def spherical_rotation_ransac(
+    target_bearing: torch.Tensor,
+    source_bearing: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    threshold_rad: float,
+    iterations: int = 128,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Estimate the target-to-source rotation with deterministic batched RANSAC."""
+
+    if target_bearing.shape != source_bearing.shape or target_bearing.ndim != 2 or target_bearing.shape[-1] != 3:
+        raise ValueError("Spherical rotation bearings must both have shape Nx3")
+    count = int(target_bearing.shape[0])
+    if count < 3:
+        raise ValueError("Spherical rotation RANSAC requires at least three matches")
+    device, dtype = target_bearing.device, target_bearing.dtype
+    target = F.normalize(target_bearing, dim=-1, eps=1.0e-8)
+    source = F.normalize(source_bearing.to(target), dim=-1, eps=1.0e-8)
+    weights = weight.to(device=device, dtype=dtype).clamp_min(1.0e-8)
+    hypotheses = max(1, int(iterations))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed) & 0x7FFFFFFF)
+    # Weighted Gumbel top-k gives deterministic, non-replacement minimal sets
+    # without a Python loop or a CUDA synchronization per hypothesis.
+    uniform = torch.rand(hypotheses, count, device=device, dtype=dtype, generator=generator)
+    gumbel = -torch.log(-torch.log(uniform.clamp(1.0e-7, 1.0 - 1.0e-7)))
+    sample_indices = torch.topk(weights.log().view(1, -1) + gumbel, k=3, dim=-1).indices
+    target_sample = target[sample_indices]
+    source_sample = source[sample_indices]
+    sample_weight = weights[sample_indices]
+    sample_weight = sample_weight / sample_weight.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    target_mean = (sample_weight[..., None] * target_sample).sum(dim=1)
+    source_mean = (sample_weight[..., None] * source_sample).sum(dim=1)
+    target_centered = target_sample - target_mean[:, None]
+    source_centered = source_sample - source_mean[:, None]
+    covariance = torch.einsum(
+        "ki,kij,kil->kjl", sample_weight, target_centered, source_centered
+    )
+    u, _, vh = torch.linalg.svd(covariance)
+    correction = torch.eye(3, device=device, dtype=dtype).expand(hypotheses, -1, -1).clone()
+    raw_rotation = vh.transpose(-1, -2) @ u.transpose(-1, -2)
+    correction[:, -1, -1] = torch.where(
+        torch.linalg.det(raw_rotation) < 0.0,
+        correction.new_tensor(-1.0),
+        correction.new_tensor(1.0),
+    )
+    rotations = vh.transpose(-1, -2) @ correction @ u.transpose(-1, -2)
+    rotated = torch.einsum("kij,nj->kni", rotations, target)
+    angular = torch.atan2(
+        torch.cross(source.unsqueeze(0), rotated, dim=-1).norm(dim=-1),
+        (source.unsqueeze(0) * rotated).sum(dim=-1).clamp(-1.0, 1.0),
+    )
+    inliers = angular <= max(float(threshold_rad), 1.0e-8)
+    weighted_support = (inliers.to(dtype) * weights.view(1, -1)).sum(dim=-1)
+    inlier_error = (
+        inliers.to(dtype) * weights.view(1, -1) * angular
+    ).sum(dim=-1) / weighted_support.clamp_min(1.0e-8)
+    maximum_support = weighted_support.max()
+    tied = weighted_support >= maximum_support - 1.0e-8
+    ranked_error = torch.where(tied, inlier_error, torch.full_like(inlier_error, torch.inf))
+    best = int(ranked_error.argmin().item())
+    best_inliers = inliers[best]
+    if int(best_inliers.sum()) >= 3:
+        transform = weighted_umeyama(
+            target[best_inliers], source[best_inliers], weights[best_inliers], allow_scale=False
+        )
+    else:
+        transform = weighted_umeyama(target, source, weights, allow_scale=False)
+    _, rotation, _ = sim3_components(transform)
+    rotated = torch.einsum("ij,nj->ni", rotation, target)
+    angular = torch.atan2(
+        torch.cross(source, rotated, dim=-1).norm(dim=-1),
+        (source * rotated).sum(dim=-1).clamp(-1.0, 1.0),
+    )
+    final_inliers = angular <= max(float(threshold_rad), 1.0e-8)
+    inlier_ratio = float(final_inliers.float().mean().detach().cpu())
+    residual = (
+        float(angular[final_inliers].mean().detach().cpu())
+        if bool(final_inliers.any())
+        else float("inf")
+    )
+    return rotation, final_inliers, inlier_ratio, residual
+
+
 class PanoramaLoopDetector:
     def __init__(
         self,
@@ -73,6 +158,7 @@ class PanoramaLoopDetector:
         max_scale_change: float = 2.5,
         coincident_translation_threshold: float = 0.15,
         coincident_rotation_residual_deg: float = 2.0,
+        rotation_ransac_iterations: int = 128,
         factor_queries_per_direction: int = 2048,
         fibonacci_oversample_factor: int = 8,
         fibonacci_seed: int = 123,
@@ -96,6 +182,7 @@ class PanoramaLoopDetector:
         self.max_matches = max(self.min_matches, int(max_matches))
         self.coincident_translation_threshold = float(coincident_translation_threshold)
         self.coincident_rotation_residual = math.radians(float(coincident_rotation_residual_deg))
+        self.rotation_ransac_iterations = max(1, int(rotation_ransac_iterations))
         self.factor_queries_per_direction = max(1, int(factor_queries_per_direction))
         self.fibonacci_oversample_factor = max(1, int(fibonacci_oversample_factor))
         self.fibonacci_seed = int(fibonacci_seed)
@@ -484,19 +571,28 @@ class PanoramaLoopDetector:
         alignment = self.aligner.align(target_point, source_point, weight)
         measurement = alignment.as_matrix().to(source_point)
 
-        rotation_transform = weighted_umeyama(target_bearing, source_bearing, weight, allow_scale=False)
-        _, rotation_measurement, _ = sim3_components(rotation_transform)
-        rotated = torch.einsum("ij,nj->ni", rotation_measurement, target_bearing)
-        angular = torch.atan2(
-            torch.cross(source_bearing, rotated, dim=-1).norm(dim=-1),
-            (source_bearing * rotated).sum(dim=-1).clamp(-1.0, 1.0),
+        rotation_seed = (
+            self.fibonacci_seed
+            + 65_537 * int(source.window_id)
+            + 4_099 * int(target.window_id)
+            + 257 * int(source.frame_ids[source_frame_index])
+            + 17 * int(target.frame_ids[target_frame_index])
+        ) & 0x7FFFFFFF
+        rotation_measurement, angular_inlier, rotation_inlier_ratio, rotation_residual = spherical_rotation_ransac(
+            target_bearing,
+            source_bearing,
+            weight,
+            threshold_rad=self.coincident_rotation_residual,
+            iterations=self.rotation_ransac_iterations,
+            seed=rotation_seed,
         )
-        angular_inlier = angular <= self.coincident_rotation_residual
-        rotation_inlier_ratio = float(angular_inlier.float().mean().detach().cpu())
 
         metadata = {
             "yaw_correlation": yaw_score,
             "rotation_inlier_ratio": rotation_inlier_ratio,
+            "rotation_ransac_residual": rotation_residual,
+            "rotation_ransac_iterations": self.rotation_ransac_iterations,
+            "rotation_ransac_seed": rotation_seed,
             "alignment_residual": float(alignment.residual),
             "alignment_inlier_ratio": float(alignment.inlier_ratio),
             "num_matches": int(source_point.shape[0]),
@@ -568,7 +664,7 @@ class PanoramaLoopDetector:
                 self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=False, edge_type="coincident_dense_spherical")
                 if int(reverse_match["count"]) > 0 else None,
             )
-            return PanoramaLoopVerification(True, factor, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), rotation_inlier_ratio, float(angular[angular_inlier].mean().detach().cpu()) if bool(angular_inlier.any()) else float("inf"), "rotation_only", metadata, tuple(value for value in dense_factors if value is not None))
+            return PanoramaLoopVerification(True, factor, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), rotation_inlier_ratio, rotation_residual, "rotation_only", metadata, tuple(value for value in dense_factors if value is not None))
 
         return PanoramaLoopVerification(False, None, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), float(alignment.inlier_ratio), float(alignment.residual), "geometric_verification_failed", metadata)
 

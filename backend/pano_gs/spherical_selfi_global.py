@@ -114,6 +114,7 @@ class SphericalSelfiGlobalBackend:
             max_scale_change=float(loop_cfg.get("max_scale_change", 2.5)),
             coincident_translation_threshold=float(loop_cfg.get("coincident_translation_threshold", 0.15)),
             coincident_rotation_residual_deg=float(loop_cfg.get("coincident_rotation_residual_deg", 2.0)),
+            rotation_ransac_iterations=int(loop_cfg.get("rotation_ransac_iterations", 128)),
             factor_queries_per_direction=int(graph_cfg.get("factor_queries_per_direction", 2048)),
             fibonacci_oversample_factor=self.fibonacci_oversample_factor,
             fibonacci_seed=self.fibonacci_seed,

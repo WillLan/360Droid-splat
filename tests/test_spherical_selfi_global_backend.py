@@ -21,7 +21,7 @@ from backend.pano_gs.stage2_global_fusion import (
 )
 from frontend.pano_droid.spherical_ba import se3_exp
 from frontend.pano_droid.interfaces import PanoFrame
-from frontend.spherical_selfi.panorama_loop import circular_yaw_shift
+from frontend.spherical_selfi.panorama_loop import circular_yaw_shift, spherical_rotation_ransac
 from frontend.spherical_selfi.runtime import SphericalSelfiWindowFrontend
 from frontend.spherical_selfi.window_packet import (
     LocalGaussianWindowPacket,
@@ -32,6 +32,7 @@ from geometry.sim3 import (
     sim3_exp,
     sim3_from_components,
     sim3_identity,
+    sim3_inverse,
     sim3_log,
     sim3_components,
 )
@@ -174,6 +175,66 @@ def test_dense_spherical_depth_factor_recovers_window_scale() -> None:
     assert float(translation.norm()) < 2.0e-4
 
 
+def test_dense_spherical_factor_jacobian_matches_finite_difference() -> None:
+    torch.manual_seed(7)
+    dtype = torch.float64
+    count = 32
+    source_bearing = torch.nn.functional.normalize(
+        torch.randn(count, 3, dtype=dtype), dim=-1
+    )
+    source_depth = torch.linspace(1.0, 4.0, count, dtype=dtype)
+    truth = sim3_exp(
+        torch.tensor([0.12, -0.07, 0.04, 0.03, -0.02, 0.01, 0.08], dtype=dtype)
+    )
+    target_point = apply_sim3(
+        sim3_inverse(truth), source_bearing * source_depth[:, None]
+    )
+    target_depth = target_point.norm(dim=-1)
+    factor = DenseSphericalFactorBlock(
+        source=0,
+        target=1,
+        source_local_pose=torch.eye(4, dtype=dtype),
+        target_local_pose=torch.eye(4, dtype=dtype),
+        source_bearing=source_bearing,
+        target_bearing=target_point / target_depth[:, None],
+        source_depth=source_depth,
+        target_depth=target_depth,
+        factor_weight=torch.linspace(0.4, 1.0, count, dtype=dtype),
+        depth_factor_weight=0.1,
+        s2_huber_delta_deg=10.0,
+    )
+    source_transform = sim3_identity(dtype=dtype)
+    initial = sim3_exp(
+        torch.tensor([0.002, -0.001, 0.001, 0.0008, -0.0005, 0.0003, 0.001], dtype=dtype)
+    ) @ truth
+
+    def weighted_residual(delta: torch.Tensor) -> torch.Tensor:
+        residual, information = GlobalSim3FactorGraph._factor_residual(
+            factor,
+            source_transform,
+            sim3_exp(delta) @ initial,
+        )
+        return information.sqrt() * residual
+
+    zero = torch.zeros(7, dtype=dtype)
+    jacobian = torch.func.jacfwd(weighted_residual)(zero)
+    direction = torch.tensor(
+        [0.2, -0.3, 0.1, 0.1, 0.15, -0.12, 0.08], dtype=dtype
+    )
+    direction = direction / direction.norm()
+    epsilon = 1.0e-5
+    finite_difference = (
+        weighted_residual(epsilon * direction)
+        - weighted_residual(-epsilon * direction)
+    ) / (2.0 * epsilon)
+    torch.testing.assert_close(
+        jacobian @ direction,
+        finite_difference,
+        atol=2.0e-6,
+        rtol=2.0e-5,
+    )
+
+
 def test_s2_log_antipodal_is_finite_and_not_zero() -> None:
     base = torch.tensor([[0.0, 0.0, 1.0]])
     antipode = -base
@@ -192,6 +253,26 @@ def test_yaw_invariant_retrieval_descriptor_and_shift() -> None:
     shift, score = circular_yaw_shift(feature[0], rolled[0])
     assert shift in {5, 11}
     assert math.isfinite(score)
+
+
+def test_spherical_rotation_ransac_recovers_rotation_with_outliers() -> None:
+    torch.manual_seed(23)
+    target = torch.nn.functional.normalize(torch.randn(96, 3), dim=-1)
+    truth = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.12, -0.18, 0.07]))[:3, :3]
+    source = target @ truth.T
+    source[64:] = torch.nn.functional.normalize(torch.randn(32, 3), dim=-1)
+    rotation, inliers, ratio, residual = spherical_rotation_ransac(
+        target,
+        source,
+        torch.ones(96),
+        threshold_rad=math.radians(2.0),
+        iterations=128,
+        seed=19,
+    )
+    torch.testing.assert_close(rotation, truth, atol=2.0e-4, rtol=2.0e-4)
+    assert int(inliers[:64].sum()) == 64
+    assert ratio >= 0.65
+    assert residual < math.radians(0.05)
 
 
 def test_rgb_sh_rotation_preserves_directional_value() -> None:

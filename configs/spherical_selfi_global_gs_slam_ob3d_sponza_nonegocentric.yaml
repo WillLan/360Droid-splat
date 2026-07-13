@@ -3,9 +3,9 @@ base_config: spherical_selfi_global_gs_slam.yaml
 Dataset:
   synthetic: false
   type: ob3d
-  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D
+  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D/OB3D
   scene: sponza
-  split: NonEgocentric
+  split: Non-Egocentric
   erp_resize_height: 504
   erp_resize_width: 1008
 
