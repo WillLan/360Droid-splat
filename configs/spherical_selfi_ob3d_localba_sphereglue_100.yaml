@@ -20,7 +20,8 @@ SphericalSelfiRuntime:
       aggregation: add
       lightglue_repo: /mnt/disk1/lanboyang/External/LightGlue
       sphereglue_repo: /mnt/disk1/lanboyang/External/SphereGlue
-      sphereglue_checkpoint: /mnt/disk1/lanboyang/External/SphereGlue/model_weights/superpoint/autosaved.pt
+      superpoint_checkpoint: /mnt/disk1/lanboyang/External/LightGlue/weights/superpoint_v1.pth
+      sphereglue_checkpoint: /mnt/disk1/lanboyang/External/SphereGlue/model_weights/superpoint/model.safetensors
 
 WeightsAndBiases:
   run_name: ob3d_sponza_localba_isolated_sphereglue_100
@@ -28,4 +29,3 @@ WeightsAndBiases:
 
 Results:
   save_dir: outputs/ob3d_sponza_localba_isolated_sphereglue_100
-

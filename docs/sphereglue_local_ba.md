@@ -11,12 +11,13 @@ Configure three external paths under
 type: superpoint_sphereglue
 lightglue_repo: /path/to/LightGlue
 sphereglue_repo: /path/to/SphereGlue
-sphereglue_checkpoint: /path/to/SphereGlue/model_weights/superpoint/autosaved.pt
+superpoint_checkpoint: /path/to/superpoint_v1.pth
+sphereglue_checkpoint: /path/to/SphereGlue/checkpoint.pt  # or .safetensors
 ```
 
 At startup the adapter checks that these files exist and records SHA-256
-digests for the LightGlue SuperPoint source, SphereGlue source, and SphereGlue
-checkpoint in the per-window matching metadata. External code and weights must
+digests for the LightGlue SuperPoint source, SuperPoint checkpoint, SphereGlue
+source, and SphereGlue checkpoint in the per-window matching metadata. External code and weights must
 be obtained and used under their own licenses. In particular, do not copy or
 redistribute the SuperPoint pretrained weights through this repository.
 

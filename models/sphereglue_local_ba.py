@@ -133,20 +133,29 @@ class SphereGlueLocalBAMatcher:
     def _load_external_models(self) -> tuple[Any, Any, dict[str, Any]]:
         lightglue_root_value = self.config.get("lightglue_repo")
         sphereglue_root_value = self.config.get("sphereglue_repo")
+        superpoint_checkpoint_value = self.config.get("superpoint_checkpoint")
         checkpoint_value = self.config.get("sphereglue_checkpoint")
-        if not lightglue_root_value or not sphereglue_root_value or not checkpoint_value:
+        if (
+            not lightglue_root_value
+            or not sphereglue_root_value
+            or not superpoint_checkpoint_value
+            or not checkpoint_value
+        ):
             raise ValueError(
                 "SphereGlue local BA requires matching.lightglue_repo, "
-                "matching.sphereglue_repo, and matching.sphereglue_checkpoint. "
+                "matching.sphereglue_repo, matching.superpoint_checkpoint, and "
+                "matching.sphereglue_checkpoint. "
                 "Keep these research-only dependencies outside this repository."
             )
         lightglue_root = Path(str(lightglue_root_value)).expanduser().resolve()
         sphereglue_root = Path(str(sphereglue_root_value)).expanduser().resolve()
+        superpoint_checkpoint = Path(str(superpoint_checkpoint_value)).expanduser().resolve()
         checkpoint = Path(str(checkpoint_value)).expanduser().resolve()
         lightglue_source = lightglue_root / "lightglue" / "superpoint.py"
         sphereglue_source = sphereglue_root / "model" / "sphereglue.py"
         for label, path in (
             ("LightGlue SuperPoint source", lightglue_source),
+            ("SuperPoint checkpoint", superpoint_checkpoint),
             ("SphereGlue source", sphereglue_source),
             ("SphereGlue checkpoint", checkpoint),
         ):
@@ -169,12 +178,25 @@ class SphereGlueLocalBAMatcher:
             if inserted:
                 sys.path.remove(root_text)
 
-        superpoint = superpoint_class(
-            nms_radius=int(self.config.get("nms_radius", 4)),
-            max_num_keypoints=self.extractor_max_keypoints,
-            detection_threshold=float(self.config.get("detection_threshold", 5.0e-4)),
-            remove_borders=int(self.config.get("remove_borders", 4)),
+        superpoint_state = torch.load(
+            superpoint_checkpoint,
+            map_location="cpu",
+            weights_only=True,
         )
+        # LightGlue's SuperPoint constructor downloads this state internally.
+        # Substitute the explicitly configured, hash-recorded external file so
+        # inference never depends on an implicit network fetch or torch cache.
+        original_url_loader = torch.hub.load_state_dict_from_url
+        torch.hub.load_state_dict_from_url = lambda *_args, **_kwargs: superpoint_state
+        try:
+            superpoint = superpoint_class(
+                nms_radius=int(self.config.get("nms_radius", 4)),
+                max_num_keypoints=self.extractor_max_keypoints,
+                detection_threshold=float(self.config.get("detection_threshold", 5.0e-4)),
+                remove_borders=int(self.config.get("remove_borders", 4)),
+            )
+        finally:
+            torch.hub.load_state_dict_from_url = original_url_loader
 
         spec = importlib.util.spec_from_file_location(
             "_spherical_selfi_external_sphereglue",
@@ -203,15 +225,26 @@ class SphereGlueLocalBAMatcher:
             "output_dim": 512,
         }
         sphereglue = module.SphereGlue(model_config)
-        try:
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        except TypeError:
-            payload = torch.load(checkpoint, map_location="cpu")
-        state = payload.get("MODEL_STATE_DICT", payload) if isinstance(payload, dict) else payload
+        if checkpoint.suffix.lower() == ".safetensors":
+            try:
+                from safetensors.torch import load_file as load_safetensors
+            except ImportError as exc:
+                raise RuntimeError(
+                    "A .safetensors SphereGlue checkpoint requires the safetensors package"
+                ) from exc
+            state = load_safetensors(str(checkpoint), device="cpu")
+        else:
+            try:
+                payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            except TypeError:
+                payload = torch.load(checkpoint, map_location="cpu")
+            state = payload.get("MODEL_STATE_DICT", payload) if isinstance(payload, dict) else payload
         sphereglue.load_state_dict(state, strict=True)
         return superpoint, sphereglue, {
             "lightglue_superpoint_source": str(lightglue_source),
             "lightglue_superpoint_source_sha256": _sha256(lightglue_source),
+            "superpoint_checkpoint": str(superpoint_checkpoint),
+            "superpoint_checkpoint_sha256": _sha256(superpoint_checkpoint),
             "sphereglue_source": str(sphereglue_source),
             "sphereglue_source_sha256": _sha256(sphereglue_source),
             "sphereglue_checkpoint": str(checkpoint),
@@ -426,4 +459,3 @@ class SphereGlueLocalBAMatcher:
             target_valid=target_valid,
             metadata=metadata,
         )
-
