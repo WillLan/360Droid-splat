@@ -1,0 +1,9 @@
+base_config: spherical_selfi_ob3d_localba_adapter_100.yaml
+
+WeightsAndBiases:
+  group: ob3d-sponza-local-ba-bafix-lm5-se3-affine-analytic
+  run_name: ob3d_sponza_localba_bafix_lm5_se3_affine_analytic_adapter_100
+  tags: [spherical-selfi, ob3d, local-ba-isolated, ba-fix, analytic-jacobian, standard-lm, adapter-ba, formal100]
+
+Results:
+  save_dir: outputs/ob3d_sponza_localba_bafix_lm5_se3_affine_analytic_adapter_100

@@ -2708,6 +2708,21 @@ class PanoDroidGSSlamSystem:
                         scalar = float(value)
                         return scalar if np.isfinite(scalar) else None
 
+                    def finite_sequence(value):
+                        if not isinstance(value, (list, tuple)):
+                            return []
+                        return [
+                            float(item)
+                            for item in value
+                            if isinstance(item, (int, float)) and np.isfinite(float(item))
+                        ]
+
+                    gradient_norms = finite_sequence(ba_diagnostic.get("gradient_norms"))
+                    pose_step_norms = finite_sequence(ba_diagnostic.get("pose_step_norms"))
+                    depth_step_norms = finite_sequence(ba_diagnostic.get("depth_step_norms"))
+                    trial_gain_ratios = finite_sequence(ba_diagnostic.get("trial_gain_ratios"))
+                    affine_accepted = ba_diagnostic.get("depth_affine_accepted") or []
+
                     record = {
                         "window_id": int(diagnostic["window_id"]),
                         "frame_ids": [int(value) for value in diagnostic["frame_ids"]],
@@ -2726,6 +2741,19 @@ class PanoDroidGSSlamSystem:
                             ba_diagnostic.get("final_objective")
                         ),
                         "accepted_steps": ba_diagnostic.get("accepted_steps"),
+                        "jacobian_mode": ba_diagnostic.get("jacobian_mode"),
+                        "max_factor_jacobian_norm": finite_optional(
+                            ba_diagnostic.get("max_factor_jacobian_norm")
+                        ),
+                        "analytic_autodiff_max_abs": finite_optional(
+                            ba_diagnostic.get("analytic_autodiff_max_abs")
+                        ),
+                        "final_damping": finite_optional(ba_diagnostic.get("final_damping")),
+                        "gradient_norms": gradient_norms,
+                        "pose_step_norms": pose_step_norms,
+                        "depth_step_norms": depth_step_norms,
+                        "trial_gain_ratios": trial_gain_ratios,
+                        "depth_affine_accepted": [bool(value) for value in affine_accepted],
                     }
                     local_ba_window_records.append(record)
                     local_ba_payload = {
@@ -2734,7 +2762,25 @@ class PanoDroidGSSlamSystem:
                         "local_ba/valid_factors": record["num_factors"],
                         "local_ba/matching_sec": record["matching_sec"],
                         "local_ba/ba_sec": record["ba_sec"],
+                        "local_ba/accepted_steps": int(record["accepted_steps"] or 0),
+                        "local_ba/affine_accepted_frames": int(
+                            sum(record["depth_affine_accepted"])
+                        ),
                     }
+                    optional_scalars = {
+                        "local_ba/max_factor_jacobian_norm": record["max_factor_jacobian_norm"],
+                        "local_ba/analytic_autodiff_max_abs": record["analytic_autodiff_max_abs"],
+                        "local_ba/final_damping": record["final_damping"],
+                        "local_ba/gradient_norm": gradient_norms[-1] if gradient_norms else None,
+                        "local_ba/pose_step_norm": max(pose_step_norms) if pose_step_norms else None,
+                        "local_ba/depth_step_norm": max(depth_step_norms) if depth_step_norms else None,
+                        "local_ba/lm_gain_ratio": (
+                            float(np.mean(trial_gain_ratios)) if trial_gain_ratios else None
+                        ),
+                    }
+                    local_ba_payload.update(
+                        {key: value for key, value in optional_scalars.items() if value is not None}
+                    )
                     if record["initial_median_residual_deg"] is not None:
                         local_ba_payload["local_ba/initial_residual_deg"] = float(
                             record["initial_median_residual_deg"]

@@ -1,0 +1,9 @@
+base_config: spherical_selfi_ob3d_fullgraph_noba_100.yaml
+
+WeightsAndBiases:
+  group: ob3d-sponza-fullgraph-bafix-lm5-se3-affine-analytic
+  run_name: ob3d_sponza_fullgraph_bafix_lm5_se3_affine_analytic_noba_100
+  tags: [spherical-selfi, ob3d, full-system, ba-fix, graph-jacobian-fix, no-ba, formal100]
+
+Results:
+  save_dir: outputs/ob3d_sponza_fullgraph_bafix_lm5_se3_affine_analytic_noba_100

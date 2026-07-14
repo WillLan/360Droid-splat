@@ -22,7 +22,13 @@ from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from models.spherical_selfi_stage3_ba import (
     BlockSparseSphericalBA,
     Stage3MatchCache,
+    _factor_residual_and_analytic_jacobian,
+    _factor_residual_from_local_delta,
+    _right_pose_prior_residual_and_jacobian,
+    _se3_exp_out_of_place,
+    _solve_diagonal_depth_schur,
     _weighted_affine_fit,
+    _weighted_affine_fit_with_acceptance,
     all_directed_pairs,
     build_stage3_match_cache,
     directed_pairs_for_topology,
@@ -228,6 +234,176 @@ def test_affine_depth_fit_recovers_scale_and_shift_with_outlier() -> None:
     scale, shift = _weighted_affine_fit(source, target, torch.ones_like(source), median_depth=5.5)
     torch.testing.assert_close(scale, torch.tensor(1.2), atol=2e-2, rtol=0.0)
     torch.testing.assert_close(shift, torch.tensor(-0.3), atol=8e-2, rtol=0.0)
+
+
+def test_affine_depth_writeback_requires_support_and_strict_improvement() -> None:
+    source = torch.linspace(1.0, 5.0, 32)
+    target = 1.1 * source - 0.15
+    weight = torch.ones_like(source)
+    scale, shift, accepted, identity_error, fit_error = _weighted_affine_fit_with_acceptance(
+        source,
+        target,
+        weight,
+        median_depth=3.0,
+        min_support=16,
+        min_relative_improvement=1.0e-3,
+    )
+    assert accepted
+    assert float(fit_error) < float(identity_error) * (1.0 - 1.0e-3)
+    torch.testing.assert_close(scale, torch.tensor(1.1), atol=1.0e-4, rtol=0.0)
+    torch.testing.assert_close(shift, torch.tensor(-0.15), atol=1.0e-4, rtol=0.0)
+
+    scale, shift, accepted, _, _ = _weighted_affine_fit_with_acceptance(
+        source,
+        source,
+        weight,
+        median_depth=3.0,
+        min_support=16,
+        min_relative_improvement=1.0e-3,
+    )
+    assert not accepted
+    torch.testing.assert_close(scale, torch.tensor(1.0))
+    torch.testing.assert_close(shift, torch.tensor(0.0))
+
+    _, _, accepted, _, _ = _weighted_affine_fit_with_acceptance(
+        source[:4],
+        target[:4],
+        weight[:4],
+        median_depth=2.0,
+        min_support=16,
+        min_relative_improvement=1.0e-3,
+    )
+    assert not accepted
+
+
+def test_dense_affine_query_weights_exclude_unsupported_samples() -> None:
+    source_frame = torch.tensor([0, 0, 1], dtype=torch.long)
+    depth_index = torch.tensor([0, 2, 4], dtype=torch.long)
+    factor_weight = torch.tensor([0.2, 0.8, 0.5])
+    weights = BlockSparseSphericalBA._query_weights(
+        source_frame,
+        depth_index,
+        factor_weight,
+        frame=0,
+        query_count=4,
+    )
+    torch.testing.assert_close(weights, torch.tensor([0.2, 0.0, 0.8, 0.0]))
+
+
+def test_diagonal_depth_schur_matches_dense_normal_equation() -> None:
+    torch.manual_seed(17)
+    dtype = torch.float64
+    pose_dim, depth_dim = 6, 11
+    hpd = torch.randn(depth_dim, pose_dim, dtype=dtype) * 0.1
+    hdd = torch.rand(depth_dim, dtype=dtype) + 0.5
+    schur_factor = torch.randn(pose_dim, pose_dim, dtype=dtype)
+    positive_schur = schur_factor.T @ schur_factor + 0.25 * torch.eye(
+        pose_dim, dtype=dtype
+    )
+    hpp = positive_schur + hpd.T @ (hdd.reciprocal()[:, None] * hpd)
+    gp = torch.randn(pose_dim, dtype=dtype)
+    gd = torch.randn(depth_dim, dtype=dtype)
+
+    pose_step, depth_step = _solve_diagonal_depth_schur(hpp, gp, hpd, hdd, gd)
+    full_normal = torch.cat(
+        [
+            torch.cat([hpp, hpd.T], dim=1),
+            torch.cat([hpd, torch.diag(hdd)], dim=1),
+        ],
+        dim=0,
+    )
+    dense_step = -torch.linalg.solve(full_normal, torch.cat([gp, gd]))
+    torch.testing.assert_close(pose_step, dense_step[:pose_dim], atol=1.0e-10, rtol=1.0e-10)
+    torch.testing.assert_close(depth_step, dense_step[pose_dim:], atol=1.0e-10, rtol=1.0e-10)
+
+
+def test_autodiff_jacobian_is_restored_after_inference_tensor_materialization() -> None:
+    with torch.inference_mode():
+        inference_value = torch.tensor([2.0])
+        broken = torch.func.jacrev(lambda value: value.square())(inference_value)
+    with torch.inference_mode(False), torch.enable_grad():
+        regular_value = inference_value.detach().clone()
+        restored = torch.func.jacrev(lambda value: value.square())(regular_value)
+    torch.testing.assert_close(broken, torch.zeros_like(broken))
+    torch.testing.assert_close(restored, torch.tensor([[4.0]]))
+
+
+@pytest.mark.parametrize(
+    "source_ray,target_ray",
+    [
+        ([0.3, 0.2, 0.9], [0.25, 0.18, 0.95]),
+        ([1.0e-4, 0.05, -1.0], [-0.03, 0.07, -0.99]),
+        ([0.05, 0.99, 0.1], [0.08, 0.98, 0.15]),
+    ],
+)
+def test_analytic_spherical_factor_jacobian_matches_autodiff_and_finite_difference(
+    source_ray,
+    target_ray,
+) -> None:
+    source_pose = se3_exp(torch.tensor([0.2, -0.1, 0.05, 0.02, -0.03, 0.01]))
+    target_pose = se3_exp(torch.tensor([-0.1, 0.05, 0.02, -0.01, 0.04, -0.02]))
+    source = torch.nn.functional.normalize(torch.tensor(source_ray, dtype=torch.float32), dim=0)
+    target = torch.nn.functional.normalize(torch.tensor(target_ray, dtype=torch.float32), dim=0)
+    log_depth = torch.tensor(-0.7)
+    residual, analytic = _factor_residual_and_analytic_jacobian(
+        source_pose,
+        target_pose,
+        source,
+        target,
+        log_depth,
+    )
+    zero = torch.zeros(13)
+
+    def residual_from_delta(delta: torch.Tensor) -> torch.Tensor:
+        return _factor_residual_from_local_delta(
+            delta,
+            source_pose,
+            target_pose,
+            source,
+            target,
+            log_depth,
+            "right",
+        )
+
+    autodiff = torch.func.jacrev(residual_from_delta)(zero)
+    epsilon = 1.0e-4
+    columns = []
+    for index in range(13):
+        direction = torch.zeros(13)
+        direction[index] = epsilon
+        columns.append(
+            (residual_from_delta(direction) - residual_from_delta(-direction))
+            / (2.0 * epsilon)
+        )
+    finite_difference = torch.stack(columns, dim=-1)
+    torch.testing.assert_close(residual, residual_from_delta(zero), atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(analytic, autodiff, atol=1.0e-5, rtol=1.0e-4)
+    torch.testing.assert_close(analytic, finite_difference, atol=5.0e-4, rtol=2.0e-3)
+
+
+def test_right_pose_prior_analytic_jacobian_matches_autodiff() -> None:
+    initial = torch.eye(4).repeat(3, 1, 1)
+    initial[1] = se3_exp(torch.tensor([0.2, -0.1, 0.05, 0.02, -0.03, 0.01]))
+    initial[2] = se3_exp(torch.tensor([-0.1, 0.05, 0.02, -0.01, 0.04, -0.02]))
+    current = initial.clone()
+    current[1] = current[1] @ se3_exp(torch.tensor([0.01, -0.005, 0.002, 0.003, -0.004, 0.002]))
+    current[2] = current[2] @ se3_exp(torch.tensor([-0.004, 0.003, 0.005, -0.002, 0.001, 0.004]))
+    residual, analytic = _right_pose_prior_residual_and_jacobian(current, initial)
+    zero = torch.zeros(12)
+
+    def residual_from_delta(delta: torch.Tensor) -> torch.Tensor:
+        updated = torch.stack(
+            [
+                current[0],
+                current[1] @ _se3_exp_out_of_place(delta[:6]),
+                current[2] @ _se3_exp_out_of_place(delta[6:]),
+            ]
+        )
+        return BlockSparseSphericalBA._pose_prior_vector(updated, initial)
+
+    autodiff = torch.func.jacrev(residual_from_delta)(zero)
+    torch.testing.assert_close(residual, residual_from_delta(zero), atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(analytic, autodiff, atol=1.0e-5, rtol=1.0e-4)
 
 
 def test_block_sparse_ba_returns_finite_dense_contract() -> None:
@@ -477,6 +653,8 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         dense_depth_mode="none",
         gauge_mode="initial_baseline",
         pose_update_side="right",
+        jacobian_mode="analytic",
+        validate_analytic_jacobian=True,
         lm_max_trials=8,
     )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
     assert bool(right_output.accepted[0])
@@ -568,12 +746,14 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
         min_factors=8,
         factor_chunk_size=128,
         solver_mode="standard_lm",
-        dense_depth_mode="none",
+        dense_depth_mode="affine",
         min_initial_median_residual_deg=180.0,
     )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
     assert not bool(gated_output.accepted[0])
     assert gated_output.diagnostics[0]["reason"] == "below_min_initial_median_residual"
     torch.testing.assert_close(gated_output.poses_c2w[0], poses_initial)
+    torch.testing.assert_close(gated_output.dense_depth[0], depth)
+    assert not bool(gated_output.depth_affine_accepted[0].any())
     torch.testing.assert_close(
         gated_output.initial_median_residual_deg,
         gated_output.final_median_residual_deg,

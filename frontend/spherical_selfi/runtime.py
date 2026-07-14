@@ -148,6 +148,35 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             min_affine_support=int(local_ba.get("min_affine_support", 64)),
             min_depth=float(local_ba.get("min_depth", 0.05)),
             max_depth=float(local_ba.get("max_depth", 20.0)),
+            solver_mode=str(local_ba.get("solver_mode", "backtracking_gn")),
+            dense_depth_mode=str(local_ba.get("dense_depth_mode", "affine")),
+            gauge_mode=str(local_ba.get("gauge_mode", "none")),
+            lm_max_trials=int(local_ba.get("lm_max_trials", 4)),
+            lm_acceptance_eta=float(local_ba.get("lm_acceptance_eta", 1.0e-4)),
+            lm_damping_min=float(local_ba.get("lm_damping_min", 1.0e-8)),
+            lm_damping_max=float(local_ba.get("lm_damping_max", 1.0e8)),
+            lm_diagonal_floor=float(local_ba.get("lm_diagonal_floor", 1.0e-6)),
+            max_initial_residual_deg=local_ba.get("max_initial_residual_deg"),
+            min_parallax_deg=float(local_ba.get("min_parallax_deg", 0.0)),
+            pose_update_side=str(local_ba.get("pose_update_side", "left")),
+            pose_dof_mode=str(local_ba.get("pose_dof_mode", "se3")),
+            min_initial_median_residual_deg=float(
+                local_ba.get("min_initial_median_residual_deg", 0.0)
+            ),
+            jacobian_mode=str(local_ba.get("jacobian_mode", "autodiff_reference")),
+            validate_analytic_jacobian=bool(
+                local_ba.get("validate_analytic_jacobian", False)
+            ),
+            analytic_jacobian_atol=float(local_ba.get("analytic_jacobian_atol", 1.0e-5)),
+            analytic_jacobian_rtol=float(local_ba.get("analytic_jacobian_rtol", 1.0e-4)),
+            gradient_tolerance=float(local_ba.get("gradient_tolerance", 1.0e-8)),
+            step_tolerance=float(local_ba.get("step_tolerance", 1.0e-8)),
+            relative_objective_tolerance=float(
+                local_ba.get("relative_objective_tolerance", 1.0e-6)
+            ),
+            affine_min_relative_improvement=float(
+                local_ba.get("affine_min_relative_improvement", 1.0e-3)
+            ),
         )
         self.frames: list[PanoFrame] = []
         self.frame_buffer_start = 0
@@ -222,48 +251,58 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         matching_start = time.perf_counter()
-        if self.local_ba_matcher_name == "superpoint_sphereglue":
-            if self.sphereglue_local_ba_matcher is None:
-                raise RuntimeError("SphereGlue local BA matcher was not initialized")
-            cache = self.sphereglue_local_ba_matcher.build_cache(
-                images,
-                observation.refined_depth,
-                static_valid_mask=combined_valid,
-            )
-        else:
-            fibonacci_seed = int(self.fibonacci_config.get("seed", 123)) + int(
-                self.window_index
-            )
-            generator = torch.Generator(device=self.head_device)
-            generator.manual_seed(fibonacci_seed)
-            cache = build_stage3_match_cache(
-                dense_features,
-                observation.refined_depth,
-                num_queries=int(cfg.get("num_queries", 2048)),
-                min_depth=float(cfg.get("min_depth", 0.05)),
-                max_depth=float(cfg.get("max_depth", 20.0)),
-                temperature=float(cfg.get("temperature", 0.07)),
-                query_chunk_size=int(cfg.get("query_chunk_size", 32)),
-                fibonacci_oversample_factor=int(cfg.get("fibonacci_oversample_factor", 8)),
-                use_spherical_area_correction=bool(cfg.get("use_spherical_area_correction", True)),
-                forward_backward=bool(cfg.get("forward_backward", True)),
-                fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
-                min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
-                static_valid_mask=combined_valid,
-                generator=generator,
-            )
-            cache.metadata["fibonacci_seed"] = fibonacci_seed
+        with torch.no_grad():
+            if self.local_ba_matcher_name == "superpoint_sphereglue":
+                if self.sphereglue_local_ba_matcher is None:
+                    raise RuntimeError("SphereGlue local BA matcher was not initialized")
+                cache = self.sphereglue_local_ba_matcher.build_cache(
+                    images,
+                    observation.refined_depth,
+                    static_valid_mask=combined_valid,
+                )
+            else:
+                fibonacci_seed = int(self.fibonacci_config.get("seed", 123)) + int(
+                    self.window_index
+                )
+                generator = torch.Generator(device=self.head_device)
+                generator.manual_seed(fibonacci_seed)
+                cache = build_stage3_match_cache(
+                    dense_features,
+                    observation.refined_depth,
+                    num_queries=int(cfg.get("num_queries", 2048)),
+                    min_depth=float(cfg.get("min_depth", 0.05)),
+                    max_depth=float(cfg.get("max_depth", 20.0)),
+                    temperature=float(cfg.get("temperature", 0.07)),
+                    query_chunk_size=int(cfg.get("query_chunk_size", 32)),
+                    fibonacci_oversample_factor=int(cfg.get("fibonacci_oversample_factor", 8)),
+                    use_spherical_area_correction=bool(cfg.get("use_spherical_area_correction", True)),
+                    forward_backward=bool(cfg.get("forward_backward", True)),
+                    fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
+                    min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
+                    static_valid_mask=combined_valid,
+                    generator=generator,
+                )
+                cache.metadata["fibonacci_seed"] = fibonacci_seed
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         matching_sec = float(time.perf_counter() - matching_start)
         ba_start = time.perf_counter()
-        result = self.local_ba(observation.poses_c2w, observation.refined_depth, cache)
+        with torch.inference_mode(False):
+            ba_poses = observation.poses_c2w.detach().clone()
+            ba_depth = observation.refined_depth.detach().clone()
+            ba_cache = cache.detached_clone()
+            if self.local_ba.jacobian_mode == "autodiff_reference":
+                with torch.enable_grad():
+                    result = self.local_ba(ba_poses, ba_depth, ba_cache)
+            else:
+                with torch.no_grad():
+                    result = self.local_ba(ba_poses, ba_depth, ba_cache)
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         ba_sec = float(time.perf_counter() - ba_start)
         updated = observation.with_geometry(
-            poses_c2w=result.poses_c2w,
-            refined_depth=result.dense_depth,
+            poses_c2w=result.poses_c2w.detach(),
+            refined_depth=result.dense_depth.detach(),
         )
         return updated, cache, result, matching_sec, ba_sec
 
@@ -319,14 +358,14 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                         feature_sky.to(self.head_device),
                         observation.image_size,
                     ).reshape(1, views, 1, *observation.image_size)
-            initial_poses_c2w = observation.poses_c2w.detach().cpu().float().clone()
-            ba_valid = None if sky_prob is None else sky_prob < self.sky_threshold
-            observation, match_cache, ba_result, matching_sec, ba_sec = self._run_local_ba(
-                observation,
-                dense,
-                images,
-                static_valid_mask=ba_valid,
-            )
+        initial_poses_c2w = observation.poses_c2w.detach().cpu().float().clone()
+        ba_valid = None if sky_prob is None else sky_prob < self.sky_threshold
+        observation, match_cache, ba_result, matching_sec, ba_sec = self._run_local_ba(
+            observation,
+            dense,
+            images,
+            static_valid_mask=ba_valid,
+        )
 
         gt_values = [
             None

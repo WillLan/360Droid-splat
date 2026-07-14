@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from frontend.pano_droid.spherical_ba import skew, so3_exp
+from frontend.pano_droid.spherical_camera import tangent_basis
 from frontend.pano_vggt.spherical_correspondence import spherical_tangent_residual
 from geometry.sim3 import sim3_log
 from geometry.spherical_erp import (
@@ -63,6 +64,30 @@ class Stage3MatchCache:
     @property
     def num_factors(self) -> int:
         return int(self.valid_mask.sum().detach().cpu())
+
+    def detached_clone(self) -> "Stage3MatchCache":
+        """Materialize ordinary detached tensors outside inference mode."""
+
+        def clone(value: torch.Tensor | None) -> torch.Tensor | None:
+            return None if value is None else value.detach().clone()
+
+        return Stage3MatchCache(
+            source_uv=clone(self.source_uv),
+            source_ray=clone(self.source_ray),
+            source_depth=clone(self.source_depth),
+            source_valid=clone(self.source_valid),
+            edges=clone(self.edges),
+            target_uv=clone(self.target_uv),
+            target_ray=clone(self.target_ray),
+            top1_cosine=clone(self.top1_cosine),
+            top2_margin=clone(self.top2_margin),
+            entropy=clone(self.entropy),
+            valid_mask=clone(self.valid_mask),
+            factor_weight=clone(self.factor_weight),
+            mutual_mask=clone(self.mutual_mask),
+            target_valid=clone(self.target_valid),
+            metadata=copy.deepcopy(self.metadata),
+        )
 
 
 def all_directed_pairs(num_views: int, *, device: torch.device | str | None = None) -> torch.Tensor:
@@ -370,6 +395,9 @@ class Stage3BAOutput:
     sparse_depth: torch.Tensor
     depth_scale: torch.Tensor
     depth_shift: torch.Tensor
+    depth_affine_accepted: torch.Tensor
+    depth_affine_identity_error: torch.Tensor
+    depth_affine_fit_error: torch.Tensor
     accepted: torch.Tensor
     initial_median_residual_deg: torch.Tensor
     final_median_residual_deg: torch.Tensor
@@ -428,6 +456,168 @@ def _se3_exp_out_of_place(xi: torch.Tensor) -> torch.Tensor:
     return torch.cat([top, bottom[..., None, :]], dim=-2)
 
 
+def _so3_log_vector(rotation: torch.Tensor) -> torch.Tensor:
+    """Stable SO(3) logarithm used by the right-local pose prior."""
+
+    vee = 0.5 * torch.stack(
+        [
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sin_theta = vee.norm(dim=-1)
+    cos_theta = ((rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5).clamp(
+        -1.0, 1.0
+    )
+    theta = torch.atan2(sin_theta, cos_theta)
+    scale = torch.where(
+        sin_theta > 1.0e-7,
+        theta / sin_theta.clamp_min(1.0e-7),
+        1.0 + theta.square() / 6.0,
+    )
+    return scale[..., None] * vee
+
+
+def _so3_right_jacobian_inverse(rotation_vector: torch.Tensor) -> torch.Tensor:
+    """Inverse SO(3) right Jacobian for ``Log(R Exp(delta))``."""
+
+    theta = rotation_vector.norm(dim=-1, keepdim=True)
+    theta2 = theta.square()
+    matrix = skew(rotation_vector)
+    eye = torch.eye(3, device=rotation_vector.device, dtype=rotation_vector.dtype).expand(
+        *rotation_vector.shape[:-1], 3, 3
+    )
+    small = theta < 1.0e-4
+    coefficient = torch.where(
+        small,
+        1.0 / 12.0 + theta2 / 720.0 + theta2.square() / 30240.0,
+        1.0 / theta2.clamp_min(1.0e-12)
+        - (1.0 + torch.cos(theta))
+        / (2.0 * theta * torch.sin(theta)).clamp_min(1.0e-12),
+    )
+    return eye + 0.5 * matrix + coefficient[..., None] * (matrix @ matrix)
+
+
+def _spherical_log_residual_and_jacobian(
+    target_bearing: torch.Tensor,
+    predicted_bearing: torch.Tensor,
+    *,
+    eps: float = 1.0e-7,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``Log_target(predicted)`` and its analytic derivative w.r.t. a unit prediction."""
+
+    target = F.normalize(target_bearing, dim=-1, eps=1.0e-12)
+    predicted = F.normalize(predicted_bearing, dim=-1, eps=1.0e-12)
+    dot = (target * predicted).sum(dim=-1).clamp(-1.0 + eps, 1.0 - eps)
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta).clamp_min(eps)
+    tangent = predicted - dot[..., None] * target
+    scale = theta / sin_theta
+    log_vector = scale[..., None] * tangent
+    basis = tangent_basis(target, eps=1.0e-12)
+    residual = torch.einsum("...ij,...i->...j", basis, log_vector)
+
+    projector = (
+        torch.eye(3, device=target.device, dtype=target.dtype).expand(*target.shape[:-1], 3, 3)
+        - target[..., :, None] * target[..., None, :]
+    )
+    exact_derivative = (
+        -sin_theta.reciprocal().square()
+        + theta * dot / sin_theta.pow(3)
+    )
+    near_zero = theta < 1.0e-4
+    derivative_scale = torch.where(
+        near_zero,
+        dot.new_full(dot.shape, -1.0 / 3.0),
+        exact_derivative,
+    )
+    derivative_log = (
+        scale[..., None, None] * projector
+        + tangent[..., :, None]
+        * (derivative_scale[..., None] * target)[..., None, :]
+    )
+    jacobian = torch.einsum("...ji,...jk->...ik", basis, derivative_log)
+    return residual, jacobian
+
+
+def _factor_residual_and_analytic_jacobian(
+    src_pose: torch.Tensor,
+    tgt_pose: torch.Tensor,
+    src_ray: torch.Tensor,
+    tgt_ray: torch.Tensor,
+    log_inv_depth: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Analytic right-local SE(3)/log-depth Jacobian for one or more factors."""
+
+    depth = torch.exp(-log_inv_depth)
+    point_source = depth[..., None] * src_ray
+    src_rotation = src_pose[..., :3, :3]
+    tgt_rotation = tgt_pose[..., :3, :3]
+    point_world = torch.einsum("...ij,...j->...i", src_rotation, point_source) + src_pose[..., :3, 3]
+    point_target = torch.einsum(
+        "...ij,...j->...i",
+        tgt_rotation.transpose(-1, -2),
+        point_world - tgt_pose[..., :3, 3],
+    )
+    point_norm = point_target.norm(dim=-1).clamp_min(1.0e-8)
+    predicted = point_target / point_norm[..., None]
+    residual, residual_wrt_bearing = _spherical_log_residual_and_jacobian(tgt_ray, predicted)
+
+    eye = torch.eye(3, device=point_target.device, dtype=point_target.dtype).expand(
+        *point_target.shape[:-1], 3, 3
+    )
+    bearing_wrt_point = (
+        eye - predicted[..., :, None] * predicted[..., None, :]
+    ) / point_norm[..., None, None]
+    residual_wrt_point = residual_wrt_bearing @ bearing_wrt_point
+    target_from_source = tgt_rotation.transpose(-1, -2) @ src_rotation
+    source_point_jacobian = torch.cat(
+        [eye, -skew(point_source)],
+        dim=-1,
+    )
+    source_jacobian = target_from_source @ source_point_jacobian
+    target_jacobian = torch.cat([-eye, skew(point_target)], dim=-1)
+    depth_jacobian = -torch.einsum("...ij,...j->...i", target_from_source, point_source)
+    geometry_jacobian = torch.cat(
+        [source_jacobian, target_jacobian, depth_jacobian[..., None]],
+        dim=-1,
+    )
+    return residual, residual_wrt_point @ geometry_jacobian
+
+
+def _right_pose_prior_residual_and_jacobian(
+    current: torch.Tensor,
+    initial: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pose prior and block Jacobian for right-local c2w increments."""
+
+    if int(current.shape[0]) <= 1:
+        zero = current.new_zeros(0)
+        return zero, current.new_zeros((0, 0))
+    current_free = current[1:]
+    initial_free = initial[1:]
+    initial_rotation_t = initial_free[:, :3, :3].transpose(1, 2)
+    relative_rotation = initial_rotation_t @ current_free[:, :3, :3]
+    rotation_residual = _so3_log_vector(relative_rotation)
+    translation_residual = torch.einsum(
+        "nij,nj->ni",
+        initial_rotation_t,
+        current_free[:, :3, 3] - initial_free[:, :3, 3],
+    )
+    residual = torch.cat([translation_residual, rotation_residual], dim=-1).reshape(-1)
+    blocks = current.new_zeros((int(current_free.shape[0]), 6, 6))
+    blocks[:, :3, :3] = initial_rotation_t @ current_free[:, :3, :3]
+    blocks[:, 3:, 3:] = _so3_right_jacobian_inverse(rotation_residual)
+    count = int(current_free.shape[0])
+    jacobian = current.new_zeros((count * 6, count * 6))
+    for index in range(count):
+        frame_slice = slice(index * 6, (index + 1) * 6)
+        jacobian[frame_slice, frame_slice] = blocks[index]
+    return residual, jacobian
+
+
 def _weighted_affine_fit(
     source: torch.Tensor,
     target: torch.Tensor,
@@ -456,6 +646,112 @@ def _weighted_affine_fit(
     shift_limit = 0.25 * float(median_depth)
     shift = solution[1].clamp(-shift_limit, shift_limit)
     return scale, shift
+
+
+def _weighted_huber_error(
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    delta: float,
+) -> torch.Tensor:
+    absolute = residual.abs()
+    delta_tensor = absolute.new_tensor(max(float(delta), 1.0e-8))
+    robust = torch.where(
+        absolute <= delta_tensor,
+        0.5 * absolute.square(),
+        delta_tensor * (absolute - 0.5 * delta_tensor),
+    )
+    valid_weight = weight.clamp_min(0.0)
+    return (valid_weight * robust).sum() / valid_weight.sum().clamp_min(1.0e-8)
+
+
+def _weighted_affine_fit_with_acceptance(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    median_depth: float,
+    min_support: int,
+    min_relative_improvement: float,
+) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor, torch.Tensor]:
+    valid = torch.isfinite(source) & torch.isfinite(target) & torch.isfinite(weight) & (weight > 0)
+    one = source.new_tensor(1.0)
+    zero = source.new_tensor(0.0)
+    inf = source.new_tensor(float("inf"))
+    if int(valid.sum()) < int(min_support):
+        return one, zero, False, inf, inf
+    x, y, w = source[valid], target[valid], weight[valid]
+    scale, shift = _weighted_affine_fit(
+        x,
+        y,
+        w,
+        median_depth=float(median_depth),
+    )
+    delta = max(0.01, 0.05 * float(median_depth))
+    identity_error = _weighted_huber_error(x - y, w, delta=delta)
+    fit_error = _weighted_huber_error(scale * x + shift - y, w, delta=delta)
+    finite = bool(torch.isfinite(scale)) and bool(torch.isfinite(shift))
+    finite = finite and bool(torch.isfinite(identity_error)) and bool(torch.isfinite(fit_error))
+    required = identity_error * (1.0 - max(0.0, float(min_relative_improvement)))
+    accepted = finite and float(identity_error) > 0.0 and float(fit_error) < float(required)
+    if not accepted:
+        return one, zero, False, identity_error, fit_error
+    return scale, shift, True, identity_error, fit_error
+
+
+def _solve_diagonal_depth_schur(
+    hpp: torch.Tensor,
+    gp: torch.Tensor,
+    hpd: torch.Tensor,
+    hdd: torch.Tensor,
+    gd: torch.Tensor,
+    *,
+    constraint: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve a pose/depth normal equation with diagonal depth blocks.
+
+    The block convention is ``[[Hpp, Hpd.T], [Hpd, diag(Hdd)]]`` and the
+    returned step solves ``H step = -gradient``.  An optional pose-space row
+    imposes the hard linear constraint ``constraint @ pose_step = 0``.
+    """
+
+    pose_dim = int(gp.numel())
+    depth_dim = int(gd.numel())
+    if tuple(hpp.shape) != (pose_dim, pose_dim):
+        raise ValueError("hpp shape must match the pose gradient")
+    if tuple(hpd.shape) != (depth_dim, pose_dim):
+        raise ValueError("hpd shape must be depth_dim x pose_dim")
+    if tuple(hdd.shape) != (depth_dim,):
+        raise ValueError("hdd shape must match the depth gradient")
+    if not all(torch.isfinite(value).all() for value in (hpp, gp, hpd, hdd, gd)):
+        raise ValueError("Schur system contains non-finite values")
+    if bool((hdd <= 0.0).any()):
+        raise ValueError("Schur depth diagonal must be strictly positive")
+
+    inverse_hdd = hdd.reciprocal()
+    schur = hpp - hpd.transpose(0, 1) @ (inverse_hdd[:, None] * hpd)
+    rhs = gp - hpd.transpose(0, 1) @ (inverse_hdd * gd)
+    if pose_dim:
+        if constraint is not None and float(constraint.norm()) > 1.0e-10:
+            if tuple(constraint.shape) != (pose_dim,):
+                raise ValueError("constraint shape must match the pose dimension")
+            kkt = torch.zeros(
+                pose_dim + 1,
+                pose_dim + 1,
+                device=hpp.device,
+                dtype=hpp.dtype,
+            )
+            kkt[:pose_dim, :pose_dim] = schur
+            kkt[:pose_dim, pose_dim] = constraint
+            kkt[pose_dim, :pose_dim] = constraint
+            kkt_rhs = torch.cat([-rhs, rhs.new_zeros(1)], dim=0)
+            pose_step = torch.linalg.solve(kkt, kkt_rhs)[:pose_dim]
+        else:
+            pose_step = -torch.linalg.solve(schur, rhs)
+    else:
+        pose_step = gp.new_zeros(0)
+    depth_step = -(gd + hpd @ pose_step) * inverse_hdd
+    return pose_step, depth_step
 
 
 class BlockSparseSphericalBA:
@@ -491,6 +787,14 @@ class BlockSparseSphericalBA:
         pose_update_side: str = "left",
         pose_dof_mode: str = "se3",
         min_initial_median_residual_deg: float = 0.0,
+        jacobian_mode: str = "autodiff_reference",
+        validate_analytic_jacobian: bool = False,
+        analytic_jacobian_atol: float = 1.0e-5,
+        analytic_jacobian_rtol: float = 1.0e-4,
+        gradient_tolerance: float = 1.0e-8,
+        step_tolerance: float = 1.0e-8,
+        relative_objective_tolerance: float = 1.0e-6,
+        affine_min_relative_improvement: float = 1.0e-3,
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -552,6 +856,20 @@ class BlockSparseSphericalBA:
         self.min_initial_median_residual_deg = max(
             0.0, float(min_initial_median_residual_deg)
         )
+        self.jacobian_mode = str(jacobian_mode).lower()
+        if self.jacobian_mode not in {"analytic", "autodiff_reference"}:
+            raise ValueError("jacobian_mode must be 'analytic' or 'autodiff_reference'.")
+        if self.jacobian_mode == "analytic" and self.pose_update_side != "right":
+            raise ValueError("jacobian_mode='analytic' requires pose_update_side='right'.")
+        self.validate_analytic_jacobian = bool(validate_analytic_jacobian)
+        self.analytic_jacobian_atol = max(0.0, float(analytic_jacobian_atol))
+        self.analytic_jacobian_rtol = max(0.0, float(analytic_jacobian_rtol))
+        self.gradient_tolerance = max(0.0, float(gradient_tolerance))
+        self.step_tolerance = max(0.0, float(step_tolerance))
+        self.relative_objective_tolerance = max(0.0, float(relative_objective_tolerance))
+        self.affine_min_relative_improvement = max(
+            0.0, float(affine_min_relative_improvement)
+        )
 
     def __call__(
         self,
@@ -576,6 +894,9 @@ class BlockSparseSphericalBA:
         output_poses: list[torch.Tensor] = []
         scales: list[torch.Tensor] = []
         shifts: list[torch.Tensor] = []
+        affine_accepted_values: list[torch.Tensor] = []
+        affine_identity_errors: list[torch.Tensor] = []
+        affine_fit_errors: list[torch.Tensor] = []
         sparse_values: list[torch.Tensor] = []
         accepted_values: list[torch.Tensor] = []
         initial_residuals: list[torch.Tensor] = []
@@ -596,16 +917,40 @@ class BlockSparseSphericalBA:
             initial_residuals.append(dense_depth.new_tensor(result[5]))
             final_residuals.append(dense_depth.new_tensor(result[6]))
             diagnostics.append(result[7])
+            affine_accepted_values.append(
+                torch.as_tensor(
+                    result[7].get("depth_affine_accepted", [False] * views),
+                    device=dense_depth.device,
+                    dtype=torch.bool,
+                )
+            )
+            affine_identity_errors.append(
+                torch.as_tensor(
+                    result[7].get("depth_affine_identity_error", [float("inf")] * views),
+                    device=dense_depth.device,
+                    dtype=dense_depth.dtype,
+                )
+            )
+            affine_fit_errors.append(
+                torch.as_tensor(
+                    result[7].get("depth_affine_fit_error", [float("inf")] * views),
+                    device=dense_depth.device,
+                    dtype=dense_depth.dtype,
+                )
+            )
 
         pose_tensor = torch.stack(output_poses, dim=0).to(device=poses_c2w.device, dtype=poses_c2w.dtype).detach()
         scale_tensor = torch.stack(scales, dim=0).to(device=dense_depth.device, dtype=dense_depth.dtype).detach()
         shift_tensor = torch.stack(shifts, dim=0).to(device=dense_depth.device, dtype=dense_depth.dtype).detach()
         valid_geometry = torch.isfinite(dense_depth) & (dense_depth >= self.min_depth) & (dense_depth <= self.max_depth)
         accepted_tensor = torch.stack(accepted_values)
+        affine_accepted_tensor = torch.stack(affine_accepted_values)
+        affine_identity_tensor = torch.stack(affine_identity_errors)
+        affine_fit_tensor = torch.stack(affine_fit_errors)
         if self.dense_depth_mode == "affine":
             affine = scale_tensor[:, :, None, None, None] * dense_depth + shift_tensor[:, :, None, None, None]
             affine = affine.clamp(self.min_depth, self.max_depth)
-            use_affine = accepted_tensor[:, None, None, None, None] & valid_geometry
+            use_affine = affine_accepted_tensor[:, :, None, None, None] & valid_geometry
             output_depth = torch.where(use_affine, affine, dense_depth)
         else:
             output_depth = dense_depth
@@ -615,6 +960,9 @@ class BlockSparseSphericalBA:
             sparse_depth=torch.stack(sparse_values, dim=0).to(device=dense_depth.device, dtype=dense_depth.dtype),
             depth_scale=scale_tensor,
             depth_shift=shift_tensor,
+            depth_affine_accepted=affine_accepted_tensor,
+            depth_affine_identity_error=affine_identity_tensor,
+            depth_affine_fit_error=affine_fit_tensor,
             accepted=accepted_tensor,
             initial_median_residual_deg=torch.stack(initial_residuals),
             final_median_residual_deg=torch.stack(final_residuals),
@@ -664,6 +1012,9 @@ class BlockSparseSphericalBA:
             sparse_depth=translation.sparse_depth,
             depth_scale=translation.depth_scale,
             depth_shift=translation.depth_shift,
+            depth_affine_accepted=translation.depth_affine_accepted,
+            depth_affine_identity_error=translation.depth_affine_identity_error,
+            depth_affine_fit_error=translation.depth_affine_fit_error,
             accepted=rotation.accepted | translation.accepted,
             initial_median_residual_deg=rotation.initial_median_residual_deg,
             final_median_residual_deg=translation.final_median_residual_deg,
@@ -805,6 +1156,18 @@ class BlockSparseSphericalBA:
         accepted_steps = 0
         gain_ratios: list[float] = []
         gauge_scales: list[float] = []
+        gradient_norms: list[float] = []
+        pose_step_norms: list[float] = []
+        depth_step_norms: list[float] = []
+        trial_objectives: list[float] = []
+        trial_dampings: list[float] = []
+        trial_predicted_reductions: list[float] = []
+        trial_actual_reductions: list[float] = []
+        trial_gain_ratios: list[float] = []
+        max_factor_jacobian_norm = 0.0
+        analytic_autodiff_max_abs = 0.0
+        analytic_autodiff_max_rel = 0.0
+        termination_reason: str | None = None
         lm_nu = 2.0
         initial_objective = self._objective(
             cur_pose,
@@ -824,22 +1187,58 @@ class BlockSparseSphericalBA:
             hpp = torch.zeros(pose_dim, pose_dim, device=device, dtype=torch.float32)
             gp = torch.zeros(pose_dim, device=device, dtype=torch.float32)
             if pose_dim and self.pose_prior_weight > 0.0:
-                prior_zero = torch.zeros(pose_dim, device=device, dtype=torch.float32)
+                if self.jacobian_mode == "analytic":
+                    prior_residual, prior_jacobian = _right_pose_prior_residual_and_jacobian(
+                        cur_pose,
+                        poses,
+                    )
+                    if self.validate_analytic_jacobian:
+                        prior_zero = torch.zeros(pose_dim, device=device, dtype=torch.float32)
 
-                def pose_prior_from_delta(delta: torch.Tensor) -> torch.Tensor:
-                    updated = [cur_pose[0]]
-                    for frame_idx in range(1, views):
-                        step = delta[(frame_idx - 1) * 6 : frame_idx * 6]
-                        transform = _se3_exp_out_of_place(step)
-                        updated.append(
-                            cur_pose[frame_idx] @ transform
-                            if self.pose_update_side == "right"
-                            else transform @ cur_pose[frame_idx]
-                        )
-                    return self._pose_prior_vector(torch.stack(updated, dim=0), poses)
+                        def reference_pose_prior(delta: torch.Tensor) -> torch.Tensor:
+                            updated = [cur_pose[0]]
+                            for frame_idx in range(1, views):
+                                step = delta[(frame_idx - 1) * 6 : frame_idx * 6]
+                                updated.append(
+                                    cur_pose[frame_idx] @ _se3_exp_out_of_place(step)
+                                )
+                            return self._pose_prior_vector(torch.stack(updated, dim=0), poses)
 
-                prior_residual = pose_prior_from_delta(prior_zero)
-                prior_jacobian = torch.func.jacrev(pose_prior_from_delta)(prior_zero)
+                        with torch.enable_grad():
+                            reference_prior_residual = reference_pose_prior(prior_zero)
+                            reference_prior_jacobian = torch.func.jacrev(reference_pose_prior)(
+                                prior_zero
+                            )
+                        if not torch.allclose(
+                            prior_residual,
+                            reference_prior_residual,
+                            atol=self.analytic_jacobian_atol,
+                            rtol=self.analytic_jacobian_rtol,
+                        ) or not torch.allclose(
+                            prior_jacobian,
+                            reference_prior_jacobian,
+                            atol=self.analytic_jacobian_atol,
+                            rtol=self.analytic_jacobian_rtol,
+                        ):
+                            failed_reason = "analytic_pose_prior_jacobian_mismatch"
+                            break
+                else:
+                    prior_zero = torch.zeros(pose_dim, device=device, dtype=torch.float32)
+
+                    def pose_prior_from_delta(delta: torch.Tensor) -> torch.Tensor:
+                        updated = [cur_pose[0]]
+                        for frame_idx in range(1, views):
+                            step = delta[(frame_idx - 1) * 6 : frame_idx * 6]
+                            transform = _se3_exp_out_of_place(step)
+                            updated.append(
+                                cur_pose[frame_idx] @ transform
+                                if self.pose_update_side == "right"
+                                else transform @ cur_pose[frame_idx]
+                            )
+                        return self._pose_prior_vector(torch.stack(updated, dim=0), poses)
+
+                    prior_residual = pose_prior_from_delta(prior_zero)
+                    prior_jacobian = torch.func.jacrev(pose_prior_from_delta)(prior_zero)
                 hpp += self.pose_prior_weight * (prior_jacobian.T @ prior_jacobian)
                 gp += self.pose_prior_weight * (prior_jacobian.T @ prior_residual)
             hpd = torch.zeros(depth_dim, pose_dim, device=device, dtype=torch.float32)
@@ -863,22 +1262,77 @@ class BlockSparseSphericalBA:
                         self.pose_update_side,
                     )
 
-                jacobian_fn = torch.func.jacrev(single, argnums=0)
-                residual = torch.func.vmap(single)(
-                    local_zero,
-                    cur_pose[chunk_src],
-                    cur_pose[chunk_tgt],
-                    src_ray[start:stop],
-                    tgt_ray[start:stop],
-                    cur_log[chunk_depth],
-                )
-                jacobian = torch.func.vmap(jacobian_fn)(
-                    local_zero,
-                    cur_pose[chunk_src],
-                    cur_pose[chunk_tgt],
-                    src_ray[start:stop],
-                    tgt_ray[start:stop],
-                    cur_log[chunk_depth],
+                if self.jacobian_mode == "analytic":
+                    residual, jacobian = _factor_residual_and_analytic_jacobian(
+                        cur_pose[chunk_src],
+                        cur_pose[chunk_tgt],
+                        src_ray[start:stop],
+                        tgt_ray[start:stop],
+                        cur_log[chunk_depth],
+                    )
+                    if self.validate_analytic_jacobian:
+                        with torch.enable_grad():
+                            jacobian_fn = torch.func.jacrev(single, argnums=0)
+                            reference_residual = torch.func.vmap(single)(
+                                local_zero,
+                                cur_pose[chunk_src],
+                                cur_pose[chunk_tgt],
+                                src_ray[start:stop],
+                                tgt_ray[start:stop],
+                                cur_log[chunk_depth],
+                            )
+                            reference_jacobian = torch.func.vmap(jacobian_fn)(
+                                local_zero,
+                                cur_pose[chunk_src],
+                                cur_pose[chunk_tgt],
+                                src_ray[start:stop],
+                                tgt_ray[start:stop],
+                                cur_log[chunk_depth],
+                            )
+                        absolute = (jacobian - reference_jacobian).abs()
+                        relative = absolute / reference_jacobian.abs().clamp_min(1.0e-8)
+                        analytic_autodiff_max_abs = max(
+                            analytic_autodiff_max_abs,
+                            float(absolute.max().detach().cpu()),
+                        )
+                        analytic_autodiff_max_rel = max(
+                            analytic_autodiff_max_rel,
+                            float(relative.max().detach().cpu()),
+                        )
+                        if not torch.allclose(
+                            residual,
+                            reference_residual,
+                            atol=self.analytic_jacobian_atol,
+                            rtol=self.analytic_jacobian_rtol,
+                        ) or not torch.allclose(
+                            jacobian,
+                            reference_jacobian,
+                            atol=self.analytic_jacobian_atol,
+                            rtol=self.analytic_jacobian_rtol,
+                        ):
+                            failed_reason = "analytic_jacobian_mismatch"
+                            break
+                else:
+                    jacobian_fn = torch.func.jacrev(single, argnums=0)
+                    residual = torch.func.vmap(single)(
+                        local_zero,
+                        cur_pose[chunk_src],
+                        cur_pose[chunk_tgt],
+                        src_ray[start:stop],
+                        tgt_ray[start:stop],
+                        cur_log[chunk_depth],
+                    )
+                    jacobian = torch.func.vmap(jacobian_fn)(
+                        local_zero,
+                        cur_pose[chunk_src],
+                        cur_pose[chunk_tgt],
+                        src_ray[start:stop],
+                        tgt_ray[start:stop],
+                        cur_log[chunk_depth],
+                    )
+                max_factor_jacobian_norm = max(
+                    max_factor_jacobian_norm,
+                    float(jacobian.norm(dim=(-2, -1)).max().detach().cpu()),
                 )
                 norm = residual.norm(dim=-1)
                 robust = torch.where(norm <= self.huber_delta, torch.ones_like(norm), self.huber_delta / norm.clamp_min(1.0e-8))
@@ -901,8 +1355,19 @@ class BlockSparseSphericalBA:
                 hdd.index_add_(0, chunk_depth, jd.square().sum(dim=-1))
                 gd.index_add_(0, chunk_depth, (jd * residual).sum(dim=-1))
 
+            if failed_reason is not None:
+                break
+
             if not all(torch.isfinite(value).all() for value in (hpp, gp, hpd, hdd, gd)):
                 failed_reason = "non_finite_normal_equations"
+                break
+            if initial_median > 1.0e-6 and max_factor_jacobian_norm < 1.0e-8:
+                failed_reason = "zero_jacobian"
+                break
+            gradient_norm = float(torch.cat([gp, gd]).norm().detach().cpu())
+            gradient_norms.append(gradient_norm)
+            if gradient_norm <= self.gradient_tolerance:
+                termination_reason = "converged_gradient"
                 break
             pose_diagonal = (
                 hpp.diagonal().clamp_min(self.lm_diagonal_floor)
@@ -932,39 +1397,25 @@ class BlockSparseSphericalBA:
                     if diagonal
                     else torch.full_like(hdd, float(damping))
                 )
-                inv_hdd = damped_hdd.clamp_min(1.0e-12).reciprocal()
-                schur = damped_hpp - active_hpd.transpose(0, 1) @ (inv_hdd[:, None] * active_hpd)
-                rhs = active_gp - active_hpd.transpose(0, 1) @ (inv_hdd * gd)
                 active_gauge_jacobian = None
                 if gauge_jacobian is not None and active_pose_dim:
                     candidate_gauge = gauge_jacobian.index_select(0, active_pose_index)
                     if float(candidate_gauge.norm()) > 1.0e-10:
                         active_gauge_jacobian = candidate_gauge
                 try:
-                    if active_pose_dim and active_gauge_jacobian is not None:
-                        kkt = torch.zeros(
-                            active_pose_dim + 1,
-                            active_pose_dim + 1,
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        kkt[:active_pose_dim, :active_pose_dim] = schur
-                        kkt[:active_pose_dim, active_pose_dim] = active_gauge_jacobian
-                        kkt[active_pose_dim, :active_pose_dim] = active_gauge_jacobian
-                        kkt_rhs = torch.cat([-rhs, rhs.new_zeros(1)], dim=0)
-                        active_pose_step = torch.linalg.solve(kkt, kkt_rhs)[:active_pose_dim]
-                    else:
-                        active_pose_step = (
-                            -torch.linalg.solve(schur, rhs)
-                            if active_pose_dim
-                            else torch.zeros(0, device=device)
-                        )
-                except RuntimeError:
+                    active_pose_step, depth_step = _solve_diagonal_depth_schur(
+                        damped_hpp,
+                        active_gp,
+                        active_hpd,
+                        damped_hdd,
+                        gd,
+                        constraint=active_gauge_jacobian,
+                    )
+                except (RuntimeError, ValueError):
                     return None
                 pose_step = torch.zeros(pose_dim, device=device, dtype=torch.float32)
                 if active_pose_dim:
                     pose_step.index_copy_(0, active_pose_index, active_pose_step)
-                depth_step = -(gd + hpd @ pose_step) * inv_hdd
                 if not torch.isfinite(depth_step).all() or not torch.isfinite(pose_step).all():
                     return None
                 pose_step = pose_step.reshape(max(0, views - 1), 6)
@@ -1015,14 +1466,23 @@ class BlockSparseSphericalBA:
                 return trial_pose, trial_log, gauge_scale
 
             accepted_step = False
+            stop_after_accept = False
             if self.solver_mode == "standard_lm":
                 for _trial in range(self.lm_max_trials):
+                    trial_dampings.append(float(current_damping))
                     solved = solve_step(current_damping, diagonal=True)
                     if solved is None:
                         current_damping = min(self.lm_damping_max, current_damping * lm_nu)
                         lm_nu *= 2.0
                         continue
                     delta_pose, delta_depth = solved
+                    pose_step_norm = float(delta_pose.norm().detach().cpu())
+                    depth_step_norm = float(delta_depth.norm().detach().cpu())
+                    pose_step_norms.append(pose_step_norm)
+                    depth_step_norms.append(depth_step_norm)
+                    if max(pose_step_norm, depth_step_norm) <= self.step_tolerance:
+                        termination_reason = "converged_step"
+                        break
                     candidate = build_trial(delta_pose, delta_depth, step_scale=1.0)
                     if candidate is None:
                         current_damping = min(self.lm_damping_max, current_damping * lm_nu)
@@ -1046,10 +1506,8 @@ class BlockSparseSphericalBA:
                         if self.pose_update_side == "right"
                         else trial_pose[1:] @ torch.linalg.inv(cur_pose[1:])
                     )
-                    # Gauge projection changes world translations after the raw
-                    # LM step.  The gain-ratio model must therefore use the
-                    # effective left-multiplicative tangent step, not the
-                    # pre-projection proposal returned by the linear solve.
+                    # Gauge projection changes translations after the raw LM
+                    # step.  Use the effective tangent step after projection.
                     flat_pose = sim3_log(relative_pose)[..., :6].reshape(-1)
                     effective_depth = trial_log - cur_log
                     quadratic = (
@@ -1064,11 +1522,19 @@ class BlockSparseSphericalBA:
                     )
                     actual_reduction = current_objective - trial_objective
                     rho = actual_reduction / predicted_reduction.clamp_min(1.0e-12)
+                    trial_objectives.append(float(trial_objective.detach().cpu()))
+                    trial_predicted_reductions.append(float(predicted_reduction.detach().cpu()))
+                    trial_actual_reductions.append(float(actual_reduction.detach().cpu()))
+                    trial_gain_ratios.append(float(rho.detach().cpu()))
                     if (
                         bool(torch.isfinite(trial_objective))
+                        and bool(torch.isfinite(predicted_reduction))
+                        and bool(torch.isfinite(actual_reduction))
                         and float(predicted_reduction) > 0.0
+                        and float(actual_reduction) > 1.0e-10
                         and float(rho) > self.lm_acceptance_eta
                     ):
+                        previous_objective = current_objective
                         cur_pose = trial_pose
                         cur_log = trial_log
                         current_objective = trial_objective
@@ -1082,6 +1548,12 @@ class BlockSparseSphericalBA:
                         lm_nu = 2.0
                         accepted_steps += 1
                         accepted_step = True
+                        relative_improvement = float(actual_reduction) / max(
+                            abs(float(previous_objective)), 1.0e-12
+                        )
+                        if relative_improvement <= self.relative_objective_tolerance:
+                            termination_reason = "converged_objective"
+                            stop_after_accept = True
                         break
                     current_damping = min(self.lm_damping_max, current_damping * lm_nu)
                     lm_nu *= 2.0
@@ -1091,6 +1563,8 @@ class BlockSparseSphericalBA:
                     failed_reason = "linear_solve_failure"
                     break
                 delta_pose, delta_depth = solved
+                pose_step_norms.append(float(delta_pose.norm().detach().cpu()))
+                depth_step_norms.append(float(delta_depth.norm().detach().cpu()))
                 for step_scale in (1.0, 0.5, 0.25, 0.125):
                     candidate = build_trial(delta_pose, delta_depth, step_scale=step_scale)
                     if candidate is None:
@@ -1108,6 +1582,8 @@ class BlockSparseSphericalBA:
                         tgt_ray,
                         factor_weight,
                     )
+                    trial_objectives.append(float(trial_objective.detach().cpu()))
+                    trial_dampings.append(float(current_damping))
                     if bool(torch.isfinite(trial_objective)) and float(trial_objective) < float(current_objective) - 1.0e-10:
                         cur_pose = trial_pose
                         cur_log = trial_log
@@ -1120,19 +1596,40 @@ class BlockSparseSphericalBA:
                 if not accepted_step:
                     current_damping = min(self.lm_damping_max, current_damping * 10.0)
             if not accepted_step and self.solver_mode == "standard_lm":
+                if termination_reason is None:
+                    termination_reason = "lm_no_descent"
+                break
+            if stop_after_accept:
                 break
 
         final_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         final_median = float(torch.rad2deg(final_angle).median().detach().cpu())
-        objective_improved = float(current_objective) <= float(initial_objective) + 1.0e-10
+        objective_improved = float(current_objective) < float(initial_objective) - 1.0e-10
         residual_limit = max(1.0e-6, initial_median * self.residual_worse_tolerance)
         residual_acceptable = final_median <= residual_limit
+        finite_state = bool(torch.isfinite(cur_pose).all()) and bool(torch.isfinite(cur_log).all())
+        anchor_acceptable = bool(torch.allclose(cur_pose[0], poses[0], atol=1.0e-6, rtol=1.0e-6))
+        gauge_error = 0.0
+        if self.gauge_mode == "initial_baseline" and views > 1:
+            initial_offsets = poses[:, :3, 3] - poses[0, :3, 3]
+            reference_index = int(initial_offsets.norm(dim=-1).argmax())
+            initial_length = initial_offsets[reference_index].norm()
+            current_length = (cur_pose[reference_index, :3, 3] - cur_pose[0, :3, 3]).norm()
+            gauge_error = float(
+                ((current_length - initial_length).abs() / initial_length.clamp_min(1.0e-8))
+                .detach()
+                .cpu()
+            )
+        gauge_acceptable = gauge_error <= 1.0e-5
         accepted = (
             failed_reason is None
             and math.isfinite(final_median)
             and objective_improved
             and residual_acceptable
-            and (accepted_steps > 0 or self.iterations == 0 or initial_median <= 1.0e-6)
+            and finite_state
+            and anchor_acceptable
+            and gauge_acceptable
+            and accepted_steps > 0
         )
         if not accepted:
             cur_pose = poses
@@ -1141,6 +1638,13 @@ class BlockSparseSphericalBA:
         original_depth = source_depth.reshape(views, query_count)
         scales = torch.ones(views, device=device, dtype=torch.float32)
         shifts = torch.zeros(views, device=device, dtype=torch.float32)
+        affine_accepted = torch.zeros(views, device=device, dtype=torch.bool)
+        affine_identity_error = torch.full(
+            (views,), float("inf"), device=device, dtype=torch.float32
+        )
+        affine_fit_error = torch.full(
+            (views,), float("inf"), device=device, dtype=torch.float32
+        )
         if accepted and self.dense_depth_mode == "affine":
             for frame in range(views):
                 mask = cache.source_valid[batch_idx, frame].to(device=device)
@@ -1148,7 +1652,13 @@ class BlockSparseSphericalBA:
                 if support < self.min_affine_support:
                     continue
                 median_depth = float(original_depth[frame, mask].median().detach().cpu())
-                scales[frame], shifts[frame] = _weighted_affine_fit(
+                (
+                    scales[frame],
+                    shifts[frame],
+                    affine_ok,
+                    affine_identity_error[frame],
+                    affine_fit_error[frame],
+                ) = _weighted_affine_fit_with_acceptance(
                     original_depth[frame, mask],
                     optimized_depth[frame, mask],
                     self._query_weights(
@@ -1159,12 +1669,40 @@ class BlockSparseSphericalBA:
                         query_count=query_count,
                     )[mask],
                     median_depth=median_depth,
+                    min_support=self.min_affine_support,
+                    min_relative_improvement=self.affine_min_relative_improvement,
                 )
+                affine_accepted[frame] = bool(affine_ok)
+                if affine_ok:
+                    dense_source = depth_map[frame]
+                    dense_source_valid = (
+                        torch.isfinite(dense_source)
+                        & (dense_source >= self.min_depth)
+                        & (dense_source <= self.max_depth)
+                    )
+                    dense_trial = scales[frame] * dense_source + shifts[frame]
+                    dense_trial_valid = (
+                        torch.isfinite(dense_trial)
+                        & (dense_trial >= self.min_depth)
+                        & (dense_trial <= self.max_depth)
+                    )
+                    if bool(dense_source_valid.any()) and not bool(
+                        dense_trial_valid[dense_source_valid].all()
+                    ):
+                        scales[frame] = 1.0
+                        shifts[frame] = 0.0
+                        affine_accepted[frame] = False
+        reason = "accepted" if accepted else (
+            failed_reason
+            or ("residual_worse" if not residual_acceptable else None)
+            or ("non_finite_state" if not finite_state else None)
+            or ("anchor_changed" if not anchor_acceptable else None)
+            or ("gauge_violation" if not gauge_acceptable else None)
+            or termination_reason
+            or "objective_not_improved"
+        )
         return cur_pose, optimized_depth, scales, shifts, accepted, initial_median, final_median, {
-            "reason": "accepted" if accepted else (
-                failed_reason
-                or ("residual_worse" if not residual_acceptable else "objective_not_improved")
-            ),
+            "reason": reason,
             "num_factors": int(src.numel()),
             "initial_geometry_residual_p50_deg": float(
                 torch.rad2deg(initial_geometry_residual).median().detach().cpu()
@@ -1178,6 +1716,10 @@ class BlockSparseSphericalBA:
             "initial_median_residual_deg": initial_median,
             "final_median_residual_deg": final_median,
             "residual_acceptable": bool(residual_acceptable),
+            "finite_state": bool(finite_state),
+            "anchor_acceptable": bool(anchor_acceptable),
+            "gauge_error": float(gauge_error),
+            "gauge_acceptable": bool(gauge_acceptable),
             "initial_objective": float(initial_objective.detach().cpu()),
             "final_objective": float(current_objective.detach().cpu()),
             "accepted_steps": int(accepted_steps),
@@ -1187,6 +1729,22 @@ class BlockSparseSphericalBA:
             "gauge_mode": self.gauge_mode,
             "pose_update_side": self.pose_update_side,
             "pose_dof_mode": self.pose_dof_mode,
+            "jacobian_mode": self.jacobian_mode,
+            "max_factor_jacobian_norm": float(max_factor_jacobian_norm),
+            "analytic_autodiff_max_abs": float(analytic_autodiff_max_abs),
+            "analytic_autodiff_max_rel": float(analytic_autodiff_max_rel),
+            "gradient_norms": gradient_norms,
+            "pose_step_norms": pose_step_norms,
+            "depth_step_norms": depth_step_norms,
+            "trial_objectives": trial_objectives,
+            "trial_dampings": trial_dampings,
+            "trial_predicted_reductions": trial_predicted_reductions,
+            "trial_actual_reductions": trial_actual_reductions,
+            "trial_gain_ratios": trial_gain_ratios,
+            "termination_reason": termination_reason,
+            "depth_affine_accepted": affine_accepted.detach().cpu().tolist(),
+            "depth_affine_identity_error": affine_identity_error.detach().cpu().tolist(),
+            "depth_affine_fit_error": affine_fit_error.detach().cpu().tolist(),
             "min_initial_median_residual_deg": self.min_initial_median_residual_deg,
             "gain_ratio_mean": float(sum(gain_ratios) / len(gain_ratios)) if gain_ratios else float("nan"),
             "gauge_scale_mean": float(sum(gauge_scales) / len(gauge_scales)) if gauge_scales else 1.0,
@@ -1241,7 +1799,9 @@ class BlockSparseSphericalBA:
             local_index = depth_index[selected] - int(frame) * int(query_count)
             output.index_add_(0, local_index, factor_weight[selected])
             count.index_add_(0, local_index, torch.ones_like(factor_weight[selected]))
-        return torch.where(count > 0, output / count.clamp_min(1.0), torch.ones_like(output)).clamp_min(1.0e-6)
+        supported = count > 0
+        average = (output / count.clamp_min(1.0)).clamp_min(1.0e-6)
+        return torch.where(supported, average, torch.zeros_like(output))
 
     def _apply_scale_gauge(
         self,
@@ -1358,22 +1918,5 @@ class BlockSparseSphericalBA:
 
     @staticmethod
     def _pose_prior_vector(current: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-        if int(current.shape[0]) <= 1:
-            return current.new_zeros(0)
-        relative_rotation = current[1:, :3, :3] @ initial[1:, :3, :3].transpose(1, 2)
-        trace = relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-        theta = torch.acos(((trace - 1.0) * 0.5).clamp(-1.0 + 1.0e-7, 1.0 - 1.0e-7))
-        vee = torch.stack(
-            [
-                relative_rotation[:, 2, 1] - relative_rotation[:, 1, 2],
-                relative_rotation[:, 0, 2] - relative_rotation[:, 2, 0],
-                relative_rotation[:, 1, 0] - relative_rotation[:, 0, 1],
-            ],
-            dim=-1,
-        )
-        scale = theta / (2.0 * torch.sin(theta)).clamp_min(1.0e-7)
-        omega = scale[:, None] * vee
-        small = theta < 1.0e-4
-        omega = torch.where(small[:, None], 0.5 * vee, omega)
-        translation = current[1:, :3, 3] - initial[1:, :3, 3]
-        return torch.cat([translation, omega], dim=-1).reshape(-1)
+        residual, _ = _right_pose_prior_residual_and_jacobian(current, initial)
+        return residual

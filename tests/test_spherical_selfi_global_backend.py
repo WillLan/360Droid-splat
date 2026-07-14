@@ -692,6 +692,14 @@ def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) 
         "local_ba": {
             "enabled": True,
             "iterations": 1,
+            "solver_mode": "standard_lm",
+            "lm_max_trials": 2,
+            "jacobian_mode": "analytic",
+            "validate_analytic_jacobian": True,
+            "pose_update_side": "right",
+            "pose_dof_mode": "se3",
+            "gauge_mode": "initial_baseline",
+            "dense_depth_mode": "affine",
             "min_factors": 1,
             "min_affine_support": 2,
             "matching": {
@@ -713,7 +721,98 @@ def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) 
     assert diagnostics[0]["matcher"] == "adapter"
     assert diagnostics[0]["num_factors"] > 0
     assert diagnostics[0]["ba_diagnostics"] is not None
+    assert diagnostics[0]["ba_diagnostics"]["reason"] != "zero_jacobian"
+    assert diagnostics[0]["ba_diagnostics"]["reason"] != "analytic_jacobian_mismatch"
+    assert diagnostics[0]["ba_diagnostics"]["max_factor_jacobian_norm"] > 1.0e-8
     assert diagnostics[0]["matching_metadata"]["fibonacci_seed"] == 123
+
+
+def test_accepted_local_ba_pose_reaches_packet_outputs_and_world_points(tmp_path: Path) -> None:
+    config = stage2_default_config()
+    config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_local_ba_writeback.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
+        "local_ba": {"enabled": True},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    captured = {}
+
+    def accepted_ba(observation, dense_features, images, static_valid_mask=None):
+        del dense_features, images, static_valid_mask
+        poses = observation.poses_c2w.detach().clone()
+        poses[:, 1] = poses[:, 1] @ se3_exp(
+            torch.tensor([0.02, -0.01, 0.005, 0.01, -0.005, 0.003])
+        )
+        poses[:, 2] = poses[:, 2] @ se3_exp(
+            torch.tensor([-0.01, 0.015, 0.004, -0.006, 0.004, 0.008])
+        )
+        depth = observation.refined_depth.detach().clone() * 1.01
+        updated = observation.with_geometry(poses_c2w=poses, refined_depth=depth)
+        captured["updated"] = updated
+        result = SimpleNamespace(
+            poses_c2w=poses,
+            dense_depth=depth,
+            accepted=torch.tensor([True]),
+            initial_median_residual_deg=torch.tensor([2.0]),
+            final_median_residual_deg=torch.tensor([1.0]),
+            diagnostics=[
+                {
+                    "reason": "accepted",
+                    "initial_objective": 2.0,
+                    "final_objective": 1.0,
+                    "accepted_steps": 1,
+                }
+            ],
+        )
+        return updated, None, result, 0.0, 0.0
+
+    frontend._run_local_ba = accepted_ba
+    for frame_id in range(3):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+    outputs = frontend.pop_ready_outputs() + frontend.flush()
+    packets = frontend.consume_local_gaussian_windows()
+    assert len(packets) == 1
+    packet = packets[0]
+    updated = captured["updated"]
+    expected_local = torch.linalg.inv(updated.poses_c2w[0, 0]) @ updated.poses_c2w[0]
+    expected_local[0] = torch.eye(4)
+    torch.testing.assert_close(packet.local_poses_c2w, expected_local)
+    torch.testing.assert_close(packet.local_poses_c2w[0], torch.eye(4))
+    by_frame = {int(output.frame_id): output for output in outputs}
+    for index in range(3):
+        torch.testing.assert_close(by_frame[index].pose_c2w, updated.poses_c2w[0, index])
+        torch.testing.assert_close(
+            by_frame[index].world_points,
+            updated.centers_world()[0, index],
+        )
+    torch.testing.assert_close(
+        by_frame[1].relative_pose,
+        torch.linalg.inv(updated.poses_c2w[0, 1]) @ updated.poses_c2w[0, 0],
+    )
+    torch.testing.assert_close(
+        by_frame[2].relative_pose,
+        torch.linalg.inv(updated.poses_c2w[0, 2]) @ updated.poses_c2w[0, 1],
+    )
+    assert all(output.tracking_status == "tracked_spherical_selfi_stage2_ba" for output in outputs)
 
 
 def test_window_scheduler_has_exact_one_frame_overlap_and_partial_flush(tmp_path: Path) -> None:

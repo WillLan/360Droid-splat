@@ -3,8 +3,22 @@ base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric.yaml
 SphericalSelfiRuntime:
   local_ba:
     enabled: false
-    iterations: 3
+    iterations: 5
     damping: 1.0e-4
+    solver_mode: standard_lm
+    lm_max_trials: 6
+    lm_acceptance_eta: 1.0e-4
+    lm_damping_min: 1.0e-8
+    lm_damping_max: 1.0e8
+    lm_diagonal_floor: 1.0e-6
+    jacobian_mode: analytic
+    validate_analytic_jacobian: false
+    analytic_jacobian_atol: 1.0e-5
+    analytic_jacobian_rtol: 1.0e-4
+    pose_update_side: right
+    pose_dof_mode: se3
+    gauge_mode: initial_baseline
+    dense_depth_mode: affine
     huber_delta_deg: 0.5
     pose_prior_weight: 1.0e-3
     depth_prior_weight: 1.0e-2
@@ -16,6 +30,10 @@ SphericalSelfiRuntime:
     min_affine_support: 64
     min_depth: 0.05
     max_depth: 20.0
+    gradient_tolerance: 1.0e-8
+    step_tolerance: 1.0e-8
+    relative_objective_tolerance: 1.0e-6
+    affine_min_relative_improvement: 1.0e-3
     matching:
       type: adapter
       num_queries: 1024
@@ -41,4 +59,3 @@ WeightsAndBiases:
 Visualization:
   enabled: true
   save_local: true
-
