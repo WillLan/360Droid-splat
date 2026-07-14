@@ -71,6 +71,18 @@
   concurrent head-training queue. Keep this to at most 2 concurrent groups
   such as one `sky_only` group and one `matching_only` group.
 - CPU and system memory are the primary safety constraints. Monitor CPU load, RAM, and swap while experiments are running. If the server is under heavy CPU load, close to memory pressure, or swap begins growing, pause launching new runs and report the status.
+- A user may explicitly authorize a forced launch after the current CPU, RAM,
+  swap, target-GPU usage, and conflicting process status have been reported.
+  In this override mode, run at most one project experiment group at a time,
+  queue that group's jobs sequentially on the selected GPU, and set
+  `OMP_NUM_THREADS=2`, `MKL_NUM_THREADS=2`, `OPENBLAS_NUM_THREADS=2`, and
+  `NUMEXPR_NUM_THREADS=2`.
+- A forced-launch experiment must run with a 15-second resource monitor. Stop
+  only this project's process group if available system memory falls below
+  80 GiB or if `/proc/vmstat` reports increasing swap-in/swap-out activity for
+  two consecutive samples. Send `SIGINT`, wait up to 10 seconds, then send
+  `SIGTERM` if the process group is still alive. Never stop or modify another
+  user's processes.
 - Avoid commands or job layouts that can occupy excessive CPU/RAM and make the server unresponsive or prevent SSH login, even if GPU memory appears available.
 - Preserve existing experiment outputs. Do not delete or overwrite result directories unless the user explicitly asks.
 
