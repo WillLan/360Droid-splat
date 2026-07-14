@@ -659,6 +659,9 @@ def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() 
     )(poses_initial.unsqueeze(0), depth.unsqueeze(0), cache)
     assert bool(right_output.accepted[0])
     assert right_output.diagnostics[0]["final_objective"] < right_output.diagnostics[0]["initial_objective"]
+    assert right_output.diagnostics[0]["published_pose_updated"]
+    assert max(right_output.diagnostics[0]["published_pose_twist_norms"][1:]) > 0.0
+    assert max(right_output.diagnostics[0]["published_translation_update_norms"][1:]) > 0.0
     right_baseline = (right_output.poses_c2w[0, 1, :3, 3] - right_output.poses_c2w[0, 0, :3, 3]).norm()
     torch.testing.assert_close(right_baseline, initial_baseline, atol=2e-6, rtol=0.0)
 

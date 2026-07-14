@@ -2721,6 +2721,15 @@ class PanoDroidGSSlamSystem:
                     pose_step_norms = finite_sequence(ba_diagnostic.get("pose_step_norms"))
                     depth_step_norms = finite_sequence(ba_diagnostic.get("depth_step_norms"))
                     trial_gain_ratios = finite_sequence(ba_diagnostic.get("trial_gain_ratios"))
+                    published_pose_twist_norms = finite_sequence(
+                        ba_diagnostic.get("published_pose_twist_norms")
+                    )
+                    published_translation_update_norms = finite_sequence(
+                        ba_diagnostic.get("published_translation_update_norms")
+                    )
+                    published_rotation_update_deg = finite_sequence(
+                        ba_diagnostic.get("published_rotation_update_deg")
+                    )
                     affine_accepted = ba_diagnostic.get("depth_affine_accepted") or []
 
                     record = {
@@ -2753,6 +2762,14 @@ class PanoDroidGSSlamSystem:
                         "pose_step_norms": pose_step_norms,
                         "depth_step_norms": depth_step_norms,
                         "trial_gain_ratios": trial_gain_ratios,
+                        "published_pose_updated": bool(
+                            ba_diagnostic.get("published_pose_updated", False)
+                        ),
+                        "published_pose_twist_norms": published_pose_twist_norms,
+                        "published_translation_update_norms": (
+                            published_translation_update_norms
+                        ),
+                        "published_rotation_update_deg": published_rotation_update_deg,
                         "depth_affine_accepted": [bool(value) for value in affine_accepted],
                     }
                     local_ba_window_records.append(record)
@@ -2766,6 +2783,9 @@ class PanoDroidGSSlamSystem:
                         "local_ba/affine_accepted_frames": int(
                             sum(record["depth_affine_accepted"])
                         ),
+                        "local_ba/published_pose_updated": int(
+                            record["published_pose_updated"]
+                        ),
                     }
                     optional_scalars = {
                         "local_ba/max_factor_jacobian_norm": record["max_factor_jacobian_norm"],
@@ -2776,6 +2796,21 @@ class PanoDroidGSSlamSystem:
                         "local_ba/depth_step_norm": max(depth_step_norms) if depth_step_norms else None,
                         "local_ba/lm_gain_ratio": (
                             float(np.mean(trial_gain_ratios)) if trial_gain_ratios else None
+                        ),
+                        "local_ba/published_pose_twist_norm_max": (
+                            max(published_pose_twist_norms[1:])
+                            if len(published_pose_twist_norms) > 1
+                            else None
+                        ),
+                        "local_ba/published_translation_update_max": (
+                            max(published_translation_update_norms[1:])
+                            if len(published_translation_update_norms) > 1
+                            else None
+                        ),
+                        "local_ba/published_rotation_update_deg_max": (
+                            max(published_rotation_update_deg[1:])
+                            if len(published_rotation_update_deg) > 1
+                            else None
                         ),
                     }
                     local_ba_payload.update(

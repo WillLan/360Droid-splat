@@ -1634,6 +1634,22 @@ class BlockSparseSphericalBA:
         if not accepted:
             cur_pose = poses
             cur_log = log0
+        published_relative_pose = torch.linalg.inv(poses) @ cur_pose
+        published_pose_twist = sim3_log(published_relative_pose)[..., :6]
+        published_translation_update = (
+            cur_pose[:, :3, 3] - poses[:, :3, 3]
+        ).norm(dim=-1)
+        published_rotation_cosine = (
+            published_relative_pose[:, :3, :3].diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            - 1.0
+        ) * 0.5
+        published_rotation_update_deg = torch.rad2deg(
+            torch.acos(published_rotation_cosine.clamp(-1.0, 1.0))
+        )
+        free_pose_twist = published_pose_twist[1:]
+        published_pose_updated = bool(accepted) and bool(free_pose_twist.numel()) and bool(
+            free_pose_twist.norm(dim=-1).max() > max(self.step_tolerance, 1.0e-8)
+        )
         optimized_depth = torch.exp(-cur_log).reshape(views, query_count)
         original_depth = source_depth.reshape(views, query_count)
         scales = torch.ones(views, device=device, dtype=torch.float32)
@@ -1736,6 +1752,10 @@ class BlockSparseSphericalBA:
             "gradient_norms": gradient_norms,
             "pose_step_norms": pose_step_norms,
             "depth_step_norms": depth_step_norms,
+            "published_pose_updated": published_pose_updated,
+            "published_pose_twist_norms": published_pose_twist.norm(dim=-1).detach().cpu().tolist(),
+            "published_translation_update_norms": published_translation_update.detach().cpu().tolist(),
+            "published_rotation_update_deg": published_rotation_update_deg.detach().cpu().tolist(),
             "trial_objectives": trial_objectives,
             "trial_dampings": trial_dampings,
             "trial_predicted_reductions": trial_predicted_reductions,
