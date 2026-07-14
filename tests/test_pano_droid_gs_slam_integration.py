@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -1766,6 +1767,79 @@ def test_system_runs_synthetic_smoke(tmp_path: Path):
     assert summary["anchors"] > 0
     assert (tmp_path / "summary.json").is_file()
     assert summary["keyframe_decisions_path"] is None
+
+
+def test_local_ba_diagnostics_are_saved_when_global_backend_is_disabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class DiagnosticFrontend:
+        def __init__(self) -> None:
+            self.pending = [
+                {
+                    "window_id": 0,
+                    "frame_ids": (0, 1, 2, 3),
+                    "matcher": "adapter",
+                    "accepted": True,
+                    "num_factors": 512,
+                    "initial_median_residual_deg": 1.5,
+                    "final_median_residual_deg": 0.5,
+                    "matching_sec": 0.1,
+                    "ba_sec": 0.2,
+                    "ba_diagnostics": {
+                        "reason": "accepted",
+                        "accepted_steps": 2,
+                        "initial_objective": 4.0,
+                        "final_objective": 1.0,
+                        "published_pose_updated": True,
+                        "published_pose_twist_norms": [0.0, 0.01, 0.02, 0.03],
+                        "published_translation_update_norms": [0.0, 0.005, 0.01, 0.015],
+                        "published_rotation_update_deg": [0.0, 0.1, 0.2, 0.3],
+                    },
+                }
+            ]
+
+        def initialize(self, sequence_meta) -> None:
+            del sequence_meta
+
+        def track(self, frame) -> FrontendOutput:
+            return _small_frontend_output(int(frame.frame_id))
+
+        def consume_local_ba_diagnostics(self):
+            records, self.pending = self.pending, []
+            return records
+
+    monkeypatch.setattr(
+        "system.pano_droid_gs_slam.build_frontend_from_config",
+        lambda config: DiagnosticFrontend(),
+    )
+    cfg = {
+        "Dataset": {"synthetic": True, "synthetic_length": 1, "height": 4, "width": 8},
+        "Frontend": {"mode": "spherical_selfi_window"},
+        "SphericalSelfiGlobalBackend": {"enabled": False},
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "Mapping": {
+            "max_seeds_per_keyframe": 4,
+            "min_depth_confidence": 0.0,
+            "refine_steps_per_keyframe": 0,
+        },
+        "Renderer": {"allow_smoke_fallback": True},
+        "WeightsAndBiases": {"mode": "disabled"},
+        "Visualization": {"save_local": False},
+        "Results": {"save_dir": str(tmp_path)},
+    }
+    summary = PanoDroidGSSlamSystem(cfg).run(max_frames=1)
+    assert summary["local_ba"] == {
+        "windows": 1,
+        "accepted": 1,
+        "accepted_ratio": 1.0,
+        "mean_valid_factors": 512.0,
+        "mean_matching_sec": 0.1,
+        "mean_ba_sec": 0.2,
+    }
+    records = json.loads((tmp_path / "local_ba_windows.json").read_text(encoding="utf-8"))
+    assert records[0]["published_pose_updated"] is True
+    assert records[0]["published_pose_twist_norms"][-1] == 0.03
 
 
 def test_system_first_chunk_block_keyframe_keeps_all_init_frames(tmp_path: Path):

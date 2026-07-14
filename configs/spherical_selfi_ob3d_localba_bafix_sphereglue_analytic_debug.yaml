@@ -7,8 +7,8 @@ SphericalSelfiRuntime:
 
 WeightsAndBiases:
   group: ob3d-sponza-local-ba-bafix-debug
-  run_name: ob3d_sponza_localba_bafix_sphereglue_analytic_debug
-  tags: [spherical-selfi, ob3d, local-ba-debug, ba-fix, sphereglue-ba, analytic-jacobian, jacobian-validation, research-only]
+  run_name: ob3d_sponza_localba_bafix_sphereglue_poseverify_r2
+  tags: [spherical-selfi, ob3d, local-ba-debug, ba-fix, sphereglue-ba, analytic-jacobian, jacobian-validation, pose-update-validation, research-only]
 
 Results:
-  save_dir: outputs/ob3d_sponza_localba_bafix_sphereglue_analytic_debug
+  save_dir: outputs/ob3d_sponza_localba_bafix_sphereglue_poseverify_r2

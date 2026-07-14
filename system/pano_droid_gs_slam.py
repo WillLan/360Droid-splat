@@ -2638,43 +2638,42 @@ class PanoDroidGSSlamSystem:
                 pending_spherical_selfi_geometry_updates.pop(frame_id, None)
 
         def drain_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
-            if not spherical_selfi_global_enabled:
-                return
-            consume = getattr(self.frontend, "consume_local_gaussian_windows", None)
-            if not callable(consume):
-                raise RuntimeError(
-                    "SphericalSelfiGlobalBackend is enabled but the frontend does not expose "
-                    "consume_local_gaussian_windows()."
-                )
-            for packet in consume():
-                section_start = time.perf_counter()
-                result = self.spherical_selfi_global_backend.process_packet(packet)
-                elapsed = float(time.perf_counter() - section_start)
-                fusion_profile = {
-                    f"fusion_{key}": float(value)
-                    for key, value in result.fusion.items()
-                    if isinstance(value, (int, float)) and not isinstance(value, bool)
-                }
-                gpu_memory_mb = (
-                    float(torch.cuda.memory_allocated(self.map.get_xyz.device) / (1024.0 * 1024.0))
-                    if self.map.get_xyz.device.type == "cuda"
-                    else 0.0
-                )
-                write_profile(
-                    "backend_spherical_selfi_window",
-                    window_id=float(result.window_id),
-                    aligned=float(result.aligned),
-                    loops=float(result.loop_accepted),
-                    requested=float(result.fusion.get("requested", 0)),
-                    window_compacted=float(result.fusion.get("window_compacted", 0)),
-                    deduplicated=float(result.fusion.get("deduplicated", 0)),
-                    anchors_after=float(result.fusion.get("anchors_after", self.map.anchor_count())),
-                    moved=float(result.correction.get("moved", 0)),
-                    gpu_memory_mb=gpu_memory_mb,
-                    total_sec=elapsed,
-                    **fusion_profile,
-                )
-                wandb_payload = {
+            if spherical_selfi_global_enabled:
+                consume = getattr(self.frontend, "consume_local_gaussian_windows", None)
+                if not callable(consume):
+                    raise RuntimeError(
+                        "SphericalSelfiGlobalBackend is enabled but the frontend does not expose "
+                        "consume_local_gaussian_windows()."
+                    )
+                for packet in consume():
+                    section_start = time.perf_counter()
+                    result = self.spherical_selfi_global_backend.process_packet(packet)
+                    elapsed = float(time.perf_counter() - section_start)
+                    fusion_profile = {
+                        f"fusion_{key}": float(value)
+                        for key, value in result.fusion.items()
+                        if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    }
+                    gpu_memory_mb = (
+                        float(torch.cuda.memory_allocated(self.map.get_xyz.device) / (1024.0 * 1024.0))
+                        if self.map.get_xyz.device.type == "cuda"
+                        else 0.0
+                    )
+                    write_profile(
+                        "backend_spherical_selfi_window",
+                        window_id=float(result.window_id),
+                        aligned=float(result.aligned),
+                        loops=float(result.loop_accepted),
+                        requested=float(result.fusion.get("requested", 0)),
+                        window_compacted=float(result.fusion.get("window_compacted", 0)),
+                        deduplicated=float(result.fusion.get("deduplicated", 0)),
+                        anchors_after=float(result.fusion.get("anchors_after", self.map.anchor_count())),
+                        moved=float(result.correction.get("moved", 0)),
+                        gpu_memory_mb=gpu_memory_mb,
+                        total_sec=elapsed,
+                        **fusion_profile,
+                    )
+                    wandb_payload = {
                         "backend/selfi_window_id": int(result.window_id),
                         "backend/selfi_loop_accepted": int(result.loop_accepted),
                         "backend/selfi_window_compacted": int(result.fusion.get("window_compacted", 0)),
@@ -2687,17 +2686,17 @@ class PanoDroidGSSlamSystem:
                         "backend/selfi_map_saturated": int(result.fusion.get("map_saturated", 0)),
                         "backend/selfi_gpu_memory_mb": gpu_memory_mb,
                     }
-                wandb_payload.update(
-                    {
-                        f"backend/selfi_{key}": float(value)
-                        for key, value in result.fusion.items()
-                        if isinstance(value, (int, float)) and not isinstance(value, bool)
-                    }
-                )
-                logger._log_wandb_payload(
-                    wandb_payload,
-                    step=max(1, int(logger._step) + 1),
-                )
+                    wandb_payload.update(
+                        {
+                            f"backend/selfi_{key}": float(value)
+                            for key, value in result.fusion.items()
+                            if isinstance(value, (int, float)) and not isinstance(value, bool)
+                        }
+                    )
+                    logger._log_wandb_payload(
+                        wandb_payload,
+                        step=max(1, int(logger._step) + 1),
+                    )
             consume_ba = getattr(self.frontend, "consume_local_ba_diagnostics", None)
             if callable(consume_ba):
                 for diagnostic in consume_ba():
@@ -2828,11 +2827,14 @@ class PanoDroidGSSlamSystem:
                         local_ba_payload,
                         step=max(1, int(logger._step) + 1),
                     )
-            graph_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
-            # Historical observations must follow graph-loop corrections too;
-            # replacing only the not-yet-emitted FrontendOutput would leave the
-            # photometric replay cameras at stale poses.
-            apply_spherical_selfi_geometry_updates(graph_geometry_updates, outputs)
+            if spherical_selfi_global_enabled:
+                graph_geometry_updates = (
+                    self.spherical_selfi_global_backend.pop_frame_geometry_updates()
+                )
+                # Historical observations must follow graph-loop corrections too;
+                # replacing only the not-yet-emitted FrontendOutput would leave the
+                # photometric replay cameras at stale poses.
+                apply_spherical_selfi_geometry_updates(graph_geometry_updates, outputs)
 
         def optimize_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
             nonlocal last_feedforward_metrics
