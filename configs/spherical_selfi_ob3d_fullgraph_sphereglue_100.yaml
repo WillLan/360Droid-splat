@@ -25,8 +25,8 @@ SphericalSelfiRuntime:
 
 WeightsAndBiases:
   group: ob3d-sponza-fullgraph-ba-matcher-100
-  run_name: ob3d_sponza_fullgraph_jacfix_sphereglueba_100
-  tags: [spherical-selfi, ob3d, sponza, non-egocentric, full-system, graph-jacobian-fix, superpoint, sphereglue-ba, research-only, formal100]
+  run_name: ob3d_sponza_fullgraph_jacfix_sphereglueba_100_metricsfix
+  tags: [spherical-selfi, ob3d, sponza, non-egocentric, full-system, graph-jacobian-fix, superpoint, sphereglue-ba, research-only, formal100, metricsfix]
 
 Results:
-  save_dir: outputs/ob3d_sponza_fullgraph_jacfix_sphereglueba_100
+  save_dir: outputs/ob3d_sponza_fullgraph_jacfix_sphereglueba_100_metricsfix

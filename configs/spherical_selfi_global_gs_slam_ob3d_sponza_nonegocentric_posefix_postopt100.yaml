@@ -10,3 +10,4 @@ Visualization:
 
 Results:
   save_dir: outputs/spherical_selfi_global_ob3d_sponza_nonegocentric_posefix_voxel020_postopt100
+  render_final_all_frames: true
