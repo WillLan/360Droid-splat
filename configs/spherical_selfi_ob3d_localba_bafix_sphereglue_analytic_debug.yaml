@@ -1,0 +1,14 @@
+base_config: spherical_selfi_ob3d_localba_bafix_sphereglue_100.yaml
+
+SphericalSelfiRuntime:
+  local_ba:
+    jacobian_mode: analytic
+    validate_analytic_jacobian: true
+
+WeightsAndBiases:
+  group: ob3d-sponza-local-ba-bafix-debug
+  run_name: ob3d_sponza_localba_bafix_sphereglue_analytic_debug
+  tags: [spherical-selfi, ob3d, local-ba-debug, ba-fix, sphereglue-ba, analytic-jacobian, jacobian-validation, research-only]
+
+Results:
+  save_dir: outputs/ob3d_sponza_localba_bafix_sphereglue_analytic_debug
