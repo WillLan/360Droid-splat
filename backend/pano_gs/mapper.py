@@ -1395,7 +1395,7 @@ class PanoGaussianMapper:
             {
                 "gaussian_scope": "owner_window_visible",
                 "active_owner_window_id": int(window_id),
-                "pose_refine_enable": True,
+                "pose_refine_enable": bool(cfg.get("pose_refine_enable", True)),
                 "random_observation_per_iter": True,
                 "sample_observations_per_step": 1,
                 "sampler": "shuffled_cycle",

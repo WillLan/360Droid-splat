@@ -17,7 +17,11 @@ from frontend.pano_vggt.matching_adapter import (
     load_matching_sky_checkpoint,
     run_matching_sky_head,
 )
-from models.spherical_selfi_stage3_ba import BlockSparseSphericalBA, build_stage3_match_cache
+from models.spherical_selfi_stage3_ba import (
+    BlockSparseSphericalBA,
+    Stage3MatchCache,
+    build_stage3_match_cache,
+)
 from models.sphereglue_local_ba import SphereGlueLocalBAMatcher
 from models.spherical_selfi_gaussian_head import erp_bilinear_resize
 from training.train_spherical_selfi_gaussian_head import (
@@ -27,7 +31,7 @@ from training.train_spherical_selfi_gaussian_head import (
     load_stage2_checkpoint,
 )
 
-from .window_packet import LocalGaussianWindowPacket, LocalGaussianWindowQueue
+from .window_packet import BoundaryMatchBlock, LocalGaussianWindowPacket, LocalGaussianWindowQueue
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -42,6 +46,65 @@ def _finite_optional_float(value: Any) -> float | None:
         return None
     scalar = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
     return scalar if math.isfinite(scalar) else None
+
+
+def _boundary_matches_from_cache(
+    cache: Stage3MatchCache | None,
+    image_size: tuple[int, int],
+) -> BoundaryMatchBlock | None:
+    """Extract first/last matches and canonicalize both directions."""
+
+    if cache is None or cache.batch_size != 1 or cache.num_views < 2:
+        return None
+    last = cache.num_views - 1
+    height, width = (int(value) for value in image_size)
+    entropy_scale = max(math.log(max(2, height * width)), 1.0e-8)
+    values: dict[str, list[torch.Tensor]] = {
+        "source_uv": [],
+        "target_uv": [],
+        "source_bearing": [],
+        "target_bearing": [],
+        "top1_cosine": [],
+        "top2_margin": [],
+        "normalized_entropy": [],
+    }
+    for edge_index, pair in enumerate(cache.edges.detach().cpu().tolist()):
+        source_index, target_index = int(pair[0]), int(pair[1])
+        if (source_index, target_index) not in {(0, last), (last, 0)}:
+            continue
+        keep = cache.valid_mask[0, edge_index].bool()
+        if not bool(keep.any()):
+            continue
+        if source_index == 0:
+            source_uv = cache.source_uv[0, 0, keep]
+            target_uv = cache.target_uv[0, edge_index, keep]
+            source_bearing = cache.source_ray[0, 0, keep]
+            target_bearing = cache.target_ray[0, edge_index, keep]
+        else:
+            # Reverse queries are last->first. Swap them into the canonical
+            # first->last direction before publishing the private packet.
+            source_uv = cache.target_uv[0, edge_index, keep]
+            target_uv = cache.source_uv[0, last, keep]
+            source_bearing = cache.target_ray[0, edge_index, keep]
+            target_bearing = cache.source_ray[0, last, keep]
+        values["source_uv"].append(source_uv)
+        values["target_uv"].append(target_uv)
+        values["source_bearing"].append(source_bearing)
+        values["target_bearing"].append(target_bearing)
+        values["top1_cosine"].append(cache.top1_cosine[0, edge_index, keep])
+        values["top2_margin"].append(cache.top2_margin[0, edge_index, keep])
+        values["normalized_entropy"].append(
+            (cache.entropy[0, edge_index, keep] / entropy_scale).clamp(0.0, 1.0)
+        )
+    if not values["source_uv"]:
+        return None
+    with torch.inference_mode(False):
+        return BoundaryMatchBlock(
+            **{
+                name: torch.cat(parts, dim=0).detach().clone()
+                for name, parts in values.items()
+            }
+        )
 
 
 class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
@@ -424,6 +487,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             latitude_bands=self.latitude_bands,
             sky_prob=sky_prob,
             sky_threshold=self.sky_threshold,
+            boundary_matches=_boundary_matches_from_cache(
+                match_cache, observation.image_size
+            ),
             match_quality=match_quality,
             metadata={
                 "local_ba_enabled": self.local_ba_enabled,

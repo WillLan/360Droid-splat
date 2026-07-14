@@ -8,7 +8,6 @@ from typing import Any, Iterable
 
 import torch
 
-from frontend.pano_droid.spherical_ba import so3_exp
 from geometry.sim3 import (
     apply_sim3,
     sim3_components,
@@ -83,6 +82,9 @@ class Sim3GraphOptimizeResult:
     reason: str
     pcg_iterations: int = 0
     pcg_relative_residual: float = 0.0
+    final_damping: float = 0.0
+    gain_ratio: float = 0.0
+    rejected_trials: int = 0
 
 
 def _so3_residual(rotation: torch.Tensor) -> torch.Tensor:
@@ -137,6 +139,11 @@ class GlobalSim3FactorGraph:
         max_translation_update: float = 1.0,
         max_rotation_update_deg: float = 10.0,
         max_log_scale_update: float = 0.25,
+        lm_max_trials: int = 6,
+        lm_acceptance_eta: float = 1.0e-4,
+        lm_damping_min: float = 1.0e-8,
+        lm_damping_max: float = 1.0e8,
+        lm_diagonal_floor: float = 1.0e-6,
     ) -> None:
         self.nodes: dict[int, torch.Tensor] = {}
         self.edges: list[GraphFactor] = []
@@ -147,13 +154,19 @@ class GlobalSim3FactorGraph:
         self.max_translation_update = float(max_translation_update)
         self.max_rotation_update = math.radians(float(max_rotation_update_deg))
         self.max_log_scale_update = float(max_log_scale_update)
+        self.lm_max_trials = max(1, int(lm_max_trials))
+        self.lm_acceptance_eta = float(lm_acceptance_eta)
+        self.lm_damping_min = float(lm_damping_min)
+        self.lm_damping_max = float(lm_damping_max)
+        self.lm_diagonal_floor = float(lm_diagonal_floor)
         self.fixed_node_id: int | None = None
         self._last_pcg_iterations = 0
         self._last_pcg_relative_residual = 0.0
 
     def add_node(self, node_id: int, transform_anchor_to_global: torch.Tensor) -> None:
         node = int(node_id)
-        value = transform_anchor_to_global.detach().clone().float()
+        with torch.inference_mode(False):
+            value = transform_anchor_to_global.detach().clone().float()
         if value.shape != (4, 4) or not bool(torch.isfinite(value).all()):
             raise ValueError("Sim(3) graph node must be a finite 4x4 transform")
         scale, rotation, _ = sim3_components(value)
@@ -182,6 +195,12 @@ class GlobalSim3FactorGraph:
                     raise ValueError("Dense spherical depth/weight arrays must share correspondence count")
             if edge.source_local_pose.shape != (4, 4) or edge.target_local_pose.shape != (4, 4):
                 raise ValueError("Dense spherical local poses must be 4x4")
+        # Materialize all factor constants as ordinary tensors. This keeps the
+        # graph independent from the frontend's inference-mode tensor lifetime.
+        with torch.inference_mode(False):
+            for name, value in vars(edge).items():
+                if torch.is_tensor(value):
+                    setattr(edge, name, value.detach().clone())
         self.edges.append(edge)
 
     def transform(self, node_id: int) -> torch.Tensor:
@@ -339,17 +358,24 @@ class GlobalSim3FactorGraph:
         linearized: list[tuple[list[int], list[torch.Tensor], torch.Tensor]],
         trainable_ids: list[int],
         gradient: torch.Tensor,
+        damping: float | None = None,
     ) -> torch.Tensor:
         count = len(trainable_ids)
         id_to_slot = {node_id: idx for idx, node_id in enumerate(trainable_ids)}
-        block_diag = torch.eye(7, device=gradient.device, dtype=gradient.dtype).repeat(count, 1, 1) * self.damping
+        lm_damping = self.damping if damping is None else float(damping)
+        normal_diag = torch.zeros(count, 7, device=gradient.device, dtype=gradient.dtype)
+        block_diag = torch.zeros(count, 7, 7, device=gradient.device, dtype=gradient.dtype)
         for ids, blocks, _ in linearized:
             for node_id, jacobian in zip(ids, blocks):
                 slot = id_to_slot[node_id]
-                block_diag[slot] += jacobian.T @ jacobian
+                normal = jacobian.T @ jacobian
+                block_diag[slot] += normal
+                normal_diag[slot] += normal.diagonal()
+        damping_diag = normal_diag.clamp_min(self.lm_diagonal_floor)
+        block_diag += torch.diag_embed(lm_damping * damping_diag)
 
         def matvec(vector: torch.Tensor) -> torch.Tensor:
-            value = self.damping * vector
+            value = lm_damping * damping_diag * vector
             for ids, blocks, _ in linearized:
                 projected = None
                 for node_id, jacobian in zip(ids, blocks):
@@ -393,17 +419,47 @@ class GlobalSim3FactorGraph:
         self._last_pcg_relative_residual = float((residual.norm() / rhs_norm).detach().cpu())
         return solution
 
-    def optimize(self, active_node_ids: Iterable[int] | None = None) -> Sim3GraphOptimizeResult:
+    def optimize(
+        self,
+        active_node_ids: Iterable[int] | None = None,
+        *,
+        fixed_node_ids: Iterable[int] | None = None,
+    ) -> Sim3GraphOptimizeResult:
+        # Explicitly leave any caller inference context. Factor constants are
+        # ordinary cloned tensors, while jacfwd owns the local differentiable
+        # tangent variables used for each block linearization.
+        with torch.inference_mode(False), torch.enable_grad():
+            return self._optimize_impl(
+                active_node_ids,
+                fixed_node_ids=fixed_node_ids,
+            )
+
+    def _optimize_impl(
+        self,
+        active_node_ids: Iterable[int] | None,
+        *,
+        fixed_node_ids: Iterable[int] | None,
+    ) -> Sim3GraphOptimizeResult:
         if len(self.nodes) <= 1 or not self.edges:
             value = float(self.objective().detach().cpu())
-            return Sim3GraphOptimizeResult(False, 0, value, value, 0.0, (), "insufficient_graph")
+            return Sim3GraphOptimizeResult(
+                False, 0, value, value, 0.0, (), "insufficient_graph",
+                final_damping=float(self.damping),
+            )
         selected = set(self.nodes) if active_node_ids is None else {int(node) for node in active_node_ids}
         selected &= set(self.nodes)
-        trainable_ids = sorted(node for node in selected if node != self.fixed_node_id)
+        fixed = {int(node) for node in (fixed_node_ids or ())}
+        if self.fixed_node_id is not None:
+            fixed.add(int(self.fixed_node_id))
+        trainable_ids = sorted(node for node in selected if node not in fixed)
         if not trainable_ids:
             value = float(self.objective().detach().cpu())
-            return Sim3GraphOptimizeResult(False, 0, value, value, 0.0, (), "no_trainable_nodes")
+            return Sim3GraphOptimizeResult(
+                False, 0, value, value, 0.0, (), "no_trainable_nodes",
+                final_damping=float(self.damping),
+            )
 
+        snapshot = {node_id: self.nodes[node_id].clone() for node_id in trainable_ids}
         initial = float(self.objective().detach().cpu())
         last = initial
         accepted_any = False
@@ -411,24 +467,40 @@ class GlobalSim3FactorGraph:
         actual_iterations = 0
         termination_reason = "max_iterations"
         trainable = {node_id: idx for idx, node_id in enumerate(trainable_ids)}
+        damping = min(max(float(self.damping), self.lm_damping_min), self.lm_damping_max)
+        gain_ratio = 0.0
+        rejected_trials = 0
+
+        def failure(reason: str) -> Sim3GraphOptimizeResult:
+            self.nodes.update({node_id: value.clone() for node_id, value in snapshot.items()})
+            return Sim3GraphOptimizeResult(
+                False,
+                0,
+                initial,
+                initial,
+                0.0,
+                tuple(trainable_ids),
+                reason,
+                pcg_iterations=int(self._last_pcg_iterations),
+                pcg_relative_residual=float(self._last_pcg_relative_residual),
+                final_damping=float(damping),
+                gain_ratio=0.0,
+                rejected_trials=int(rejected_trials),
+            )
+
+        if not math.isfinite(initial):
+            return failure("non_finite_initial_objective")
 
         for iteration in range(self.max_iterations):
             linearized = []
             for edge in self.edges:
-                factor_linearization = self._linearize_factor(edge, trainable)
-                ids, blocks, residual = factor_linearization
+                ids, blocks, residual = self._linearize_factor(edge, trainable)
                 finite = bool(torch.isfinite(residual).all()) and all(
                     bool(torch.isfinite(block).all()) for block in blocks
                 )
                 if not finite:
-                    return Sim3GraphOptimizeResult(
-                        accepted_any,
-                        actual_iterations,
-                        initial,
-                        last,
-                        max_update,
-                        tuple(trainable_ids),
-                        f"non_finite_linearization:{edge.edge_type}:{int(edge.source)}->{int(edge.target)}",
+                    return failure(
+                        f"non_finite_linearization:{edge.edge_type}:{int(edge.source)}->{int(edge.target)}"
                     )
                 linearized.append((ids, blocks, residual))
             gradient = next(iter(self.nodes.values())).new_zeros(len(trainable_ids), 7)
@@ -436,48 +508,79 @@ class GlobalSim3FactorGraph:
                 for node_id, jacobian in zip(ids, blocks):
                     gradient[trainable[node_id]] += jacobian.T @ residual
             if not bool(torch.isfinite(gradient).all()):
-                return Sim3GraphOptimizeResult(accepted_any, actual_iterations, initial, last, max_update, tuple(trainable_ids), "non_finite_gradient")
+                return failure("non_finite_gradient")
             if float(gradient.norm()) < 1.0e-9:
                 termination_reason = "converged_gradient"
                 break
-            update = self._pcg(linearized, trainable_ids, gradient)
-            if not bool(torch.isfinite(update).all()):
-                return Sim3GraphOptimizeResult(accepted_any, actual_iterations, initial, last, max_update, tuple(trainable_ids), "non_finite_step")
-
-            translation_norm = update[:, :3].norm(dim=-1).clamp_min(1.0e-8)
-            rotation_norm = update[:, 3:6].norm(dim=-1).clamp_min(1.0e-8)
-            update[:, :3] *= torch.minimum(
-                torch.ones_like(translation_norm),
-                translation_norm.new_tensor(self.max_translation_update) / translation_norm,
-            )[:, None]
-            update[:, 3:6] *= torch.minimum(
-                torch.ones_like(rotation_norm),
-                rotation_norm.new_tensor(self.max_rotation_update) / rotation_norm,
-            )[:, None]
-            update[:, 6].clamp_(-self.max_log_scale_update, self.max_log_scale_update)
-            max_update = max(max_update, float(update.norm(dim=-1).max().detach().cpu()))
-            if float(update.norm()) < 1.0e-9:
-                termination_reason = "converged_step"
-                break
 
             accepted = False
-            for step_scale in (1.0, 0.5, 0.25, 0.125):
+            for _ in range(self.lm_max_trials):
+                update = self._pcg(
+                    linearized,
+                    trainable_ids,
+                    gradient,
+                    damping=damping,
+                )
+                if not bool(torch.isfinite(update).all()):
+                    return failure("non_finite_step")
+                translation_norm = update[:, :3].norm(dim=-1).clamp_min(1.0e-8)
+                rotation_norm = update[:, 3:6].norm(dim=-1).clamp_min(1.0e-8)
+                update[:, :3] *= torch.minimum(
+                    torch.ones_like(translation_norm),
+                    translation_norm.new_tensor(self.max_translation_update) / translation_norm,
+                )[:, None]
+                update[:, 3:6] *= torch.minimum(
+                    torch.ones_like(rotation_norm),
+                    rotation_norm.new_tensor(self.max_rotation_update) / rotation_norm,
+                )[:, None]
+                update[:, 6].clamp_(-self.max_log_scale_update, self.max_log_scale_update)
+                update_norm = float(update.norm())
+                if update_norm < 1.0e-9:
+                    termination_reason = "converged_step"
+                    accepted = False
+                    break
                 proposal = {
-                    node_id: sim3_exp(step_scale * update[idx]) @ self.nodes[node_id]
+                    node_id: sim3_exp(update[idx]) @ self.nodes[node_id]
                     for idx, node_id in enumerate(trainable_ids)
                 }
                 objective = float(self.objective(node_overrides=proposal).detach().cpu())
-                if math.isfinite(objective) and objective < last - 1.0e-10:
-                    self.nodes.update({node_id: value.detach() for node_id, value in proposal.items()})
+                actual_reduction = last - objective
+                predicted_reduction = max(
+                    float((-0.5 * (gradient * update).sum()).detach().cpu()),
+                    1.0e-12,
+                )
+                trial_gain = actual_reduction / predicted_reduction
+                if (
+                    math.isfinite(objective)
+                    and actual_reduction > 1.0e-10
+                    and trial_gain >= self.lm_acceptance_eta
+                ):
+                    self.nodes.update(
+                        {node_id: value.detach() for node_id, value in proposal.items()}
+                    )
                     last = objective
+                    gain_ratio = float(trial_gain)
+                    max_update = max(
+                        max_update,
+                        float(update.norm(dim=-1).max().detach().cpu()),
+                    )
+                    damping = max(
+                        self.lm_damping_min,
+                        damping * max(1.0 / 3.0, 1.0 - (2.0 * trial_gain - 1.0) ** 3),
+                    )
                     accepted = True
                     accepted_any = True
                     actual_iterations = iteration + 1
                     break
+                rejected_trials += 1
+                damping = min(self.lm_damping_max, damping * 10.0)
+            if termination_reason == "converged_step":
+                break
             if not accepted:
-                termination_reason = "line_search_no_descent"
+                termination_reason = "lm_no_acceptable_step"
                 break
 
+        self.damping = float(damping)
         return Sim3GraphOptimizeResult(
             accepted_any,
             actual_iterations,
@@ -488,6 +591,9 @@ class GlobalSim3FactorGraph:
             "accepted" if accepted_any else termination_reason,
             pcg_iterations=int(self._last_pcg_iterations),
             pcg_relative_residual=float(self._last_pcg_relative_residual),
+            final_damping=float(damping),
+            gain_ratio=float(gain_ratio),
+            rejected_trials=int(rejected_trials),
         )
 
     def corrected_camera_poses(self, local_poses_by_node: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:

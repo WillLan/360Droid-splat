@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from geometry.sim3 import sim3_components, weighted_umeyama
+
 
 @dataclass
 class SimilarityTransform:
@@ -53,25 +55,18 @@ def _umeyama(
     *,
     allow_scale: bool,
 ) -> SimilarityTransform:
-    source = source.float()
-    target = target.float()
-    weights = weights.float().clamp_min(0.0)
-    weights = weights / weights.sum().clamp_min(1e-8)
-    src_mean = (weights[:, None] * source).sum(dim=0)
-    tgt_mean = (weights[:, None] * target).sum(dim=0)
-    src_c = source - src_mean
-    tgt_c = target - tgt_mean
-    cov = (weights[:, None] * src_c).T @ tgt_c
-    u, s, vh = torch.linalg.svd(cov)
-    rot = vh.T @ u.T
-    if torch.linalg.det(rot) < 0:
-        vh = vh.clone()
-        vh[-1] *= -1.0
-        rot = vh.T @ u.T
-    var_src = (weights * (src_c.square().sum(dim=1))).sum().clamp_min(1e-8)
-    scale = float(s.sum() / var_src) if allow_scale else 1.0
-    trans = tgt_mean - scale * (rot @ src_mean)
-    return SimilarityTransform(scale=scale, rotation=rot, translation=trans)
+    transform = weighted_umeyama(
+        source.float(),
+        target.float(),
+        weights.float(),
+        allow_scale=allow_scale,
+    )
+    scale, rotation, translation = sim3_components(transform)
+    return SimilarityTransform(
+        scale=float(scale.detach().cpu()),
+        rotation=rotation,
+        translation=translation,
+    )
 
 
 def _residual(transform: SimilarityTransform, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -90,6 +85,8 @@ class SubmapAligner:
         max_scale_change: float = 2.5,
         min_points: int = 32,
         return_rejected_transform: bool = False,
+        irls_iterations: int = 3,
+        huber_delta: float | None = None,
     ) -> None:
         mode = str(align_mode).lower()
         if mode not in {"sim3", "se3"}:
@@ -100,6 +97,8 @@ class SubmapAligner:
         self.max_scale_change = float(max_scale_change)
         self.min_points = int(min_points)
         self.return_rejected_transform = bool(return_rejected_transform)
+        self.irls_iterations = max(1, int(irls_iterations))
+        self.huber_delta = None if huber_delta is None else float(huber_delta)
 
     def align(
         self,
@@ -122,16 +121,32 @@ class SubmapAligner:
             return SimilarityTransform.identity(device=source.device, dtype=source.dtype)
 
         transform = _umeyama(source, target, weights, allow_scale=self.align_mode == "sim3")
+        gate = self.max_residual
+        for _ in range(self.irls_iterations):
+            dist = _residual(transform, source, target)
+            med = torch.quantile(dist.detach(), 0.5)
+            gate = max(self.max_residual, float(med * 2.5))
+            inliers = dist <= gate
+            if int(inliers.sum()) < self.min_points:
+                break
+            delta = (
+                max(float(self.huber_delta), 1.0e-8)
+                if self.huber_delta is not None
+                else max(float(med * 1.4826), 1.0e-6)
+            )
+            huber = torch.minimum(
+                torch.ones_like(dist[inliers]),
+                dist[inliers].new_tensor(delta) / dist[inliers].clamp_min(1.0e-8),
+            )
+            transform = _umeyama(
+                source[inliers],
+                target[inliers],
+                weights[inliers] * huber,
+                allow_scale=self.align_mode == "sim3",
+            )
         dist = _residual(transform, source, target)
-        med = torch.quantile(dist.detach(), 0.5)
-        gate = max(self.max_residual, float(med * 2.5))
         inliers = dist <= gate
         inlier_ratio = float(inliers.float().mean())
-        if int(inliers.sum()) >= self.min_points:
-            transform = _umeyama(source[inliers], target[inliers], weights[inliers], allow_scale=self.align_mode == "sim3")
-            dist = _residual(transform, source, target)
-            inliers = dist <= gate
-            inlier_ratio = float(inliers.float().mean())
 
         residual = float(dist[inliers].mean()) if bool(inliers.any()) else float(dist.mean())
         scale_ok = (1.0 / self.max_scale_change) <= float(transform.scale) <= self.max_scale_change

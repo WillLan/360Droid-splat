@@ -25,6 +25,7 @@ from frontend.pano_droid.interfaces import PanoFrame
 from frontend.spherical_selfi.panorama_loop import circular_yaw_shift, spherical_rotation_ransac
 from frontend.spherical_selfi.runtime import SphericalSelfiWindowFrontend
 from frontend.spherical_selfi.window_packet import (
+    BoundaryMatchBlock,
     LocalGaussianWindowPacket,
     build_panorama_retrieval_descriptor,
 )
@@ -464,6 +465,269 @@ def test_two_overlapping_windows_build_graph_and_global_map() -> None:
     assert abs(float(updates[2][0, 3]) - 0.2) < 2e-3
 
 
+def _boundary_backend(
+    gaussian_map: PanoGaussianMap,
+    *,
+    mapper=None,
+    start_nodes: int = 6,
+    interval_edges: int = 3,
+) -> SphericalSelfiGlobalBackend:
+    return SphericalSelfiGlobalBackend(
+        gaussian_map,
+        mapper=mapper,
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "boundary_frame",
+                "min_overlap_points": 8,
+                "max_overlap_points": 128,
+                "min_dense_factors": 8,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "forward_backward": False,
+                "allow_boundary_matching_fallback": True,
+                "allow_unaligned_fallback": False,
+                "optimization_start_nodes": start_nodes,
+                "optimization_interval_edges": interval_edges,
+                "active_nodes": 6,
+            },
+            "loop_closure": {
+                "exclude_recent_windows": 100,
+                "min_matches": 8,
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.25],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+
+def test_boundary_frame_graph_reuses_shared_node_and_uses_one_dense_factor_per_window() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    packet0 = _packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _packet(1, poses1, (1, 2), feature_by_frame=features)
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map)
+
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+
+    assert result.aligned
+    assert set(backend.graph.nodes) == {0, 1, 2}
+    assert backend.window_anchor_nodes == {0: 0, 1: 1}
+    assert len(backend.graph.edges) == 2
+    assert all(isinstance(factor, DenseSphericalFactorBlock) for factor in backend.graph.edges)
+    assert all(factor.edge_type == "boundary_dense_spherical" for factor in backend.graph.edges)
+    assert all(torch.equal(factor.factor_weight, torch.ones_like(factor.factor_weight)) for factor in backend.graph.edges)
+    geometry = backend.pop_frame_geometry_updates()
+    assert geometry[1].owner_window_id == geometry[1].depth_owner_window_id == 0
+    torch.testing.assert_close(geometry[1].pose_c2w, apply_sim3_to_c2w(backend.graph.transform(1), torch.eye(4)))
+
+
+def test_boundary_graph_waits_for_six_nodes_then_runs_recent_ba() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(6)}
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, start_nodes=6, interval_edges=3)
+    results = []
+    for window_id in range(5):
+        poses = torch.eye(4).repeat(2, 1, 1)
+        poses[0, 0, 3] = 0.1 * window_id
+        poses[1, 0, 3] = 0.1 * (window_id + 1)
+        if window_id == 4:
+            perturbed = backend.graph.transform(4).clone()
+            perturbed[0, 3] += 0.03
+            backend.graph.nodes[4] = perturbed
+        results.append(
+            backend.process_packet(
+                _packet(window_id, poses, (window_id, window_id + 1), feature_by_frame=features)
+            )
+        )
+
+    assert all(result.graph is None for result in results[:4])
+    assert results[4].graph is not None
+    assert results[4].diagnostics["global_ba_scheduled"]
+    assert len(backend.graph.nodes) == 6
+    assert results[4].graph.final_objective <= results[4].graph.initial_objective
+    assert 0 not in results[4].graph.optimized_node_ids
+
+
+def test_boundary_factor_ignores_confidence_and_hard_excludes_sky() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 0.1
+    packet = _packet(0, poses, (0, 1))
+    uv = packet.observation.source_uv.reshape(-1, 2)[:16].clone()
+    bearing = erp_pixel_to_unit_ray(uv, *packet.observation.image_size)
+    packet.boundary_matches = BoundaryMatchBlock(
+        source_uv=uv,
+        target_uv=uv.clone(),
+        source_bearing=bearing,
+        target_bearing=bearing.clone(),
+        top1_cosine=torch.ones(16),
+        top2_margin=torch.ones(16),
+        normalized_entropy=torch.zeros(16),
+    )
+    packet.observation = replace(
+        packet.observation,
+        confidence=torch.rand_like(packet.observation.confidence),
+    )
+    packet.sky_prob[0, 0, 0, 0, 0] = 1.0
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map)
+    factor, diagnostics = backend._boundary_factor(packet)
+
+    assert factor is not None
+    assert diagnostics["sky_rejected"] >= 1
+    assert factor.source_depth.numel() == 15
+    torch.testing.assert_close(factor.factor_weight, torch.ones_like(factor.factor_weight))
+
+
+def test_global_graph_materializes_inference_factors_and_descends() -> None:
+    graph = GlobalSim3FactorGraph(max_iterations=4)
+    graph.add_node(0, sim3_identity())
+    graph.add_node(
+        1,
+        sim3_from_components(1.0, torch.eye(3), torch.tensor([0.1, 0.0, 0.0])),
+    )
+    with torch.inference_mode():
+        bearing = torch.nn.functional.normalize(torch.randn(32, 3), dim=-1)
+        factor = DenseSphericalFactorBlock(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            source_bearing=bearing,
+            target_bearing=bearing,
+            source_depth=torch.full((32,), 2.0),
+            target_depth=torch.full((32,), 2.0),
+            factor_weight=torch.ones(32),
+        )
+    graph.add_edge(factor)
+    assert not graph.edges[0].source_bearing.is_inference()
+    result = graph.optimize()
+    assert result.accepted
+    assert result.final_objective < result.initial_objective
+
+
+def test_shared_umeyama_rescales_all_new_chunk_geometry() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.15
+    packet0 = _packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _packet(1, poses1, (1, 2), feature_by_frame=features)
+    packet1.observation = packet1.observation.with_geometry(
+        refined_depth=torch.ones_like(packet1.observation.refined_depth)
+    )
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map)
+
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+
+    scale = float(result.diagnostics["alignment"]["chunk_scale_normalization"])
+    assert abs(scale - 2.0) < 2.0e-3
+    assert abs(float(packet1.local_poses_c2w[-1, 0, 3]) - 0.1) < 2.0e-3
+    torch.testing.assert_close(
+        packet1.observation.refined_depth,
+        torch.full_like(packet1.observation.refined_depth, 2.0),
+        atol=2.0e-3,
+        rtol=2.0e-3,
+    )
+    _, _, end_translation = sim3_components(backend.graph.transform(2))
+    assert abs(float(end_translation[0]) - 0.2) < 3.0e-3
+    geometry = backend.pop_frame_geometry_updates()
+    assert abs(float(geometry[2].depth_scale) - 2.0) < 2.0e-3
+    # The shared frame remains owned by the previous window and therefore is
+    # not rescaled a second time by the new chunk's local normalization.
+    assert abs(float(geometry[1].depth_scale) - 1.0) < 2.0e-3
+
+
+def test_boundary_map_optimization_freezes_all_pose_parameters() -> None:
+    packet = _packet(0, torch.eye(4).repeat(2, 1, 1), (0, 1))
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.settings = None
+            self.extra_loss_fn = "unset"
+            self.commits = 0
+
+        def set_spherical_selfi_observation_geometry(self, *args, **kwargs) -> None:
+            return None
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_window(self, *, settings, extra_loss_fn, **kwargs):
+            self.settings = dict(settings)
+            self.extra_loss_fn = extra_loss_fn
+            return {"steps": 3.0, "window_rollback": 0.0}
+
+        def commit_spherical_selfi_window(self) -> None:
+            self.commits += 1
+
+        def rollback_spherical_selfi_window(self) -> None:
+            raise AssertionError("map-only optimization should not roll back")
+
+    mapper = _Mapper()
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, mapper=mapper)
+    backend.graph.add_node(0, sim3_identity())
+    backend.window_anchor_nodes[0] = 0
+    backend.window_order = [0]
+    backend.packets[0] = packet.compact_for_memory()
+    backend._optimization_packets[0] = packet
+
+    metrics = backend._run_map_optimization(0, packet.frame_ids, 3)
+
+    assert metrics["pose_refine_enabled"] == 0.0
+    assert mapper.settings["pose_lr"] == 0.0
+    assert mapper.settings["pose_refine_enable"] is False
+    assert mapper.extra_loss_fn is None
+    assert mapper.commits == 1
+
+
+def test_global_graph_rolls_back_transaction_on_non_finite_factor() -> None:
+    graph = GlobalSim3FactorGraph(max_iterations=3)
+    graph.add_node(0, sim3_identity())
+    initial = sim3_from_components(1.0, torch.eye(3), torch.tensor([0.1, 0.0, 0.0]))
+    graph.add_node(1, initial)
+    graph.add_edge(
+        DenseSphericalFactorBlock(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            source_bearing=torch.tensor([[float("nan"), 0.0, 1.0]]),
+            target_bearing=torch.tensor([[0.0, 0.0, 1.0]]),
+            source_depth=torch.ones(1),
+            target_depth=torch.ones(1),
+            factor_weight=torch.ones(1),
+        )
+    )
+
+    result = graph.optimize()
+
+    assert not result.accepted
+    assert result.reason == "non_finite_initial_objective"
+    torch.testing.assert_close(graph.transform(1), initial)
+
+
 def test_joint_pose_sync_rebases_scale_and_updates_both_overlap_packets() -> None:
     poses0 = torch.eye(4).repeat(2, 1, 1)
     poses0[1, 0, 3] = 2.0
@@ -715,8 +979,11 @@ def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) 
     for frame_id in range(3):
         frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
     frontend.pop_ready_outputs()
-    frontend.consume_local_gaussian_windows()
+    packets = frontend.consume_local_gaussian_windows()
     diagnostics = frontend.consume_local_ba_diagnostics()
+    assert len(packets) == 1
+    assert packets[0].boundary_matches is not None
+    assert packets[0].boundary_matches.count > 0
     assert len(diagnostics) == 1
     assert diagnostics[0]["matcher"] == "adapter"
     assert diagnostics[0]["num_factors"] > 0

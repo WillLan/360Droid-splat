@@ -128,6 +128,54 @@ def _verification_features(features: torch.Tensor, size: tuple[int, int] | None)
 
 
 @dataclass
+class BoundaryMatchBlock:
+    """Compact first-to-last adapter correspondences for one local window.
+
+    All correspondences use the canonical first-frame -> last-frame direction.
+    Reverse adapter queries are swapped into that direction before entering the
+    packet.  Network scores remain diagnostics/hard-gate inputs; they are never
+    used as continuous global-BA weights.
+    """
+
+    source_uv: torch.Tensor  # Nx2, first-frame ERP pixels
+    target_uv: torch.Tensor  # Nx2, last-frame ERP pixels
+    source_bearing: torch.Tensor  # Nx3
+    target_bearing: torch.Tensor  # Nx3
+    top1_cosine: torch.Tensor  # N
+    top2_margin: torch.Tensor  # N
+    normalized_entropy: torch.Tensor  # N, normalized to [0, 1]
+
+    def __post_init__(self) -> None:
+        count = int(self.source_uv.shape[0])
+        if tuple(self.source_uv.shape) != (count, 2) or tuple(self.target_uv.shape) != (count, 2):
+            raise ValueError("Boundary match UV arrays must have shape Nx2")
+        if tuple(self.source_bearing.shape) != (count, 3) or tuple(self.target_bearing.shape) != (count, 3):
+            raise ValueError("Boundary match bearings must have shape Nx3")
+        for name in ("top1_cosine", "top2_margin", "normalized_entropy"):
+            if tuple(getattr(self, name).shape) != (count,):
+                raise ValueError(f"Boundary match {name} must have shape N")
+
+    @property
+    def count(self) -> int:
+        return int(self.source_uv.shape[0])
+
+    def detached_clone(self, *, device: torch.device | str | None = None) -> "BoundaryMatchBlock":
+        def clone(value: torch.Tensor) -> torch.Tensor:
+            result = value.detach().clone()
+            return result if device is None else result.to(device)
+
+        return BoundaryMatchBlock(
+            source_uv=clone(self.source_uv),
+            target_uv=clone(self.target_uv),
+            source_bearing=clone(self.source_bearing),
+            target_bearing=clone(self.target_bearing),
+            top1_cosine=clone(self.top1_cosine),
+            top2_margin=clone(self.top2_margin),
+            normalized_entropy=clone(self.normalized_entropy),
+        )
+
+
+@dataclass
 class LocalGaussianWindowPacket:
     window_id: int
     anchor_frame_id: int
@@ -143,6 +191,7 @@ class LocalGaussianWindowPacket:
     sky_mask: torch.Tensor
     static_mask: torch.Tensor
     geometry_consistency: torch.Tensor
+    boundary_matches: BoundaryMatchBlock | None = None
     match_quality: dict[str, torch.Tensor] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -181,6 +230,7 @@ class LocalGaussianWindowPacket:
         sky_threshold: float = 0.5,
         static_mask: torch.Tensor | None = None,
         geometry_consistency: torch.Tensor | None = None,
+        boundary_matches: BoundaryMatchBlock | None = None,
         match_quality: dict[str, torch.Tensor] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "LocalGaussianWindowPacket":
@@ -240,6 +290,7 @@ class LocalGaussianWindowPacket:
             sky_mask=sky,
             static_mask=static,
             geometry_consistency=consistent,
+            boundary_matches=boundary_matches,
             match_quality=dict(match_quality or {}),
             metadata=dict(metadata or {}),
         )
@@ -342,6 +393,11 @@ class LocalGaussianWindowPacket:
             sky_mask=compact_mask(self.sky_mask),
             static_mask=compact_mask(self.static_mask),
             geometry_consistency=compact_mask(self.geometry_consistency),
+            boundary_matches=(
+                None
+                if self.boundary_matches is None
+                else self.boundary_matches.detached_clone(device="cpu")
+            ),
             match_quality={key: value.detach().cpu() for key, value in self.match_quality.items()},
             metadata=dict(self.metadata),
         )

@@ -342,8 +342,6 @@ class PanoramaLoopDetector:
             target_valid=source.finite_gaussian_mask[0, source_frame_index].detach(),
             source_sky_probability=source.sky_prob[0, source_frame_index].detach(),
             target_sky_probability=source.sky_prob[0, source_frame_index].detach(),
-            source_confidence=source.observation.confidence[0, source_frame_index].detach(),
-            target_confidence=source.observation.confidence[0, source_frame_index].detach(),
             sky_threshold=self.sky_threshold,
             seed=seed,
         )
@@ -405,23 +403,10 @@ class PanoramaLoopDetector:
         target_sky = sample_erp_with_wrap(
             target.sky_prob[0, target_frame_index].detach().to(source_depth_map), target_uv
         )[..., 0].clamp(0.0, 1.0)
-        target_confidence = sample_erp_with_wrap(
-            target.observation.confidence[0, target_frame_index].detach().to(source_depth_map), target_uv
-        )[..., 0].clamp_min(0.0)
-        source_non_sky = (1.0 - queries.source_sky_probability).clamp(0.0, 1.0)
-        target_non_sky = (1.0 - target_sky).clamp(0.0, 1.0)
-        match_weight = (
-            ((cosine + 1.0) * 0.5)
-            * torch.sigmoid(margin)
-            * (1.0 - entropy).clamp(0.0, 1.0)
-        )
-        weight = (
-            match_weight
-            * queries.source_confidence
-            * target_confidence
-            * source_non_sky
-            * target_non_sky
-        )
+        # Adapter scores, depth validity and sky masks are hard gates only.
+        # Fibonacci already samples equal solid angle, so retained loop factors
+        # carry unit measurement weight.
+        weight = torch.ones_like(cosine)
         valid = (
             target_valid
             & forward_backward_valid
@@ -432,8 +417,6 @@ class PanoramaLoopDetector:
             & (cosine >= self.min_match_cosine)
             & (margin >= self.min_match_margin)
             & (entropy <= self.max_match_entropy)
-            & torch.isfinite(weight)
-            & (weight >= self.min_factor_weight)
         )
         return {
             "count": int(valid.sum().item()),

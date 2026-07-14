@@ -2679,13 +2679,39 @@ class PanoDroidGSSlamSystem:
                         "backend/selfi_window_compacted": int(result.fusion.get("window_compacted", 0)),
                         "backend/selfi_global_anchors": int(result.fusion.get("anchors_after", self.map.anchor_count())),
                         "backend/selfi_graph_objective": 0.0 if result.graph is None else float(result.graph.final_objective),
+                        "backend/selfi_graph_initial_objective": 0.0 if result.graph is None else float(result.graph.initial_objective),
+                        "backend/selfi_graph_objective_reduction": 0.0 if result.graph is None else float(result.graph.initial_objective - result.graph.final_objective),
                         "backend/selfi_graph_iterations": 0 if result.graph is None else int(result.graph.iterations),
                         "backend/selfi_graph_pcg_iterations": 0 if result.graph is None else int(result.graph.pcg_iterations),
                         "backend/selfi_graph_pcg_relative_residual": 0.0 if result.graph is None else float(result.graph.pcg_relative_residual),
                         "backend/selfi_graph_reason": "none" if result.graph is None else str(result.graph.reason),
+                        "backend/selfi_graph_final_damping": 0.0 if result.graph is None else float(result.graph.final_damping),
+                        "backend/selfi_graph_gain_ratio": 0.0 if result.graph is None else float(result.graph.gain_ratio),
+                        "backend/selfi_graph_rejected_trials": 0 if result.graph is None else int(result.graph.rejected_trials),
+                        "backend/selfi_global_ba_scheduled": int(bool(result.diagnostics.get("global_ba_scheduled", False))),
                         "backend/selfi_map_saturated": int(result.fusion.get("map_saturated", 0)),
                         "backend/selfi_gpu_memory_mb": gpu_memory_mb,
                     }
+                    alignment_diag = dict(result.diagnostics.get("alignment", {}) or {})
+                    boundary_diag = dict(result.diagnostics.get("boundary_factor", {}) or {})
+                    for metric_name, source_name in (
+                        ("chunk_scale_normalization", "chunk_scale_normalization"),
+                        ("canonical_rotation_mismatch_deg", "canonical_rotation_mismatch_deg"),
+                        ("canonical_translation_mismatch", "canonical_translation_mismatch"),
+                        ("overlap_residual", "overlap_residual"),
+                        ("overlap_inlier_ratio", "overlap_inlier_ratio"),
+                    ):
+                        value = alignment_diag.get(source_name)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            wandb_payload[f"backend/selfi_{metric_name}"] = float(value)
+                    for metric_name in (
+                        "raw_boundary_matches",
+                        "hard_gated_boundary_matches",
+                        "sky_rejected",
+                    ):
+                        value = boundary_diag.get(metric_name)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            wandb_payload[f"backend/selfi_{metric_name}"] = float(value)
                     wandb_payload.update(
                         {
                             f"backend/selfi_{key}": float(value)
