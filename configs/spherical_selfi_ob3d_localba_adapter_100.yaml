@@ -1,0 +1,16 @@
+base_config: spherical_selfi_ob3d_localba_isolated_base.yaml
+
+SphericalSelfiRuntime:
+  local_ba:
+    enabled: true
+    matching:
+      type: adapter
+      num_queries: 1024
+
+WeightsAndBiases:
+  run_name: ob3d_sponza_localba_isolated_adapter_100
+  tags: [spherical-selfi, ob3d, sponza, non-egocentric, local-ba-isolated, adapter-ba, formal100]
+
+Results:
+  save_dir: outputs/ob3d_sponza_localba_isolated_adapter_100
+

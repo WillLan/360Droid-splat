@@ -1,0 +1,44 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric.yaml
+
+SphericalSelfiRuntime:
+  local_ba:
+    enabled: false
+    iterations: 3
+    damping: 1.0e-4
+    huber_delta_deg: 0.5
+    pose_prior_weight: 1.0e-3
+    depth_prior_weight: 1.0e-2
+    max_pose_update_deg: 5.0
+    max_translation_update: 0.05
+    max_logdepth_update: 0.35
+    factor_chunk_size: 2048
+    min_factors: 256
+    min_affine_support: 64
+    min_depth: 0.05
+    max_depth: 20.0
+    matching:
+      type: adapter
+      num_queries: 1024
+      min_depth: 0.05
+      max_depth: 20.0
+      temperature: 0.07
+      query_chunk_size: 32
+      fibonacci_oversample_factor: 8
+      use_spherical_area_correction: true
+      forward_backward: true
+      fb_tolerance_deg: 1.0
+      min_factor_weight: 0.01
+
+SphericalSelfiGlobalBackend:
+  enabled: false
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  mode: online
+  group: ob3d-sponza-local-ba-matcher-100
+
+Visualization:
+  enabled: true
+  save_local: true
+

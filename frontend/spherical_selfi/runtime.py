@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -16,6 +18,7 @@ from frontend.pano_vggt.matching_adapter import (
     run_matching_sky_head,
 )
 from models.spherical_selfi_stage3_ba import BlockSparseSphericalBA, build_stage3_match_cache
+from models.sphereglue_local_ba import SphereGlueLocalBAMatcher
 from models.spherical_selfi_gaussian_head import erp_bilinear_resize
 from training.train_spherical_selfi_gaussian_head import (
     build_frozen_feature_stack,
@@ -32,6 +35,13 @@ def _device(value: str | torch.device) -> torch.device:
     if requested.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA device {requested} requested for spherical-Selfi runtime but CUDA is unavailable")
     return requested
+
+
+def _finite_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    scalar = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
+    return scalar if math.isfinite(scalar) else None
 
 
 class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
@@ -109,6 +119,20 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         local_ba = dict(runtime.get("local_ba", {}) or {})
         self.local_ba_enabled = bool(local_ba.get("enabled", False))
         self.local_ba_matching = dict(local_ba.get("matching", {}) or {})
+        self.local_ba_matcher_name = str(
+            self.local_ba_matching.get("type", "adapter")
+        ).strip().lower()
+        if self.local_ba_matcher_name not in {"adapter", "superpoint_sphereglue"}:
+            raise ValueError(
+                "SphericalSelfiRuntime.local_ba.matching.type must be "
+                "'adapter' or 'superpoint_sphereglue'."
+            )
+        self.sphereglue_local_ba_matcher = None
+        if self.local_ba_enabled and self.local_ba_matcher_name == "superpoint_sphereglue":
+            self.sphereglue_local_ba_matcher = SphereGlueLocalBAMatcher(
+                self.local_ba_matching,
+                device=self.head_device,
+            )
         self.local_ba = BlockSparseSphericalBA(
             iterations=int(local_ba.get("iterations", 3)),
             damping=float(local_ba.get("damping", 1.0e-4)),
@@ -134,6 +158,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.emitted_frame_ids: set[int] = set()
         self.sky_prob_by_frame: dict[int, torch.Tensor] = {}
         self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
+        self._local_ba_diagnostics: list[dict[str, Any]] = []
         self.last_processed_frame_id: int | None = None
 
     def initialize(self, sequence_meta: dict) -> None:
@@ -149,6 +174,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.emitted_frame_ids.clear()
         self.sky_prob_by_frame.clear()
         self.sky_mask_by_frame.clear()
+        self._local_ba_diagnostics.clear()
         self._local_gaussian_windows.clear()
         self.last_processed_frame_id = None
 
@@ -178,35 +204,68 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             tracking_status="pending_spherical_selfi_window",
         )
 
-    def _run_local_ba(self, observation, dense_features, static_valid_mask=None):
+    def _run_local_ba(
+        self,
+        observation,
+        dense_features,
+        images,
+        static_valid_mask=None,
+    ):
         if not self.local_ba_enabled:
-            return observation, None, None
+            return observation, None, None, 0.0, 0.0
         cfg = self.local_ba_matching
-        cache = build_stage3_match_cache(
-            dense_features,
-            observation.refined_depth,
-            num_queries=int(cfg.get("num_queries", 2048)),
-            min_depth=float(cfg.get("min_depth", 0.05)),
-            max_depth=float(cfg.get("max_depth", 20.0)),
-            temperature=float(cfg.get("temperature", 0.07)),
-            query_chunk_size=int(cfg.get("query_chunk_size", 32)),
-            fibonacci_oversample_factor=int(cfg.get("fibonacci_oversample_factor", 8)),
-            use_spherical_area_correction=bool(cfg.get("use_spherical_area_correction", True)),
-            forward_backward=bool(cfg.get("forward_backward", True)),
-            fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
-            min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
-            static_valid_mask=(
-                observation.valid_mask
-                if static_valid_mask is None
-                else observation.valid_mask & static_valid_mask.bool()
-            ),
+        combined_valid = (
+            observation.valid_mask
+            if static_valid_mask is None
+            else observation.valid_mask & static_valid_mask.bool()
         )
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        matching_start = time.perf_counter()
+        if self.local_ba_matcher_name == "superpoint_sphereglue":
+            if self.sphereglue_local_ba_matcher is None:
+                raise RuntimeError("SphereGlue local BA matcher was not initialized")
+            cache = self.sphereglue_local_ba_matcher.build_cache(
+                images,
+                observation.refined_depth,
+                static_valid_mask=combined_valid,
+            )
+        else:
+            fibonacci_seed = int(self.fibonacci_config.get("seed", 123)) + int(
+                self.window_index
+            )
+            generator = torch.Generator(device=self.head_device)
+            generator.manual_seed(fibonacci_seed)
+            cache = build_stage3_match_cache(
+                dense_features,
+                observation.refined_depth,
+                num_queries=int(cfg.get("num_queries", 2048)),
+                min_depth=float(cfg.get("min_depth", 0.05)),
+                max_depth=float(cfg.get("max_depth", 20.0)),
+                temperature=float(cfg.get("temperature", 0.07)),
+                query_chunk_size=int(cfg.get("query_chunk_size", 32)),
+                fibonacci_oversample_factor=int(cfg.get("fibonacci_oversample_factor", 8)),
+                use_spherical_area_correction=bool(cfg.get("use_spherical_area_correction", True)),
+                forward_backward=bool(cfg.get("forward_backward", True)),
+                fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
+                min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
+                static_valid_mask=combined_valid,
+                generator=generator,
+            )
+            cache.metadata["fibonacci_seed"] = fibonacci_seed
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        matching_sec = float(time.perf_counter() - matching_start)
+        ba_start = time.perf_counter()
         result = self.local_ba(observation.poses_c2w, observation.refined_depth, cache)
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        ba_sec = float(time.perf_counter() - ba_start)
         updated = observation.with_geometry(
             poses_c2w=result.poses_c2w,
             refined_depth=result.dense_depth,
         )
-        return updated, cache, result
+        return updated, cache, result, matching_sec, ba_sec
 
     def _run_window(self, frames: list[PanoFrame]) -> None:
         images = torch.stack([ensure_chw_image(frame.image).float() for frame in frames], dim=0).unsqueeze(0)
@@ -260,10 +319,54 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                         feature_sky.to(self.head_device),
                         observation.image_size,
                     ).reshape(1, views, 1, *observation.image_size)
+            initial_poses_c2w = observation.poses_c2w.detach().cpu().float().clone()
             ba_valid = None if sky_prob is None else sky_prob < self.sky_threshold
-            observation, match_cache, ba_result = self._run_local_ba(
-                observation, dense, static_valid_mask=ba_valid
+            observation, match_cache, ba_result, matching_sec, ba_sec = self._run_local_ba(
+                observation,
+                dense,
+                images,
+                static_valid_mask=ba_valid,
             )
+
+        gt_values = [
+            None
+            if frame.meta is None or frame.meta.get("gt_c2w") is None
+            else torch.as_tensor(frame.meta["gt_c2w"]).detach().cpu().float()
+            for frame in frames
+        ]
+        gt_poses_c2w = (
+            torch.stack([value for value in gt_values if value is not None], dim=0)
+            if all(value is not None for value in gt_values)
+            else None
+        )
+        self._local_ba_diagnostics.append(
+            {
+                "window_id": int(self.window_index),
+                "frame_ids": tuple(int(frame.frame_id) for frame in frames),
+                "matcher": (
+                    self.local_ba_matcher_name if self.local_ba_enabled else "none"
+                ),
+                "initial_poses_c2w": initial_poses_c2w[0],
+                "refined_poses_c2w": observation.poses_c2w[0].detach().cpu().float(),
+                "gt_poses_c2w": gt_poses_c2w,
+                "accepted": False if ba_result is None else bool(ba_result.accepted[0]),
+                "initial_median_residual_deg": (
+                    None
+                    if ba_result is None
+                    else _finite_optional_float(ba_result.initial_median_residual_deg[0])
+                ),
+                "final_median_residual_deg": (
+                    None
+                    if ba_result is None
+                    else _finite_optional_float(ba_result.final_median_residual_deg[0])
+                ),
+                "num_factors": 0 if match_cache is None else int(match_cache.num_factors),
+                "matching_sec": float(matching_sec),
+                "ba_sec": float(ba_sec),
+                "ba_diagnostics": None if ba_result is None else dict(ba_result.diagnostics[0]),
+                "matching_metadata": None if match_cache is None else dict(match_cache.metadata),
+            }
+        )
 
         match_quality = {}
         if match_cache is not None:
@@ -285,6 +388,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             match_quality=match_quality,
             metadata={
                 "local_ba_enabled": self.local_ba_enabled,
+                "local_ba_matcher": self.local_ba_matcher_name,
                 "local_ba_accepted": None if ba_result is None else bool(ba_result.accepted[0]),
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
                 "fibonacci": dict(self.fibonacci_config),
@@ -373,6 +477,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         outputs = list(self.ready_outputs)
         self.ready_outputs.clear()
         return outputs
+
+    def consume_local_ba_diagnostics(self) -> list[dict[str, Any]]:
+        diagnostics = list(self._local_ba_diagnostics)
+        self._local_ba_diagnostics.clear()
+        return diagnostics
 
     def sky_mask_for_frame(
         self,

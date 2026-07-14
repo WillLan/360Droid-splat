@@ -70,7 +70,6 @@ def sim3_exp(delta: torch.Tensor) -> torch.Tensor:
 def _so3_log(rotation: torch.Tensor) -> torch.Tensor:
     trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
     cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
-    theta = torch.acos(cos_theta)
     vee = torch.stack(
         [
             rotation[..., 2, 1] - rotation[..., 1, 2],
@@ -79,6 +78,13 @@ def _so3_log(rotation: torch.Tensor) -> torch.Tensor:
         ],
         dim=-1,
     )
+    # ``acos(cos_theta)`` has an infinite derivative at the identity.  The
+    # value is well-defined there, but reverse-mode differentiation through a
+    # zero-residual graph factor consequently produced NaN Jacobians.  For a
+    # proper rotation ``||vee(R-R^T)|| / 2 == |sin(theta)|``; atan2 therefore
+    # yields the same principal angle with a finite identity derivative.
+    sine_magnitude = 0.5 * torch.linalg.vector_norm(vee, dim=-1)
+    theta = torch.atan2(sine_magnitude, cos_theta)
     sin_theta = torch.sin(theta)
     regular = theta / (2.0 * sin_theta.clamp_min(1.0e-8))
     omega = regular[..., None] * vee

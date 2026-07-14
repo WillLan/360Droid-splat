@@ -115,6 +115,38 @@ def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
     torch.testing.assert_close(graph.transform(1), truth, atol=2e-4, rtol=2e-4)
 
 
+def test_sim3_log_identity_jacobians_are_finite() -> None:
+    zero = torch.zeros(7, dtype=torch.float64)
+
+    def log_after_update(delta: torch.Tensor) -> torch.Tensor:
+        return sim3_log(sim3_exp(delta))
+
+    for jacobian in (
+        torch.func.jacfwd(log_after_update)(zero),
+        torch.func.jacrev(log_after_update)(zero),
+    ):
+        assert torch.isfinite(jacobian).all()
+        torch.testing.assert_close(jacobian, torch.eye(7, dtype=zero.dtype), atol=2e-6, rtol=2e-6)
+
+
+def test_identity_graph_factor_linearization_is_finite() -> None:
+    graph = GlobalSim3FactorGraph(max_iterations=2)
+    graph.add_node(0, sim3_identity(dtype=torch.float64))
+    graph.add_node(1, sim3_identity(dtype=torch.float64))
+    factor = Sim3GraphEdge(
+        source=0,
+        target=1,
+        measurement_target_to_source=sim3_identity(dtype=torch.float64),
+        information_diag=torch.ones(7, dtype=torch.float64),
+    )
+    graph.add_edge(factor)
+    _, blocks, residual = graph._linearize_factor(factor, {1: 0})
+    assert torch.isfinite(residual).all()
+    assert blocks and torch.isfinite(blocks[0]).all()
+    result = graph.optimize()
+    assert result.reason == "converged_gradient"
+
+
 def test_coincident_panorama_factor_corrects_center_rotation_without_scale() -> None:
     truth_rotation = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.0, 0.35, 0.0]))[:3, :3]
     initial_rotation = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.0, 0.10, 0.0]))[:3, :3]
@@ -618,6 +650,7 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
         frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
     ready = frontend.pop_ready_outputs()
     packets = frontend.consume_local_gaussian_windows()
+    diagnostics = frontend.consume_local_ba_diagnostics()
     flushed = frontend.flush()
     assert [output.frame_id for output in ready + flushed] == [0, 1, 2]
     assert all(output.inverse_depth is not None for output in ready + flushed)
@@ -625,6 +658,62 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
     assert len(packets) == 1
     assert packets[0].frame_ids == (0, 1, 2)
     assert packets[0].local_poses_c2w[0].equal(torch.eye(4))
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["matcher"] == "none"
+    assert diagnostics[0]["frame_ids"] == (0, 1, 2)
+    assert diagnostics[0]["gt_poses_c2w"] is None
+    assert frontend.consume_local_ba_diagnostics() == []
+
+
+def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) -> None:
+    config = stage2_default_config()
+    config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_local_ba.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
+        "local_ba": {
+            "enabled": True,
+            "iterations": 1,
+            "min_factors": 1,
+            "min_affine_support": 2,
+            "matching": {
+                "type": "adapter",
+                "num_queries": 4,
+                "query_chunk_size": 2,
+                "forward_backward": False,
+                "min_factor_weight": 0.0,
+            },
+        },
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    for frame_id in range(3):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+    frontend.pop_ready_outputs()
+    frontend.consume_local_gaussian_windows()
+    diagnostics = frontend.consume_local_ba_diagnostics()
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["matcher"] == "adapter"
+    assert diagnostics[0]["num_factors"] > 0
+    assert diagnostics[0]["ba_diagnostics"] is not None
+    assert diagnostics[0]["matching_metadata"]["fibonacci_seed"] == 123
 
 
 def test_window_scheduler_has_exact_one_frame_overlap_and_partial_flush(tmp_path: Path) -> None:

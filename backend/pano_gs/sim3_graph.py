@@ -310,11 +310,12 @@ class GlobalSim3FactorGraph:
 
         zero = source.new_zeros(7 * len(endpoint_ids))
         weighted_residual = residual_from_delta(zero)
-        jacobian = (
-            torch.func.jacfwd(residual_from_delta)(zero)
-            if isinstance(factor, DenseSphericalFactorBlock)
-            else torch.func.jacrev(residual_from_delta)(zero)
-        )
+        # Each factor has at most fourteen tangent inputs.  Forward-mode is
+        # both inexpensive at this block size and remains finite for exact
+        # zero-residual Sim(3)/SO(3) factors.  Reverse-mode previously exposed
+        # the singular derivative of an identity-angle ``acos`` and caused an
+        # entire graph update to terminate with ``non_finite_gradient``.
+        jacobian = torch.func.jacfwd(residual_from_delta)(zero).to(weighted_residual)
         if isinstance(factor, CoincidentPanoramaFactor):
             # A same-center panorama observation contains no scale evidence.
             # Under left-multiplicative Sim(3) perturbations the scale column
@@ -412,7 +413,24 @@ class GlobalSim3FactorGraph:
         trainable = {node_id: idx for idx, node_id in enumerate(trainable_ids)}
 
         for iteration in range(self.max_iterations):
-            linearized = [self._linearize_factor(edge, trainable) for edge in self.edges]
+            linearized = []
+            for edge in self.edges:
+                factor_linearization = self._linearize_factor(edge, trainable)
+                ids, blocks, residual = factor_linearization
+                finite = bool(torch.isfinite(residual).all()) and all(
+                    bool(torch.isfinite(block).all()) for block in blocks
+                )
+                if not finite:
+                    return Sim3GraphOptimizeResult(
+                        accepted_any,
+                        actual_iterations,
+                        initial,
+                        last,
+                        max_update,
+                        tuple(trainable_ids),
+                        f"non_finite_linearization:{edge.edge_type}:{int(edge.source)}->{int(edge.target)}",
+                    )
+                linearized.append((ids, blocks, residual))
             gradient = next(iter(self.nodes.values())).new_zeros(len(trainable_ids), 7)
             for ids, blocks, residual in linearized:
                 for node_id, jacobian in zip(ids, blocks):

@@ -24,6 +24,7 @@ from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_gri
 from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from geometry.pose import relative_c2w
+from geometry.trajectory_metrics import c2w_trajectory_metrics
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
@@ -1980,6 +1981,7 @@ class PanoDroidGSSlamSystem:
         recent_feedforward_chunks: list[tuple[int | None, list[int]]] = []
         frame_cache: dict[int, PanoFrame] = {}
         final_frame_records: dict[int, dict] = {}
+        local_ba_window_records: list[dict] = []
         chunk_keyframe_anchor_frame_id: int | None = None
         frame_count = 0
         keyframes = 0
@@ -2696,6 +2698,55 @@ class PanoDroidGSSlamSystem:
                     wandb_payload,
                     step=max(1, int(logger._step) + 1),
                 )
+            consume_ba = getattr(self.frontend, "consume_local_ba_diagnostics", None)
+            if callable(consume_ba):
+                for diagnostic in consume_ba():
+                    ba_diagnostic = diagnostic.get("ba_diagnostics") or {}
+                    def finite_optional(value):
+                        if value is None:
+                            return None
+                        scalar = float(value)
+                        return scalar if np.isfinite(scalar) else None
+
+                    record = {
+                        "window_id": int(diagnostic["window_id"]),
+                        "frame_ids": [int(value) for value in diagnostic["frame_ids"]],
+                        "matcher": str(diagnostic["matcher"]),
+                        "accepted": bool(diagnostic["accepted"]),
+                        "num_factors": int(diagnostic["num_factors"]),
+                        "initial_median_residual_deg": diagnostic.get("initial_median_residual_deg"),
+                        "final_median_residual_deg": diagnostic.get("final_median_residual_deg"),
+                        "matching_sec": float(diagnostic["matching_sec"]),
+                        "ba_sec": float(diagnostic["ba_sec"]),
+                        "reason": ba_diagnostic.get("reason"),
+                        "initial_objective": finite_optional(
+                            ba_diagnostic.get("initial_objective")
+                        ),
+                        "final_objective": finite_optional(
+                            ba_diagnostic.get("final_objective")
+                        ),
+                        "accepted_steps": ba_diagnostic.get("accepted_steps"),
+                    }
+                    local_ba_window_records.append(record)
+                    local_ba_payload = {
+                        "local_ba/window_id": record["window_id"],
+                        "local_ba/accepted": int(record["accepted"]),
+                        "local_ba/valid_factors": record["num_factors"],
+                        "local_ba/matching_sec": record["matching_sec"],
+                        "local_ba/ba_sec": record["ba_sec"],
+                    }
+                    if record["initial_median_residual_deg"] is not None:
+                        local_ba_payload["local_ba/initial_residual_deg"] = float(
+                            record["initial_median_residual_deg"]
+                        )
+                    if record["final_median_residual_deg"] is not None:
+                        local_ba_payload["local_ba/final_residual_deg"] = float(
+                            record["final_median_residual_deg"]
+                        )
+                    logger._log_wandb_payload(
+                        local_ba_payload,
+                        step=max(1, int(logger._step) + 1),
+                    )
             graph_geometry_updates = self.spherical_selfi_global_backend.pop_frame_geometry_updates()
             # Historical observations must follow graph-loop corrections too;
             # replacing only the not-yet-emitted FrontendOutput would leave the
@@ -3205,12 +3256,32 @@ class PanoDroidGSSlamSystem:
             psnrs: list[float] = []
             pred_xyz: list[np.ndarray] = []
             gt_xyz: list[np.ndarray] = []
+            trajectory_frame_ids: list[int] = []
+            predicted_poses: list[torch.Tensor] = []
+            target_poses: list[torch.Tensor] = []
+            pose_by_frame: dict[int, torch.Tensor] = {}
             for frame_id in sorted(records):
                 rec = records[int(frame_id)]
-                image = rec["image"]
                 pose = self.mapper.refined_pose_c2w(int(frame_id))
                 if pose is None:
                     pose = rec["pose_c2w"]
+                pose = pose.detach().cpu().float()
+                pose_by_frame[int(frame_id)] = pose
+                gt_pose = rec.get("gt_c2w")
+                if (
+                    torch.is_tensor(gt_pose)
+                    and tuple(gt_pose.shape) == (4, 4)
+                    and tuple(pose.shape) == (4, 4)
+                ):
+                    trajectory_frame_ids.append(int(frame_id))
+                    predicted_poses.append(pose)
+                    target_poses.append(gt_pose.detach().cpu().float())
+                    pred_xyz.append(pose[:3, 3].numpy())
+                    gt_xyz.append(gt_pose.detach().cpu().float()[:3, 3].numpy())
+            for frame_id in sorted(records):
+                rec = records[int(frame_id)]
+                image = rec["image"]
+                pose = pose_by_frame[int(frame_id)]
                 sky_mask = rec.get("sky_mask")
                 try:
                     pkg = self.mapper.render_view(image=image, c2w=pose, sky_mask=sky_mask)
@@ -3246,26 +3317,49 @@ class PanoDroidGSSlamSystem:
                 canvas.save(panel_path)
                 per_frame.append({"frame_id": int(frame_id), "psnr": psnr, "render_vs_gt": str(panel_path)})
 
-                gt_pose = rec.get("gt_c2w")
-                if torch.is_tensor(gt_pose) and tuple(gt_pose.shape) == (4, 4) and tuple(pose.shape) == (4, 4):
-                    pred_xyz.append(pose.detach().cpu().float()[:3, 3].numpy())
-                    gt_xyz.append(gt_pose.detach().cpu().float()[:3, 3].numpy())
-
             ate_metrics: dict[str, float] = {}
             if len(pred_xyz) >= 1 and len(pred_xyz) == len(gt_xyz):
                 _, _, ate_metrics, _ = _compute_ape_translation(
                     np.asarray(pred_xyz, dtype=np.float32),
                     np.asarray(gt_xyz, dtype=np.float32),
                 )
+            trajectory_metrics: dict[str, float] = {}
+            if len(predicted_poses) >= 2:
+                trajectory_metrics = c2w_trajectory_metrics(
+                    torch.stack(predicted_poses, dim=0),
+                    torch.stack(target_poses, dim=0),
+                )
+            trajectory_payload = {
+                "pose_convention": "c2w",
+                "frame_ids": trajectory_frame_ids,
+                "predicted_c2w": [pose.tolist() for pose in predicted_poses],
+                "target_c2w": [pose.tolist() for pose in target_poses],
+                "metrics": trajectory_metrics,
+            }
+            trajectory_path = root / "trajectory.json"
+            with open(trajectory_path, "w", encoding="utf-8") as f:
+                json.dump(trajectory_payload, f, indent=2)
             metrics = {
                 "render_count": int(len(per_frame)),
                 "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
                 "ate_rmse": ate_metrics.get("rmse"),
                 "ate_count": int(len(pred_xyz)),
+                **trajectory_metrics,
             }
-            payload = {"metrics": metrics, "frames": per_frame}
+            payload = {
+                "metrics": metrics,
+                "frames": per_frame,
+                "trajectory": str(trajectory_path),
+            }
             with open(root / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
+            logger._log_wandb_payload(
+                {
+                    f"final_pose/{key}": value
+                    for key, value in trajectory_metrics.items()
+                },
+                step=max(1, int(logger._step) + 1),
+            )
             return {"root": str(root), "metrics": metrics}
 
         def save_final_artifacts() -> dict:
@@ -3438,6 +3532,34 @@ class PanoDroidGSSlamSystem:
                 else {}
             )
             dense_ba_summary = _summarize_dense_ba_stats(self.frontend)
+            local_ba_path = output_dir / "local_ba_windows.json"
+            with open(local_ba_path, "w", encoding="utf-8") as f:
+                json.dump(local_ba_window_records, f, indent=2)
+            accepted_local_ba = sum(int(record["accepted"]) for record in local_ba_window_records)
+            local_ba_summary = {
+                "windows": int(len(local_ba_window_records)),
+                "accepted": int(accepted_local_ba),
+                "accepted_ratio": (
+                    float(accepted_local_ba / len(local_ba_window_records))
+                    if local_ba_window_records
+                    else 0.0
+                ),
+                "mean_valid_factors": (
+                    float(np.mean([record["num_factors"] for record in local_ba_window_records]))
+                    if local_ba_window_records
+                    else 0.0
+                ),
+                "mean_matching_sec": (
+                    float(np.mean([record["matching_sec"] for record in local_ba_window_records]))
+                    if local_ba_window_records
+                    else 0.0
+                ),
+                "mean_ba_sec": (
+                    float(np.mean([record["ba_sec"] for record in local_ba_window_records]))
+                    if local_ba_window_records
+                    else 0.0
+                ),
+            }
             summary = {
                 "frames": frame_count,
                 "keyframes": keyframes,
@@ -3491,10 +3613,21 @@ class PanoDroidGSSlamSystem:
                 "backend_last_feedforward_metrics": last_feedforward_metrics,
                 "backend_final_metrics": final_metrics,
                 "final_all_frames_ate_rmse": final_all_metrics.get("ate_rmse"),
+                "final_all_frames_se3_ate_rmse": final_all_metrics.get("se3_ate_rmse"),
+                "final_all_frames_rpe_delta_1_translation_rmse": final_all_metrics.get("rpe_delta_1_translation_rmse"),
+                "final_all_frames_rpe_delta_1_rotation_mean_deg": final_all_metrics.get("rpe_delta_1_rotation_mean_deg"),
+                "final_all_frames_scale_drift_percent": final_all_metrics.get("scale_drift_percent"),
+                "final_all_frames_trajectory_metrics": {
+                    key: value
+                    for key, value in final_all_metrics.items()
+                    if key not in {"render_count", "mean_psnr", "ate_count"}
+                },
                 "final_all_frames_mean_psnr": final_all_metrics.get("mean_psnr"),
                 "backend_final_trajectory_png": final_backend_traj,
                 "artifacts": final_artifacts,
                 "dense_ba": dense_ba_summary,
+                "local_ba": local_ba_summary,
+                "local_ba_windows_path": str(local_ba_path),
                 "spherical_selfi_runtime_config": (
                     self.config.get("SphericalSelfiRuntime", {})
                     if spherical_selfi_global_enabled

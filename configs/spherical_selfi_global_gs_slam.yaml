@@ -102,6 +102,7 @@ SphericalSelfiRuntime:
     min_depth: 0.05
     max_depth: 20.0
     matching:
+      type: adapter
       num_queries: 2048
       min_depth: 0.05
       max_depth: 20.0

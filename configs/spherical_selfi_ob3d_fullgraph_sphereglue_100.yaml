@@ -1,0 +1,32 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric_posefix_postopt100.yaml
+
+SphericalSelfiRuntime:
+  local_ba:
+    enabled: true
+    matching:
+      type: superpoint_sphereglue
+      num_queries: 1024
+      extractor_max_keypoints: 2048
+      min_depth: 0.05
+      max_depth: 20.0
+      min_factor_weight: 0.01
+      nms_radius: 4
+      detection_threshold: 5.0e-4
+      remove_borders: 4
+      chebyshev_k: 2
+      knn: 20
+      sinkhorn_iterations: 20
+      match_threshold: 0.2
+      aggregation: add
+      lightglue_repo: /mnt/disk1/lanboyang/External/LightGlue
+      sphereglue_repo: /mnt/disk1/lanboyang/External/SphereGlue
+      sphereglue_checkpoint: /mnt/disk1/lanboyang/External/SphereGlue/model_weights/superpoint/autosaved.pt
+
+WeightsAndBiases:
+  group: ob3d-sponza-fullgraph-ba-matcher-100
+  run_name: ob3d_sponza_fullgraph_jacfix_sphereglueba_100
+  tags: [spherical-selfi, ob3d, sponza, non-egocentric, full-system, graph-jacobian-fix, superpoint, sphereglue-ba, research-only, formal100]
+
+Results:
+  save_dir: outputs/ob3d_sponza_fullgraph_jacfix_sphereglueba_100
+

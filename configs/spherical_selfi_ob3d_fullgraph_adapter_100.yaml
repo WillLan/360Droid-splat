@@ -1,0 +1,17 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric_posefix_postopt100.yaml
+
+SphericalSelfiRuntime:
+  local_ba:
+    enabled: true
+    matching:
+      type: adapter
+      num_queries: 1024
+
+WeightsAndBiases:
+  group: ob3d-sponza-fullgraph-ba-matcher-100
+  run_name: ob3d_sponza_fullgraph_jacfix_adapterba_100
+  tags: [spherical-selfi, ob3d, sponza, non-egocentric, full-system, graph-jacobian-fix, adapter-ba, formal100]
+
+Results:
+  save_dir: outputs/ob3d_sponza_fullgraph_jacfix_adapterba_100
+
