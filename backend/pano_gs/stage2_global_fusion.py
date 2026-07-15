@@ -704,6 +704,69 @@ class Stage2GlobalMapFusion:
         self._write_map(compacted)
         return {"moved": moved, "deduplicated": before - len(compacted)}
 
+    def deduplicate_owner_neighborhood(
+        self,
+        owner_window_ids: set[int] | list[int] | tuple[int, ...],
+    ) -> int:
+        """Prune cross-owner voxel duplicates only in a committed loop neighborhood."""
+
+        if not self.lazy_owner_transforms or self.map.anchor_count() <= 1:
+            return 0
+        owners = {int(value) for value in owner_window_ids}
+        if len(owners) < 2:
+            return 0
+        owner_ids = self.map._anchor_owner_window_id
+        selected_cpu = torch.zeros_like(owner_ids, dtype=torch.bool)
+        for owner in owners:
+            selected_cpu |= owner_ids == owner
+        selected_rows_cpu = torch.nonzero(selected_cpu, as_tuple=False).flatten()
+        if int(selected_rows_cpu.numel()) <= 1:
+            return 0
+
+        device = self.map.get_xyz.device
+        selected_rows = selected_rows_cpu.to(device=device, dtype=torch.long)
+        xyz = self.map.get_xyz.detach().index_select(0, selected_rows)
+        scale = self.map.get_scaling.detach().index_select(0, selected_rows)
+        level, grid = self._levels_and_grid(xyz, scale)
+        key = torch.cat([level[:, None], grid], dim=-1)
+        unique, inverse = torch.unique(key, dim=0, return_inverse=True, sorted=True)
+        if int(unique.shape[0]) == int(selected_rows.shape[0]):
+            return 0
+        quality = self.map._anchor_quality.to(device=device).index_select(
+            0, selected_rows
+        )
+        opacity = self.map.get_opacity.detach().reshape(-1).index_select(
+            0, selected_rows
+        )
+        score = quality.clamp_min(0.0) * opacity.clamp_min(0.0)
+        maximum = score.new_full((int(unique.shape[0]),), -torch.inf)
+        maximum.scatter_reduce_(0, inverse, score, reduce="amax", include_self=True)
+        local_index = torch.arange(
+            int(selected_rows.shape[0]), device=device, dtype=torch.long
+        )
+        candidate = torch.where(
+            score >= maximum[inverse] - 1.0e-12,
+            local_index,
+            torch.full_like(local_index, int(selected_rows.shape[0])),
+        )
+        winner = torch.full(
+            (int(unique.shape[0]),),
+            int(selected_rows.shape[0]),
+            device=device,
+            dtype=torch.long,
+        )
+        winner.scatter_reduce_(0, inverse, candidate, reduce="amin", include_self=True)
+        keep_local = torch.zeros(
+            int(selected_rows.shape[0]), device=device, dtype=torch.bool
+        )
+        keep_local[winner[winner < int(selected_rows.shape[0])]] = True
+        duplicate_rows = selected_rows[~keep_local]
+        if int(duplicate_rows.numel()) == 0:
+            return 0
+        prune = torch.zeros(self.map.anchor_count(), device=device, dtype=torch.bool)
+        prune[duplicate_rows] = True
+        return int(self.map.prune_anchors(prune))
+
     def prune_lifecycle(
         self,
         *,

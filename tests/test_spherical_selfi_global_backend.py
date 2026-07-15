@@ -142,13 +142,18 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 5
     assert graph["normalize_dense_information_by_count"] is True
+    assert graph["analytic_dense_linearization"] is True
+    assert graph["restrict_objective_to_active_factors"] is True
     assert global_backend["hierarchical_submaps"]["enabled"] is True
+    assert global_backend["hierarchical_submaps"]["local_camera_model"] == "se3_shared_scale"
     assert global_backend["hierarchical_submaps"]["compress_frozen_dense_factors"] is True
     assert global_backend["loop_closure"]["descriptor"]["mode"] == "so3_sh_gram"
+    assert global_backend["loop_closure"]["insert_pose_factor"] is True
     assert global_backend["loop_closure"]["verification"]["mode"] == "spherical_so3"
     assert global_backend["keyframe_selection"]["enabled"] is True
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
     assert map_optimization["loop_neighborhood_refinement"] is True
+    assert map_optimization["loop_seam_deduplication"] is True
     assert map_optimization["extra_steps_on_loop"] == 20
     assert map_optimization["pose_lr"] == 2.0e-4
     assert map_optimization["pose_refine_enable"] is True
@@ -172,6 +177,27 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
         "scaling_lr": 1.0e-4,
         "rotation_lr": 1.0e-4,
     }
+
+
+def test_new_so3_hierarchical_features_are_default_off_for_legacy_configs() -> None:
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        config={"enabled": True},
+    )
+
+    assert backend.loop_detector.descriptor_mode == "latitude_bands"
+    assert not backend.loop_detector.so3_verification
+    assert not backend.hierarchical_submaps_enabled
+    assert backend.submap_graph is None
+    assert backend.robust_loop_mode == "off"
+    assert not backend.loop_transaction_enabled
+    assert not backend.lazy_submap_transforms_enabled
+    assert not backend.insert_loop_pose_factor
+    assert not backend.graph.analytic_dense_linearization
+    assert not backend.graph.restrict_objective_to_active_factors
+    assert not backend.normalize_dense_information_by_count
+    assert not backend.loop_neighborhood_refinement_enabled
+    assert not backend.loop_seam_dedup_enabled
 
 
 def test_spherical_keyframe_policy_combines_gap_descriptor_coverage_and_parallax() -> None:
@@ -386,6 +412,37 @@ def test_dense_spherical_depth_factor_recovers_window_scale() -> None:
     assert abs(float(scale) - 2.0) < 2.0e-3
     torch.testing.assert_close(rotation, torch.eye(3), atol=2e-4, rtol=2e-4)
     assert float(translation.norm()) < 2.0e-4
+
+
+def test_local_se3_graph_locks_boundary_scale_for_hierarchical_submap() -> None:
+    bearing = torch.nn.functional.normalize(torch.randn(64, 3), dim=-1)
+    graph = GlobalSim3FactorGraph(
+        max_iterations=8,
+        pcg_iterations=32,
+        lock_scale_updates=True,
+    )
+    graph.add_node(0, sim3_identity())
+    initial = sim3_from_components(1.25, torch.eye(3), torch.zeros(3))
+    graph.add_node(1, initial)
+    graph.add_edge(
+        DenseSphericalFactorBlock(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            source_bearing=bearing,
+            target_bearing=bearing,
+            source_depth=torch.full((64,), 2.0),
+            target_depth=torch.ones(64),
+            factor_weight=torch.ones(64),
+            depth_factor_weight=1.0,
+        )
+    )
+
+    graph.optimize()
+
+    scale, _, _ = sim3_components(graph.transform(1))
+    assert abs(float(scale) - 1.25) < 1.0e-6
 
 
 def test_dense_spherical_factor_jacobian_matches_finite_difference() -> None:
@@ -1054,6 +1111,15 @@ def test_boundary_loop_transaction_rolls_back_dcs_rejected_factor() -> None:
         dense_factors=(dense,),
     )
     backend.loop_detector.detect = lambda packet: [verification]
+    correction_calls = 0
+    original_correction = backend.fusion.apply_owner_corrections
+
+    def record_correction(old, new):
+        nonlocal correction_calls
+        correction_calls += 1
+        return original_correction(old, new)
+
+    backend.fusion.apply_owner_corrections = record_correction
 
     result = backend.process_packet(_packet(1, poses1, (1, 2), feature_by_frame=features))
 
@@ -1062,6 +1128,7 @@ def test_boundary_loop_transaction_rolls_back_dcs_rejected_factor() -> None:
     assert verification.reason == "loop_transaction_rejected"
     assert verification.metadata["graph_transaction"]["minimum_dcs_scale"] < 0.5
     assert not backend.accepted_loop_pairs
+    assert correction_calls == 0
 
 
 def test_hierarchical_backend_freezes_five_window_submaps_and_keeps_six_node_local_graph() -> None:
@@ -1125,6 +1192,12 @@ def test_hierarchical_backend_freezes_five_window_submaps_and_keeps_six_node_loc
     assert backend.submaps[1].window_ids == list(range(5, 10))
     assert backend.submaps[0].boundary_node_ids == list(range(6))
     assert backend.submaps[1].boundary_node_ids == list(range(5, 11))
+    for record in backend.submaps.values():
+        scales = [
+            float(sim3_components(backend.graph.transform(node))[0])
+            for node in record.boundary_node_ids
+        ]
+        assert max(scales) - min(scales) < 1.0e-6
     assert backend.window_to_submap == {
         **{window_id: 0 for window_id in range(5)},
         **{window_id: 1 for window_id in range(5, 10)},
@@ -1144,6 +1217,42 @@ def test_hierarchical_backend_freezes_five_window_submaps_and_keeps_six_node_loc
     assert final["hierarchical_submaps_enabled"] is True
     assert final["submap_nodes"] == 2
     assert final["compressed_dense_factors"] == 10
+
+    window_transforms = backend._window_anchor_transforms()
+    window_measurement = (
+        sim3_inverse(window_transforms[0]) @ window_transforms[5]
+    )
+    loop = PanoramaLoopVerification(
+        accepted=True,
+        factor=LoopPoseMeasurement(
+            kind="sim3",
+            source=0,
+            target=5,
+            measurement_target_to_source=window_measurement,
+            information_diag=torch.ones(7),
+            edge_type="loop",
+        ),
+        source_window_id=0,
+        target_window_id=5,
+        retrieval_score=1.0,
+        yaw_shift_columns=0,
+        num_matches=64,
+        inlier_ratio=1.0,
+        residual=0.0,
+        reason="synthetic",
+    )
+    converted = backend._loop_measurement_for_submaps(loop)
+    assert converted is not None and converted.measurement_target_to_source is not None
+    expected_submap_measurement = (
+        sim3_inverse(backend.submap_graph.transform(0))
+        @ backend.submap_graph.transform(1)
+    )
+    torch.testing.assert_close(
+        converted.measurement_target_to_source,
+        expected_submap_measurement,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
 
     before = backend._window_anchor_transforms()
     moved = backend.submap_graph.transform(1).clone()
@@ -1194,6 +1303,30 @@ def test_lazy_owner_correction_updates_transform_without_rewriting_gaussians() -
     assert stats["moved"] == gaussian_map.anchor_count()
     assert stats["deduplicated"] == 0
     assert stats["lazy"] == 1
+
+
+def test_lazy_loop_neighborhood_deduplicates_cross_owner_seam_only_on_commit() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 0.1
+    gaussian_map = PanoGaussianMap(config={}, sh_degree=2, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.25,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        lazy_owner_transforms=True,
+    )
+    fusion.fuse_packet(_packet(0, poses, (0, 1)), torch.eye(4))
+    first_count = gaussian_map.anchor_count()
+    fusion.fuse_packet(_packet(1, poses, (2, 3)), torch.eye(4))
+    combined_count = gaussian_map.anchor_count()
+
+    removed = fusion.deduplicate_owner_neighborhood({0, 1})
+
+    assert first_count > 0
+    assert combined_count == 2 * first_count
+    assert removed == first_count
+    assert gaussian_map.anchor_count() == first_count
 
 
 def test_boundary_factor_ignores_confidence_and_hard_excludes_sky() -> None:

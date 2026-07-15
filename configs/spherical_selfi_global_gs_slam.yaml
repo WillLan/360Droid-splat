@@ -192,6 +192,7 @@ SphericalSelfiGlobalBackend:
     enabled: true
     windows_per_submap: 5
     shared_boundary_nodes: 1
+    local_camera_model: se3_shared_scale
     compress_frozen_dense_factors: true
   global_graph:
     node_mode: boundary_frame
@@ -207,6 +208,8 @@ SphericalSelfiGlobalBackend:
     pcg_iterations: 64
     pcg_tolerance: 1.0e-6
     dense_linearization_chunk_size: 512
+    analytic_dense_linearization: true
+    restrict_objective_to_active_factors: true
     normalize_dense_information_by_count: true
     dense_information_reference_count: 64
     recent_windows: 32
@@ -249,6 +252,7 @@ SphericalSelfiGlobalBackend:
   loop_closure:
     # Explicit opt-in to the arbitrary-orientation loop path. Code defaults
     # remain on the legacy latitude-band descriptor for older configs.
+    insert_pose_factor: true
     descriptor:
       mode: so3_sh_gram
       max_degree: 6
@@ -325,6 +329,7 @@ SphericalSelfiGlobalBackend:
     extra_steps_on_loop: 20
     loop_neighborhood_refinement: true
     loop_neighborhood_submap_radius: 1
+    loop_seam_deduplication: true
     final_steps: 0
     seed: 123
 

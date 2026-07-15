@@ -117,6 +117,17 @@ class SphericalSelfiGlobalBackend:
         self.compress_frozen_dense_factors = bool(
             hierarchical_cfg.get("compress_frozen_dense_factors", True)
         )
+        self.local_camera_model = str(
+            hierarchical_cfg.get(
+                "local_camera_model",
+                "se3_shared_scale" if self.hierarchical_submaps_enabled else "sim3_per_node",
+            )
+        ).lower()
+        if self.local_camera_model not in {"se3_shared_scale", "sim3_per_node"}:
+            raise ValueError(
+                "hierarchical_submaps.local_camera_model must be "
+                "'se3_shared_scale' or 'sim3_per_node'"
+            )
         self.allow_unaligned_fallback = bool(graph_cfg.get("allow_unaligned_fallback", False))
         self.allow_boundary_matching_fallback = bool(
             graph_cfg.get("allow_boundary_matching_fallback", False)
@@ -155,6 +166,9 @@ class SphericalSelfiGlobalBackend:
         self.loop_neighborhood_submap_radius = max(
             0, int(optimize_cfg.get("loop_neighborhood_submap_radius", 1))
         )
+        self.loop_seam_dedup_enabled = bool(
+            optimize_cfg.get("loop_seam_deduplication", False)
+        )
         self.final_map_steps = max(0, int(optimize_cfg.get("final_steps", 0)))
         self.map_optimize_config = optimize_cfg
         self.lazy_submap_transforms_enabled = bool(lazy_map_cfg.get("enabled", False))
@@ -192,6 +206,9 @@ class SphericalSelfiGlobalBackend:
         self.loop_path_max_log_scale = float(
             robust_loop_cfg.get("path_max_log_scale", math.log(3.0))
         )
+        self.insert_loop_pose_factor = bool(
+            loop_cfg.get("insert_pose_factor", False)
+        )
         self.lifecycle_prune_interval = max(
             0, int(fusion_cfg.get("lifecycle_prune_interval_windows", 0))
         )
@@ -215,6 +232,16 @@ class SphericalSelfiGlobalBackend:
             lm_diagonal_floor=float(graph_cfg.get("lm_diagonal_floor", 1.0e-6)),
             dense_linearization_chunk_size=int(
                 graph_cfg.get("dense_linearization_chunk_size", 512)
+            ),
+            lock_scale_updates=(
+                self.hierarchical_submaps_enabled
+                and self.local_camera_model == "se3_shared_scale"
+            ),
+            analytic_dense_linearization=bool(
+                graph_cfg.get("analytic_dense_linearization", False)
+            ),
+            restrict_objective_to_active_factors=bool(
+                graph_cfg.get("restrict_objective_to_active_factors", False)
             ),
         )
         self.submap_graph = (
@@ -241,6 +268,18 @@ class SphericalSelfiGlobalBackend:
                     hierarchical_cfg.get(
                         "dense_linearization_chunk_size",
                         graph_cfg.get("dense_linearization_chunk_size", 512),
+                    )
+                ),
+                analytic_dense_linearization=bool(
+                    hierarchical_cfg.get(
+                        "analytic_dense_linearization",
+                        graph_cfg.get("analytic_dense_linearization", False),
+                    )
+                ),
+                restrict_objective_to_active_factors=bool(
+                    hierarchical_cfg.get(
+                        "restrict_objective_to_active_factors",
+                        graph_cfg.get("restrict_objective_to_active_factors", False),
                     )
                 ),
             )
@@ -335,6 +374,7 @@ class SphericalSelfiGlobalBackend:
         self._geometry_updates: dict[int, FrameGeometryUpdate] = {}
         self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
+        self._pending_seam_owner_windows: set[int] = set()
         self.results: list[GlobalWindowBackendResult] = []
 
     def _dense_factor_information_options(self) -> dict[str, bool | float]:
@@ -382,6 +422,23 @@ class SphericalSelfiGlobalBackend:
             for window_id, anchor_node in self.window_anchor_nodes.items()
             if int(anchor_node) in self.graph.nodes
         }
+
+    @staticmethod
+    def _owner_transforms_changed(
+        old: dict[int, torch.Tensor],
+        new: dict[int, torch.Tensor],
+        *,
+        tolerance: float = 1.0e-8,
+    ) -> bool:
+        for owner in set(old) & set(new):
+            if not torch.allclose(
+                old[owner].to(new[owner]),
+                new[owner],
+                atol=float(tolerance),
+                rtol=float(tolerance),
+            ):
+                return True
+        return False
 
     def _register_hierarchical_window(
         self,
@@ -1256,13 +1313,36 @@ class SphericalSelfiGlobalBackend:
     def run_pending_map_optimization(self) -> dict[str, float]:
         """Run low-rate map updates after the system registered window images."""
 
-        if not self._pending_map_optimization:
+        if not self._pending_map_optimization and not self._pending_seam_owner_windows:
             return {}
         pending = list(self._pending_map_optimization)
         self._pending_map_optimization.clear()
         last_metrics: dict[str, float] = {}
+        rolled_back = False
         for window_id, frame_ids, steps in pending:
             last_metrics = self._run_map_optimization(window_id, frame_ids, steps)
+            rolled_back = rolled_back or bool(
+                float(last_metrics.get("window_rollback", 0.0)) > 0.0
+            )
+        if self._pending_seam_owner_windows:
+            seam_owners = set(self._pending_seam_owner_windows)
+            self._pending_seam_owner_windows.clear()
+            deduplicated = 0
+            if self.loop_seam_dedup_enabled and not rolled_back:
+                deduplicated = self.fusion.deduplicate_owner_neighborhood(
+                    seam_owners
+                )
+                if deduplicated > 0 and self.mapper is not None:
+                    self.mapper.optimizer = self.map.make_optimizer(
+                        lr=float(
+                            self.config.get("map_optimization", {}).get(
+                                "lr", 2.0e-3
+                            )
+                        )
+                    )
+                    self.mapper.stats.n_anchors = self.map.anchor_count()
+            last_metrics["seam_deduplicated"] = float(deduplicated)
+            last_metrics["seam_refinement_rollback"] = float(rolled_back)
         return last_metrics
 
     def _enqueue_map_optimization(
@@ -1614,8 +1694,8 @@ class SphericalSelfiGlobalBackend:
     def _canonical_loop_pair(result: PanoramaLoopVerification) -> tuple[int, int]:
         return tuple(sorted((int(result.source_window_id), int(result.target_window_id))))
 
-    @staticmethod
     def _materialize_loop_pose_factor(
+        self,
         measurement: LoopPoseMeasurement,
     ) -> Sim3GraphEdge | CoincidentPanoramaFactor:
         """Convert a verified backend-neutral measurement into a graph factor."""
@@ -1623,11 +1703,25 @@ class SphericalSelfiGlobalBackend:
         if measurement.kind == "sim3":
             assert measurement.measurement_target_to_source is not None
             assert measurement.information_diag is not None
+            information = measurement.information_diag
+            if self.normalize_dense_information_by_count:
+                count = max(
+                    1.0,
+                    float(
+                        measurement.metadata.get(
+                            "verified_num_matches",
+                            measurement.metadata.get("num_matches", 1.0),
+                        )
+                    ),
+                )
+                information = information * (
+                    self.dense_information_reference_count / count
+                )
             return Sim3GraphEdge(
                 source=int(measurement.source),
                 target=int(measurement.target),
                 measurement_target_to_source=measurement.measurement_target_to_source,
-                information_diag=measurement.information_diag,
+                information_diag=information,
                 edge_type=measurement.edge_type,
                 robust_delta=measurement.robust_delta,
                 dcs_phi=measurement.dcs_phi,
@@ -1636,14 +1730,29 @@ class SphericalSelfiGlobalBackend:
         assert measurement.source_local_pose is not None
         assert measurement.target_local_pose is not None
         assert measurement.measured_source_to_target_rotation is not None
+        center_weight = float(measurement.center_weight)
+        rotation_weight = float(measurement.rotation_weight)
+        if self.normalize_dense_information_by_count:
+            count = max(
+                1.0,
+                float(
+                    measurement.metadata.get(
+                        "verified_num_matches",
+                        measurement.metadata.get("num_matches", 1.0),
+                    )
+                ),
+            )
+            normalization = self.dense_information_reference_count / count
+            center_weight *= normalization
+            rotation_weight *= normalization
         return CoincidentPanoramaFactor(
             source=int(measurement.source),
             target=int(measurement.target),
             source_local_pose=measurement.source_local_pose,
             target_local_pose=measurement.target_local_pose,
             measured_source_to_target_rotation=measurement.measured_source_to_target_rotation,
-            center_weight=float(measurement.center_weight),
-            rotation_weight=float(measurement.rotation_weight),
+            center_weight=center_weight,
+            rotation_weight=rotation_weight,
             robust_delta=float(measurement.robust_delta),
             edge_type=measurement.edge_type,
             dcs_phi=measurement.dcs_phi,
@@ -1805,6 +1914,43 @@ class SphericalSelfiGlobalBackend:
             robust_delta=measurement.robust_delta,
             dcs_phi=measurement.dcs_phi,
             metadata=dict(measurement.metadata),
+        )
+
+    def _loop_measurement_for_boundary_nodes(
+        self,
+        result: PanoramaLoopVerification,
+    ) -> LoopPoseMeasurement | None:
+        measurement = result.factor
+        if measurement is None:
+            return None
+        source = self.window_anchor_nodes.get(int(result.source_window_id))
+        target = self.window_anchor_nodes.get(int(result.target_window_id))
+        if source is None or target is None or int(source) == int(target):
+            return None
+        values = {
+            "kind": measurement.kind,
+            "source": int(source),
+            "target": int(target),
+            "edge_type": measurement.edge_type,
+            "robust_delta": measurement.robust_delta,
+            "dcs_phi": measurement.dcs_phi,
+            "metadata": dict(measurement.metadata),
+        }
+        if measurement.kind == "sim3":
+            return LoopPoseMeasurement(
+                **values,
+                measurement_target_to_source=measurement.measurement_target_to_source,
+                information_diag=measurement.information_diag,
+            )
+        return LoopPoseMeasurement(
+            **values,
+            source_local_pose=measurement.source_local_pose,
+            target_local_pose=measurement.target_local_pose,
+            measured_source_to_target_rotation=(
+                measurement.measured_source_to_target_rotation
+            ),
+            center_weight=measurement.center_weight,
+            rotation_weight=measurement.rotation_weight,
         )
 
     def _merge_loop_submap_dense_factors(
@@ -2168,9 +2314,10 @@ class SphericalSelfiGlobalBackend:
             self._sequential_edges_since_optimization += 1
         self._register_hierarchical_window(window_id, start_frame, end_frame)
 
-        # Loop retrieval operates on window packets, but accepted dense factors
-        # are re-keyed to the corresponding boundary-frame nodes. The correlated
-        # Sim(3)/coincident summary factor is deliberately not inserted.
+        # Loop retrieval operates on window packets. Verified pose and dense
+        # spherical measurements are both re-keyed to boundary/submap nodes;
+        # count normalization prevents the correlated blocks from being
+        # over-weighted merely because they contain many correspondences.
         loop_results = self.loop_detector.detect(packet)
         loop_graph = (
             self.submap_graph
@@ -2179,7 +2326,9 @@ class SphericalSelfiGlobalBackend:
         )
         assert loop_graph is not None
         accepted_loops: list[PanoramaLoopVerification] = []
-        pending_loop_factors: list[DenseSphericalFactorBlock] = []
+        pending_loop_factors: list[
+            DenseSphericalFactorBlock | Sim3GraphEdge | CoincidentPanoramaFactor
+        ] = []
         loop_edge_start = len(loop_graph.edges)
         for loop_result in loop_results:
             if not loop_result.accepted or not loop_result.dense_factors:
@@ -2191,7 +2340,7 @@ class SphericalSelfiGlobalBackend:
             loop_measurement = (
                 self._loop_measurement_for_submaps(loop_result)
                 if self.hierarchical_submaps_enabled
-                else loop_result.factor
+                else self._loop_measurement_for_boundary_nodes(loop_result)
             )
             if loop_measurement is None:
                 self._reject_loop_result(loop_result, "intra_submap_or_missing_loop_measurement")
@@ -2223,8 +2372,17 @@ class SphericalSelfiGlobalBackend:
                 else self._merge_loop_dense_factors(loop_result)
             )
             if merged is not None and merged.source != merged.target:
+                pose_factor = (
+                    self._materialize_loop_pose_factor(loop_measurement)
+                    if self.insert_loop_pose_factor
+                    else None
+                )
+                if pose_factor is not None:
+                    loop_graph.add_edge(pose_factor)
                 loop_graph.add_edge(merged)
                 accepted_loops.append(loop_result)
+                if pose_factor is not None:
+                    pending_loop_factors.append(pose_factor)
                 pending_loop_factors.append(merged)
 
         old_window_transforms = self._window_anchor_transforms()
@@ -2312,6 +2470,9 @@ class SphericalSelfiGlobalBackend:
                 new_window_transforms,
             )
             if graph_result is not None
+            and self._owner_transforms_changed(
+                old_window_transforms, new_window_transforms
+            )
             else {"moved": 0, "deduplicated": 0}
         )
 
@@ -2345,7 +2506,9 @@ class SphericalSelfiGlobalBackend:
                 window_id, packet.frame_ids, self.map_steps_per_window
             )
             refinement_frames: list[int] = []
-            for refinement_window in self._loop_neighborhood_windows(accepted_loops):
+            refinement_windows = self._loop_neighborhood_windows(accepted_loops)
+            self._pending_seam_owner_windows.update(refinement_windows)
+            for refinement_window in refinement_windows:
                 refinement_packet = self.packets.get(int(refinement_window))
                 if refinement_packet is not None:
                     refinement_frames.extend(
@@ -2386,6 +2549,7 @@ class SphericalSelfiGlobalBackend:
                 "graph_node_mode": "boundary_frame",
                 "global_ba_scheduled": graph_result is not None,
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,
+                "local_camera_model": self.local_camera_model,
                 "submap_id": self.window_to_submap.get(window_id),
                 "submap_frozen": bool(submap_frozen),
                 "submap_count": len(self.submaps),
@@ -2543,7 +2707,11 @@ class SphericalSelfiGlobalBackend:
         else:
             graph_result = self.graph.optimize(self.window_order[-self.recent_optimization_windows :] + [window_id])
         new_transforms = {node: value.clone() for node, value in self.graph.nodes.items()}
-        correction = self.fusion.apply_owner_corrections(old_transforms, new_transforms)
+        correction = (
+            self.fusion.apply_owner_corrections(old_transforms, new_transforms)
+            if self._owner_transforms_changed(old_transforms, new_transforms)
+            else {"moved": 0, "deduplicated": 0}
+        )
 
         compact_packet = packet.compact_for_memory()
         self.packets[window_id] = compact_packet
@@ -2568,7 +2736,9 @@ class SphericalSelfiGlobalBackend:
                 window_id, packet.frame_ids, self.map_steps_per_window
             )
             refinement_frames: list[int] = []
-            for refinement_window in self._loop_neighborhood_windows(accepted_loops):
+            refinement_windows = self._loop_neighborhood_windows(accepted_loops)
+            self._pending_seam_owner_windows.update(refinement_windows)
+            for refinement_window in refinement_windows:
                 refinement_packet = self.packets.get(int(refinement_window))
                 if refinement_packet is not None:
                     refinement_frames.extend(
@@ -2664,9 +2834,13 @@ class SphericalSelfiGlobalBackend:
             else:
                 graph_result = self.graph.optimize()
             new_transforms = self._window_anchor_transforms()
-            correction = self.fusion.apply_owner_corrections(
-                old_transforms,
-                new_transforms,
+            correction = (
+                self.fusion.apply_owner_corrections(
+                    old_transforms,
+                    new_transforms,
+                )
+                if self._owner_transforms_changed(old_transforms, new_transforms)
+                else {"moved": 0, "deduplicated": 0}
             )
             self._refresh_geometry_updates()
             map_metrics = self._run_map_optimization(
@@ -2683,6 +2857,7 @@ class SphericalSelfiGlobalBackend:
                 "graph_reason": graph_result.reason,
                 "graph_node_mode": "boundary_frame",
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,
+                "local_camera_model": self.local_camera_model,
                 "submap_nodes": (
                     len(self.submap_graph.nodes)
                     if self.submap_graph is not None
@@ -2707,7 +2882,11 @@ class SphericalSelfiGlobalBackend:
         pending_metrics = self.run_pending_map_optimization()
         old_transforms = {node: value.clone() for node, value in self.graph.nodes.items()}
         graph_result = self.graph.optimize()
-        correction = self.fusion.apply_owner_corrections(old_transforms, self.graph.nodes)
+        correction = (
+            self.fusion.apply_owner_corrections(old_transforms, self.graph.nodes)
+            if self._owner_transforms_changed(old_transforms, self.graph.nodes)
+            else {"moved": 0, "deduplicated": 0}
+        )
         self._refresh_pose_updates()
         map_metrics = self._run_map_optimization(
             int(self.window_order[-1]), tuple(self.frame_owner_window), self.final_map_steps

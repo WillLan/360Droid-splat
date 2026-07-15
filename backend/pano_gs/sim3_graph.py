@@ -220,6 +220,9 @@ class GlobalSim3FactorGraph:
         lm_damping_max: float = 1.0e8,
         lm_diagonal_floor: float = 1.0e-6,
         dense_linearization_chunk_size: int = 512,
+        lock_scale_updates: bool = False,
+        analytic_dense_linearization: bool = False,
+        restrict_objective_to_active_factors: bool = False,
     ) -> None:
         self.nodes: dict[int, torch.Tensor] = {}
         self.edges: list[GraphFactor] = []
@@ -236,6 +239,11 @@ class GlobalSim3FactorGraph:
         self.lm_damping_max = float(lm_damping_max)
         self.lm_diagonal_floor = float(lm_diagonal_floor)
         self.dense_linearization_chunk_size = max(16, int(dense_linearization_chunk_size))
+        self.lock_scale_updates = bool(lock_scale_updates)
+        self.analytic_dense_linearization = bool(analytic_dense_linearization)
+        self.restrict_objective_to_active_factors = bool(
+            restrict_objective_to_active_factors
+        )
         self.fixed_node_id: int | None = None
         self._last_pcg_iterations = 0
         self._last_pcg_relative_residual = 0.0
@@ -632,7 +640,7 @@ class GlobalSim3FactorGraph:
         factor: GraphFactor,
         trainable: dict[int, int],
     ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
-        if isinstance(factor, DenseSphericalFactorBlock):
+        if isinstance(factor, DenseSphericalFactorBlock) and self.analytic_dense_linearization:
             return self._dense_factor_normal_equations(factor, trainable)
         endpoint_ids, blocks, residual = self._linearize_factor(factor, trainable)
         count = len(endpoint_ids)
@@ -821,11 +829,16 @@ class GlobalSim3FactorGraph:
                 final_damping=float(self.damping),
             )
 
-        active_edges = [
-            edge
-            for edge in self.edges
-            if int(edge.source) in trainable_ids or int(edge.target) in trainable_ids
-        ]
+        active_edges = (
+            [
+                edge
+                for edge in self.edges
+                if int(edge.source) in trainable_ids
+                or int(edge.target) in trainable_ids
+            ]
+            if self.restrict_objective_to_active_factors
+            else list(self.edges)
+        )
         if not active_edges:
             value = float(self.objective().detach().cpu())
             return Sim3GraphOptimizeResult(
@@ -880,6 +893,12 @@ class GlobalSim3FactorGraph:
                 ids, hessian, factor_gradient = self._linearize_normal_factor(
                     edge, trainable
                 )
+                if self.lock_scale_updates and ids:
+                    hessian = hessian.clone()
+                    factor_gradient = factor_gradient.clone()
+                    hessian[..., 6, :] = 0.0
+                    hessian[..., :, 6] = 0.0
+                    factor_gradient[..., 6] = 0.0
                 finite = bool(torch.isfinite(hessian).all()) and bool(
                     torch.isfinite(factor_gradient).all()
                 )

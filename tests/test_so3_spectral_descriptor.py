@@ -84,3 +84,6 @@ def test_so3_window_retrieval_uses_best_frame_pair_and_candidate_nms() -> None:
     assert candidates[0].target_frame_index == 3
     assert candidates[1].source_frame_index == 0
     assert candidates[1].target_frame_index == 1
+    assert detector._descriptor_database is not None
+    assert detector._descriptor_database.dtype == torch.float16
+    assert detector.descriptor_database_bytes == 3 * 4 * 8 * 2

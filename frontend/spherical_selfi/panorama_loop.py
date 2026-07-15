@@ -289,9 +289,49 @@ class PanoramaLoopDetector:
             return_rejected_transform=True,
         )
         self.memory: list[LocalGaussianWindowPacket] = []
+        self._descriptor_database: torch.Tensor | None = None
+        self._descriptor_offsets: list[tuple[int, int]] = []
+        self._descriptor_rows = 0
 
     def add(self, packet: LocalGaussianWindowPacket) -> None:
+        if self.so3_retrieval:
+            descriptor = packet.retrieval_descriptors.detach().cpu().to(torch.float16)
+            if descriptor.ndim != 2:
+                raise ValueError("SO(3) retrieval descriptors must have shape SxD")
+            rows, dimension = (int(value) for value in descriptor.shape)
+            required = self._descriptor_rows + rows
+            if self._descriptor_database is None:
+                self._descriptor_database = torch.empty(
+                    max(64, required), dimension, dtype=torch.float16
+                )
+            elif int(self._descriptor_database.shape[1]) != dimension:
+                raise ValueError(
+                    "Loop descriptor dimension changed within one retrieval database: "
+                    f"database={int(self._descriptor_database.shape[1])}, incoming={dimension}."
+                )
+            elif int(self._descriptor_database.shape[0]) < required:
+                capacity = max(required, int(self._descriptor_database.shape[0]) * 2)
+                expanded = torch.empty(capacity, dimension, dtype=torch.float16)
+                expanded[: self._descriptor_rows] = self._descriptor_database[
+                    : self._descriptor_rows
+                ]
+                self._descriptor_database = expanded
+            assert self._descriptor_database is not None
+            start = self._descriptor_rows
+            self._descriptor_database[start:required] = descriptor
+            self._descriptor_offsets.append((start, required))
+            self._descriptor_rows = required
         self.memory.append(packet)
+
+    @property
+    def descriptor_database_bytes(self) -> int:
+        if self._descriptor_database is None:
+            return 0
+        return int(
+            self._descriptor_rows
+            * int(self._descriptor_database.shape[1])
+            * self._descriptor_database.element_size()
+        )
 
     def retrieve(self, packet: LocalGaussianWindowPacket) -> list[PanoramaLoopCandidate]:
         if not self.memory:
@@ -315,19 +355,18 @@ class PanoramaLoopDetector:
 
         query = F.normalize(packet.retrieval_descriptors.detach().cpu().float(), dim=-1, eps=1.0e-8)
         descriptor_dim = int(query.shape[-1])
-        row_counts = [int(candidate.retrieval_descriptors.shape[0]) for candidate in candidates]
-        for candidate in candidates:
-            if int(candidate.retrieval_descriptors.shape[-1]) != descriptor_dim:
-                raise ValueError(
-                    "Loop descriptor dimension changed within one retrieval database: "
-                    f"query={descriptor_dim}, window {candidate.window_id}="
-                    f"{int(candidate.retrieval_descriptors.shape[-1])}."
-                )
+        if self._descriptor_database is None or len(self._descriptor_offsets) != len(self.memory):
+            raise RuntimeError("SO(3) descriptor database is inconsistent with loop memory")
+        if int(self._descriptor_database.shape[1]) != descriptor_dim:
+            raise ValueError(
+                "Loop descriptor dimension changed within one retrieval database: "
+                f"query={descriptor_dim}, database={int(self._descriptor_database.shape[1])}."
+            )
+        offsets = self._descriptor_offsets[:cutoff]
+        row_counts = [stop - start for start, stop in offsets]
+        database_rows = offsets[-1][1]
         database = F.normalize(
-            torch.cat(
-                [candidate.retrieval_descriptors.detach().cpu().float() for candidate in candidates],
-                dim=0,
-            ),
+            self._descriptor_database[:database_rows].float(),
             dim=-1,
             eps=1.0e-8,
         )
@@ -557,7 +596,7 @@ class PanoramaLoopDetector:
         )
         selected = torch.nonzero(valid, as_tuple=False).flatten()
         raw_valid_count = int(selected.numel())
-        if raw_valid_count > self.max_matches:
+        if self.so3_verification and raw_valid_count > self.max_matches:
             quality = (
                 ((cosine[selected] + 1.0) * 0.5)
                 * torch.sigmoid(10.0 * margin[selected])
