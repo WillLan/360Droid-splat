@@ -440,6 +440,32 @@ def _segment_sum(value: torch.Tensor, inverse: torch.Tensor, count: int) -> torc
     return output
 
 
+def _chunked_eigh_3x3(
+    covariance: torch.Tensor,
+    *,
+    chunk_size: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Avoid cuSOLVER's large-batch limit for full-resolution anchor windows."""
+
+    if covariance.ndim != 3 or tuple(covariance.shape[-2:]) != (3, 3):
+        raise ValueError("covariance must have shape Nx3x3")
+    if not bool(torch.isfinite(covariance).all()):
+        raise ValueError("Anchor covariance contains non-finite values after member filtering")
+    size = max(1, int(chunk_size))
+    eigenvalue_parts = []
+    eigenvector_parts = []
+    for start in range(0, int(covariance.shape[0]), size):
+        values, vectors = torch.linalg.eigh(covariance[start : start + size].float())
+        eigenvalue_parts.append(values)
+        eigenvector_parts.append(vectors)
+    if not eigenvalue_parts:
+        return (
+            covariance.new_zeros(0, 3, dtype=torch.float32),
+            covariance.new_zeros(0, 3, 3, dtype=torch.float32),
+        )
+    return torch.cat(eigenvalue_parts, dim=0), torch.cat(eigenvector_parts, dim=0)
+
+
 def voxelize_per_pixel_gaussians(
     observation: PerPixelGaussianObservation,
     adapter_features: torch.Tensor,
@@ -466,12 +492,21 @@ def voxelize_per_pixel_gaussians(
     local_poses = relative_c2w(poses, poses[:, :1]).to(observation.refined_depth)
     local_poses[:, 0] = torch.eye(4, device=poses.device, dtype=poses.dtype)
     centers_camera = observation.centers_camera()
+    dense_scales = observation.scales()
+    dense_opacity = observation.source_view_confidence()
     local_rotation = local_poses[:, :, :3, :3]
     local_translation = local_poses[:, :, :3, 3]
     centers_local = torch.einsum("bsij,bshwj->bshwi", local_rotation, centers_camera)
     centers_local = centers_local + local_translation[:, :, None, None, :]
     reference_depth = torch.linalg.norm(centers_local, dim=-1)
     finite = torch.isfinite(centers_local).all(dim=-1) & torch.isfinite(reference_depth) & (reference_depth > 0.0)
+    finite = finite & torch.isfinite(dense_scales).all(dim=2)
+    finite = finite & torch.isfinite(observation.local_quaternion).all(dim=2)
+    finite = finite & torch.isfinite(observation.confidence[:, :, 0])
+    finite = finite & torch.isfinite(dense_opacity[:, :, 0])
+    finite = finite & torch.isfinite(adapter_features).all(dim=2)
+    finite = finite & torch.isfinite(images).all(dim=2)
+    finite = finite & torch.isfinite(observation.rgb_sh).all(dim=(2, 3))
     selection_4d = selection[:, :, 0] & finite
 
     flat_selected = torch.nonzero(selection_4d.reshape(-1), as_tuple=False).flatten()
@@ -512,7 +547,7 @@ def voxelize_per_pixel_gaussians(
     anchor_count = int(unique.shape[0])
 
     confidence = observation.confidence[:, :, 0].reshape(-1).index_select(0, flat_selected).to(dtype)
-    opacity_member = observation.source_view_confidence()[:, :, 0].reshape(-1).index_select(0, flat_selected).to(dtype)
+    opacity_member = dense_opacity[:, :, 0].reshape(-1).index_select(0, flat_selected).to(dtype)
     # The Stage-2 confidence is the existing observation-quality score.  Keep
     # it as the sole moment-matching weight instead of applying opacity twice.
     weight = confidence.clamp_min(1.0e-8)
@@ -530,7 +565,7 @@ def voxelize_per_pixel_gaussians(
     anchor_voxel = centers.new_tensor(config.voxel_sizes)[anchor_levels]
     voxel_center = (anchor_grids.to(dtype) + 0.5) * anchor_voxel[:, None]
 
-    member_scale = observation.scales().permute(0, 1, 3, 4, 2).reshape(-1, 3).index_select(0, flat_selected).to(dtype)
+    member_scale = dense_scales.permute(0, 1, 3, 4, 2).reshape(-1, 3).index_select(0, flat_selected).to(dtype)
     local_quaternion = observation.local_quaternion.permute(0, 1, 3, 4, 2).reshape(-1, 4).index_select(0, flat_selected).to(dtype)
     member_pose_rotation = local_rotation[member_batch, member_view]
     member_rotation_matrix = member_pose_rotation @ quaternion_to_matrix(local_quaternion)
@@ -538,7 +573,8 @@ def voxelize_per_pixel_gaussians(
     offset = centers - anchor_xyz[inverse]
     covariance = covariance + offset[:, :, None] * offset[:, None, :]
     anchor_covariance = average(covariance)
-    eigenvalues, eigenvectors = torch.linalg.eigh(anchor_covariance.float())
+    anchor_covariance = 0.5 * (anchor_covariance + anchor_covariance.transpose(-1, -2))
+    eigenvalues, eigenvectors = _chunked_eigh_3x3(anchor_covariance)
     determinant = torch.linalg.det(eigenvectors)
     eigenvectors = eigenvectors.clone()
     eigenvectors[determinant < 0.0, :, 2] *= -1.0

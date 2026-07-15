@@ -19,6 +19,7 @@ from models.spherical_voxel_anchor_refiner import (
     VoxelAnchorConfig,
     VoxelAnchorRenderGroup,
     VoxelAnchorStage3Model,
+    _chunked_eigh_3x3,
     depth_to_voxel_level,
     depth_to_voxel_size,
     load_voxel_anchor_checkpoint,
@@ -100,6 +101,33 @@ def test_voxel_config_rejects_invalid_boundaries_and_sizes() -> None:
         VoxelAnchorConfig(depth_boundaries=(5.0, 5.0, 40.0))
     with pytest.raises(ValueError, match="four positive"):
         VoxelAnchorConfig(voxel_sizes=(0.04, 0.08, -0.16, 0.32))
+
+
+def test_chunked_anchor_eigh_matches_direct_decomposition() -> None:
+    torch.manual_seed(8)
+    matrix = torch.randn(23, 3, 3)
+    covariance = matrix @ matrix.transpose(-1, -2) + 1.0e-4 * torch.eye(3)
+    expected_values, expected_vectors = torch.linalg.eigh(covariance)
+    values, vectors = _chunked_eigh_3x3(covariance, chunk_size=4)
+    torch.testing.assert_close(values, expected_values)
+    reconstructed = vectors @ torch.diag_embed(values) @ vectors.transpose(-1, -2)
+    torch.testing.assert_close(reconstructed, covariance, atol=2.0e-5, rtol=2.0e-5)
+
+
+def test_nonfinite_member_attributes_are_filtered_before_moment_matching() -> None:
+    observation, features, images = _observation(views=1)
+    valid = torch.zeros_like(observation.valid_mask)
+    valid[:, 0, :, 3, 5] = True
+    log_scale = observation.log_scale_multiplier.clone()
+    log_scale[:, 0, 0, 3, 5] = torch.nan
+    observation = replace(observation, valid_mask=valid, log_scale_multiplier=log_scale)
+    anchors = voxelize_per_pixel_gaussians(
+        observation,
+        features,
+        images,
+        VoxelAnchorConfig(use_resnet_error=False, pretrained_resnet=False),
+    )
+    assert anchors.num_anchors == 0
 
 
 def test_same_point_from_different_source_depths_has_one_reference_key() -> None:
