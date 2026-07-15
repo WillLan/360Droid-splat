@@ -22,6 +22,7 @@ from frontend.pano_vggt.matching_adapter import (
 from models.spherical_selfi_stage3_ba import (
     BlockSparseSphericalBA,
     Stage3MatchCache,
+    apply_selfi_dense_depth_shift,
     build_stage3_match_cache,
     filter_stage3_match_cache_robust,
 )
@@ -222,6 +223,17 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
 
         local_ba = dict(runtime.get("local_ba", {}) or {})
         self.local_ba_enabled = bool(local_ba.get("enabled", False))
+        self.local_ba_defer_dense_affine = bool(
+            local_ba.get("defer_dense_depth_affine", False)
+        )
+        self.local_ba_requested_dense_depth_mode = str(
+            local_ba.get("dense_depth_mode", "affine")
+        ).strip().lower()
+        if self.local_ba_requested_dense_depth_mode not in {"affine", "none"}:
+            raise ValueError("local_ba.dense_depth_mode must be 'affine' or 'none'")
+        self.local_ba_dense_depth_output_floor = float(
+            local_ba.get("dense_depth_output_floor", 0.01)
+        )
         self.local_ba_matching = dict(local_ba.get("matching", {}) or {})
         self.local_ba_matcher_name = str(
             self.local_ba_matching.get("type", "adapter")
@@ -248,12 +260,18 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             max_logdepth_update=float(local_ba.get("max_logdepth_update", 0.35)),
             factor_chunk_size=int(local_ba.get("factor_chunk_size", 2048)),
             min_factors=int(local_ba.get("min_factors", 256)),
-            residual_worse_tolerance=1.0,
+            residual_worse_tolerance=float(
+                local_ba.get("residual_worse_tolerance", 1.0)
+            ),
             min_affine_support=int(local_ba.get("min_affine_support", 64)),
             min_depth=float(local_ba.get("min_depth", 0.05)),
             max_depth=float(local_ba.get("max_depth", 20.0)),
             solver_mode=str(local_ba.get("solver_mode", "backtracking_gn")),
-            dense_depth_mode=str(local_ba.get("dense_depth_mode", "affine")),
+            dense_depth_mode=(
+                "none"
+                if self.local_ba_defer_dense_affine
+                else self.local_ba_requested_dense_depth_mode
+            ),
             gauge_mode=str(local_ba.get("gauge_mode", "none")),
             lm_max_trials=int(local_ba.get("lm_max_trials", 4)),
             lm_acceptance_eta=float(local_ba.get("lm_acceptance_eta", 1.0e-4)),
@@ -406,20 +424,36 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             ba_poses = observation.poses_c2w.detach().clone()
             ba_depth = observation.refined_depth.detach().clone()
             ba_cache = cache.detached_clone()
+            ba_initial_sparse = ba_cache.source_depth.detach().clone().clamp(
+                self.local_ba.min_depth,
+                self.local_ba.max_depth,
+            )
             if self.local_ba.jacobian_mode == "autodiff_reference":
                 with torch.enable_grad():
-                    stage1_result = self.local_ba(ba_poses, ba_depth, ba_cache)
+                    stage1_result = self.local_ba(
+                        ba_poses,
+                        ba_depth,
+                        ba_cache,
+                        initial_sparse_depth=ba_initial_sparse,
+                    )
             else:
                 with torch.no_grad():
-                    stage1_result = self.local_ba(ba_poses, ba_depth, ba_cache)
+                    stage1_result = self.local_ba(
+                        ba_poses,
+                        ba_depth,
+                        ba_cache,
+                        initial_sparse_depth=ba_initial_sparse,
+                    )
             result = stage1_result
             published_cache = cache
+            affine_inlier_cache = ba_cache
             if self.local_ba_outlier_enabled:
                 filter_cfg = self.local_ba_outlier_config
                 filtered_cache, filter_diagnostics = filter_stage3_match_cache_robust(
                     ba_cache,
                     stage1_result.poses_c2w.detach(),
-                    stage1_result.dense_depth.detach(),
+                    ba_depth,
+                    sparse_source_depth=stage1_result.sparse_depth.detach(),
                     angular_mad_scale=float(filter_cfg.get("angular_mad_scale", 3.0)),
                     angular_min_deg=float(filter_cfg.get("angular_min_deg", 1.0)),
                     angular_max_deg=float(filter_cfg.get("angular_max_deg", 5.0)),
@@ -430,6 +464,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                         filter_cfg.get("sim3_max_relative_depth", 0.05)
                     ),
                 )
+                affine_inlier_cache = filtered_cache
                 min_inliers = max(
                     self.local_ba_second.min_factors,
                     int(filter_cfg.get("min_inliers", self.local_ba_second.min_factors)),
@@ -438,23 +473,37 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 stage2_supported = all(
                     int(value["post_filter_inliers"]) >= min_inliers
                     and float(value["post_filter_inlier_ratio"]) >= min_ratio
+                    and all(
+                        int(edge["sim3_inliers"]) >= min_inliers
+                        and float(edge["sim3_inliers"])
+                        / float(max(1, int(edge["initial"])))
+                        >= min_ratio
+                        for edge in value["edge_filter_counts"]
+                    )
                     for value in filter_diagnostics
                 )
                 if stage2_supported:
                     published_cache = filtered_cache
+                    stage2_dense_depth = (
+                        ba_depth
+                        if self.local_ba_defer_dense_affine
+                        else stage1_result.dense_depth.detach().clone()
+                    )
                     if self.local_ba_second.jacobian_mode == "autodiff_reference":
                         with torch.enable_grad():
                             stage2_result = self.local_ba_second(
                                 stage1_result.poses_c2w.detach().clone(),
-                                stage1_result.dense_depth.detach().clone(),
+                                stage2_dense_depth,
                                 filtered_cache,
+                                initial_sparse_depth=stage1_result.sparse_depth.detach().clone(),
                             )
                     else:
                         with torch.no_grad():
                             stage2_result = self.local_ba_second(
                                 stage1_result.poses_c2w.detach().clone(),
-                                stage1_result.dense_depth.detach().clone(),
+                                stage2_dense_depth,
                                 filtered_cache,
+                                initial_sparse_depth=stage1_result.sparse_depth.detach().clone(),
                             )
                     raw_stage2_accepted = stage2_result.accepted.clone()
                     stage2_result.accepted = stage1_result.accepted | raw_stage2_accepted
@@ -521,6 +570,19 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                                 "reason": "insufficient_post_filter_inliers_stage1_retained",
                             }
                         )
+            if (
+                self.local_ba_defer_dense_affine
+                and self.local_ba_requested_dense_depth_mode == "affine"
+            ):
+                result = apply_selfi_dense_depth_shift(
+                    result,
+                    ba_depth,
+                    ba_initial_sparse,
+                    affine_inlier_cache,
+                    min_support=self.local_ba.min_affine_support,
+                    min_relative_improvement=self.local_ba.affine_min_relative_improvement,
+                    output_depth_floor=self.local_ba_dense_depth_output_floor,
+                )
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         ba_sec = float(time.perf_counter() - ba_start)
@@ -640,6 +702,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                         observation.image_size,
                     ).reshape(1, views, 1, *observation.image_size)
         initial_poses_c2w = observation.poses_c2w.detach().cpu().float().clone()
+        pre_depth_shift_depth = observation.refined_depth.detach().clone()
         ba_valid = None if sky_prob is None else sky_prob < self.sky_threshold
         observation, match_cache, ba_result, matching_sec, ba_sec = self._run_local_ba(
             observation,
@@ -652,6 +715,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             dense,
             images,
             sky_prob,
+        )
+        depth_shift_applied = bool(
+            ba_result is not None
+            and getattr(ba_result, "depth_affine_accepted", None) is not None
+            and bool(ba_result.depth_affine_accepted.any().detach().cpu())
         )
 
         gt_values = [
@@ -711,6 +779,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             latitude_bands=self.latitude_bands,
             sky_prob=sky_prob,
             sky_threshold=self.sky_threshold,
+            pre_depth_shift_depth=(
+                pre_depth_shift_depth if depth_shift_applied else None
+            ),
             anchor_observation=anchor_observation,
             boundary_matches=_boundary_matches_from_cache(
                 match_cache, observation.image_size
@@ -720,6 +791,8 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "local_ba_enabled": self.local_ba_enabled,
                 "local_ba_matcher": self.local_ba_matcher_name,
                 "local_ba_accepted": None if ba_result is None else bool(ba_result.accepted[0]),
+                "dense_depth_shift_applied": depth_shift_applied,
+                "dense_depth_shift_deferred": self.local_ba_defer_dense_affine,
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
                 "fibonacci": dict(self.fibonacci_config),
                 "voxel_anchor_refiner_enabled": self.voxel_anchor_enabled,

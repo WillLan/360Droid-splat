@@ -194,6 +194,7 @@ class LocalGaussianWindowPacket:
     sky_mask: torch.Tensor
     static_mask: torch.Tensor
     geometry_consistency: torch.Tensor
+    pre_depth_shift_depth: torch.Tensor | None = None
     anchor_observation: VoxelAnchorObservation | None = None
     boundary_matches: BoundaryMatchBlock | None = None
     match_quality: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -218,6 +219,12 @@ class LocalGaussianWindowPacket:
                 raise ValueError(f"{name} must have shape {expected}")
         if not torch.equal(self.valid_mask.bool(), self.finite_gaussian_mask.bool()):
             raise ValueError("valid_mask must equal finite_gaussian_mask for backend compatibility")
+        if self.pre_depth_shift_depth is not None and tuple(
+            self.pre_depth_shift_depth.shape
+        ) != tuple(self.observation.refined_depth.shape):
+            raise ValueError(
+                "pre_depth_shift_depth must match observation.refined_depth shape"
+            )
         if self.anchor_observation is not None:
             anchors = self.anchor_observation
             if anchors.batch_size != 1 or anchors.num_views != views:
@@ -240,6 +247,7 @@ class LocalGaussianWindowPacket:
         sky_threshold: float = 0.5,
         static_mask: torch.Tensor | None = None,
         geometry_consistency: torch.Tensor | None = None,
+        pre_depth_shift_depth: torch.Tensor | None = None,
         anchor_observation: VoxelAnchorObservation | None = None,
         boundary_matches: BoundaryMatchBlock | None = None,
         match_quality: dict[str, torch.Tensor] | None = None,
@@ -301,6 +309,11 @@ class LocalGaussianWindowPacket:
             sky_mask=sky,
             static_mask=static,
             geometry_consistency=consistent,
+            pre_depth_shift_depth=(
+                None
+                if pre_depth_shift_depth is None
+                else pre_depth_shift_depth.detach().clone().to(local_observation.refined_depth)
+            ),
             anchor_observation=anchor_observation,
             boundary_matches=boundary_matches,
             match_quality=dict(match_quality or {}),
@@ -405,6 +418,7 @@ class LocalGaussianWindowPacket:
             sky_mask=compact_mask(self.sky_mask),
             static_mask=compact_mask(self.static_mask),
             geometry_consistency=compact_mask(self.geometry_consistency),
+            pre_depth_shift_depth=None,
             # Historical packets retain only the low-resolution data needed
             # for loop verification.  The explicit anchors have already been
             # fused into the backend map before this compact copy is stored.

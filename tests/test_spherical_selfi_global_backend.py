@@ -105,7 +105,19 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
 
     assert local_ba["iterations"] == 5
     assert local_ba["lm_max_trials"] == 8
+    assert local_ba["lm_acceptance_eta"] == 1.0e-6
+    assert local_ba["residual_worse_tolerance"] == 1.05
+    assert local_ba["max_pose_update_deg"] == 10.0
+    assert local_ba["max_translation_update"] == 0.10
+    assert local_ba["max_logdepth_update"] == 0.70
+    assert local_ba["min_factors"] == 128
+    assert local_ba["defer_dense_depth_affine"] is True
+    assert local_ba["dense_depth_output_floor"] == 0.01
     assert outlier["second_stage_iterations"] == 10
+    assert outlier["angular_max_deg"] == 10.0
+    assert outlier["sim3_max_relative_depth"] == 0.10
+    assert outlier["min_inliers"] == 128
+    assert outlier["min_inlier_ratio"] == 0.20
     assert local_ba["matching"]["factor_weight_mode"] == "fibonacci_equal"
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 5
@@ -571,6 +583,84 @@ def test_boundary_frame_graph_reuses_shared_node_and_uses_one_dense_factor_per_w
     geometry = backend.pop_frame_geometry_updates()
     assert geometry[1].owner_window_id == geometry[1].depth_owner_window_id == 0
     torch.testing.assert_close(geometry[1].pose_c2w, apply_sim3_to_c2w(backend.graph.transform(1), torch.eye(4)))
+
+
+def test_shared_frame_umeyama_ignores_descriptor_disagreement() -> None:
+    positive = torch.ones(24, 6, 12)
+    negative = -positive
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    packet0 = _packet(
+        0,
+        poses0,
+        (0, 1),
+        feature_by_frame={0: positive, 1: positive},
+    )
+    packet1 = _packet(
+        1,
+        poses1,
+        (1, 2),
+        feature_by_frame={1: negative, 2: negative},
+    )
+    backend = _boundary_backend(PanoGaussianMap(config={}, device="cpu"))
+
+    measurement, diagnostics = backend._shared_frame_alignment(packet0, packet1)
+
+    assert measurement is not None
+    assert diagnostics["descriptor_gate"] is False
+    assert diagnostics["weight_mode"] == "fibonacci_equal_joint_geometry_mask"
+    assert diagnostics["overlap_points"] >= backend.overlap_aligner.min_points
+
+
+def test_boundary_alignment_rolls_back_shift_then_syncs_canonical_depth() -> None:
+    shared = torch.randn(24, 6, 12)
+    features = {0: shared, 1: shared, 2: shared}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    packet0 = _packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _packet(1, poses1, (1, 2), feature_by_frame=features)
+    unshifted = packet1.observation.refined_depth.detach().clone()
+    packet1.pre_depth_shift_depth = unshifted
+    packet1.observation = packet1.observation.with_geometry(
+        refined_depth=1.5 * unshifted
+    )
+    packet1.metadata["dense_depth_shift_applied"] = True
+    backend = _boundary_backend(PanoGaussianMap(config={}, device="cpu"))
+    backend.process_packet(packet0)
+    actual_alignment = backend._shared_frame_alignment
+    call_count = 0
+
+    def fail_twice_then_align(source, target):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return None, {"reason": f"forced_failure_{call_count}"}
+        return actual_alignment(source, target)
+
+    backend._shared_frame_alignment = fail_twice_then_align
+    result = backend.process_packet(packet1)
+
+    assert result.aligned
+    alignment = result.diagnostics["alignment"]
+    assert alignment["depth_shift_rollback"] is True
+    assert alignment["alignment_recovery_stage"] == "canonical_depth_retry"
+    assert [value["stage"] for value in alignment["alignment_attempts"]] == [
+        "ba_pose_shifted_depth",
+        "ba_pose_depth_shift_rollback",
+        "canonical_depth_retry",
+    ]
+    torch.testing.assert_close(
+        packet1.observation.refined_depth[0, 0],
+        packet0.observation.refined_depth[0, 1],
+    )
+    assert packet1.metadata["canonical_shared_depth_owner_window"] == 0
+    assert backend.frame_depth_owner_window[1] == 0
 
 
 def test_boundary_graph_waits_for_six_nodes_then_runs_recent_ba() -> None:

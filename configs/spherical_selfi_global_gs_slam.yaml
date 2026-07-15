@@ -107,7 +107,7 @@ SphericalSelfiRuntime:
     damping: 1.0e-4
     solver_mode: standard_lm
     lm_max_trials: 8
-    lm_acceptance_eta: 1.0e-4
+    lm_acceptance_eta: 1.0e-6
     lm_damping_min: 1.0e-8
     lm_damping_max: 1.0e8
     lm_diagonal_floor: 1.0e-6
@@ -119,14 +119,17 @@ SphericalSelfiRuntime:
     pose_dof_mode: se3
     gauge_mode: initial_baseline
     dense_depth_mode: affine
+    defer_dense_depth_affine: true
+    dense_depth_output_floor: 0.01
+    residual_worse_tolerance: 1.05
     huber_delta_deg: 0.5
     pose_prior_weight: 1.0e-3
     depth_prior_weight: 1.0e-2
-    max_pose_update_deg: 5.0
-    max_translation_update: 0.05
-    max_logdepth_update: 0.35
+    max_pose_update_deg: 10.0
+    max_translation_update: 0.10
+    max_logdepth_update: 0.70
     factor_chunk_size: 2048
-    min_factors: 256
+    min_factors: 128
     min_affine_support: 64
     min_depth: 0.05
     max_depth: 20.0
@@ -139,13 +142,13 @@ SphericalSelfiRuntime:
       second_stage_iterations: 10
       angular_mad_scale: 3.0
       angular_min_deg: 1.0
-      angular_max_deg: 5.0
+      angular_max_deg: 10.0
       sim3_irls_iterations: 3
       sim3_mad_scale: 3.0
       sim3_min_residual: 0.01
-      sim3_max_relative_depth: 0.05
-      min_inliers: 256
-      min_inlier_ratio: 0.3
+      sim3_max_relative_depth: 0.10
+      min_inliers: 128
+      min_inlier_ratio: 0.20
     matching:
       type: adapter
       num_queries: 2048

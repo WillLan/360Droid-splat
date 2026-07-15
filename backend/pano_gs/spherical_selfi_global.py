@@ -21,6 +21,7 @@ from geometry.sim3 import (
     sim3_identity,
     sim3_inverse,
 )
+from models.spherical_voxel_anchor_refiner import voxelize_per_pixel_gaussians
 
 from .mapper import PanoGaussianMap, PanoGaussianMapper
 from .sim3_graph import (
@@ -242,9 +243,81 @@ class SphericalSelfiGlobalBackend:
             poses_c2w=poses.unsqueeze(0).to(packet.observation.poses_c2w),
             refined_depth=depth.to(packet.observation.refined_depth),
         )
+        if packet.pre_depth_shift_depth is not None:
+            packet.pre_depth_shift_depth = packet.pre_depth_shift_depth * value
         if packet.anchor_observation is not None:
             packet.anchor_observation = packet.anchor_observation.rescale_geometry(value)
         packet.metadata["global_alignment_local_scale"] = value
+
+    @staticmethod
+    def _rebuild_packet_anchor_geometry(packet: LocalGaussianWindowPacket) -> bool:
+        """Re-voxelize anchors after a non-uniform per-frame depth replacement."""
+
+        if packet.anchor_observation is None:
+            return False
+        config = packet.anchor_observation.config
+        observation = packet.observation
+        images = observation.refined_depth.new_zeros(
+            observation.batch_size,
+            observation.num_source_views,
+            3,
+            *observation.image_size,
+        )
+        packet.anchor_observation = voxelize_per_pixel_gaussians(
+            observation,
+            packet.adapter_features.to(observation.refined_depth),
+            images,
+            config,
+            valid_mask=packet.finite_gaussian_mask.to(observation.refined_depth.device),
+        ).detach_for_backend()
+        packet.metadata["anchor_geometry_rebuilt_after_depth_sync"] = True
+        return True
+
+    @classmethod
+    def _replace_packet_depth(
+        cls,
+        packet: LocalGaussianWindowPacket,
+        depth: torch.Tensor,
+        *,
+        rebuild_anchors: bool = True,
+    ) -> None:
+        target = depth.detach().to(packet.observation.refined_depth)
+        if tuple(target.shape) != tuple(packet.observation.refined_depth.shape):
+            raise ValueError("Replacement packet depth must match refined_depth shape")
+        packet.observation = packet.observation.with_geometry(refined_depth=target.clone())
+        if rebuild_anchors:
+            cls._rebuild_packet_anchor_geometry(packet)
+
+    @classmethod
+    def _restore_packet_pre_shift_depth(
+        cls,
+        packet: LocalGaussianWindowPacket,
+    ) -> bool:
+        if packet.pre_depth_shift_depth is None:
+            return False
+        cls._replace_packet_depth(packet, packet.pre_depth_shift_depth)
+        packet.pre_depth_shift_depth = None
+        packet.metadata["depth_shift_rollback"] = True
+        return True
+
+    @classmethod
+    def _synchronize_shared_canonical_depth(
+        cls,
+        source: LocalGaussianWindowPacket,
+        target: LocalGaussianWindowPacket,
+        frame_id: int,
+    ) -> None:
+        source_index = source.frame_index(frame_id)
+        target_index = target.frame_index(frame_id)
+        source_depth = source.observation.refined_depth[0, source_index]
+        target_depth = target.observation.refined_depth
+        if tuple(source_depth.shape) != tuple(target_depth[0, target_index].shape):
+            raise ValueError("Canonical shared-frame depth requires matching ERP resolution")
+        synchronized = target_depth.detach().clone()
+        synchronized[0, target_index] = source_depth.to(synchronized)
+        cls._replace_packet_depth(target, synchronized)
+        target.metadata["canonical_shared_depth_frame_id"] = int(frame_id)
+        target.metadata["canonical_shared_depth_owner_window"] = int(source.window_id)
 
     def _shared_frame_alignment(
         self,
@@ -293,46 +366,10 @@ class SphericalSelfiGlobalBackend:
                 "fibonacci_seed": edge_seed,
             }
 
-        source_feature = source.adapter_features[0, source_index].detach().to(samples.bearing)
-        target_feature = target.adapter_features[0, target_index].detach().to(samples.bearing)
-
-        def feature_uv(feature: torch.Tensor, observation_hw: tuple[int, int]) -> torch.Tensor:
-            image_h, image_w = observation_hw
-            uv = samples.uv.clone()
-            uv[:, 0] *= float(feature.shape[-1]) / float(image_w)
-            uv[:, 1] *= float(feature.shape[-2]) / float(image_h)
-            return uv
-
-        source_descriptor = torch.nn.functional.normalize(
-            sample_erp_with_wrap(
-                source_feature,
-                feature_uv(source_feature, source.observation.image_size),
-            ),
-            dim=-1,
-            eps=1.0e-8,
-        )
-        target_descriptor = torch.nn.functional.normalize(
-            sample_erp_with_wrap(
-                target_feature,
-                feature_uv(target_feature, target.observation.image_size),
-            ),
-            dim=-1,
-            eps=1.0e-8,
-        )
-        descriptor_cosine = (source_descriptor * target_descriptor).sum(dim=-1).clamp(-1.0, 1.0)
-        hard_keep = descriptor_cosine >= self.min_match_cosine
-        if int(hard_keep.sum()) < self.overlap_aligner.min_points:
-            return None, {
-                "reason": "insufficient_hard_gated_overlap_support",
-                "overlap_frame_ids": overlap,
-                "overlap_points": int(hard_keep.sum()),
-                "fibonacci_seed": edge_seed,
-            }
-
         source_pose = source.local_poses_c2w[source_index].to(samples.bearing)
         target_pose = target.local_poses_c2w[target_index].to(samples.bearing)
-        source_camera = samples.bearing[hard_keep] * samples.source_depth[hard_keep, None]
-        target_camera = samples.bearing[hard_keep] * samples.target_depth[hard_keep, None]
+        source_camera = samples.bearing * samples.source_depth[:, None]
+        target_camera = samples.bearing * samples.target_depth[:, None]
         source_points = source_camera @ source_pose[:3, :3].transpose(0, 1) + source_pose[:3, 3]
         target_points = target_camera @ target_pose[:3, :3].transpose(0, 1) + target_pose[:3, 3]
         # Fibonacci samples are equal-solid-angle. All accepted points enter
@@ -352,10 +389,8 @@ class SphericalSelfiGlobalBackend:
             "overlap_inlier_ratio": float(alignment.inlier_ratio),
             "fibonacci_seed": int(samples.seed),
             "fibonacci_longitude_phase": float(samples.longitude_phase),
-            "mean_overlap_descriptor_cosine": float(
-                descriptor_cosine[hard_keep].mean().detach().cpu()
-            ),
-            "weight_mode": "fibonacci_equal_after_hard_gates",
+            "descriptor_gate": False,
+            "weight_mode": "fibonacci_equal_joint_geometry_mask",
         }
         if not alignment.accepted:
             diagnostics["reason"] = "overlap_alignment_rejected"
@@ -1318,8 +1353,44 @@ class SphericalSelfiGlobalBackend:
                 )
             if start_frame not in self.graph.nodes:
                 raise RuntimeError(f"Shared boundary node {start_frame} is missing")
-            measurement, alignment_diagnostics = self._shared_frame_alignment(
+            alignment_attempts: list[dict[str, Any]] = []
+            measurement, attempt_diagnostics = self._shared_frame_alignment(
                 previous_packet, packet
+            )
+            alignment_attempts.append(
+                {"stage": "ba_pose_shifted_depth", **attempt_diagnostics}
+            )
+            recovery_stage = "ba_pose_shifted_depth"
+            if measurement is None and self._restore_packet_pre_shift_depth(packet):
+                measurement, attempt_diagnostics = self._shared_frame_alignment(
+                    previous_packet, packet
+                )
+                alignment_attempts.append(
+                    {"stage": "ba_pose_depth_shift_rollback", **attempt_diagnostics}
+                )
+                recovery_stage = "ba_pose_depth_shift_rollback"
+            if measurement is None:
+                self._synchronize_shared_canonical_depth(
+                    previous_packet,
+                    packet,
+                    start_frame,
+                )
+                measurement, attempt_diagnostics = self._shared_frame_alignment(
+                    previous_packet, packet
+                )
+                alignment_attempts.append(
+                    {"stage": "canonical_depth_retry", **attempt_diagnostics}
+                )
+                recovery_stage = "canonical_depth_retry"
+            alignment_diagnostics = dict(attempt_diagnostics)
+            alignment_diagnostics.update(
+                {
+                    "alignment_attempts": alignment_attempts,
+                    "alignment_recovery_stage": recovery_stage,
+                    "depth_shift_rollback": bool(
+                        packet.metadata.get("depth_shift_rollback", False)
+                    ),
+                }
             )
             if measurement is None:
                 if not self.allow_unaligned_fallback:
@@ -1340,6 +1411,12 @@ class SphericalSelfiGlobalBackend:
                 scale, rotation, translation = sim3_components(canonicalization)
                 local_scale = float(scale.detach().cpu())
                 self._rescale_packet_geometry(packet, local_scale)
+                self._synchronize_shared_canonical_depth(
+                    previous_packet,
+                    packet,
+                    start_frame,
+                )
+                packet.pre_depth_shift_depth = None
                 rotation_trace = rotation.diagonal().sum()
                 rotation_angle = torch.acos(
                     ((rotation_trace - 1.0) * 0.5).clamp(-1.0, 1.0)
@@ -1356,6 +1433,11 @@ class SphericalSelfiGlobalBackend:
                     }
                 )
                 aligned = True
+
+        # Recovery state is needed only while this packet is the incoming
+        # target.  Once admitted it becomes the canonical source for the next
+        # boundary and the dense backup can be released.
+        packet.pre_depth_shift_depth = None
 
         boundary_factor, boundary_diagnostics = self._boundary_factor(packet)
         if boundary_factor is None and not self.allow_unaligned_fallback:

@@ -21,6 +21,7 @@ from models.spherical_recurrent_gaussian_refiner import (
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from models.spherical_selfi_stage3_ba import (
     BlockSparseSphericalBA,
+    Stage3BAOutput,
     Stage3MatchCache,
     _factor_residual_and_analytic_jacobian,
     _factor_residual_from_local_delta,
@@ -30,6 +31,7 @@ from models.spherical_selfi_stage3_ba import (
     _weighted_affine_fit,
     _weighted_affine_fit_with_acceptance,
     all_directed_pairs,
+    apply_selfi_dense_depth_shift,
     build_stage3_match_cache,
     directed_pairs_for_topology,
     filter_stage3_match_cache_robust,
@@ -162,7 +164,12 @@ def test_robust_match_filter_rejects_angular_and_per_edge_sim3_outliers() -> Non
     )
     poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
 
-    filtered, diagnostics = filter_stage3_match_cache_robust(cache, poses, depth)
+    filtered, diagnostics = filter_stage3_match_cache_robust(
+        cache,
+        poses,
+        depth,
+        sparse_source_depth=cache.source_depth,
+    )
 
     assert not bool(filtered.valid_mask[0, 0, 0])
     assert not bool(filtered.valid_mask[0, 0, 1])
@@ -170,6 +177,7 @@ def test_robust_match_filter_rejects_angular_and_per_edge_sim3_outliers() -> Non
     assert diagnostics[0]["angular_outliers"] >= 1
     assert diagnostics[0]["sim3_outliers"] >= 1
     assert diagnostics[0]["post_filter_inliers"] == filtered.num_factors
+    assert diagnostics[0]["edge_filter_counts"][0]["final_inliers"] == filtered.num_factors
 
 
 def test_match_cache_filters_static_source_and_target_pixels() -> None:
@@ -330,6 +338,70 @@ def test_affine_depth_writeback_requires_support_and_strict_improvement() -> Non
         min_relative_improvement=1.0e-3,
     )
     assert not accepted
+
+
+def test_deferred_selfi_affine_is_applied_once_without_upper_depth_clamp() -> None:
+    query_count = 64
+    source_sparse = torch.linspace(1.0, 4.0, query_count).view(1, 1, -1)
+    target_sparse = 2.0 * source_sparse
+    dense = torch.tensor([[[[[0.001, 2.0, 15.0]]]]])
+    cache = Stage3MatchCache(
+        source_uv=torch.zeros(1, 1, query_count, 2),
+        source_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(1, 1, query_count, 1),
+        source_depth=source_sparse,
+        source_valid=torch.ones(1, 1, query_count, dtype=torch.bool),
+        edges=torch.tensor([[0, 0]]),
+        target_uv=torch.zeros(1, 1, query_count, 2),
+        target_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(1, 1, query_count, 1),
+        top1_cosine=torch.zeros(1, 1, query_count),
+        top2_margin=torch.zeros(1, 1, query_count),
+        entropy=torch.zeros(1, 1, query_count),
+        valid_mask=torch.ones(1, 1, query_count, dtype=torch.bool),
+        factor_weight=torch.ones(1, 1, query_count),
+    )
+    result = Stage3BAOutput(
+        poses_c2w=torch.eye(4).view(1, 1, 4, 4),
+        dense_depth=dense.clone(),
+        sparse_depth=target_sparse,
+        depth_scale=torch.ones(1, 1),
+        depth_shift=torch.zeros(1, 1),
+        depth_affine_accepted=torch.zeros(1, 1, dtype=torch.bool),
+        depth_affine_identity_error=torch.full((1, 1), float("inf")),
+        depth_affine_fit_error=torch.full((1, 1), float("inf")),
+        accepted=torch.tensor([True]),
+        initial_median_residual_deg=torch.tensor([1.0]),
+        final_median_residual_deg=torch.tensor([0.5]),
+        diagnostics=[{}],
+    )
+
+    shifted = apply_selfi_dense_depth_shift(
+        result,
+        dense,
+        source_sparse,
+        cache,
+        min_support=64,
+        output_depth_floor=0.01,
+    )
+
+    assert bool(shifted.depth_affine_accepted[0, 0])
+    torch.testing.assert_close(shifted.depth_scale, torch.tensor([[2.0]]), atol=1.0e-5, rtol=0.0)
+    assert float(shifted.dense_depth[0, 0, 0, 0, 0]) == pytest.approx(0.01)
+    assert float(shifted.dense_depth.max()) == pytest.approx(30.0)
+    assert shifted.diagnostics[0]["dense_depth_affine_applications"] == 1
+    assert shifted.diagnostics[0]["dense_depth_output_max_clamp"] is None
+
+
+def test_gaussian_centers_and_footprints_follow_unbounded_shifted_depth() -> None:
+    observation, _, _ = _observation(views=2, height=4, width=8)
+    original_centers = observation.centers_camera()
+    original_scales = observation.scales()
+    shifted = observation.with_geometry(refined_depth=observation.refined_depth * 25.0)
+
+    torch.testing.assert_close(shifted.centers_camera(), original_centers * 25.0)
+    torch.testing.assert_close(shifted.scales(), original_scales * 25.0)
+    assert float(shifted.refined_depth.max().detach()) > 20.0
+    assert bool(torch.isfinite(shifted.centers_camera()).all())
+    assert bool(torch.isfinite(shifted.scales()).all())
 
 
 def test_dense_affine_query_weights_exclude_unsupported_samples() -> None:
@@ -500,6 +572,33 @@ def test_dense_depth_none_is_strict_identity() -> None:
     assert torch.equal(output.dense_depth, observation.refined_depth)
     assert torch.equal(output.depth_scale, torch.ones_like(output.depth_scale))
     assert torch.equal(output.depth_shift, torch.zeros_like(output.depth_shift))
+
+
+def test_second_stage_sparse_depth_initialization_is_inherited_exactly() -> None:
+    observation, feature, _ = _observation(views=3)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=4,
+        query_chunk_size=2,
+        generator=torch.Generator().manual_seed(31),
+    )
+    inherited = torch.full((1, 3, 4), 3.25)
+    solver = BlockSparseSphericalBA(
+        iterations=0,
+        min_factors=1,
+        dense_depth_mode="none",
+    )
+
+    output = solver(
+        observation.poses_c2w,
+        observation.refined_depth,
+        cache,
+        initial_sparse_depth=inherited,
+    )
+
+    torch.testing.assert_close(output.sparse_depth, inherited)
+    assert not bool(output.accepted[0])
 
 
 def test_initial_baseline_gauge_preserves_bearing_geometry() -> None:

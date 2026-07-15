@@ -9,7 +9,7 @@ the dense global Jacobian used by the older correctness-first solver.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
@@ -426,6 +426,7 @@ def filter_stage3_match_cache_robust(
     poses_c2w: torch.Tensor,
     dense_depth: torch.Tensor,
     *,
+    sparse_source_depth: torch.Tensor | None = None,
     angular_mad_scale: float = 3.0,
     angular_min_deg: float = 1.0,
     angular_max_deg: float = 5.0,
@@ -451,6 +452,12 @@ def filter_stage3_match_cache_robust(
         cache.num_views,
     ):
         raise ValueError("dense_depth must have shape BxSx1xHxW matching the cache")
+    if sparse_source_depth is not None and tuple(sparse_source_depth.shape) != (
+        cache.batch_size,
+        cache.num_views,
+        cache.queries_per_source,
+    ):
+        raise ValueError("sparse_source_depth must have shape BxSxQ matching the cache")
 
     filtered = cache.detached_clone()
     final_valid = torch.zeros_like(cache.valid_mask)
@@ -458,6 +465,8 @@ def filter_stage3_match_cache_robust(
     angular_lower = math.radians(float(angular_min_deg))
     angular_upper = math.radians(float(angular_max_deg))
     irls_iterations = max(1, int(sim3_irls_iterations))
+    sampling_min_depth = float(cache.metadata.get("min_depth", 0.05))
+    sampling_max_depth = float(cache.metadata.get("max_depth", 20.0))
 
     for batch_idx in range(cache.batch_size):
         batch_initial = int(cache.valid_mask[batch_idx].sum().detach().cpu())
@@ -479,6 +488,8 @@ def filter_stage3_match_cache_robust(
                         "initial": 0,
                         "angular_inliers": 0,
                         "sim3_inliers": 0,
+                        "final_inliers": 0,
+                        "final_inlier_ratio": 0.0,
                         "reason": "empty_edge",
                     }
                 )
@@ -486,9 +497,15 @@ def filter_stage3_match_cache_robust(
 
             source_uv = cache.source_uv[batch_idx, src].unsqueeze(0)
             target_uv = cache.target_uv[batch_idx, edge_idx].unsqueeze(0)
-            source_depth = sample_erp_with_wrap(
-                dense_depth[batch_idx : batch_idx + 1, src], source_uv
-            )[0, ..., 0]
+            if sparse_source_depth is None:
+                source_depth = sample_erp_with_wrap(
+                    dense_depth[batch_idx : batch_idx + 1, src], source_uv
+                )[0, ..., 0]
+            else:
+                source_depth = sparse_source_depth[batch_idx, src].to(
+                    device=dense_depth.device,
+                    dtype=dense_depth.dtype,
+                )
             target_depth = sample_erp_with_wrap(
                 dense_depth[batch_idx : batch_idx + 1, tgt], target_uv
             )[0, ..., 0]
@@ -513,8 +530,10 @@ def filter_stage3_match_cache_robust(
                 torch.isfinite(angular_residual)
                 & torch.isfinite(source_depth)
                 & torch.isfinite(target_depth)
-                & (source_depth > 0.0)
-                & (target_depth > 0.0)
+                & (source_depth >= sampling_min_depth)
+                & (source_depth <= sampling_max_depth)
+                & (target_depth >= sampling_min_depth)
+                & (target_depth <= sampling_max_depth)
                 & (predicted_depth > 1.0e-8)
             )
             angular_values = angular_residual[valid & angular_finite]
@@ -608,6 +627,8 @@ def filter_stage3_match_cache_robust(
                     "initial": edge_initial,
                     "angular_inliers": angular_count,
                     "sim3_inliers": edge_final,
+                    "final_inliers": edge_final,
+                    "final_inlier_ratio": float(edge_final) / float(max(1, edge_initial)),
                     "angular_threshold_deg": float(
                         torch.rad2deg(angular_threshold).detach().cpu()
                     ),
@@ -962,6 +983,178 @@ def _weighted_affine_fit_with_acceptance(
     return scale, shift, True, identity_error, fit_error
 
 
+@torch.no_grad()
+def apply_selfi_dense_depth_shift(
+    result: Stage3BAOutput,
+    original_dense_depth: torch.Tensor,
+    initial_sparse_depth: torch.Tensor,
+    inlier_cache: Stage3MatchCache,
+    *,
+    min_support: int = 64,
+    min_relative_improvement: float = 1.0e-3,
+    output_depth_floor: float = 0.01,
+) -> Stage3BAOutput:
+    """Fit and publish the per-frame SELF-I affine exactly once.
+
+    Local LM stages operate only on pose and sparse depth.  This function is
+    deliberately separate so the finally selected sparse state is the sole
+    source of the dense affine update.  BA/matching validity limits are not
+    reused here: finite affine outputs above the configured sampling maximum
+    remain untouched.
+    """
+
+    if original_dense_depth.ndim != 5 or int(original_dense_depth.shape[2]) != 1:
+        raise ValueError("original_dense_depth must have shape BxSx1xHxW")
+    batch, views = (int(value) for value in original_dense_depth.shape[:2])
+    expected_sparse = (batch, views, inlier_cache.queries_per_source)
+    if tuple(initial_sparse_depth.shape) != expected_sparse:
+        raise ValueError(f"initial_sparse_depth must have shape {expected_sparse}")
+    if tuple(result.sparse_depth.shape) != expected_sparse:
+        raise ValueError("result.sparse_depth must match initial_sparse_depth")
+    if inlier_cache.batch_size != batch or inlier_cache.num_views != views:
+        raise ValueError("inlier_cache must share batch/view dimensions with dense depth")
+    floor = float(output_depth_floor)
+    if not math.isfinite(floor) or floor <= 0.0:
+        raise ValueError("output_depth_floor must be positive and finite")
+
+    output_depth = original_dense_depth.detach().clone()
+    scales = torch.ones((batch, views), device=output_depth.device, dtype=output_depth.dtype)
+    shifts = torch.zeros_like(scales)
+    affine_accepted = torch.zeros((batch, views), device=output_depth.device, dtype=torch.bool)
+    identity_errors = torch.full_like(scales, float("inf"))
+    fit_errors = torch.full_like(scales, float("inf"))
+    diagnostics = [dict(value) for value in result.diagnostics]
+    edge_pairs = inlier_cache.edges.detach().cpu().tolist()
+
+    for batch_idx in range(batch):
+        frame_diagnostics: list[dict[str, Any]] = []
+        for frame in range(views):
+            supported = inlier_cache.source_valid[batch_idx, frame].to(
+                device=output_depth.device
+            ).bool()
+            outgoing = [
+                edge_idx
+                for edge_idx, pair in enumerate(edge_pairs)
+                if int(pair[0]) == frame
+            ]
+            if outgoing:
+                edge_support = inlier_cache.valid_mask[batch_idx, outgoing].to(
+                    device=output_depth.device
+                ).any(dim=0)
+                supported &= edge_support
+            else:
+                supported &= False
+            source = initial_sparse_depth[batch_idx, frame].to(output_depth)
+            target = result.sparse_depth[batch_idx, frame].to(output_depth)
+            supported &= (
+                torch.isfinite(source)
+                & torch.isfinite(target)
+                & (source > 0.0)
+                & (target > 0.0)
+            )
+            support_count = int(supported.sum().detach().cpu())
+            median_depth = (
+                float(source[supported].median().detach().cpu())
+                if support_count > 0
+                else 1.0
+            )
+            weight = torch.ones_like(source)
+            (
+                scale,
+                shift,
+                accepted,
+                identity_error,
+                fit_error,
+            ) = _weighted_affine_fit_with_acceptance(
+                source[supported],
+                target[supported],
+                weight[supported],
+                median_depth=median_depth,
+                min_support=int(min_support),
+                min_relative_improvement=float(min_relative_improvement),
+            )
+            if not bool(result.accepted[batch_idx]):
+                accepted = False
+                scale = scale.new_tensor(1.0)
+                shift = shift.new_tensor(0.0)
+            scales[batch_idx, frame] = scale
+            shifts[batch_idx, frame] = shift
+            identity_errors[batch_idx, frame] = identity_error
+            fit_errors[batch_idx, frame] = fit_error
+            affine_accepted[batch_idx, frame] = bool(accepted)
+
+            dense_source = original_dense_depth[batch_idx, frame]
+            if accepted:
+                trial = scale * dense_source + shift
+                finite_source = torch.isfinite(dense_source)
+                published = torch.where(torch.isfinite(trial), trial, dense_source)
+                published = torch.where(
+                    finite_source,
+                    published.clamp_min(floor),
+                    dense_source,
+                )
+                output_depth[batch_idx, frame] = published
+            finite_output = output_depth[batch_idx, frame][
+                torch.isfinite(output_depth[batch_idx, frame])
+            ]
+            if int(finite_output.numel()) > 0:
+                quantiles = torch.quantile(
+                    finite_output.float(),
+                    finite_output.new_tensor([0.50, 0.95, 0.99], dtype=torch.float32),
+                )
+                depth_p50, depth_p95, depth_p99 = (
+                    float(value.detach().cpu()) for value in quantiles
+                )
+                depth_max = float(finite_output.max().detach().cpu())
+                floor_count = int((finite_output <= floor + 1.0e-8).sum().detach().cpu())
+            else:
+                depth_p50 = depth_p95 = depth_p99 = depth_max = float("nan")
+                floor_count = 0
+            identity_value = float(identity_error.detach().cpu())
+            fit_value = float(fit_error.detach().cpu())
+            relative_improvement = (
+                (identity_value - fit_value) / max(abs(identity_value), 1.0e-12)
+                if math.isfinite(identity_value) and math.isfinite(fit_value)
+                else float("nan")
+            )
+            frame_diagnostics.append(
+                {
+                    "frame_index": frame,
+                    "scale": float(scale.detach().cpu()),
+                    "shift": float(shift.detach().cpu()),
+                    "support": support_count,
+                    "accepted": bool(accepted),
+                    "identity_error": identity_value,
+                    "fit_error": fit_value,
+                    "relative_improvement": relative_improvement,
+                    "depth_p50": depth_p50,
+                    "depth_p95": depth_p95,
+                    "depth_p99": depth_p99,
+                    "depth_max": depth_max,
+                    "depth_floor_count": floor_count,
+                }
+            )
+        diagnostics[batch_idx].update(
+            {
+                "dense_depth_affine_applications": 1,
+                "dense_depth_output_floor": floor,
+                "dense_depth_output_max_clamp": None,
+                "depth_affine_frames": frame_diagnostics,
+            }
+        )
+
+    return replace(
+        result,
+        dense_depth=output_depth,
+        depth_scale=scales,
+        depth_shift=shifts,
+        depth_affine_accepted=affine_accepted,
+        depth_affine_identity_error=identity_errors,
+        depth_affine_fit_error=fit_errors,
+        diagnostics=diagnostics,
+    )
+
+
 def _solve_diagonal_depth_schur(
     hpp: torch.Tensor,
     gp: torch.Tensor,
@@ -1139,6 +1332,8 @@ class BlockSparseSphericalBA:
         poses_c2w: torch.Tensor,
         dense_depth: torch.Tensor,
         cache: Stage3MatchCache,
+        *,
+        initial_sparse_depth: torch.Tensor | None = None,
     ) -> Stage3BAOutput:
         if poses_c2w.ndim != 4 or poses_c2w.shape[-2:] != (4, 4):
             raise ValueError("poses_c2w must have shape BxSx4x4.")
@@ -1147,11 +1342,15 @@ class BlockSparseSphericalBA:
         batch, views = int(poses_c2w.shape[0]), int(poses_c2w.shape[1])
         if cache.batch_size != batch or cache.num_views != views:
             raise ValueError("BA inputs and match cache must share batch/view dimensions.")
+        expected_sparse = (batch, views, cache.queries_per_source)
+        if initial_sparse_depth is not None and tuple(initial_sparse_depth.shape) != expected_sparse:
+            raise ValueError(f"initial_sparse_depth must have shape {expected_sparse}.")
         if self.pose_dof_mode == "rotation_then_translation":
             return self._run_rotation_then_translation(
                 poses_c2w,
                 dense_depth,
                 cache,
+                initial_sparse_depth=initial_sparse_depth,
             )
 
         output_poses: list[torch.Tensor] = []
@@ -1171,6 +1370,11 @@ class BlockSparseSphericalBA:
                 dense_depth[batch_idx].detach().float(),
                 cache,
                 batch_idx=batch_idx,
+                initial_sparse_depth=(
+                    None
+                    if initial_sparse_depth is None
+                    else initial_sparse_depth[batch_idx].detach().float()
+                ),
             )
             output_poses.append(result[0])
             sparse_values.append(result[1])
@@ -1237,13 +1441,25 @@ class BlockSparseSphericalBA:
         poses_c2w: torch.Tensor,
         dense_depth: torch.Tensor,
         cache: Stage3MatchCache,
+        *,
+        initial_sparse_depth: torch.Tensor | None = None,
     ) -> Stage3BAOutput:
         rotation_solver = copy.copy(self)
         rotation_solver.pose_dof_mode = "rotation_only"
         translation_solver = copy.copy(self)
         translation_solver.pose_dof_mode = "translation_only"
-        rotation = rotation_solver(poses_c2w, dense_depth, cache)
-        translation = translation_solver(rotation.poses_c2w, rotation.dense_depth, cache)
+        rotation = rotation_solver(
+            poses_c2w,
+            dense_depth,
+            cache,
+            initial_sparse_depth=initial_sparse_depth,
+        )
+        translation = translation_solver(
+            rotation.poses_c2w,
+            rotation.dense_depth,
+            cache,
+            initial_sparse_depth=rotation.sparse_depth,
+        )
         diagnostics: list[dict[str, Any]] = []
         for index, (rotation_diag, translation_diag) in enumerate(
             zip(rotation.diagnostics, translation.diagnostics, strict=True)
@@ -1291,11 +1507,23 @@ class BlockSparseSphericalBA:
         cache: Stage3MatchCache,
         *,
         batch_idx: int,
+        initial_sparse_depth: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool, float, float, dict[str, Any]]:
         device = poses.device
         views, query_count = cache.num_views, cache.queries_per_source
-        source_depth = sample_erp_with_wrap(depth_map, cache.source_uv[batch_idx])[..., 0].reshape(-1)
-        source_depth = source_depth.clamp(self.min_depth, self.max_depth)
+        if initial_sparse_depth is None:
+            source_depth = sample_erp_with_wrap(
+                depth_map, cache.source_uv[batch_idx]
+            )[..., 0].reshape(-1)
+            source_depth = source_depth.clamp(self.min_depth, self.max_depth)
+        else:
+            if tuple(initial_sparse_depth.shape) != (views, query_count):
+                raise ValueError(
+                    f"initial_sparse_depth batch slice must have shape {(views, query_count)}"
+                )
+            source_depth = initial_sparse_depth.to(device=device, dtype=torch.float32).reshape(-1)
+            if not bool(torch.isfinite(source_depth).all()) or bool((source_depth <= 0.0).any()):
+                raise ValueError("initial_sparse_depth must be finite and strictly positive")
         log0 = -source_depth.log()
         edges = cache.edges.to(device=device)
         src = edges[:, 0, None].expand(-1, query_count).reshape(-1)
