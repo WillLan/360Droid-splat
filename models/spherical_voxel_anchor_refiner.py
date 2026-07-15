@@ -779,6 +779,11 @@ class BinaryAnchorErrorPooler(nn.Module):
                 low_uv[:, 0] *= float(low_w) / float(width)
                 low_uv[:, 1] *= float(low_h) / float(height)
                 sampled_error = sample_erp_with_wrap(target_error_maps[batch_idx, target], low_uv)
+                # Keep cross-view statistics in FP32 even when the error
+                # encoder runs under BF16 autocast. index_add_ requires the
+                # source and accumulation buffer to have exactly the same
+                # dtype, and the means are more stable in the anchor dtype.
+                sampled_error = sampled_error.to(dtype=signed_sum.dtype)
                 sampled_depth = sample_erp_with_wrap(render_group.depth[batch_idx, target], uv)[:, 0]
                 sampled_alpha = sample_erp_with_wrap(render_group.alpha[batch_idx, target], uv)[:, 0]
                 sampled_target_valid = sample_erp_with_wrap(target_valid[batch_idx, target].float(), uv)[:, 0] > 0.5

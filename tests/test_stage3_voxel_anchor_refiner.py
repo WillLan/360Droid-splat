@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -193,6 +194,27 @@ def test_binary_multiview_pooling_keeps_only_signed_abs_and_coverage() -> None:
     render.alpha[:, 1] = 0.99
     changed = pooler(anchors, error, render, target_valid)
     torch.testing.assert_close(changed.raw_statistics, output.raw_statistics)
+
+
+def test_binary_pooling_accumulates_bfloat16_error_samples_in_float32() -> None:
+    _, _, _, anchors = _single_member_anchor()
+    pooler = BinaryAnchorErrorPooler()
+    error, render, target_valid = _constant_feedback(
+        anchors,
+        values=[1.0, -2.0, 3.0, -4.0],
+        alphas=[0.9, 0.9, 0.9, 0.9],
+    )
+
+    def sample_first_pixel(feature_map: torch.Tensor, pixel: torch.Tensor) -> torch.Tensor:
+        return feature_map[:, 0, 0].view(1, -1).expand(int(pixel.shape[0]), -1)
+
+    with patch(
+        "models.spherical_voxel_anchor_refiner.sample_erp_with_wrap",
+        side_effect=sample_first_pixel,
+    ):
+        output = pooler(anchors, error.bfloat16(), render, target_valid)
+    assert output.raw_statistics.dtype == torch.float32
+    assert bool(torch.isfinite(output.raw_statistics).all())
 
 
 def test_target_order_permutation_leaves_anchor_statistics_unchanged() -> None:
