@@ -248,6 +248,26 @@ class SphericalSelfiGaussianHead(nn.Module):
             return gradient_checkpoint(module, value, skip, use_reentrant=False)
         return module(value, skip)
 
+    def _decode_flat(
+        self, flat_input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode an independent flattened B*V batch into raw Gaussian fields."""
+
+        skips = [self._run(self.stem, flat_input)]
+        for level in self.encoder:
+            skips.append(self._run(level, skips[-1]))
+        decoded = skips[-1]
+        for level, skip in zip(self.decoder, reversed(skips[:-1])):
+            decoded = self._run_decoder(level, decoded, skip)
+        parameters = self.parameter_mlp(decoded)
+        return (
+            self.quaternion_head(decoded),
+            self.depth_head(decoded),
+            self.scale_head(parameters),
+            self.rgb_sh_head(parameters),
+            self.density_sh_head(parameters),
+        )
+
     @staticmethod
     def _normalize_depth(depth: torch.Tensor, *, batch: int, views: int) -> torch.Tensor:
         value = depth
@@ -268,6 +288,7 @@ class SphericalSelfiGaussianHead(nn.Module):
         *,
         frame_ids: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        flat_batch_chunk_size: int | None = None,
     ) -> PerPixelGaussianObservation:
         if adapter_features.ndim != 5:
             raise ValueError("adapter_features must have shape BxSxCxHxW.")
@@ -295,19 +316,21 @@ class SphericalSelfiGaussianHead(nn.Module):
             [features.reshape(batch * views, channels, height, width), images.reshape(batch * views, 3, height, width)],
             dim=1,
         )
-        skips = [self._run(self.stem, flat_input)]
-        for level in self.encoder:
-            skips.append(self._run(level, skips[-1]))
-        decoded = skips[-1]
-        for level, skip in zip(self.decoder, reversed(skips[:-1])):
-            decoded = self._run_decoder(level, decoded, skip)
-
-        quaternion_raw = self.quaternion_head(decoded)
-        depth_raw = self.depth_head(decoded)
-        parameters = self.parameter_mlp(decoded)
-        log_scale = self.scale_head(parameters).reshape(batch, views, 3, height, width)
-        rgb_sh = self.rgb_sh_head(parameters).reshape(batch, views, self.rgb_sh_count, 3, height, width)
-        density_sh = self.density_sh_head(parameters).reshape(batch, views, self.density_sh_count, height, width)
+        flat_count = int(flat_input.shape[0])
+        chunk_size = flat_count if flat_batch_chunk_size is None else int(flat_batch_chunk_size)
+        if chunk_size <= 0:
+            chunk_size = flat_count
+        decoded_chunks = [
+            self._decode_flat(flat_input[start : start + chunk_size])
+            for start in range(0, flat_count, chunk_size)
+        ]
+        quaternion_raw, depth_raw, log_scale_raw, rgb_sh_raw, density_sh_raw = (
+            torch.cat([chunk[index] for chunk in decoded_chunks], dim=0)
+            for index in range(5)
+        )
+        log_scale = log_scale_raw.reshape(batch, views, 3, height, width)
+        rgb_sh = rgb_sh_raw.reshape(batch, views, self.rgb_sh_count, 3, height, width)
+        density_sh = density_sh_raw.reshape(batch, views, self.density_sh_count, height, width)
         quaternion = normalize_quaternion(
             quaternion_raw.reshape(batch, views, 4, height, width).permute(0, 1, 3, 4, 2)
         ).permute(0, 1, 4, 2, 3)

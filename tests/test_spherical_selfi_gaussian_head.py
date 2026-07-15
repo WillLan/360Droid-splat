@@ -44,6 +44,48 @@ def test_head_supports_odd_runtime_shape_and_bounds_depth_residual() -> None:
     assert bool((output.refined_depth > 0.0).all())
 
 
+def test_head_view_chunking_matches_full_batch_inference() -> None:
+    torch.manual_seed(11)
+    head = _tiny_head().eval()
+    with torch.no_grad():
+        for module in (
+            head.quaternion_head.conv,
+            head.depth_head.conv,
+            head.scale_head,
+            head.rgb_sh_head,
+            head.density_sh_head,
+        ):
+            module.weight.normal_(std=0.01)
+    feature, rgb, depth, poses = _inputs(16, 32, views=4)
+    with torch.inference_mode():
+        full = head(feature, rgb, depth, poses)
+        chunked = head(
+            feature,
+            rgb,
+            depth,
+            poses,
+            flat_batch_chunk_size=1,
+        )
+    for name in (
+        "initial_depth",
+        "depth_residual",
+        "refined_depth",
+        "local_quaternion",
+        "log_scale_multiplier",
+        "rgb_sh",
+        "density_sh",
+        "confidence",
+    ):
+        torch.testing.assert_close(
+            getattr(chunked, name),
+            getattr(full, name),
+            atol=5.0e-6,
+            rtol=1.0e-5,
+        )
+    assert torch.equal(chunked.valid_mask, full.valid_mask)
+    assert torch.equal(chunked.frame_ids, full.frame_ids)
+
+
 def test_head_backward_is_finite_and_frozen_inputs_receive_no_required_grad() -> None:
     head = _tiny_head()
     feature, rgb, depth, poses = _inputs(16, 32, views=1)

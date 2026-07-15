@@ -256,6 +256,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.adapter_view_chunk_size = max(
             0, int(runtime.get("adapter_view_chunk_size", 0))
         )
+        self.head_view_chunk_size = max(
+            0, int(runtime.get("head_view_chunk_size", 0))
+        )
         image_cfg = dict(config.get("image", {}) or {})
         self.head_size = (
             int(image_cfg.get("head_height", image_cfg.get("height", 504))),
@@ -1266,6 +1269,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 depth,
                 poses,
                 frame_ids=frame_ids,
+                flat_batch_chunk_size=(self.head_view_chunk_size or None),
             )
             sky_prob = None
             if self.sky_adapter is not None:
