@@ -166,6 +166,28 @@ def test_adapter_supports_flattened_bv_features_and_backpropagates_to_adapter_on
     assert any(grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0 for grad in grads)
 
 
+def test_adapter_view_chunking_matches_full_batch_inference():
+    torch.manual_seed(7)
+    b, v = 1, 4
+    features = [
+        torch.rand(b, v, 4, 8, 16),
+        torch.rand(b, v, 6, 4, 8),
+        torch.rand(b, v, 8, 2, 4),
+        torch.rand(b, v, 10, 1, 2),
+    ]
+    adapter = SphericalSelfiDPTAdapter(
+        [4, 6, 8, 10],
+        hidden_dim=8,
+        image_height=32,
+        image_width=64,
+    ).eval()
+    with torch.inference_mode():
+        full = adapter(features)
+        chunked = adapter(features, flat_batch_chunk_size=1)
+    assert chunked.shape == full.shape
+    assert torch.allclose(chunked, full, atol=3.0e-6, rtol=1.0e-5)
+
+
 def test_adapter_supports_token_features_with_explicit_token_hw():
     b, v = 1, 2
     token_hw = [(8, 16), (4, 8), (2, 4), (1, 2)]

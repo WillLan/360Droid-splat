@@ -242,29 +242,18 @@ class SphericalSelfiDPTAdapter(nn.Module):
         b, v = shape
         return feature.view(b, v, int(feature.shape[1]), int(feature.shape[2]), int(feature.shape[3]))
 
-    def forward(
-        self,
-        stage_features: list[Any] | tuple[Any, ...],
-        *,
-        batch_size: int | None = None,
-        num_views: int | None = None,
-    ) -> torch.Tensor:
-        """Return dense spherical features with shape ``B x V x out_dim x H x W``."""
+    def _forward_flat(self, features: list[torch.Tensor]) -> torch.Tensor:
+        """Run the adapter for an already flattened B*V feature batch."""
 
-        normalized = self._normalize_inputs(stage_features, batch_size=batch_size, num_views=num_views)
         projected: list[torch.Tensor] = []
-        restore_shape: tuple[int, int] | None = None
-        for feature, projection in zip(normalized, self.projections):
-            flat, restore_shape = self._flatten_bv(feature)
-            value = projection(flat)
+        for feature, projection in zip(features, self.projections):
+            value = projection(feature)
             target_size = self.reassemble_sizes[len(projected)]
             if target_size is not None and tuple(value.shape[-2:]) != target_size:
                 value = F.interpolate(value, size=target_size, mode="bilinear", align_corners=False)
             projected.append(value)
-        assert restore_shape is not None
 
-        fused = projected[-1]
-        fused = self.fusion_blocks[-1](fused)
+        fused = self.fusion_blocks[-1](projected[-1])
         for idx in range(2, -1, -1):
             fused = F.interpolate(fused, size=projected[idx].shape[-2:], mode="bilinear", align_corners=False)
             fused = self.fusion_blocks[idx](fused + projected[idx])
@@ -280,10 +269,32 @@ class SphericalSelfiDPTAdapter(nn.Module):
                 align_corners=False,
             )
         dense = self.output_proj(fused)
-        out = self._restore_bv(dense, restore_shape)
         if self.norm_output:
-            out = F.normalize(out, dim=2, eps=1.0e-6)
-        return out
+            dense = F.normalize(dense, dim=1, eps=1.0e-6)
+        return dense
+
+    def forward(
+        self,
+        stage_features: list[Any] | tuple[Any, ...],
+        *,
+        batch_size: int | None = None,
+        num_views: int | None = None,
+        flat_batch_chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        """Return dense spherical features with shape ``B x V x out_dim x H x W``."""
+
+        normalized = self._normalize_inputs(stage_features, batch_size=batch_size, num_views=num_views)
+        flattened = [self._flatten_bv(feature)[0] for feature in normalized]
+        restore_shape = (int(normalized[0].shape[0]), int(normalized[0].shape[1]))
+        flat_count = int(flattened[0].shape[0])
+        chunk_size = flat_count if flat_batch_chunk_size is None else int(flat_batch_chunk_size)
+        if chunk_size <= 0:
+            chunk_size = flat_count
+        chunks = [
+            self._forward_flat([feature[start : start + chunk_size] for feature in flattened])
+            for start in range(0, flat_count, chunk_size)
+        ]
+        return self._restore_bv(torch.cat(chunks, dim=0), restore_shape)
 
 
 def load_spherical_selfi_adapter_checkpoint(

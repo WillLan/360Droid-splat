@@ -253,6 +253,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.feature_device = _device(runtime.get("feature_device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.head_device = _device(runtime.get("head_device", str(self.feature_device)))
         self.feature_amp = bool(runtime.get("feature_amp", False))
+        self.adapter_view_chunk_size = max(
+            0, int(runtime.get("adapter_view_chunk_size", 0))
+        )
         image_cfg = dict(config.get("image", {}) or {})
         self.head_size = (
             int(image_cfg.get("head_height", image_cfg.get("height", 504))),
@@ -1240,6 +1243,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                     train_device=self.head_device,
                     head_size=self.head_size,
                     feature_amp=self.feature_amp,
+                    adapter_view_chunk_size=(
+                        self.adapter_view_chunk_size or None
+                    ),
                 )
 
             captured_feature = None

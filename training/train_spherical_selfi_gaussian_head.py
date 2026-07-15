@@ -373,6 +373,7 @@ def extract_frozen_inputs(
     train_device: torch.device,
     head_size: tuple[int, int],
     feature_amp: bool = False,
+    adapter_view_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the full-resolution frozen stack then explicitly resize Stage 2 inputs."""
 
@@ -392,7 +393,10 @@ def extract_frozen_inputs(
             )
         if pano_output.init_depth is None or pano_output.init_poses is None:
             raise RuntimeError("PanoVGGT must provide initial depth and poses for Stage 2.")
-        dense = adapter(pano_output.stage_features)
+        dense = adapter(
+            pano_output.stage_features,
+            flat_batch_chunk_size=adapter_view_chunk_size,
+        )
         batch, views = int(full_images.shape[0]), int(full_images.shape[1])
         depth = _canonical_depth(pano_output.init_depth, batch=batch, views=views)
         poses = pano_output.init_poses
