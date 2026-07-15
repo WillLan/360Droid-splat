@@ -2756,6 +2756,7 @@ class PanoDroidGSSlamSystem:
                         ba_diagnostic.get("published_rotation_update_deg")
                     )
                     affine_accepted = ba_diagnostic.get("depth_affine_accepted") or []
+                    depth_affine_frames = ba_diagnostic.get("depth_affine_frames") or []
 
                     record = {
                         "window_id": int(diagnostic["window_id"]),
@@ -2828,6 +2829,38 @@ class PanoDroidGSSlamSystem:
                         ),
                         "published_rotation_update_deg": published_rotation_update_deg,
                         "depth_affine_accepted": [bool(value) for value in affine_accepted],
+                        "depth_affine_frames": [
+                            dict(value)
+                            for value in depth_affine_frames
+                            if isinstance(value, dict)
+                        ],
+                        "depth_parameterization": ba_diagnostic.get(
+                            "depth_parameterization"
+                        ),
+                        "normalized_depth_shift": finite_sequence(
+                            ba_diagnostic.get("normalized_depth_shift")
+                        ),
+                        "depth_shift": finite_sequence(
+                            ba_diagnostic.get("depth_shift")
+                        ),
+                        "validation_passed": bool(
+                            ba_diagnostic.get("validation_passed", False)
+                        ),
+                        "validation_support_ok": bool(
+                            ba_diagnostic.get("validation_support_ok", False)
+                        ),
+                        "validation_angular_ok": bool(
+                            ba_diagnostic.get("validation_angular_ok", False)
+                        ),
+                        "validation_sim3_ok": bool(
+                            ba_diagnostic.get("validation_sim3_ok", False)
+                        ),
+                        "validation_initial_median_deg": finite_optional(
+                            ba_diagnostic.get("validation_initial_median_deg")
+                        ),
+                        "validation_final_median_deg": finite_optional(
+                            ba_diagnostic.get("validation_final_median_deg")
+                        ),
                     }
                     local_ba_window_records.append(record)
                     local_ba_payload = {
@@ -2851,6 +2884,9 @@ class PanoDroidGSSlamSystem:
                         ),
                         "local_ba/published_pose_updated": int(
                             record["published_pose_updated"]
+                        ),
+                        "local_ba/validation_passed": int(
+                            record["validation_passed"]
                         ),
                     }
                     optional_scalars = {
@@ -2881,6 +2917,12 @@ class PanoDroidGSSlamSystem:
                             if len(published_rotation_update_deg) > 1
                             else None
                         ),
+                        "local_ba/validation_initial_median_deg": record[
+                            "validation_initial_median_deg"
+                        ],
+                        "local_ba/validation_final_median_deg": record[
+                            "validation_final_median_deg"
+                        ],
                     }
                     local_ba_payload.update(
                         {key: value for key, value in optional_scalars.items() if value is not None}

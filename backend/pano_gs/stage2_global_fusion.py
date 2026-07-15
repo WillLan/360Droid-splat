@@ -91,6 +91,7 @@ class Stage2GlobalMapFusion:
         min_confidence: float = 0.05,
         min_opacity: float = 0.02,
         max_total_gaussians: int = 0,
+        lazy_owner_transforms: bool = False,
     ) -> None:
         self.map = gaussian_map
         values = sorted({float(value) for value in voxel_sizes if float(value) > 0.0})
@@ -100,6 +101,8 @@ class Stage2GlobalMapFusion:
         self.min_confidence = float(min_confidence)
         self.min_opacity = float(min_opacity)
         self.max_total_gaussians = max(0, int(max_total_gaussians))
+        self.lazy_owner_transforms = bool(lazy_owner_transforms)
+        self.map.configure_lazy_owner_transforms(self.lazy_owner_transforms)
         self.last_pre_cap_count = 0
         self.last_saturated = False
         # Set permanently once a VoxelAnchorRefiner packet is fused.  The
@@ -344,6 +347,49 @@ class Stage2GlobalMapFusion:
             result = result.index(selected)
         return result
 
+    def _winner_take_owner_voxel(
+        self,
+        batch: GlobalExplicitGaussianBatch,
+        *,
+        preserve_levels: bool | None = None,
+    ) -> GlobalExplicitGaussianBatch:
+        """Deduplicate only within an owner's immutable reference frame."""
+
+        if len(batch) == 0:
+            self.last_pre_cap_count = 0
+            self.last_saturated = False
+            return batch
+        preserve = self._depth_selected_mode if preserve_levels is None else bool(preserve_levels)
+        if preserve:
+            level = batch.level.long()
+            selected_size = batch.voxel_size[:, 0].to(batch.xyz).clamp_min(1.0e-8)
+            grid = torch.floor(batch.xyz / selected_size[:, None]).to(torch.int64)
+        else:
+            level, grid = self._levels_and_grid(batch.xyz, batch.scale)
+            batch.voxel_size = batch.xyz.new_tensor(self.voxel_sizes)[level, None]
+        batch.level, batch.grid_coord = level, grid
+        key = torch.cat([batch.owner_window_id[:, None], level[:, None], grid], dim=-1)
+        unique, inverse = torch.unique(key, dim=0, return_inverse=True, sorted=True)
+        max_quality = batch.quality.new_full((int(unique.shape[0]),), -torch.inf)
+        max_quality.scatter_reduce_(0, inverse, batch.quality, reduce="amax", include_self=True)
+        indices = torch.arange(len(batch), device=batch.xyz.device, dtype=torch.long)
+        candidate = torch.where(
+            batch.quality >= max_quality[inverse] - 1.0e-12,
+            indices,
+            torch.full_like(indices, len(batch)),
+        )
+        winner = torch.full(
+            (int(unique.shape[0]),), len(batch), device=batch.xyz.device, dtype=torch.long
+        )
+        winner.scatter_reduce_(0, inverse, candidate, reduce="amin", include_self=True)
+        result = batch.index(winner[winner < len(batch)])
+        self.last_pre_cap_count = len(result)
+        self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
+        if self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians:
+            selected = torch.topk(result.quality, k=self.max_total_gaussians, largest=True).indices
+            result = result.index(selected)
+        return result
+
     @staticmethod
     def _distribution(prefix: str, value: torch.Tensor) -> dict[str, float]:
         finite = value.detach().float().reshape(-1)
@@ -396,9 +442,23 @@ class Stage2GlobalMapFusion:
             return default
 
         preserve = self._depth_selected_mode if preserve_levels is None else bool(preserve_levels)
-        computed_level, computed_grid = self._levels_and_grid(
-            self.map.get_xyz.detach(), self.map.get_scaling.detach()
+        map_xyz = self.map.xyz.detach() if self.lazy_owner_transforms else self.map.get_xyz.detach()
+        map_scale = (
+            self.map._base_scaling().detach()
+            if self.lazy_owner_transforms
+            else self.map.get_scaling.detach()
         )
+        map_rotation = (
+            self.map._base_rotation().detach()
+            if self.lazy_owner_transforms
+            else self.map.get_rotation.detach()
+        )
+        map_sh = (
+            self.map._base_sh_coefficients().detach()
+            if self.lazy_owner_transforms
+            else self.map.get_sh_coefficients.detach()
+        )
+        computed_level, computed_grid = self._levels_and_grid(map_xyz, map_scale)
         if preserve:
             level = metadata("_anchor_level", computed_level.cpu()).to(device=device).long()
             voxel_size = metadata(
@@ -406,17 +466,17 @@ class Stage2GlobalMapFusion:
                 self.map.get_xyz.detach().new_tensor(self.voxel_sizes)[level.to(device=device)],
             ).to(device=device, dtype=dtype).reshape(-1, 1)
             grid = torch.floor(
-                self.map.get_xyz.detach() / voxel_size.clamp_min(1.0e-8)
+                map_xyz / voxel_size.clamp_min(1.0e-8)
             ).long()
         else:
             level, grid = computed_level, computed_grid
             voxel_size = self.map.get_xyz.detach().new_tensor(self.voxel_sizes)[level, None]
         return GlobalExplicitGaussianBatch(
-            xyz=self.map.get_xyz.detach().clone(),
-            scale=self.map.get_scaling.detach().clone(),
-            rotation=self.map.get_rotation.detach().clone(),
+            xyz=map_xyz.clone(),
+            scale=map_scale.clone(),
+            rotation=map_rotation.clone(),
             opacity=self.map.get_opacity.detach().clone(),
-            sh_coefficients=self.map.get_sh_coefficients.detach().clone(),
+            sh_coefficients=map_sh.clone(),
             quality=metadata("_anchor_quality", torch.ones(count)).to(dtype=dtype),
             owner_window_id=metadata("_anchor_owner_window_id", torch.full((count,), -1)).long(),
             level=level,
@@ -554,6 +614,13 @@ class Stage2GlobalMapFusion:
         anchor_to_global: torch.Tensor,
     ) -> dict[str, int | float]:
         before = self.map.anchor_count()
+        if self.lazy_owner_transforms:
+            self.map.set_lazy_owner_transform(
+                int(packet.window_id),
+                anchor_to_global,
+                set_reference=int(packet.window_id)
+                not in self.map._lazy_owner_reference_transforms,
+            )
         depth_selected = packet.anchor_observation is not None
         if self._depth_selected_mode and not depth_selected and before > 0:
             raise ValueError(
@@ -569,7 +636,11 @@ class Stage2GlobalMapFusion:
             incoming = self.compact_within_window(incoming_raw)
         existing = self._batch_from_map(preserve_levels=depth_selected)
         combined = incoming if len(existing) == 0 else self._concatenate([existing, incoming])
-        compacted = self._winner_take_global_voxel(combined, preserve_levels=depth_selected)
+        compacted = (
+            self._winner_take_owner_voxel(combined, preserve_levels=depth_selected)
+            if self.lazy_owner_transforms
+            else self._winner_take_global_voxel(combined, preserve_levels=depth_selected)
+        )
         pre_cap_count = int(self.last_pre_cap_count)
         saturated = bool(self.last_saturated)
         self._write_map(compacted)
@@ -596,6 +667,16 @@ class Stage2GlobalMapFusion:
         old_transforms: dict[int, torch.Tensor],
         new_transforms: dict[int, torch.Tensor],
     ) -> dict[str, int]:
+        if self.lazy_owner_transforms:
+            moved = 0
+            owners = self.map._anchor_owner_window_id
+            for owner in sorted(set(old_transforms) & set(new_transforms)):
+                count = int((owners == int(owner)).sum().item())
+                if count <= 0:
+                    continue
+                self.map.set_lazy_owner_transform(int(owner), new_transforms[owner])
+                moved += count
+            return {"moved": moved, "deduplicated": 0, "lazy": 1}
         batch = self._batch_from_map()
         if len(batch) == 0:
             return {"moved": 0, "deduplicated": 0}

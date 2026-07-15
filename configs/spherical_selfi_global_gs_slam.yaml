@@ -103,6 +103,7 @@ SphericalSelfiRuntime:
     max_depth: 20.0
   local_ba:
     enabled: true
+    pose_safe_two_stage: true
     iterations: 5
     damping: 1.0e-4
     solver_mode: standard_lm
@@ -118,9 +119,11 @@ SphericalSelfiRuntime:
     pose_update_side: right
     pose_dof_mode: se3
     gauge_mode: initial_baseline
-    dense_depth_mode: affine
+    dense_depth_mode: shift
     defer_dense_depth_affine: true
     dense_depth_output_floor: 0.01
+    max_depth_shift_ratio: 0.25
+    max_depth_shift_step_ratio: 0.05
     residual_worse_tolerance: 1.05
     huber_delta_deg: 0.5
     pose_prior_weight: 1.0e-3
@@ -142,13 +145,18 @@ SphericalSelfiRuntime:
       second_stage_iterations: 10
       angular_mad_scale: 3.0
       angular_min_deg: 1.0
-      angular_max_deg: 10.0
+      angular_max_deg: 5.0
       sim3_irls_iterations: 3
       sim3_mad_scale: 3.0
       sim3_min_residual: 0.01
-      sim3_max_relative_depth: 0.10
+      sim3_max_relative_depth: 0.05
       min_inliers: 128
       min_inlier_ratio: 0.20
+      validation_stride: 5
+      validation_min_inliers: 32
+      validation_min_inlier_ratio: 0.10
+      validation_residual_worse_tolerance: 1.0
+      validation_sim3_worse_tolerance: 1.05
     matching:
       type: adapter
       num_queries: 2048
@@ -170,6 +178,21 @@ SphericalSelfiGlobalBackend:
     enabled: true
     tolerance: 1.0e-5
     rollback_on_failure: true
+  robust_loop:
+    mode: dcs
+    dcs_phi: 25.0
+    transactional: true
+    min_commit_dcs_scale: 0.05
+    max_nonloop_objective_ratio: 1.05
+    nonloop_objective_tolerance: 1.0e-6
+    path_max_rotation_deg: 45.0
+    path_max_translation: 5.0
+    path_max_log_scale: 1.0986122887
+  hierarchical_submaps:
+    enabled: true
+    windows_per_submap: 5
+    shared_boundary_nodes: 1
+    compress_frozen_dense_factors: true
   global_graph:
     node_mode: boundary_frame
     factor_mode: dense_spherical
@@ -183,6 +206,9 @@ SphericalSelfiGlobalBackend:
     lm_diagonal_floor: 1.0e-6
     pcg_iterations: 64
     pcg_tolerance: 1.0e-6
+    dense_linearization_chunk_size: 512
+    normalize_dense_information_by_count: true
+    dense_information_reference_count: 64
     recent_windows: 32
     optimization_start_nodes: 6
     optimization_interval_edges: 5
@@ -221,11 +247,32 @@ SphericalSelfiGlobalBackend:
     max_log_scale_update: 0.25
     allow_unaligned_fallback: false
   loop_closure:
-    top_k: 5
+    # Explicit opt-in to the arbitrary-orientation loop path. Code defaults
+    # remain on the legacy latitude-band descriptor for older configs.
+    descriptor:
+      mode: so3_sh_gram
+      max_degree: 6
+      num_samples: 2048
+      store_fp16: true
+    retrieval:
+      top_k: 20
+      candidate_nms_radius: 2
+      max_verified_candidates: 3
+      max_accepted_loops: 1
+    verification:
+      mode: spherical_so3
+      rotation_inlier_threshold_deg: 2.0
+      min_rotation_inlier_ratio: 0.35
+      min_spherical_coverage_bins: 6
+      coverage_latitude_bins: 3
+      coverage_longitude_bins: 4
+      max_rotation_consistency_deg: 3.0
+      max_normalized_alignment_residual: 0.10
+    top_k: 5  # Legacy fallback; ignored by retrieval.top_k above.
     exclude_recent_windows: 3
     min_retrieval_score: 0.35
     min_match_cosine: 0.45
-    min_matches: 32
+    min_matches: 64
     max_matches: 512
     min_inlier_ratio: 0.30
     max_alignment_residual: 0.35
@@ -233,6 +280,17 @@ SphericalSelfiGlobalBackend:
     coincident_translation_threshold: 0.15
     coincident_rotation_residual_deg: 2.0
     rotation_ransac_iterations: 128
+  keyframe_selection:
+    enabled: true
+    min_gap: 2
+    max_gap: 6
+    score_threshold: 0.45
+    descriptor_weight: 0.35
+    coverage_weight: 0.20
+    parallax_weight: 0.30
+    residual_weight: 0.15
+    translation_depth_ratio: 0.05
+    rotation_deg: 10.0
   voxel_fusion:
     voxel_sizes: [0.04, 0.08, 0.16, 0.32]
     min_confidence: 0.05
@@ -258,11 +316,15 @@ SphericalSelfiGlobalBackend:
     pose_refine_enable: true
     pose_lr: 2.0e-4
     pose_prior_weight: 1.0e-3
+    lazy_submap_transforms:
+      enabled: true
     pose_grad_clip: 0.001
     s2_loss_weight: 0.1
     match_depth_loss_weight: 0.01
     visible_neighbor_lr_scale: 0.1
-    extra_steps_on_loop: 0
+    extra_steps_on_loop: 20
+    loop_neighborhood_refinement: true
+    loop_neighborhood_submap_radius: 1
     final_steps: 0
     seed: 123
 

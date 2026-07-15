@@ -1,18 +1,17 @@
-"""Yaw-invariant retrieval and spherical/3D verification for panorama loops."""
+"""Panorama loop retrieval and spherical/3D geometric verification."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
-from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from backend.pano_gs.sim3_graph import (
-    CoincidentPanoramaFactor,
-    DenseSphericalFactorBlock,
-    Sim3GraphEdge,
+from geometry.panorama_loop_contracts import (
+    DenseSphericalLoopMeasurement,
+    LoopPoseMeasurement,
+    PanoramaLoopVerification,
 )
 from frontend.pano_vggt.alignment import SubmapAligner
 from geometry.spherical_pseudo_correspondence import sample_joint_valid_fibonacci_uv
@@ -22,20 +21,14 @@ from geometry.spherical_erp import erp_pixel_to_unit_ray, sample_erp_with_wrap
 from .window_packet import LocalGaussianWindowPacket
 
 
-@dataclass
-class PanoramaLoopVerification:
-    accepted: bool
-    factor: Sim3GraphEdge | CoincidentPanoramaFactor | None
-    source_window_id: int
-    target_window_id: int
-    retrieval_score: float
-    yaw_shift_columns: int
-    num_matches: int
-    inlier_ratio: float
-    residual: float
-    reason: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-    dense_factors: tuple[DenseSphericalFactorBlock, ...] = ()
+@dataclass(frozen=True)
+class PanoramaLoopCandidate:
+    """One retrieved window and the frame pair that produced its best score."""
+
+    packet: LocalGaussianWindowPacket
+    score: float
+    source_frame_index: int
+    target_frame_index: int
 
 
 def circular_yaw_shift(source: torch.Tensor, target: torch.Tensor) -> tuple[int, float]:
@@ -143,6 +136,49 @@ def spherical_rotation_ransac(
     return rotation, final_inliers, inlier_ratio, residual
 
 
+def spherical_coverage_bins(
+    bearing: torch.Tensor,
+    *,
+    latitude_bins: int = 3,
+    longitude_bins: int = 4,
+) -> tuple[int, int]:
+    """Count occupied approximately equal-area bins on the unit sphere."""
+
+    if bearing.ndim != 2 or int(bearing.shape[-1]) != 3:
+        raise ValueError("bearing must have shape Nx3")
+    lat_count = max(1, int(latitude_bins))
+    lon_count = max(1, int(longitude_bins))
+    if int(bearing.shape[0]) == 0:
+        return 0, lat_count * lon_count
+    value = F.normalize(bearing.float(), dim=-1, eps=1.0e-8)
+    y = value[:, 1].clamp(-1.0, 1.0)
+    longitude = torch.atan2(value[:, 0], value[:, 2])
+    lat_index = torch.floor((y + 1.0) * (0.5 * lat_count)).long().clamp(0, lat_count - 1)
+    lon_index = torch.floor(
+        (longitude + math.pi) * (float(lon_count) / (2.0 * math.pi))
+    ).long().clamp(0, lon_count - 1)
+    occupied = torch.unique(lat_index * lon_count + lon_index)
+    return int(occupied.numel()), lat_count * lon_count
+
+
+def rotation_geodesic_distance(first: torch.Tensor, second: torch.Tensor) -> float:
+    """Return the SO(3) geodesic angle between two 3x3 rotations."""
+
+    if tuple(first.shape) != (3, 3) or tuple(second.shape) != (3, 3):
+        raise ValueError("rotation matrices must both have shape 3x3")
+    relative = first.transpose(0, 1) @ second.to(first)
+    skew = torch.stack(
+        [
+            relative[2, 1] - relative[1, 2],
+            relative[0, 2] - relative[2, 0],
+            relative[1, 0] - relative[0, 1],
+        ]
+    )
+    sine = 0.5 * skew.norm()
+    cosine = 0.5 * (relative.trace() - 1.0)
+    return float(torch.atan2(sine, cosine.clamp(-1.0, 1.0)).detach().cpu())
+
+
 class PanoramaLoopDetector:
     def __init__(
         self,
@@ -173,6 +209,19 @@ class PanoramaLoopDetector:
         target_area_correction: bool = True,
         depth_factor_weight: float = 0.1,
         s2_huber_delta_deg: float = 1.0,
+        descriptor_mode: str = "latitude_bands",
+        candidate_nms_radius: int = 2,
+        max_verified_candidates: int = 3,
+        max_accepted_loops: int = 1,
+        verification_mode: str = "legacy",
+        rotation_inlier_threshold_deg: float = 2.0,
+        min_rotation_inlier_ratio: float | None = None,
+        min_spherical_coverage_bins: int = 6,
+        coverage_latitude_bins: int = 3,
+        coverage_longitude_bins: int = 4,
+        max_rotation_consistency_deg: float = 3.0,
+        max_normalized_alignment_residual: float = 0.10,
+        loop_dcs_phi: float | None = None,
     ) -> None:
         self.top_k = max(1, int(top_k))
         self.exclude_recent_windows = max(0, int(exclude_recent_windows))
@@ -197,6 +246,40 @@ class PanoramaLoopDetector:
         self.target_area_correction = bool(target_area_correction)
         self.depth_factor_weight = float(depth_factor_weight)
         self.s2_huber_delta_deg = float(s2_huber_delta_deg)
+        self.descriptor_mode = str(descriptor_mode).strip().lower()
+        self.so3_retrieval = self.descriptor_mode in {
+            "so3_sh_gram",
+            "so3",
+            "spherical_harmonic_gram",
+        }
+        self.candidate_nms_radius = max(0, int(candidate_nms_radius))
+        self.max_verified_candidates = max(1, int(max_verified_candidates))
+        self.max_accepted_loops = max(1, int(max_accepted_loops))
+        self.verification_mode = str(verification_mode).strip().lower()
+        self.so3_verification = self.verification_mode in {
+            "spherical_so3",
+            "so3",
+            "full_so3",
+        }
+        self.rotation_inlier_threshold = math.radians(float(rotation_inlier_threshold_deg))
+        self.min_rotation_inlier_ratio = float(
+            min_inlier_ratio if min_rotation_inlier_ratio is None else min_rotation_inlier_ratio
+        )
+        self.min_spherical_coverage_bins = max(1, int(min_spherical_coverage_bins))
+        self.coverage_latitude_bins = max(1, int(coverage_latitude_bins))
+        self.coverage_longitude_bins = max(1, int(coverage_longitude_bins))
+        total_coverage_bins = self.coverage_latitude_bins * self.coverage_longitude_bins
+        if self.min_spherical_coverage_bins > total_coverage_bins:
+            raise ValueError(
+                "min_spherical_coverage_bins cannot exceed latitude_bins*longitude_bins"
+            )
+        self.max_rotation_consistency = math.radians(float(max_rotation_consistency_deg))
+        self.max_normalized_alignment_residual = float(max_normalized_alignment_residual)
+        self.loop_dcs_phi = (
+            None
+            if loop_dcs_phi is None or float(loop_dcs_phi) <= 0.0
+            else float(loop_dcs_phi)
+        )
         self.aligner = SubmapAligner(
             align_mode="sim3",
             max_residual=float(max_alignment_residual),
@@ -210,22 +293,76 @@ class PanoramaLoopDetector:
     def add(self, packet: LocalGaussianWindowPacket) -> None:
         self.memory.append(packet)
 
-    def retrieve(self, packet: LocalGaussianWindowPacket) -> list[tuple[LocalGaussianWindowPacket, float]]:
+    def retrieve(self, packet: LocalGaussianWindowPacket) -> list[PanoramaLoopCandidate]:
         if not self.memory:
             return []
         cutoff = max(0, len(self.memory) - self.exclude_recent_windows)
         candidates = self.memory[:cutoff]
         if not candidates:
             return []
-        query = packet.retrieval_descriptors[0].detach().float()
-        scored = []
+        if not self.so3_retrieval:
+            # Preserve the historical frame-zero/yaw-only path bit-for-bit when
+            # the new descriptor mode is disabled.
+            query = packet.retrieval_descriptors[0].detach().float()
+            scored: list[PanoramaLoopCandidate] = []
+            for candidate in candidates:
+                descriptor = candidate.retrieval_descriptors[0].to(query).float()
+                score = float(F.cosine_similarity(query, descriptor, dim=0).detach().cpu())
+                if score >= self.min_retrieval_score:
+                    scored.append(PanoramaLoopCandidate(candidate, score, 0, 0))
+            scored.sort(key=lambda item: item.score, reverse=True)
+            return scored[: self.top_k]
+
+        query = F.normalize(packet.retrieval_descriptors.detach().cpu().float(), dim=-1, eps=1.0e-8)
+        descriptor_dim = int(query.shape[-1])
+        row_counts = [int(candidate.retrieval_descriptors.shape[0]) for candidate in candidates]
         for candidate in candidates:
-            descriptor = candidate.retrieval_descriptors[0].to(query).float()
-            score = float(F.cosine_similarity(query, descriptor, dim=0).detach().cpu())
+            if int(candidate.retrieval_descriptors.shape[-1]) != descriptor_dim:
+                raise ValueError(
+                    "Loop descriptor dimension changed within one retrieval database: "
+                    f"query={descriptor_dim}, window {candidate.window_id}="
+                    f"{int(candidate.retrieval_descriptors.shape[-1])}."
+                )
+        database = F.normalize(
+            torch.cat(
+                [candidate.retrieval_descriptors.detach().cpu().float() for candidate in candidates],
+                dim=0,
+            ),
+            dim=-1,
+            eps=1.0e-8,
+        )
+        similarity = database @ query.T
+        scored = []
+        cursor = 0
+        for candidate, count in zip(candidates, row_counts):
+            block = similarity[cursor : cursor + count]
+            flat_index = int(block.reshape(-1).argmax().item())
+            source_frame_index = flat_index // int(query.shape[0])
+            target_frame_index = flat_index % int(query.shape[0])
+            score = float(block[source_frame_index, target_frame_index].item())
+            cursor += count
             if score >= self.min_retrieval_score:
-                scored.append((candidate, score))
-        scored.sort(key=lambda item: item[1], reverse=True)
-        return scored[: self.top_k]
+                scored.append(
+                    PanoramaLoopCandidate(
+                        candidate,
+                        score,
+                        source_frame_index,
+                        target_frame_index,
+                    )
+                )
+        scored.sort(key=lambda item: item.score, reverse=True)
+        selected: list[PanoramaLoopCandidate] = []
+        for item in scored:
+            if any(
+                abs(int(item.packet.window_id) - int(previous.packet.window_id))
+                <= self.candidate_nms_radius
+                for previous in selected
+            ):
+                continue
+            selected.append(item)
+            if len(selected) >= self.top_k:
+                break
+        return selected
 
     @staticmethod
     def _verification_uv(indices: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -418,19 +555,31 @@ class PanoramaLoopDetector:
             & (margin >= self.min_match_margin)
             & (entropy <= self.max_match_entropy)
         )
+        selected = torch.nonzero(valid, as_tuple=False).flatten()
+        raw_valid_count = int(selected.numel())
+        if raw_valid_count > self.max_matches:
+            quality = (
+                ((cosine[selected] + 1.0) * 0.5)
+                * torch.sigmoid(10.0 * margin[selected])
+                * (1.0 - entropy[selected]).clamp_min(0.0)
+            )
+            selected = selected[torch.topk(quality, k=self.max_matches, largest=True).indices]
+        keep = torch.zeros_like(valid)
+        keep[selected] = True
         return {
-            "count": int(valid.sum().item()),
+            "count": int(selected.numel()),
+            "raw_valid_count": raw_valid_count,
             "seed": seed,
-            "source_uv": source_uv[valid],
-            "target_uv": target_uv[valid],
-            "source_bearing": queries.bearing[valid],
-            "target_bearing": erp_pixel_to_unit_ray(target_uv[valid], *target.observation.image_size),
-            "source_depth": queries.source_depth[valid],
-            "target_depth": target_depth[valid],
-            "weight": weight[valid],
-            "top1_cosine": cosine[valid],
-            "top2_margin": margin[valid],
-            "entropy": entropy[valid],
+            "source_uv": source_uv[keep],
+            "target_uv": target_uv[keep],
+            "source_bearing": queries.bearing[keep],
+            "target_bearing": erp_pixel_to_unit_ray(target_uv[keep], *target.observation.image_size),
+            "source_depth": queries.source_depth[keep],
+            "target_depth": target_depth[keep],
+            "weight": weight[keep],
+            "top1_cosine": cosine[keep],
+            "top2_margin": margin[keep],
+            "entropy": entropy[keep],
         }
 
     @staticmethod
@@ -454,8 +603,8 @@ class PanoramaLoopDetector:
         *,
         use_depth: bool,
         edge_type: str,
-    ) -> DenseSphericalFactorBlock:
-        return DenseSphericalFactorBlock(
+    ) -> DenseSphericalLoopMeasurement:
+        return DenseSphericalLoopMeasurement(
             source=int(source.window_id),
             target=int(target.window_id),
             source_local_pose=source.local_poses_c2w[source_frame_index].detach(),
@@ -469,6 +618,7 @@ class PanoramaLoopDetector:
             s2_huber_delta_deg=self.s2_huber_delta_deg,
             use_depth=bool(use_depth),
             edge_type=edge_type,
+            dcs_phi=self.loop_dcs_phi if edge_type.startswith("loop") else None,
             metadata={
                 "fibonacci_seed": int(match["seed"]),
                 "num_matches": int(match["count"]),
@@ -476,6 +626,25 @@ class PanoramaLoopDetector:
                 "target_frame_id": int(target.frame_ids[target_frame_index]),
             },
         )
+
+    @staticmethod
+    def _select_match_inliers(
+        match: dict[str, torch.Tensor | int],
+        inlier: torch.Tensor,
+    ) -> dict[str, torch.Tensor | int]:
+        """Select one direction's angular inliers without changing metadata."""
+
+        count = int(match["count"])
+        if tuple(inlier.shape) != (count,):
+            raise ValueError("Loop inlier mask does not match directional correspondence count")
+        selected: dict[str, torch.Tensor | int] = {}
+        for key, value in match.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == count:
+                selected[key] = value[inlier.to(device=value.device)]
+            else:
+                selected[key] = value
+        selected["count"] = int(inlier.sum().item())
+        return selected
 
     def verify_pair(
         self,
@@ -519,6 +688,7 @@ class PanoramaLoopDetector:
             return PanoramaLoopVerification(False, None, source.window_id, target.window_id, retrieval_score, yaw_shift, match_count, 0.0, float("inf"), "too_few_fibonacci_matches")
 
         source_parts, target_parts, weight_parts = [], [], []
+        source_depth_parts, target_depth_parts = [], []
         source_bearing_parts, target_bearing_parts = [], []
         if int(forward_match["count"]) > 0:
             source_parts.append(self._anchor_points_from_match(
@@ -528,6 +698,8 @@ class PanoramaLoopDetector:
                 target, target_frame_index, torch.as_tensor(forward_match["target_bearing"]), torch.as_tensor(forward_match["target_depth"])
             ))
             weight_parts.append(torch.as_tensor(forward_match["weight"]))
+            source_depth_parts.append(torch.as_tensor(forward_match["source_depth"]))
+            target_depth_parts.append(torch.as_tensor(forward_match["target_depth"]))
             source_bearing_parts.append(torch.as_tensor(forward_match["source_bearing"]))
             target_bearing_parts.append(torch.as_tensor(forward_match["target_bearing"]))
         if int(reverse_match["count"]) > 0:
@@ -540,19 +712,19 @@ class PanoramaLoopDetector:
                 target, target_frame_index, torch.as_tensor(reverse_match["source_bearing"]), torch.as_tensor(reverse_match["source_depth"])
             ))
             weight_parts.append(torch.as_tensor(reverse_match["weight"]))
+            source_depth_parts.append(torch.as_tensor(reverse_match["target_depth"]))
+            target_depth_parts.append(torch.as_tensor(reverse_match["source_depth"]))
             source_bearing_parts.append(torch.as_tensor(reverse_match["target_bearing"]))
             target_bearing_parts.append(torch.as_tensor(reverse_match["source_bearing"]))
         source_point = torch.cat(source_parts, dim=0)
         target_point = torch.cat([value.to(source_point) for value in target_parts], dim=0)
         weight = torch.cat([value.to(source_point) for value in weight_parts], dim=0)
+        source_depth = torch.cat([value.to(source_point) for value in source_depth_parts], dim=0)
+        target_depth = torch.cat([value.to(source_point) for value in target_depth_parts], dim=0)
         source_bearing = torch.cat([value.to(source_point) for value in source_bearing_parts], dim=0)
         target_bearing = torch.cat([value.to(source_point) for value in target_bearing_parts], dim=0)
         if int(source_point.shape[0]) < self.min_matches:
             return PanoramaLoopVerification(False, None, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), 0.0, float("inf"), "too_few_geometric_matches")
-
-        # Z_ij maps target-window coordinates into source-window coordinates.
-        alignment = self.aligner.align(target_point, source_point, weight)
-        measurement = alignment.as_matrix().to(source_point)
 
         rotation_seed = (
             self.fibonacci_seed
@@ -565,29 +737,131 @@ class PanoramaLoopDetector:
             target_bearing,
             source_bearing,
             weight,
-            threshold_rad=self.coincident_rotation_residual,
+            threshold_rad=(
+                self.rotation_inlier_threshold
+                if self.so3_verification
+                else self.coincident_rotation_residual
+            ),
             iterations=self.rotation_ransac_iterations,
             seed=rotation_seed,
         )
 
+        source_coverage, total_coverage = spherical_coverage_bins(
+            source_bearing[angular_inlier],
+            latitude_bins=self.coverage_latitude_bins,
+            longitude_bins=self.coverage_longitude_bins,
+        )
+        target_coverage, _ = spherical_coverage_bins(
+            target_bearing[angular_inlier],
+            latitude_bins=self.coverage_latitude_bins,
+            longitude_bins=self.coverage_longitude_bins,
+        )
+        coverage = min(source_coverage, target_coverage)
+
         metadata = {
             "yaw_correlation": yaw_score,
+            "source_frame_index": int(source_frame_index),
+            "target_frame_index": int(target_frame_index),
+            "source_frame_id": int(source.frame_ids[source_frame_index]),
+            "target_frame_id": int(target.frame_ids[target_frame_index]),
             "rotation_inlier_ratio": rotation_inlier_ratio,
             "rotation_ransac_residual": rotation_residual,
             "rotation_ransac_iterations": self.rotation_ransac_iterations,
             "rotation_ransac_seed": rotation_seed,
-            "alignment_residual": float(alignment.residual),
-            "alignment_inlier_ratio": float(alignment.inlier_ratio),
+            "rotation_inlier_count": int(angular_inlier.sum().item()),
+            "spherical_coverage_bins": int(coverage),
+            "source_spherical_coverage_bins": int(source_coverage),
+            "target_spherical_coverage_bins": int(target_coverage),
+            "total_spherical_coverage_bins": int(total_coverage),
             "num_matches": int(source_point.shape[0]),
             "forward_fibonacci_matches": int(forward_match["count"]),
             "reverse_fibonacci_matches": int(reverse_match["count"]),
             "forward_seed": int(forward_match["seed"]),
             "reverse_seed": int(reverse_match["seed"]),
         }
+        if self.so3_verification:
+            if rotation_inlier_ratio < self.min_rotation_inlier_ratio:
+                return PanoramaLoopVerification(
+                    False, None, source.window_id, target.window_id, retrieval_score,
+                    yaw_shift, int(source_point.shape[0]), rotation_inlier_ratio,
+                    rotation_residual, "insufficient_rotation_inlier_ratio", metadata,
+                )
+            if int(angular_inlier.sum().item()) < self.min_matches:
+                return PanoramaLoopVerification(
+                    False, None, source.window_id, target.window_id, retrieval_score,
+                    yaw_shift, int(angular_inlier.sum().item()), rotation_inlier_ratio,
+                    rotation_residual, "too_few_rotation_inliers", metadata,
+                )
+            if coverage < self.min_spherical_coverage_bins:
+                return PanoramaLoopVerification(
+                    False, None, source.window_id, target.window_id, retrieval_score,
+                    yaw_shift, int(angular_inlier.sum().item()), rotation_inlier_ratio,
+                    rotation_residual, "insufficient_spherical_coverage", metadata,
+                )
+
+            forward_count = int(forward_match["count"])
+            forward_match = self._select_match_inliers(
+                forward_match, angular_inlier[:forward_count]
+            )
+            reverse_match = self._select_match_inliers(
+                reverse_match, angular_inlier[forward_count:]
+            )
+            source_point = source_point[angular_inlier]
+            target_point = target_point[angular_inlier]
+            weight = weight[angular_inlier]
+            source_depth = source_depth[angular_inlier]
+            target_depth = target_depth[angular_inlier]
+            source_bearing = source_bearing[angular_inlier]
+            target_bearing = target_bearing[angular_inlier]
+
+        # Z_ij maps target-window coordinates into source-window coordinates.
+        alignment = self.aligner.align(target_point, source_point, weight)
+        measurement = alignment.as_matrix().to(source_point)
+        scale, sim3_rotation, _ = sim3_components(measurement)
+        source_local_rotation = source.local_poses_c2w[source_frame_index, :3, :3].to(sim3_rotation)
+        target_local_rotation = target.local_poses_c2w[target_frame_index, :3, :3].to(sim3_rotation)
+        predicted_camera_rotation = (
+            source_local_rotation.transpose(0, 1) @ sim3_rotation @ target_local_rotation
+        )
+        rotation_consistency = rotation_geodesic_distance(
+            rotation_measurement, predicted_camera_rotation
+        )
+        median_depth = torch.cat([source_depth, target_depth]).median().clamp_min(1.0e-8)
+        normalized_alignment_residual = float(alignment.residual) / float(
+            median_depth.detach().cpu()
+        )
+        metadata.update(
+            {
+                "alignment_residual": float(alignment.residual),
+                "normalized_alignment_residual": normalized_alignment_residual,
+                "alignment_inlier_ratio": float(alignment.inlier_ratio),
+                "rotation_consistency_rad": rotation_consistency,
+                "rotation_consistency_deg": math.degrees(rotation_consistency),
+                "alignment_scale": float(scale.detach().cpu()),
+                "verified_num_matches": int(source_point.shape[0]),
+            }
+        )
+        if self.so3_verification:
+            if not math.isfinite(rotation_consistency) or rotation_consistency > self.max_rotation_consistency:
+                return PanoramaLoopVerification(
+                    False, None, source.window_id, target.window_id, retrieval_score,
+                    yaw_shift, int(source_point.shape[0]), rotation_inlier_ratio,
+                    rotation_residual, "rotation_sim3_inconsistent", metadata,
+                )
+            if (
+                not math.isfinite(normalized_alignment_residual)
+                or normalized_alignment_residual > self.max_normalized_alignment_residual
+            ):
+                return PanoramaLoopVerification(
+                    False, None, source.window_id, target.window_id, retrieval_score,
+                    yaw_shift, int(source_point.shape[0]), float(alignment.inlier_ratio),
+                    float(alignment.residual), "normalized_alignment_residual_too_large", metadata,
+                )
         if alignment.accepted:
             _, _, translation = sim3_components(measurement)
             if float(translation.norm().detach().cpu()) <= self.coincident_translation_threshold and rotation_inlier_ratio >= self.aligner.min_inlier_ratio:
-                factor: Sim3GraphEdge | CoincidentPanoramaFactor = CoincidentPanoramaFactor(
+                factor = LoopPoseMeasurement(
+                    kind="coincident",
                     source=int(source.window_id),
                     target=int(target.window_id),
                     source_local_pose=source.local_poses_c2w[source_frame_index].detach(),
@@ -596,30 +870,33 @@ class PanoramaLoopDetector:
                     center_weight=max(1.0, float(source_point.shape[0]) * float(alignment.inlier_ratio)),
                     rotation_weight=max(1.0, float(source_point.shape[0]) * rotation_inlier_ratio),
                     edge_type="coincident_panorama" if edge_type == "loop" else edge_type,
+                    dcs_phi=self.loop_dcs_phi if edge_type == "loop" else None,
                     metadata=metadata,
                 )
                 dense_factors = (
-                    self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=False, edge_type="loop_dense_spherical")
+                    self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=False, edge_type="loop_dense_spherical" if edge_type == "loop" else f"{edge_type}_dense_spherical")
                     if int(forward_match["count"]) > 0 else None,
-                    self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=False, edge_type="loop_dense_spherical")
+                    self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=False, edge_type="loop_dense_spherical" if edge_type == "loop" else f"{edge_type}_dense_spherical")
                     if int(reverse_match["count"]) > 0 else None,
                 )
                 return PanoramaLoopVerification(True, factor, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), float(alignment.inlier_ratio), float(alignment.residual), "coincident_panorama", metadata, tuple(value for value in dense_factors if value is not None))
             information = source_point.new_tensor(
                 [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.5]
             ) * max(1.0, float(source_point.shape[0]) * float(alignment.inlier_ratio))
-            factor = Sim3GraphEdge(
+            factor = LoopPoseMeasurement(
+                kind="sim3",
                 source=int(source.window_id),
                 target=int(target.window_id),
                 measurement_target_to_source=measurement.detach(),
                 information_diag=information.detach(),
                 edge_type=edge_type,
+                dcs_phi=self.loop_dcs_phi if edge_type == "loop" else None,
                 metadata=metadata,
             )
             dense_factors = (
-                self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=True, edge_type="loop_dense_spherical")
+                self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=True, edge_type="loop_dense_spherical" if edge_type == "loop" else f"{edge_type}_dense_spherical")
                 if int(forward_match["count"]) > 0 else None,
-                self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=True, edge_type="loop_dense_spherical")
+                self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=True, edge_type="loop_dense_spherical" if edge_type == "loop" else f"{edge_type}_dense_spherical")
                 if int(reverse_match["count"]) > 0 else None,
             )
             return PanoramaLoopVerification(True, factor, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), float(alignment.inlier_ratio), float(alignment.residual), "sim3", metadata, tuple(value for value in dense_factors if value is not None))
@@ -631,7 +908,8 @@ class PanoramaLoopDetector:
             <= self.coincident_translation_threshold
         )
         if rotation_inlier_ratio >= self.aligner.min_inlier_ratio and near_coincident:
-            factor = CoincidentPanoramaFactor(
+            factor = LoopPoseMeasurement(
+                kind="coincident",
                 source=int(source.window_id),
                 target=int(target.window_id),
                 source_local_pose=source.local_poses_c2w[source_frame_index].detach(),
@@ -639,12 +917,14 @@ class PanoramaLoopDetector:
                 measured_source_to_target_rotation=rotation_measurement.detach(),
                 center_weight=max(1.0, float(source_point.shape[0]) * 0.25),
                 rotation_weight=max(1.0, float(source_point.shape[0]) * rotation_inlier_ratio),
+                edge_type="coincident_panorama" if edge_type == "loop" else edge_type,
+                dcs_phi=self.loop_dcs_phi if edge_type == "loop" else None,
                 metadata=metadata,
             )
             dense_factors = (
-                self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=False, edge_type="coincident_dense_spherical")
+                self._dense_factor_from_match(source, target, source_frame_index, target_frame_index, forward_match, use_depth=False, edge_type="loop_coincident_dense_spherical" if edge_type == "loop" else f"{edge_type}_coincident_dense_spherical")
                 if int(forward_match["count"]) > 0 else None,
-                self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=False, edge_type="coincident_dense_spherical")
+                self._dense_factor_from_match(target, source, target_frame_index, source_frame_index, reverse_match, use_depth=False, edge_type="loop_coincident_dense_spherical" if edge_type == "loop" else f"{edge_type}_coincident_dense_spherical")
                 if int(reverse_match["count"]) > 0 else None,
             )
             return PanoramaLoopVerification(True, factor, source.window_id, target.window_id, retrieval_score, yaw_shift, int(source_point.shape[0]), rotation_inlier_ratio, rotation_residual, "rotation_only", metadata, tuple(value for value in dense_factors if value is not None))
@@ -653,7 +933,22 @@ class PanoramaLoopDetector:
 
     def detect(self, packet: LocalGaussianWindowPacket) -> list[PanoramaLoopVerification]:
         results = []
-        for candidate, score in self.retrieve(packet):
-            result = self.verify_pair(candidate, packet, retrieval_score=score, edge_type="loop")
+        accepted = 0
+        candidates = self.retrieve(packet)
+        if self.so3_retrieval:
+            candidates = candidates[: self.max_verified_candidates]
+        for candidate in candidates:
+            result = self.verify_pair(
+                candidate.packet,
+                packet,
+                retrieval_score=candidate.score,
+                edge_type="loop",
+                source_frame_index=candidate.source_frame_index,
+                target_frame_index=candidate.target_frame_index,
+            )
             results.append(result)
+            if result.accepted:
+                accepted += 1
+                if self.so3_retrieval and accepted >= self.max_accepted_loops:
+                    break
         return results

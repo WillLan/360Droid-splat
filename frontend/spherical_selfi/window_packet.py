@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from geometry.pose import relative_c2w
 from geometry.sim3 import apply_sim3_to_c2w
 from geometry.spherical_erp import erp_pixel_to_unit_ray
+from geometry.spherical_spectral_descriptor import (
+    SO3_SH_GRAM_DESCRIPTOR_VERSION,
+    build_so3_sh_gram_descriptor,
+)
 from models.per_pixel_gaussian_observation import (
     PerPixelGaussianObservation,
     normalize_quaternion,
@@ -117,6 +121,43 @@ def build_panorama_retrieval_descriptor(
     descriptor = torch.cat(parts, dim=-1)
     descriptor = F.normalize(descriptor.float(), dim=-1, eps=1.0e-8)
     return descriptor[0] if squeeze_batch else descriptor
+
+
+def build_configured_panorama_retrieval_descriptor(
+    features: torch.Tensor,
+    *,
+    mode: str = "latitude_bands",
+    latitude_bands: int = 8,
+    max_degree: int = 6,
+    num_samples: int = 2048,
+    spatial_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, str]:
+    """Build the configured loop descriptor and return its stable version tag."""
+
+    descriptor_mode = str(mode).strip().lower()
+    if descriptor_mode in {"latitude_bands", "yaw", "yaw_latitude_bands", "legacy"}:
+        return (
+            build_panorama_retrieval_descriptor(
+                features,
+                latitude_bands=latitude_bands,
+                spatial_weight=spatial_weight,
+            ),
+            "yaw_latitude_bands_v1",
+        )
+    if descriptor_mode in {"so3_sh_gram", "so3", "spherical_harmonic_gram"}:
+        return (
+            build_so3_sh_gram_descriptor(
+                features,
+                max_degree=max_degree,
+                num_samples=num_samples,
+                spatial_weight=spatial_weight,
+            ),
+            SO3_SH_GRAM_DESCRIPTOR_VERSION,
+        )
+    raise ValueError(
+        "retrieval descriptor mode must be 'latitude_bands' or 'so3_sh_gram'; "
+        f"got {mode!r}"
+    )
 
 
 def _verification_features(features: torch.Tensor, size: tuple[int, int] | None) -> torch.Tensor:
@@ -242,6 +283,10 @@ class LocalGaussianWindowPacket:
         frame_ids: list[int] | tuple[int, ...] | None = None,
         verification_size: tuple[int, int] | None = (32, 64),
         latitude_bands: int = 8,
+        retrieval_descriptor_mode: str = "latitude_bands",
+        retrieval_descriptor_max_degree: int = 6,
+        retrieval_descriptor_num_samples: int = 2048,
+        retrieval_descriptor_store_fp16: bool = False,
         sky_prob: torch.Tensor | None = None,
         sky_mask: torch.Tensor | None = None,
         sky_threshold: float = 0.5,
@@ -288,12 +333,31 @@ class LocalGaussianWindowPacket:
         consistent = _normalize_mask(geometry_consistency, valid, default=True)
         valid = valid & ~sky & static & consistent
         normalized_features = F.normalize(adapter_features.float(), dim=2, eps=1.0e-8)
-        retrieval = build_panorama_retrieval_descriptor(
+        descriptor_weight = valid.float() * (1.0 - probability).clamp(0.0, 1.0)
+        retrieval, descriptor_version = build_configured_panorama_retrieval_descriptor(
             normalized_features[0],
+            mode=retrieval_descriptor_mode,
             latitude_bands=latitude_bands,
-            spatial_weight=(1.0 - probability[0]).clamp(0.0, 1.0),
+            max_degree=retrieval_descriptor_max_degree,
+            num_samples=retrieval_descriptor_num_samples,
+            spatial_weight=descriptor_weight[0],
         )
+        if retrieval_descriptor_store_fp16:
+            retrieval = retrieval.to(dtype=torch.float16)
         verification = _verification_features(normalized_features, verification_size)
+        packet_metadata = dict(metadata or {})
+        packet_metadata.update(
+            {
+                "retrieval_descriptor_mode": str(retrieval_descriptor_mode).lower(),
+                "retrieval_descriptor_version": descriptor_version,
+                "retrieval_descriptor_dim": int(retrieval.shape[-1]),
+                "retrieval_descriptor_max_degree": int(retrieval_descriptor_max_degree),
+                "retrieval_descriptor_num_samples": int(retrieval_descriptor_num_samples),
+                "retrieval_descriptor_storage": (
+                    "float16" if retrieval_descriptor_store_fp16 else "float32"
+                ),
+            }
+        )
         return cls(
             window_id=int(window_id),
             anchor_frame_id=int(ids[0]),
@@ -317,7 +381,7 @@ class LocalGaussianWindowPacket:
             anchor_observation=anchor_observation,
             boundary_matches=boundary_matches,
             match_quality=dict(match_quality or {}),
-            metadata=dict(metadata or {}),
+            metadata=packet_metadata,
         )
 
     def frame_index(self, frame_id: int) -> int:
@@ -410,7 +474,7 @@ class LocalGaussianWindowPacket:
             local_poses_c2w=self.local_poses_c2w.detach().cpu().float(),
             observation=compact_observation,
             adapter_features=verification,
-            retrieval_descriptors=self.retrieval_descriptors.detach().cpu().float(),
+            retrieval_descriptors=self.retrieval_descriptors.detach().cpu().clone(),
             verification_features=verification,
             valid_mask=compact_mask(self.valid_mask),
             finite_gaussian_mask=compact_mask(self.finite_gaussian_mask),

@@ -23,8 +23,16 @@ from backend.pano_gs.stage2_global_fusion import (
 )
 from frontend.pano_droid.spherical_ba import se3_exp
 from frontend.pano_droid.interfaces import PanoFrame
-from frontend.spherical_selfi.panorama_loop import circular_yaw_shift, spherical_rotation_ransac
-from frontend.spherical_selfi.runtime import SphericalSelfiWindowFrontend
+from frontend.spherical_selfi.panorama_loop import (
+    PanoramaLoopDetector,
+    PanoramaLoopVerification,
+    circular_yaw_shift,
+    spherical_rotation_ransac,
+)
+from frontend.spherical_selfi.runtime import (
+    SphericalSelfiWindowFrontend,
+    _split_stage3_cache_for_validation,
+)
 from frontend.spherical_selfi.window_packet import (
     BoundaryMatchBlock,
     LocalGaussianWindowPacket,
@@ -40,9 +48,14 @@ from geometry.sim3 import (
     sim3_log,
     sim3_components,
 )
+from geometry.panorama_loop_contracts import (
+    DenseSphericalLoopMeasurement,
+    LoopPoseMeasurement,
+)
 from geometry.spherical_erp import erp_pixel_to_unit_ray
 from models.per_pixel_gaussian_observation import real_sh_basis
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
+from models.spherical_selfi_stage3_ba import Stage3MatchCache
 from training.train_spherical_selfi_gaussian_head import default_config as stage2_default_config
 
 
@@ -102,6 +115,7 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     outlier = local_ba["outlier_refinement"]
     map_optimization = config["SphericalSelfiGlobalBackend"]["map_optimization"]
     graph = config["SphericalSelfiGlobalBackend"]["global_graph"]
+    global_backend = config["SphericalSelfiGlobalBackend"]
 
     assert local_ba["iterations"] == 5
     assert local_ba["lm_max_trials"] == 8
@@ -111,16 +125,31 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert local_ba["max_translation_update"] == 0.10
     assert local_ba["max_logdepth_update"] == 0.70
     assert local_ba["min_factors"] == 128
+    assert local_ba["pose_safe_two_stage"] is True
     assert local_ba["defer_dense_depth_affine"] is True
+    assert local_ba["dense_depth_mode"] == "shift"
     assert local_ba["dense_depth_output_floor"] == 0.01
     assert outlier["second_stage_iterations"] == 10
-    assert outlier["angular_max_deg"] == 10.0
-    assert outlier["sim3_max_relative_depth"] == 0.10
+    assert outlier["angular_max_deg"] == 5.0
+    assert outlier["sim3_max_relative_depth"] == 0.05
     assert outlier["min_inliers"] == 128
     assert outlier["min_inlier_ratio"] == 0.20
+    assert outlier["validation_stride"] == 5
+    assert outlier["validation_min_inliers"] == 32
+    assert outlier["validation_residual_worse_tolerance"] == 1.0
+    assert outlier["validation_sim3_worse_tolerance"] == 1.05
     assert local_ba["matching"]["factor_weight_mode"] == "fibonacci_equal"
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 5
+    assert graph["normalize_dense_information_by_count"] is True
+    assert global_backend["hierarchical_submaps"]["enabled"] is True
+    assert global_backend["hierarchical_submaps"]["compress_frozen_dense_factors"] is True
+    assert global_backend["loop_closure"]["descriptor"]["mode"] == "so3_sh_gram"
+    assert global_backend["loop_closure"]["verification"]["mode"] == "spherical_so3"
+    assert global_backend["keyframe_selection"]["enabled"] is True
+    assert map_optimization["lazy_submap_transforms"]["enabled"] is True
+    assert map_optimization["loop_neighborhood_refinement"] is True
+    assert map_optimization["extra_steps_on_loop"] == 20
     assert map_optimization["pose_lr"] == 2.0e-4
     assert map_optimization["pose_refine_enable"] is True
     assert map_optimization["separate_gaussian_lrs"] is True
@@ -143,6 +172,104 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
         "scaling_lr": 1.0e-4,
         "rotation_lr": 1.0e-4,
     }
+
+
+def test_spherical_keyframe_policy_combines_gap_descriptor_coverage_and_parallax() -> None:
+    frontend = object.__new__(SphericalSelfiWindowFrontend)
+    frontend.spherical_keyframe_selection_enabled = True
+    frontend.keyframe_min_gap = 2
+    frontend.keyframe_max_gap = 5
+    frontend.keyframe_score_threshold = 0.30
+    frontend.keyframe_descriptor_weight = 0.35
+    frontend.keyframe_coverage_weight = 0.20
+    frontend.keyframe_parallax_weight = 0.30
+    frontend.keyframe_residual_weight = 0.15
+    frontend.keyframe_translation_ratio = 0.05
+    frontend.keyframe_rotation_deg = 10.0
+    frontend._keyframe_decisions = {}
+    frontend._last_keyframe_id = None
+    frontend._last_keyframe_descriptor = None
+    frontend._last_keyframe_pose = None
+    frontend._last_keyframe_coverage = 0.0
+    valid = torch.ones(4, 8, dtype=torch.bool)
+    sky = torch.zeros_like(valid)
+    confidence = torch.ones(4, 8) * 0.9
+    depth = torch.ones(4, 8) * 2.0
+    first_pose = torch.eye(4)
+    descriptor = torch.nn.functional.normalize(torch.randn(32), dim=0)
+
+    first = frontend._spherical_keyframe_decision(
+        frame_id=0,
+        descriptor=descriptor,
+        pose_c2w=first_pose,
+        valid_mask=valid,
+        sky_mask=sky,
+        confidence=confidence,
+        depth=depth,
+        ba_residual_deg=0.1,
+    )
+    too_close = frontend._spherical_keyframe_decision(
+        frame_id=1,
+        descriptor=-descriptor,
+        pose_c2w=first_pose,
+        valid_mask=valid,
+        sky_mask=sky,
+        confidence=confidence,
+        depth=depth,
+        ba_residual_deg=3.0,
+    )
+    moved_pose = first_pose.clone()
+    moved_pose[0, 3] = 0.2
+    moved = frontend._spherical_keyframe_decision(
+        frame_id=2,
+        descriptor=-descriptor,
+        pose_c2w=moved_pose,
+        valid_mask=valid,
+        sky_mask=sky,
+        confidence=confidence,
+        depth=depth,
+        ba_residual_deg=3.0,
+    )
+
+    assert first[0]
+    assert not too_close[0]
+    assert moved[0]
+    assert moved[1] > frontend.keyframe_score_threshold
+
+
+def test_stage2_validation_split_is_deterministic_disjoint_and_complete() -> None:
+    queries = 20
+    edges = torch.tensor([[0, 1], [1, 0]])
+    valid = torch.ones(1, 2, queries, dtype=torch.bool)
+    cache = Stage3MatchCache(
+        source_uv=torch.zeros(1, 2, queries, 2),
+        source_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(
+            1, 2, queries, 1
+        ),
+        source_depth=torch.ones(1, 2, queries),
+        source_valid=torch.ones(1, 2, queries, dtype=torch.bool),
+        edges=edges,
+        target_uv=torch.zeros(1, 2, queries, 2),
+        target_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(
+            1, 2, queries, 1
+        ),
+        top1_cosine=torch.ones(1, 2, queries),
+        top2_margin=torch.ones(1, 2, queries),
+        entropy=torch.zeros(1, 2, queries),
+        valid_mask=valid,
+        factor_weight=torch.ones(1, 2, queries),
+    )
+
+    training, validation = _split_stage3_cache_for_validation(cache, stride=5)
+
+    assert not bool((training.valid_mask & validation.valid_mask).any())
+    assert torch.equal(training.valid_mask | validation.valid_mask, valid)
+    assert torch.equal(
+        validation.valid_mask[0, 0],
+        torch.arange(queries).remainder(5).eq(0),
+    )
+    assert training.metadata["factor_split"] == "stage2_training"
+    assert validation.metadata["factor_split"] == "stage2_validation"
 
 
 def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
@@ -321,6 +448,88 @@ def test_dense_spherical_factor_jacobian_matches_finite_difference() -> None:
     )
 
 
+def test_dense_spherical_analytic_normal_equations_match_autodiff() -> None:
+    torch.manual_seed(17)
+    count = 37
+    graph = GlobalSim3FactorGraph(dense_linearization_chunk_size=13)
+    graph.add_node(
+        0,
+        sim3_exp(torch.tensor([0.1, -0.2, 0.05, 0.03, -0.02, 0.04, 0.08])),
+    )
+    graph.add_node(
+        1,
+        sim3_exp(torch.tensor([-0.2, 0.1, 0.15, -0.04, 0.05, -0.01, -0.03])),
+    )
+    source_bearing = torch.nn.functional.normalize(torch.randn(count, 3), dim=-1)
+    target_bearing = torch.nn.functional.normalize(torch.randn(count, 3), dim=-1)
+    source_pose = torch.eye(4)
+    source_pose[:3, 3] = torch.tensor([0.02, 0.01, -0.01])
+    target_pose = torch.eye(4)
+    target_pose[:3, 3] = torch.tensor([0.1, -0.05, 0.02])
+    factor = DenseSphericalFactorBlock(
+        source=0,
+        target=1,
+        source_local_pose=source_pose,
+        target_local_pose=target_pose,
+        source_bearing=source_bearing,
+        target_bearing=target_bearing,
+        source_depth=torch.rand(count) + 1.0,
+        target_depth=torch.rand(count) + 1.0,
+        factor_weight=torch.rand(count) + 0.1,
+        depth_factor_weight=0.2,
+        s2_huber_delta_deg=5.0,
+    )
+    graph.add_edge(factor)
+
+    ids, blocks, residual = graph._linearize_factor(factor, {0: 0, 1: 1})
+    autodiff_hessian = torch.stack(
+        [torch.stack([first.T @ second for second in blocks]) for first in blocks]
+    )
+    autodiff_gradient = torch.stack([block.T @ residual for block in blocks])
+    analytic_ids, analytic_hessian, analytic_gradient = (
+        graph._dense_factor_normal_equations(factor, {0: 0, 1: 1})
+    )
+
+    assert analytic_ids == ids == [0, 1]
+    torch.testing.assert_close(
+        analytic_hessian, autodiff_hessian, atol=1.0e-5, rtol=2.0e-5
+    )
+    torch.testing.assert_close(
+        analytic_gradient, autodiff_gradient, atol=2.0e-6, rtol=2.0e-5
+    )
+
+
+def test_dense_information_count_normalization_is_duplicate_invariant() -> None:
+    source = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    target = torch.nn.functional.normalize(
+        source + torch.tensor([[0.0, 0.02, 0.0], [0.01, 0.0, 0.0]]), dim=-1
+    )
+
+    def objective(repeats: int) -> float:
+        graph = GlobalSim3FactorGraph()
+        graph.add_node(0, sim3_identity())
+        graph.add_node(1, sim3_identity())
+        graph.add_edge(
+            DenseSphericalFactorBlock(
+                source=0,
+                target=1,
+                source_local_pose=torch.eye(4),
+                target_local_pose=torch.eye(4),
+                source_bearing=source.repeat(repeats, 1),
+                target_bearing=target.repeat(repeats, 1),
+                source_depth=torch.ones(2 * repeats),
+                target_depth=torch.ones(2 * repeats),
+                factor_weight=torch.ones(2 * repeats),
+                use_depth=False,
+                normalize_information_by_count=True,
+                information_reference_count=64.0,
+            )
+        )
+        return float(graph.objective())
+
+    assert abs(objective(1) - objective(20)) < 1.0e-6
+
+
 def test_s2_log_antipodal_is_finite_and_not_zero() -> None:
     base = torch.tensor([[0.0, 0.0, 1.0]])
     antipode = -base
@@ -359,6 +568,62 @@ def test_spherical_rotation_ransac_recovers_rotation_with_outliers() -> None:
     assert int(inliers[:64].sum()) == 64
     assert ratio >= 0.65
     assert residual < math.radians(0.05)
+
+
+def test_so3_loop_verification_filters_rotation_outliers_before_sim3() -> None:
+    torch.manual_seed(29)
+    count = 128
+    target_bearing = torch.nn.functional.normalize(torch.randn(count, 3), dim=-1)
+    truth = se3_exp(torch.tensor([0.0, 0.0, 0.0, 0.35, -0.22, 0.18]))[:3, :3]
+    source_bearing = target_bearing @ truth.T
+    source_bearing[64:] = torch.nn.functional.normalize(torch.randn(64, 3), dim=-1)
+    source_packet = _packet(0, torch.eye(4).view(1, 4, 4), (0,))
+    target_packet = _packet(10, torch.eye(4).view(1, 4, 4), (10,))
+    detector = PanoramaLoopDetector(
+        descriptor_mode="so3_sh_gram",
+        verification_mode="spherical_so3",
+        min_matches=32,
+        max_matches=128,
+        min_inlier_ratio=0.30,
+        min_rotation_inlier_ratio=0.40,
+        min_spherical_coverage_bins=6,
+        max_alignment_residual=0.05,
+        max_normalized_alignment_residual=0.05,
+        max_rotation_consistency_deg=1.0,
+        rotation_ransac_iterations=256,
+    )
+    calls = 0
+
+    def synthetic_matches(*args, direction: int, **kwargs):
+        nonlocal calls
+        calls += 1
+        start = 0 if direction == 0 else 64
+        stop = start + 64
+        source = source_bearing[start:stop]
+        target = target_bearing[start:stop]
+        if direction == 1:
+            source, target = target, source
+        return {
+            "count": 64,
+            "raw_valid_count": 64,
+            "seed": 100 + direction,
+            "source_bearing": source,
+            "target_bearing": target,
+            "source_depth": torch.full((64,), 2.0),
+            "target_depth": torch.full((64,), 2.0),
+            "weight": torch.ones(64),
+        }
+
+    detector._fibonacci_matches = synthetic_matches
+    result = detector.verify_pair(source_packet, target_packet)
+
+    assert calls == 2
+    assert result.accepted
+    assert result.reason == "coincident_panorama"
+    assert result.metadata["rotation_inlier_count"] == 64
+    assert result.metadata["verified_num_matches"] == 64
+    assert sum(int(factor.source_depth.numel()) for factor in result.dense_factors) == 64
+    assert result.metadata["rotation_consistency_deg"] < 0.1
 
 
 def test_rgb_sh_rotation_preserves_directional_value() -> None:
@@ -614,6 +879,25 @@ def test_shared_frame_umeyama_ignores_descriptor_disagreement() -> None:
     assert diagnostics["weight_mode"] == "fibonacci_equal_joint_geometry_mask"
     assert diagnostics["overlap_points"] >= backend.overlap_aligner.min_points
 
+    packet0.observation = replace(
+        packet0.observation,
+        confidence=torch.zeros_like(packet0.observation.confidence),
+    )
+    packet1.observation = replace(
+        packet1.observation,
+        confidence=torch.zeros_like(packet1.observation.confidence),
+    )
+    edge, dense_factor, shared_factor, legacy_diagnostics = backend._overlap_edge(
+        packet0, packet1
+    )
+    assert edge is not None and dense_factor is not None and shared_factor is not None
+    assert legacy_diagnostics["descriptor_gate"] is False
+    assert legacy_diagnostics["weight_mode"] == "fibonacci_equal_joint_geometry_mask"
+    torch.testing.assert_close(
+        dense_factor.factor_weight,
+        torch.ones_like(dense_factor.factor_weight),
+    )
+
 
 def test_boundary_alignment_rolls_back_shift_then_syncs_canonical_depth() -> None:
     shared = torch.randn(24, 6, 12)
@@ -689,6 +973,227 @@ def test_boundary_graph_waits_for_six_nodes_then_runs_recent_ba() -> None:
     assert len(backend.graph.nodes) == 6
     assert results[4].graph.final_objective <= results[4].graph.initial_objective
     assert 0 not in results[4].graph.optimized_node_ids
+
+
+def test_boundary_loop_transaction_rolls_back_dcs_rejected_factor() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "boundary_frame",
+                "min_overlap_points": 8,
+                "max_overlap_points": 128,
+                "min_dense_factors": 8,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "forward_backward": False,
+                "allow_boundary_matching_fallback": True,
+                "optimization_start_nodes": 6,
+            },
+            "loop_closure": {"exclude_recent_windows": 100, "min_matches": 8},
+            "robust_loop": {
+                "mode": "dcs",
+                "dcs_phi": 1.0e-3,
+                "transactional": True,
+                "min_commit_dcs_scale": 0.5,
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.25],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+    backend.process_packet(_packet(0, poses0, (0, 1), feature_by_frame=features))
+
+    source = torch.nn.functional.normalize(torch.randn(64, 3), dim=-1)
+    dense = DenseSphericalLoopMeasurement(
+        source=0,
+        target=1,
+        source_local_pose=torch.eye(4),
+        target_local_pose=torch.eye(4),
+        source_bearing=source,
+        target_bearing=-source,
+        source_depth=torch.full((64,), 2.0),
+        target_depth=torch.full((64,), 2.0),
+        factor_weight=torch.ones(64),
+        use_depth=False,
+        edge_type="loop_dense_spherical",
+        dcs_phi=1.0e-3,
+    )
+    predicted = sim3_inverse(backend.graph.transform(0)) @ backend.graph.transform(1)
+    verification = PanoramaLoopVerification(
+        accepted=True,
+        factor=LoopPoseMeasurement(
+            kind="sim3",
+            source=0,
+            target=1,
+            measurement_target_to_source=predicted,
+            information_diag=torch.ones(7),
+            edge_type="loop",
+            dcs_phi=1.0e-3,
+        ),
+        source_window_id=0,
+        target_window_id=1,
+        retrieval_score=1.0,
+        yaw_shift_columns=0,
+        num_matches=64,
+        inlier_ratio=1.0,
+        residual=0.0,
+        reason="synthetic_bad_dense_loop",
+        dense_factors=(dense,),
+    )
+    backend.loop_detector.detect = lambda packet: [verification]
+
+    result = backend.process_packet(_packet(1, poses1, (1, 2), feature_by_frame=features))
+
+    assert result.loop_accepted == 0
+    assert len(backend.graph.edges) == 2
+    assert verification.reason == "loop_transaction_rejected"
+    assert verification.metadata["graph_transaction"]["minimum_dcs_scale"] < 0.5
+    assert not backend.accepted_loop_pairs
+
+
+def test_hierarchical_backend_freezes_five_window_submaps_and_keeps_six_node_local_graph() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(11)}
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "boundary_frame",
+                "min_overlap_points": 8,
+                "max_overlap_points": 128,
+                "min_dense_factors": 8,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "forward_backward": False,
+                "allow_boundary_matching_fallback": True,
+                "optimization_start_nodes": 6,
+                "optimization_interval_edges": 5,
+                "active_nodes": 6,
+            },
+            "hierarchical_submaps": {
+                "enabled": True,
+                "windows_per_submap": 5,
+                "shared_boundary_nodes": 1,
+            },
+            "loop_closure": {"exclude_recent_windows": 100, "min_matches": 8},
+            "voxel_fusion": {
+                "voxel_sizes": [0.25],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+    results = []
+    for window_id in range(10):
+        poses = torch.eye(4).repeat(2, 1, 1)
+        poses[0, 0, 3] = 0.1 * window_id
+        poses[1, 0, 3] = 0.1 * (window_id + 1)
+        results.append(
+            backend.process_packet(
+                _packet(
+                    window_id,
+                    poses,
+                    (window_id, window_id + 1),
+                    feature_by_frame=features,
+                )
+            )
+        )
+
+    assert len(backend.graph.nodes) == 11
+    assert backend.submap_graph is not None
+    assert set(backend.submap_graph.nodes) == {0, 1}
+    assert len(backend.submap_graph.edges) == 1
+    assert backend.submap_graph.edges[0].edge_type == "submap_sequential"
+    assert backend.submaps[0].frozen and backend.submaps[1].frozen
+    assert backend.submaps[0].window_ids == list(range(5))
+    assert backend.submaps[1].window_ids == list(range(5, 10))
+    assert backend.submaps[0].boundary_node_ids == list(range(6))
+    assert backend.submaps[1].boundary_node_ids == list(range(5, 11))
+    assert backend.window_to_submap == {
+        **{window_id: 0 for window_id in range(5)},
+        **{window_id: 1 for window_id in range(5, 10)},
+    }
+    assert results[4].diagnostics["submap_frozen"]
+    assert results[9].diagnostics["submap_frozen"]
+    assert results[4].graph is not None and results[9].graph is not None
+    assert backend.submaps[0].compressed_dense_factors == 5
+    assert backend.submaps[1].compressed_dense_factors == 5
+    assert not any(
+        isinstance(factor, DenseSphericalFactorBlock)
+        and factor.edge_type == "boundary_dense_spherical"
+        for factor in backend.graph.edges
+    )
+
+    final = backend.finalize()
+    assert final["hierarchical_submaps_enabled"] is True
+    assert final["submap_nodes"] == 2
+    assert final["compressed_dense_factors"] == 10
+
+    before = backend._window_anchor_transforms()
+    moved = backend.submap_graph.transform(1).clone()
+    moved[1, 3] += 0.5
+    backend.submap_graph.nodes[1] = moved
+    backend._apply_submap_graph_to_boundary_graph()
+    after = backend._window_anchor_transforms()
+    torch.testing.assert_close(before[0], after[0])
+    assert abs(float(after[7][1, 3] - before[7][1, 3]) - 0.5) < 1.0e-5
+
+
+def test_lazy_owner_correction_updates_transform_without_rewriting_gaussians() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 0.1
+    packet = _packet(0, poses, (0, 1))
+    gaussian_map = PanoGaussianMap(config={}, sh_degree=2, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.25,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        lazy_owner_transforms=True,
+    )
+    identity = torch.eye(4)
+    fusion.fuse_packet(packet, identity)
+    base_xyz = gaussian_map.xyz.detach().clone()
+    base_scaling = gaussian_map._base_scaling().detach().clone()
+    reference_world = gaussian_map.get_xyz.detach().clone()
+    update = sim3_exp(
+        torch.tensor([0.3, -0.2, 0.1, 0.15, -0.08, 0.04, math.log(1.2)])
+    )
+
+    stats = fusion.apply_owner_corrections({0: identity}, {0: update})
+
+    torch.testing.assert_close(gaussian_map.xyz.detach(), base_xyz)
+    torch.testing.assert_close(
+        gaussian_map.get_xyz.detach(),
+        apply_sim3(update, reference_world),
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    torch.testing.assert_close(
+        gaussian_map.get_scaling.detach(),
+        1.2 * base_scaling,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    assert stats["moved"] == gaussian_map.anchor_count()
+    assert stats["deduplicated"] == 0
+    assert stats["lazy"] == 1
 
 
 def test_boundary_factor_ignores_confidence_and_hard_excludes_sky() -> None:

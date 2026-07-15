@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import math
 from pathlib import Path
 import time
@@ -24,6 +25,7 @@ from models.spherical_selfi_stage3_ba import (
     Stage3MatchCache,
     apply_selfi_dense_depth_shift,
     build_stage3_match_cache,
+    evaluate_stage3_cache_residuals,
     filter_stage3_match_cache_robust,
 )
 from models.sphereglue_local_ba import SphereGlueLocalBAMatcher
@@ -58,6 +60,73 @@ def _finite_optional_float(value: Any) -> float | None:
         return None
     scalar = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
     return scalar if math.isfinite(scalar) else None
+
+
+def _split_stage3_cache_for_validation(
+    cache: Stage3MatchCache,
+    *,
+    stride: int,
+) -> tuple[Stage3MatchCache, Stage3MatchCache]:
+    """Deterministically hold out Fibonacci query rows from Stage-2 LM."""
+
+    period = max(2, int(stride))
+    query_index = torch.arange(
+        cache.queries_per_source,
+        device=cache.valid_mask.device,
+    )
+    validation_rows = (query_index % period) == 0
+    validation_mask = validation_rows.view(1, 1, -1)
+    training = cache.detached_clone()
+    validation = cache.detached_clone()
+    training.valid_mask &= ~validation_mask
+    validation.valid_mask &= validation_mask
+    training.metadata["validation_stride"] = period
+    training.metadata["factor_split"] = "stage2_training"
+    validation.metadata["validation_stride"] = period
+    validation.metadata["factor_split"] = "stage2_validation"
+    return training, validation
+
+
+def _rollback_ba_output(
+    result,
+    *,
+    poses_c2w: torch.Tensor,
+    dense_depth: torch.Tensor,
+    sparse_depth: torch.Tensor,
+    reason: str,
+    diagnostics: list[dict[str, Any]],
+):
+    batch, views = int(poses_c2w.shape[0]), int(poses_c2w.shape[1])
+    return replace(
+        result,
+        poses_c2w=poses_c2w.detach().clone(),
+        dense_depth=dense_depth.detach().clone(),
+        sparse_depth=sparse_depth.detach().clone(),
+        depth_scale=torch.ones(
+            batch, views, device=dense_depth.device, dtype=dense_depth.dtype
+        ),
+        depth_shift=torch.zeros(
+            batch, views, device=dense_depth.device, dtype=dense_depth.dtype
+        ),
+        depth_affine_accepted=torch.zeros(
+            batch, views, device=dense_depth.device, dtype=torch.bool
+        ),
+        depth_affine_identity_error=torch.full(
+            (batch, views),
+            float("inf"),
+            device=dense_depth.device,
+            dtype=dense_depth.dtype,
+        ),
+        depth_affine_fit_error=torch.full(
+            (batch, views),
+            float("inf"),
+            device=dense_depth.device,
+            dtype=dense_depth.dtype,
+        ),
+        accepted=torch.zeros(batch, device=dense_depth.device, dtype=torch.bool),
+        final_median_residual_deg=result.initial_median_residual_deg.detach().clone(),
+        diagnostics=[{**value, "reason": reason, "published_pose_updated": False} for value in diagnostics],
+    )
 
 
 def _boundary_matches_from_cache(
@@ -137,6 +206,50 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             )
         self.verification_size = tuple(int(v) for v in window_cfg.get("verification_size", (32, 64)))
         self.latitude_bands = max(1, int(window_cfg.get("latitude_bands", 8)))
+        global_cfg = dict(config.get("SphericalSelfiGlobalBackend", {}) or {})
+        loop_cfg = dict(global_cfg.get("loop_closure", {}) or {})
+        descriptor_cfg = dict(loop_cfg.get("descriptor", {}) or {})
+        self.retrieval_descriptor_mode = str(
+            descriptor_cfg.get("mode", "latitude_bands")
+        ).lower()
+        self.retrieval_descriptor_max_degree = max(
+            0, int(descriptor_cfg.get("max_degree", 6))
+        )
+        self.retrieval_descriptor_num_samples = max(
+            1, int(descriptor_cfg.get("num_samples", 2048))
+        )
+        self.retrieval_descriptor_store_fp16 = bool(
+            descriptor_cfg.get(
+                "store_fp16", self.retrieval_descriptor_mode == "so3_sh_gram"
+            )
+        )
+        keyframe_cfg = dict(global_cfg.get("keyframe_selection", {}) or {})
+        self.spherical_keyframe_selection_enabled = bool(
+            keyframe_cfg.get("enabled", False)
+        )
+        self.keyframe_min_gap = max(1, int(keyframe_cfg.get("min_gap", 2)))
+        self.keyframe_max_gap = max(
+            self.keyframe_min_gap, int(keyframe_cfg.get("max_gap", 6))
+        )
+        self.keyframe_score_threshold = float(keyframe_cfg.get("score_threshold", 0.45))
+        self.keyframe_descriptor_weight = float(
+            keyframe_cfg.get("descriptor_weight", 0.35)
+        )
+        self.keyframe_coverage_weight = float(
+            keyframe_cfg.get("coverage_weight", 0.20)
+        )
+        self.keyframe_parallax_weight = float(
+            keyframe_cfg.get("parallax_weight", 0.30)
+        )
+        self.keyframe_residual_weight = float(
+            keyframe_cfg.get("residual_weight", 0.15)
+        )
+        self.keyframe_translation_ratio = max(
+            1.0e-6, float(keyframe_cfg.get("translation_depth_ratio", 0.05))
+        )
+        self.keyframe_rotation_deg = max(
+            1.0e-3, float(keyframe_cfg.get("rotation_deg", 10.0))
+        )
         self.feature_device = _device(runtime.get("feature_device", "cuda" if torch.cuda.is_available() else "cpu"))
         self.head_device = _device(runtime.get("head_device", str(self.feature_device)))
         self.feature_amp = bool(runtime.get("feature_amp", False))
@@ -226,11 +339,24 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.local_ba_defer_dense_affine = bool(
             local_ba.get("defer_dense_depth_affine", False)
         )
+        self.local_ba_pose_safe_two_stage = bool(
+            local_ba.get("pose_safe_two_stage", False)
+        )
         self.local_ba_requested_dense_depth_mode = str(
             local_ba.get("dense_depth_mode", "affine")
         ).strip().lower()
-        if self.local_ba_requested_dense_depth_mode not in {"affine", "none"}:
-            raise ValueError("local_ba.dense_depth_mode must be 'affine' or 'none'")
+        if self.local_ba_requested_dense_depth_mode not in {"affine", "shift", "none"}:
+            raise ValueError(
+                "local_ba.dense_depth_mode must be 'affine', 'shift', or 'none'"
+            )
+        if (
+            self.local_ba_requested_dense_depth_mode == "shift"
+            and not self.local_ba_defer_dense_affine
+        ):
+            raise ValueError(
+                "local_ba.dense_depth_mode='shift' requires "
+                "defer_dense_depth_affine=true so the dense map is updated once"
+            )
         self.local_ba_dense_depth_output_floor = float(
             local_ba.get("dense_depth_output_floor", 0.01)
         )
@@ -299,15 +425,48 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             affine_min_relative_improvement=float(
                 local_ba.get("affine_min_relative_improvement", 1.0e-3)
             ),
+            depth_parameterization=str(
+                local_ba.get("depth_parameterization", "sparse_logdepth")
+            ),
+            max_depth_shift_ratio=float(
+                local_ba.get("max_depth_shift_ratio", 0.25)
+            ),
+            max_depth_shift_step_ratio=float(
+                local_ba.get("max_depth_shift_step_ratio", 0.05)
+            ),
         )
         self.local_ba_outlier_config = dict(local_ba.get("outlier_refinement", {}) or {})
         self.local_ba_outlier_enabled = bool(
             self.local_ba_outlier_config.get("enabled", False)
         )
+        if self.local_ba_pose_safe_two_stage:
+            if not self.local_ba_outlier_enabled:
+                raise ValueError(
+                    "local_ba.pose_safe_two_stage requires outlier_refinement.enabled=true"
+                )
+            if not self.local_ba_defer_dense_affine:
+                raise ValueError(
+                    "local_ba.pose_safe_two_stage requires defer_dense_depth_affine=true"
+                )
+            if self.local_ba_requested_dense_depth_mode != "shift":
+                raise ValueError(
+                    "local_ba.pose_safe_two_stage requires dense_depth_mode='shift'"
+                )
+            if self.local_ba.pose_update_side != "right":
+                raise ValueError(
+                    "local_ba.pose_safe_two_stage requires pose_update_side='right'"
+                )
         self.local_ba_second = copy.copy(self.local_ba)
         self.local_ba_second.iterations = int(
             self.local_ba_outlier_config.get("second_stage_iterations", 10)
         )
+        if self.local_ba_pose_safe_two_stage:
+            self.local_ba.depth_parameterization = "fixed"
+            self.local_ba.dense_depth_mode = "none"
+            self.local_ba.gauge_mode = "none"
+            self.local_ba_second.depth_parameterization = "frame_shift"
+            self.local_ba_second.dense_depth_mode = "none"
+            self.local_ba_second.gauge_mode = "none"
         self.frames: list[PanoFrame] = []
         self.frame_buffer_start = 0
         self.next_window_start = 0
@@ -319,6 +478,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
         self._local_ba_diagnostics: list[dict[str, Any]] = []
         self.last_processed_frame_id: int | None = None
+        self._keyframe_decisions: dict[int, tuple[bool, float]] = {}
+        self._last_keyframe_id: int | None = None
+        self._last_keyframe_descriptor: torch.Tensor | None = None
+        self._last_keyframe_pose: torch.Tensor | None = None
+        self._last_keyframe_coverage = 0.0
 
     def initialize(self, sequence_meta: dict) -> None:
         _ = sequence_meta
@@ -336,6 +500,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self._local_ba_diagnostics.clear()
         self._local_gaussian_windows.clear()
         self.last_processed_frame_id = None
+        self._keyframe_decisions.clear()
+        self._last_keyframe_id = None
+        self._last_keyframe_descriptor = None
+        self._last_keyframe_pose = None
+        self._last_keyframe_coverage = 0.0
 
     def load_checkpoint(self, path: str) -> None:
         load_stage2_checkpoint(
@@ -447,75 +616,273 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             result = stage1_result
             published_cache = cache
             affine_inlier_cache = ba_cache
+            publication_filter_kwargs: dict[str, Any] | None = None
             if self.local_ba_outlier_enabled:
                 filter_cfg = self.local_ba_outlier_config
+                filter_kwargs = {
+                    "angular_mad_scale": float(
+                        filter_cfg.get("angular_mad_scale", 3.0)
+                    ),
+                    "angular_min_deg": float(
+                        filter_cfg.get("angular_min_deg", 1.0)
+                    ),
+                    "angular_max_deg": float(
+                        filter_cfg.get("angular_max_deg", 5.0)
+                    ),
+                    "sim3_irls_iterations": int(
+                        filter_cfg.get("sim3_irls_iterations", 3)
+                    ),
+                    "sim3_mad_scale": float(filter_cfg.get("sim3_mad_scale", 3.0)),
+                    "sim3_min_residual": float(
+                        filter_cfg.get("sim3_min_residual", 0.01)
+                    ),
+                    "sim3_max_relative_depth": float(
+                        filter_cfg.get("sim3_max_relative_depth", 0.05)
+                    ),
+                }
+                publication_filter_kwargs = filter_kwargs
+                stage2_filter_input = ba_cache
+                validation_cache = None
+                published_filter_diagnostics = None
+                if self.local_ba_pose_safe_two_stage:
+                    stage2_filter_input, validation_cache = (
+                        _split_stage3_cache_for_validation(
+                            ba_cache,
+                            stride=int(filter_cfg.get("validation_stride", 5)),
+                        )
+                    )
+                    # Graph factors may use every robust row.  This full-cache
+                    # filter is publication-only and cannot affect Stage-2 LM.
+                    published_cache, published_filter_diagnostics = (
+                        filter_stage3_match_cache_robust(
+                            ba_cache,
+                            stage1_result.poses_c2w.detach(),
+                            ba_depth,
+                            sparse_source_depth=stage1_result.sparse_depth.detach(),
+                            **filter_kwargs,
+                        )
+                    )
                 filtered_cache, filter_diagnostics = filter_stage3_match_cache_robust(
-                    ba_cache,
+                    stage2_filter_input,
                     stage1_result.poses_c2w.detach(),
                     ba_depth,
                     sparse_source_depth=stage1_result.sparse_depth.detach(),
-                    angular_mad_scale=float(filter_cfg.get("angular_mad_scale", 3.0)),
-                    angular_min_deg=float(filter_cfg.get("angular_min_deg", 1.0)),
-                    angular_max_deg=float(filter_cfg.get("angular_max_deg", 5.0)),
-                    sim3_irls_iterations=int(filter_cfg.get("sim3_irls_iterations", 3)),
-                    sim3_mad_scale=float(filter_cfg.get("sim3_mad_scale", 3.0)),
-                    sim3_min_residual=float(filter_cfg.get("sim3_min_residual", 0.01)),
-                    sim3_max_relative_depth=float(
-                        filter_cfg.get("sim3_max_relative_depth", 0.05)
-                    ),
+                    **filter_kwargs,
                 )
+                if not self.local_ba_pose_safe_two_stage:
+                    published_cache = filtered_cache
                 affine_inlier_cache = filtered_cache
                 min_inliers = max(
                     self.local_ba_second.min_factors,
                     int(filter_cfg.get("min_inliers", self.local_ba_second.min_factors)),
                 )
                 min_ratio = float(filter_cfg.get("min_inlier_ratio", 0.3))
-                stage2_supported = all(
-                    int(value["post_filter_inliers"]) >= min_inliers
-                    and float(value["post_filter_inlier_ratio"]) >= min_ratio
-                    and all(
-                        int(edge["sim3_inliers"]) >= min_inliers
-                        and float(edge["sim3_inliers"])
-                        / float(max(1, int(edge["initial"])))
-                        >= min_ratio
-                        for edge in value["edge_filter_counts"]
-                    )
-                    for value in filter_diagnostics
-                )
+                stage2_cache = filtered_cache
+                stage2_supported = True
+                for batch_idx in range(stage2_cache.batch_size):
+                    total = int(stage2_cache.valid_mask[batch_idx].sum().detach().cpu())
+                    if total < min_inliers:
+                        stage2_supported = False
+                        break
+                    for edge_idx in range(int(stage2_cache.edges.shape[0])):
+                        initial = int(
+                            stage2_filter_input.valid_mask[batch_idx, edge_idx]
+                            .sum()
+                            .detach()
+                            .cpu()
+                        )
+                        kept = int(
+                            stage2_cache.valid_mask[batch_idx, edge_idx].sum().detach().cpu()
+                        )
+                        if kept < min_inliers or kept / float(max(1, initial)) < min_ratio:
+                            stage2_supported = False
+                            break
+                    if not stage2_supported:
+                        break
                 if stage2_supported:
-                    published_cache = filtered_cache
                     stage2_dense_depth = (
                         ba_depth
                         if self.local_ba_defer_dense_affine
                         else stage1_result.dense_depth.detach().clone()
                     )
+                    stage2_seed_pose = torch.where(
+                        stage1_result.accepted[:, None, None, None],
+                        stage1_result.poses_c2w.detach(),
+                        ba_poses,
+                    )
+                    stage2_initial_sparse = (
+                        ba_initial_sparse
+                        if self.local_ba_pose_safe_two_stage
+                        else stage1_result.sparse_depth.detach().clone()
+                    )
                     if self.local_ba_second.jacobian_mode == "autodiff_reference":
                         with torch.enable_grad():
                             stage2_result = self.local_ba_second(
-                                stage1_result.poses_c2w.detach().clone(),
+                                stage2_seed_pose,
                                 stage2_dense_depth,
-                                filtered_cache,
-                                initial_sparse_depth=stage1_result.sparse_depth.detach().clone(),
+                                stage2_cache,
+                                initial_sparse_depth=stage2_initial_sparse,
+                                pose_trust_region_reference=ba_poses,
                             )
                     else:
                         with torch.no_grad():
                             stage2_result = self.local_ba_second(
-                                stage1_result.poses_c2w.detach().clone(),
+                                stage2_seed_pose,
                                 stage2_dense_depth,
-                                filtered_cache,
-                                initial_sparse_depth=stage1_result.sparse_depth.detach().clone(),
+                                stage2_cache,
+                                initial_sparse_depth=stage2_initial_sparse,
+                                pose_trust_region_reference=ba_poses,
                             )
                     raw_stage2_accepted = stage2_result.accepted.clone()
-                    stage2_result.accepted = stage1_result.accepted | raw_stage2_accepted
                     stage2_result.initial_median_residual_deg = (
                         stage1_result.initial_median_residual_deg
                     )
+                    validation_passed = raw_stage2_accepted.clone()
+                    if not self.local_ba_pose_safe_two_stage:
+                        validation_passed = (
+                            stage1_result.accepted | raw_stage2_accepted
+                        )
+                    validation_diagnostics: list[dict[str, Any]] = [
+                        {} for _ in range(stage2_cache.batch_size)
+                    ]
+                    if self.local_ba_pose_safe_two_stage and validation_cache is not None:
+                        validation_min_inliers = int(
+                            filter_cfg.get("validation_min_inliers", 32)
+                        )
+                        validation_min_ratio = float(
+                            filter_cfg.get("validation_min_inlier_ratio", 0.10)
+                        )
+                        angular_tolerance = float(
+                            filter_cfg.get("validation_residual_worse_tolerance", 1.0)
+                        )
+                        sim3_tolerance = float(
+                            filter_cfg.get("validation_sim3_worse_tolerance", 1.05)
+                        )
+                        initial_validation = evaluate_stage3_cache_residuals(
+                            validation_cache,
+                            ba_poses,
+                            ba_initial_sparse,
+                        )
+                        final_validation = evaluate_stage3_cache_residuals(
+                            validation_cache,
+                            stage2_result.poses_c2w,
+                            stage2_result.sparse_depth,
+                        )
+                        shifted_validation_depth = ba_depth + stage2_result.depth_shift[
+                            :, :, None, None, None
+                        ].to(ba_depth)
+                        _, initial_validation_filter = filter_stage3_match_cache_robust(
+                            validation_cache,
+                            ba_poses,
+                            ba_depth,
+                            sparse_source_depth=ba_initial_sparse,
+                            angular_mad_scale=float(filter_cfg.get("angular_mad_scale", 3.0)),
+                            angular_min_deg=float(filter_cfg.get("angular_min_deg", 1.0)),
+                            angular_max_deg=float(filter_cfg.get("angular_max_deg", 5.0)),
+                            sim3_irls_iterations=int(filter_cfg.get("sim3_irls_iterations", 3)),
+                            sim3_mad_scale=float(filter_cfg.get("sim3_mad_scale", 3.0)),
+                            sim3_min_residual=float(filter_cfg.get("sim3_min_residual", 0.01)),
+                            sim3_max_relative_depth=float(filter_cfg.get("sim3_max_relative_depth", 0.05)),
+                        )
+                        _, final_validation_filter = filter_stage3_match_cache_robust(
+                            validation_cache,
+                            stage2_result.poses_c2w,
+                            shifted_validation_depth,
+                            sparse_source_depth=stage2_result.sparse_depth,
+                            angular_mad_scale=float(filter_cfg.get("angular_mad_scale", 3.0)),
+                            angular_min_deg=float(filter_cfg.get("angular_min_deg", 1.0)),
+                            angular_max_deg=float(filter_cfg.get("angular_max_deg", 5.0)),
+                            sim3_irls_iterations=int(filter_cfg.get("sim3_irls_iterations", 3)),
+                            sim3_mad_scale=float(filter_cfg.get("sim3_mad_scale", 3.0)),
+                            sim3_min_residual=float(filter_cfg.get("sim3_min_residual", 0.01)),
+                            sim3_max_relative_depth=float(filter_cfg.get("sim3_max_relative_depth", 0.05)),
+                        )
+                        for batch_idx in range(stage2_cache.batch_size):
+                            angular_edges_not_worse = True
+                            sim3_edges_ok = True
+                            support_ok = True
+                            for initial_edge, final_edge, initial_filter_edge, final_filter_edge in zip(
+                                initial_validation[batch_idx]["edges"],
+                                final_validation[batch_idx]["edges"],
+                                initial_validation_filter[batch_idx]["edge_filter_counts"],
+                                final_validation_filter[batch_idx]["edge_filter_counts"],
+                                strict=True,
+                            ):
+                                initial_count = int(initial_edge["count"])
+                                final_inliers = int(final_filter_edge["final_inliers"])
+                                support_ok &= (
+                                    initial_count >= validation_min_inliers
+                                    and final_inliers >= validation_min_inliers
+                                    and final_inliers / float(max(1, initial_count))
+                                    >= validation_min_ratio
+                                )
+                                angular_edges_not_worse &= (
+                                    math.isfinite(float(initial_edge["median_deg"]))
+                                    and math.isfinite(float(final_edge["median_deg"]))
+                                    and float(final_edge["median_deg"])
+                                    <= float(initial_edge["median_deg"])
+                                    * max(1.0, angular_tolerance)
+                                    + 1.0e-8
+                                )
+                                initial_sim3 = float(
+                                    initial_filter_edge.get("sim3_residual_median", float("nan"))
+                                )
+                                final_sim3 = float(
+                                    final_filter_edge.get("sim3_residual_median", float("nan"))
+                                )
+                                sim3_edges_ok &= (
+                                    math.isfinite(initial_sim3)
+                                    and math.isfinite(final_sim3)
+                                    and final_sim3 <= initial_sim3 * sim3_tolerance + 1.0e-8
+                                )
+                            initial_angular_median = float(
+                                initial_validation[batch_idx]["median_deg"]
+                            )
+                            final_angular_median = float(
+                                final_validation[batch_idx]["median_deg"]
+                            )
+                            angular_improved = bool(
+                                math.isfinite(initial_angular_median)
+                                and math.isfinite(final_angular_median)
+                                and final_angular_median
+                                < initial_angular_median * angular_tolerance
+                            )
+                            angular_ok = angular_edges_not_worse and angular_improved
+                            passed = bool(
+                                raw_stage2_accepted[batch_idx]
+                                and support_ok
+                                and angular_ok
+                                and sim3_edges_ok
+                            )
+                            validation_passed[batch_idx] = passed
+                            validation_diagnostics[batch_idx] = {
+                                "validation_passed": passed,
+                                "validation_support_ok": bool(support_ok),
+                                "validation_angular_ok": bool(angular_ok),
+                                "validation_angular_improved": bool(
+                                    angular_improved
+                                ),
+                                "validation_angular_edges_not_worse": bool(
+                                    angular_edges_not_worse
+                                ),
+                                "validation_sim3_ok": bool(sim3_edges_ok),
+                                "validation_initial_median_deg": initial_validation[batch_idx]["median_deg"],
+                                "validation_final_median_deg": final_validation[batch_idx]["median_deg"],
+                                "validation_initial_filter": initial_validation_filter[batch_idx],
+                                "validation_final_filter": final_validation_filter[batch_idx],
+                            }
                     for batch_idx, filter_diag in enumerate(filter_diagnostics):
                         stage1_diag = dict(stage1_result.diagnostics[batch_idx])
                         stage2_diag = dict(stage2_result.diagnostics[batch_idx])
-                        stage2_accepted = bool(raw_stage2_accepted[batch_idx])
+                        raw_stage2_ok = bool(raw_stage2_accepted[batch_idx])
+                        stage2_accepted = bool(validation_passed[batch_idx])
                         combined = dict(stage2_diag)
                         combined.update(filter_diag)
+                        combined.update(validation_diagnostics[batch_idx])
+                        if published_filter_diagnostics is not None:
+                            combined["published_filter"] = dict(
+                                published_filter_diagnostics[batch_idx]
+                            )
                         combined.update(
                             {
                                 "stage1_iterations": int(self.local_ba.iterations),
@@ -523,7 +890,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                                 "stage1_reason": stage1_diag.get("reason"),
                                 "stage2_attempted": True,
                                 "stage2_iterations": int(self.local_ba_second.iterations),
-                                "stage2_accepted": stage2_accepted,
+                                "stage2_accepted": raw_stage2_ok,
                                 "stage2_reason": stage2_diag.get("reason"),
                                 "stage2_min_inliers": min_inliers,
                                 "stage2_min_inlier_ratio": min_ratio,
@@ -540,41 +907,87 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                                 )
                                 + list(stage2_diag.get("trial_gain_ratios", [])),
                                 "published_pose_updated": bool(
-                                    stage1_diag.get("published_pose_updated", False)
-                                    or stage2_diag.get("published_pose_updated", False)
+                                    (
+                                        stage2_accepted
+                                        and stage2_diag.get("published_pose_updated", False)
+                                    )
+                                    or (
+                                        not self.local_ba_pose_safe_two_stage
+                                        and stage1_diag.get("published_pose_updated", False)
+                                    )
                                 ),
                             }
                         )
-                        if stage2_accepted:
+                        if self.local_ba_pose_safe_two_stage and stage2_accepted:
+                            combined["reason"] = "accepted_pose_safe_two_stage"
+                        elif self.local_ba_pose_safe_two_stage:
+                            combined["reason"] = "stage2_rejected_input_retained"
+                        elif raw_stage2_ok:
                             combined["reason"] = "accepted_two_stage"
                         elif bool(stage1_result.accepted[batch_idx]):
                             combined["reason"] = "stage2_rejected_stage1_retained"
                         stage2_result.diagnostics[batch_idx] = combined
-                    result = stage2_result
+                    stage2_result.accepted = validation_passed
+                    if not self.local_ba_pose_safe_two_stage:
+                        result = stage2_result
+                    elif bool(validation_passed.all()):
+                        result = stage2_result
+                    else:
+                        result = _rollback_ba_output(
+                            stage2_result,
+                            poses_c2w=ba_poses,
+                            dense_depth=ba_depth,
+                            sparse_depth=ba_initial_sparse,
+                            reason="stage2_rejected_input_retained",
+                            diagnostics=stage2_result.diagnostics,
+                        )
                 else:
+                    rollback_diagnostics: list[dict[str, Any]] = []
                     for batch_idx, filter_diag in enumerate(filter_diagnostics):
-                        stage1_result.diagnostics[batch_idx].update(filter_diag)
-                        stage1_result.diagnostics[batch_idx].update(
+                        stage1_diag = dict(stage1_result.diagnostics[batch_idx])
+                        stage1_diag.update(filter_diag)
+                        stage1_diag.update(
                             {
                                 "stage1_iterations": int(self.local_ba.iterations),
                                 "stage1_accepted": bool(stage1_result.accepted[batch_idx]),
-                                "stage1_reason": stage1_result.diagnostics[batch_idx].get(
-                                    "reason"
-                                ),
+                                "stage1_reason": stage1_result.diagnostics[batch_idx].get("reason"),
                                 "stage2_attempted": False,
                                 "stage2_iterations": int(self.local_ba_second.iterations),
                                 "stage2_accepted": False,
                                 "stage2_reason": "insufficient_post_filter_inliers",
                                 "stage2_min_inliers": min_inliers,
                                 "stage2_min_inlier_ratio": min_ratio,
-                                "reason": "insufficient_post_filter_inliers_stage1_retained",
+                                "reason": "insufficient_post_filter_inliers_input_retained",
+                                "published_pose_updated": (
+                                    False
+                                    if self.local_ba_pose_safe_two_stage
+                                    else bool(stage1_diag.get("published_pose_updated", False))
+                                ),
                             }
                         )
+                        rollback_diagnostics.append(stage1_diag)
+                    if self.local_ba_pose_safe_two_stage:
+                        result = _rollback_ba_output(
+                            stage1_result,
+                            poses_c2w=ba_poses,
+                            dense_depth=ba_depth,
+                            sparse_depth=ba_initial_sparse,
+                            reason="insufficient_post_filter_inliers_input_retained",
+                            diagnostics=rollback_diagnostics,
+                        )
+                    else:
+                        stage1_result.diagnostics = rollback_diagnostics
+                        for value in stage1_result.diagnostics:
+                            value["reason"] = (
+                                "insufficient_post_filter_inliers_stage1_retained"
+                            )
+                        result = stage1_result
             if (
                 self.local_ba_defer_dense_affine
-                and self.local_ba_requested_dense_depth_mode == "affine"
+                and self.local_ba_requested_dense_depth_mode in {"affine", "shift"}
+                and bool(result.accepted.all())
             ):
-                result = apply_selfi_dense_depth_shift(
+                dense_updated_result = apply_selfi_dense_depth_shift(
                     result,
                     ba_depth,
                     ba_initial_sparse,
@@ -582,7 +995,61 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                     min_support=self.local_ba.min_affine_support,
                     min_relative_improvement=self.local_ba.affine_min_relative_improvement,
                     output_depth_floor=self.local_ba_dense_depth_output_floor,
+                    fit_mode=self.local_ba_requested_dense_depth_mode,
                 )
+                if self.local_ba_pose_safe_two_stage:
+                    required_shift = result.depth_shift.abs() > 1.0e-6
+                    shift_publish_failed = required_shift & ~dense_updated_result.depth_affine_accepted
+                    if bool(shift_publish_failed.any()):
+                        rollback_diagnostics = [
+                            {
+                                **value,
+                                "dense_shift_publish_failed_frames": torch.nonzero(
+                                    shift_publish_failed[batch_idx], as_tuple=False
+                                )
+                                .flatten()
+                                .detach()
+                                .cpu()
+                                .tolist(),
+                            }
+                            for batch_idx, value in enumerate(
+                                dense_updated_result.diagnostics
+                            )
+                        ]
+                        result = _rollback_ba_output(
+                            dense_updated_result,
+                            poses_c2w=ba_poses,
+                            dense_depth=ba_depth,
+                            sparse_depth=ba_initial_sparse,
+                            reason="dense_shift_publish_rejected_input_retained",
+                            diagnostics=rollback_diagnostics,
+                        )
+                    else:
+                        result = dense_updated_result
+                else:
+                    result = dense_updated_result
+            if (
+                self.local_ba_pose_safe_two_stage
+                and publication_filter_kwargs is not None
+            ):
+                # Factor publication must be derived from the same final state
+                # that leaves this window, including the full input rollback.
+                published_cache, final_publication_diagnostics = (
+                    filter_stage3_match_cache_robust(
+                        ba_cache,
+                        result.poses_c2w.detach(),
+                        result.dense_depth.detach(),
+                        sparse_source_depth=result.sparse_depth.detach(),
+                        **publication_filter_kwargs,
+                    )
+                )
+                for batch_idx, value in enumerate(result.diagnostics):
+                    value["published_filter"] = dict(
+                        final_publication_diagnostics[batch_idx]
+                    )
+                    value["published_filter_state"] = (
+                        "stage2" if bool(result.accepted[batch_idx]) else "input"
+                    )
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         ba_sec = float(time.perf_counter() - ba_start)
@@ -648,6 +1115,101 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                     current = current.detach_parameters()
                     hidden = hidden.detach()
         return current.detach_for_backend()
+
+    def _spherical_keyframe_decision(
+        self,
+        *,
+        frame_id: int,
+        descriptor: torch.Tensor,
+        pose_c2w: torch.Tensor,
+        valid_mask: torch.Tensor,
+        sky_mask: torch.Tensor,
+        confidence: torch.Tensor,
+        depth: torch.Tensor,
+        ba_residual_deg: float | None,
+    ) -> tuple[bool, float]:
+        """Config-gated Adapter/coverage/parallax/residual keyframe policy."""
+
+        frame = int(frame_id)
+        cached = self._keyframe_decisions.get(frame)
+        if cached is not None:
+            return cached
+        if not self.spherical_keyframe_selection_enabled:
+            decision = (True, float(1.0 - confidence.float().mean().item()))
+            self._keyframe_decisions[frame] = decision
+            return decision
+
+        descriptor_cpu = descriptor.detach().cpu().float().flatten()
+        descriptor_cpu = descriptor_cpu / descriptor_cpu.norm().clamp_min(1.0e-8)
+        pose_cpu = pose_c2w.detach().cpu().float()
+        static_valid = valid_mask.detach().cpu().bool() & ~sky_mask.detach().cpu().bool()
+        coverage = float(static_valid.float().mean().item())
+        depth_map = depth.detach().cpu().float().squeeze()
+        if tuple(depth_map.shape) != tuple(static_valid.shape):
+            raise ValueError("Keyframe depth and spherical validity mask must share HxW")
+        valid_depth = depth_map[static_valid]
+        median_depth = (
+            float(valid_depth.median().item()) if int(valid_depth.numel()) > 0 else 1.0
+        )
+
+        descriptor_novelty = 1.0
+        parallax = 1.0
+        coverage_increment = coverage
+        gap = self.keyframe_max_gap
+        if self._last_keyframe_id is not None:
+            gap = max(0, frame - self._last_keyframe_id)
+            if self._last_keyframe_descriptor is not None:
+                descriptor_novelty = float(
+                    (1.0 - torch.dot(self._last_keyframe_descriptor, descriptor_cpu))
+                    .clamp(0.0, 1.0)
+                    .item()
+                )
+            coverage_increment = max(0.0, coverage - self._last_keyframe_coverage)
+            coverage_increment += 0.25 * abs(coverage - self._last_keyframe_coverage)
+            if self._last_keyframe_pose is not None:
+                relative_rotation = (
+                    self._last_keyframe_pose[:3, :3].transpose(0, 1)
+                    @ pose_cpu[:3, :3]
+                )
+                cosine = ((torch.trace(relative_rotation) - 1.0) * 0.5).clamp(-1.0, 1.0)
+                rotation_score = math.degrees(float(torch.acos(cosine))) / self.keyframe_rotation_deg
+                translation_score = float(
+                    torch.linalg.norm(
+                        pose_cpu[:3, 3] - self._last_keyframe_pose[:3, 3]
+                    ).item()
+                ) / max(median_depth * self.keyframe_translation_ratio, 1.0e-6)
+                parallax = min(1.0, max(rotation_score, translation_score))
+
+        residual_score = (
+            min(1.0, max(0.0, float(ba_residual_deg) / 5.0))
+            if ba_residual_deg is not None and math.isfinite(float(ba_residual_deg))
+            else min(1.0, max(0.0, 1.0 - float(confidence.float().mean().item())))
+        )
+        weights = (
+            self.keyframe_descriptor_weight
+            + self.keyframe_coverage_weight
+            + self.keyframe_parallax_weight
+            + self.keyframe_residual_weight
+        )
+        score = (
+            self.keyframe_descriptor_weight * descriptor_novelty
+            + self.keyframe_coverage_weight * min(1.0, coverage_increment)
+            + self.keyframe_parallax_weight * parallax
+            + self.keyframe_residual_weight * residual_score
+        ) / max(weights, 1.0e-8)
+        selected = (
+            self._last_keyframe_id is None
+            or gap >= self.keyframe_max_gap
+            or (gap >= self.keyframe_min_gap and score >= self.keyframe_score_threshold)
+        )
+        if selected:
+            self._last_keyframe_id = frame
+            self._last_keyframe_descriptor = descriptor_cpu
+            self._last_keyframe_pose = pose_cpu
+            self._last_keyframe_coverage = coverage
+        decision = (bool(selected), float(score))
+        self._keyframe_decisions[frame] = decision
+        return decision
 
     def _run_window(self, frames: list[PanoFrame]) -> None:
         images = torch.stack([ensure_chw_image(frame.image).float() for frame in frames], dim=0).unsqueeze(0)
@@ -763,6 +1325,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         )
 
         match_quality = {}
+        ba_diagnostics = {} if ba_result is None else dict(ba_result.diagnostics[0])
         if match_cache is not None:
             match_quality = {
                 "top1_cosine": match_cache.top1_cosine.detach(),
@@ -777,6 +1340,10 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             frame_ids=[int(frame.frame_id) for frame in frames],
             verification_size=self.verification_size,
             latitude_bands=self.latitude_bands,
+            retrieval_descriptor_mode=self.retrieval_descriptor_mode,
+            retrieval_descriptor_max_degree=self.retrieval_descriptor_max_degree,
+            retrieval_descriptor_num_samples=self.retrieval_descriptor_num_samples,
+            retrieval_descriptor_store_fp16=self.retrieval_descriptor_store_fp16,
             sky_prob=sky_prob,
             sky_threshold=self.sky_threshold,
             pre_depth_shift_depth=(
@@ -791,6 +1358,15 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "local_ba_enabled": self.local_ba_enabled,
                 "local_ba_matcher": self.local_ba_matcher_name,
                 "local_ba_accepted": None if ba_result is None else bool(ba_result.accepted[0]),
+                "local_ba_pose_safe_two_stage": self.local_ba_pose_safe_two_stage,
+                "local_ba_stage1_accepted": ba_diagnostics.get("stage1_accepted"),
+                "local_ba_stage2_accepted": ba_diagnostics.get("stage2_accepted"),
+                "local_ba_validation_passed": ba_diagnostics.get(
+                    "validation_passed"
+                ),
+                "local_ba_published_pose_updated": ba_diagnostics.get(
+                    "published_pose_updated", False
+                ),
                 "dense_depth_shift_applied": depth_shift_applied,
                 "dense_depth_shift_deferred": self.local_ba_defer_dense_affine,
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
@@ -822,6 +1398,16 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             residual = None
             if ba_result is not None:
                 residual = float(ba_result.final_median_residual_deg[0].detach().cpu())
+            is_keyframe, keyframe_score = self._spherical_keyframe_decision(
+                frame_id=int(frame.frame_id),
+                descriptor=packet.retrieval_descriptors[index],
+                pose_c2w=pose,
+                valid_mask=valid,
+                sky_mask=packet.sky_mask[0, index],
+                confidence=confidence,
+                depth=observation.refined_depth[0, index],
+                ba_residual_deg=residual,
+            )
             self.pending_outputs[int(frame.frame_id)] = FrontendOutput(
                 frame_id=int(frame.frame_id),
                 timestamp=float(frame.timestamp),
@@ -831,8 +1417,8 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 inverse_depth=inverse_depth,
                 depth_confidence=confidence,
                 spherical_flow=None,
-                keyframe_score=float(1.0 - confidence.mean()),
-                is_keyframe=True,
+                keyframe_score=keyframe_score,
+                is_keyframe=is_keyframe,
                 ba_residual=residual,
                 tracking_status=(
                     "tracked_spherical_selfi_stage2_ba"

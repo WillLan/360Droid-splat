@@ -554,6 +554,8 @@ def filter_stage3_match_cache_robust(
             sim3_candidates_total += sim3_candidate_count
             reason = "ok"
             sim3_threshold_value = float("nan")
+            sim3_residual_median = float("nan")
+            sim3_residual_mean = float("nan")
             if sim3_candidate_count >= 3:
                 source_points = source_camera.index_select(0, sim3_candidates)
                 target_points = target_camera_observed.index_select(0, sim3_candidates)
@@ -593,6 +595,8 @@ def filter_stage3_match_cache_robust(
                     scale, rotation, translation = sim3_components(transform)
                     aligned = scale * (source_points @ rotation.transpose(0, 1)) + translation
                     residual = torch.linalg.norm(aligned - target_points, dim=-1)
+                    sim3_residual_median = float(residual.median().detach().cpu())
+                    sim3_residual_mean = float(residual.mean().detach().cpu())
                     scene_depth = torch.cat(
                         [source_points.norm(dim=-1), target_points.norm(dim=-1)]
                     )
@@ -633,6 +637,8 @@ def filter_stage3_match_cache_robust(
                         torch.rad2deg(angular_threshold).detach().cpu()
                     ),
                     "sim3_threshold": sim3_threshold_value,
+                    "sim3_residual_median": sim3_residual_median,
+                    "sim3_residual_mean": sim3_residual_mean,
                     "reason": reason,
                 }
             )
@@ -670,6 +676,92 @@ def filter_stage3_match_cache_robust(
         }
     )
     return filtered, diagnostics
+
+
+@torch.no_grad()
+def evaluate_stage3_cache_residuals(
+    cache: Stage3MatchCache,
+    poses_c2w: torch.Tensor,
+    sparse_source_depth: torch.Tensor,
+) -> list[dict[str, Any]]:
+    """Evaluate held-out spherical factors without changing their masks."""
+
+    expected_pose = (cache.batch_size, cache.num_views, 4, 4)
+    expected_depth = (
+        cache.batch_size,
+        cache.num_views,
+        cache.queries_per_source,
+    )
+    if tuple(poses_c2w.shape) != expected_pose:
+        raise ValueError(f"poses_c2w must have shape {expected_pose}")
+    if tuple(sparse_source_depth.shape) != expected_depth:
+        raise ValueError(f"sparse_source_depth must have shape {expected_depth}")
+
+    batches: list[dict[str, Any]] = []
+    for batch_idx in range(cache.batch_size):
+        edge_values: list[dict[str, Any]] = []
+        all_angles: list[torch.Tensor] = []
+        for edge_idx, pair in enumerate(cache.edges.detach().cpu().tolist()):
+            source, target = int(pair[0]), int(pair[1])
+            valid = cache.valid_mask[batch_idx, edge_idx].bool().to(poses_c2w.device)
+            source_depth = sparse_source_depth[batch_idx, source].to(poses_c2w)
+            source_ray = cache.source_ray[batch_idx, source].to(poses_c2w)
+            target_ray = cache.target_ray[batch_idx, edge_idx].to(poses_c2w)
+            valid &= (
+                torch.isfinite(source_depth)
+                & (source_depth > 0.0)
+                & torch.isfinite(source_ray).all(dim=-1)
+                & torch.isfinite(target_ray).all(dim=-1)
+            )
+            source_camera = source_depth[:, None] * source_ray
+            source_pose = poses_c2w[batch_idx, source]
+            target_pose = poses_c2w[batch_idx, target]
+            world = (
+                source_camera @ source_pose[:3, :3].transpose(0, 1)
+                + source_pose[:3, 3]
+            )
+            target_camera = (world - target_pose[:3, 3]) @ target_pose[:3, :3]
+            predicted = F.normalize(target_camera, dim=-1, eps=1.0e-8)
+            angle = torch.rad2deg(
+                torch.atan2(
+                    torch.cross(target_ray, predicted, dim=-1).norm(dim=-1),
+                    (target_ray * predicted).sum(dim=-1).clamp(-1.0, 1.0),
+                )
+            )
+            selected = angle[valid & torch.isfinite(angle)]
+            if int(selected.numel()) > 0:
+                all_angles.append(selected)
+                median = float(selected.median().detach().cpu())
+                p90 = float(selected.quantile(0.9).detach().cpu())
+            else:
+                median = p90 = float("inf")
+            edge_values.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "count": int(selected.numel()),
+                    "median_deg": median,
+                    "p90_deg": p90,
+                }
+            )
+        merged = torch.cat(all_angles) if all_angles else poses_c2w.new_zeros(0)
+        batches.append(
+            {
+                "count": int(merged.numel()),
+                "median_deg": (
+                    float(merged.median().detach().cpu())
+                    if int(merged.numel())
+                    else float("inf")
+                ),
+                "p90_deg": (
+                    float(merged.quantile(0.9).detach().cpu())
+                    if int(merged.numel())
+                    else float("inf")
+                ),
+                "edges": edge_values,
+            }
+        )
+    return batches
 
 
 @dataclass
@@ -993,8 +1085,9 @@ def apply_selfi_dense_depth_shift(
     min_support: int = 64,
     min_relative_improvement: float = 1.0e-3,
     output_depth_floor: float = 0.01,
+    fit_mode: str = "affine",
 ) -> Stage3BAOutput:
-    """Fit and publish the per-frame SELF-I affine exactly once.
+    """Fit and publish the per-frame SELF-I depth update exactly once.
 
     Local LM stages operate only on pose and sparse depth.  This function is
     deliberately separate so the finally selected sparse state is the sole
@@ -1016,6 +1109,9 @@ def apply_selfi_dense_depth_shift(
     floor = float(output_depth_floor)
     if not math.isfinite(floor) or floor <= 0.0:
         raise ValueError("output_depth_floor must be positive and finite")
+    mode = str(fit_mode).strip().lower()
+    if mode not in {"affine", "shift"}:
+        raise ValueError("fit_mode must be 'affine' or 'shift'")
 
     output_depth = original_dense_depth.detach().clone()
     scales = torch.ones((batch, views), device=output_depth.device, dtype=output_depth.dtype)
@@ -1059,20 +1155,49 @@ def apply_selfi_dense_depth_shift(
                 else 1.0
             )
             weight = torch.ones_like(source)
-            (
-                scale,
-                shift,
-                accepted,
-                identity_error,
-                fit_error,
-            ) = _weighted_affine_fit_with_acceptance(
-                source[supported],
-                target[supported],
-                weight[supported],
-                median_depth=median_depth,
-                min_support=int(min_support),
-                min_relative_improvement=float(min_relative_improvement),
-            )
+            if mode == "affine":
+                (
+                    scale,
+                    shift,
+                    accepted,
+                    identity_error,
+                    fit_error,
+                ) = _weighted_affine_fit_with_acceptance(
+                    source[supported],
+                    target[supported],
+                    weight[supported],
+                    median_depth=median_depth,
+                    min_support=int(min_support),
+                    min_relative_improvement=float(min_relative_improvement),
+                )
+            else:
+                scale = source.new_tensor(1.0)
+                shift = result.depth_shift[batch_idx, frame].to(source)
+                if support_count >= int(min_support):
+                    x = source[supported]
+                    y = target[supported]
+                    w = weight[supported]
+                    delta = max(0.01, 0.05 * float(median_depth))
+                    identity_error = _weighted_huber_error(x - y, w, delta=delta)
+                    fit_error = _weighted_huber_error(
+                        x + shift - y,
+                        w,
+                        delta=delta,
+                    )
+                    required = identity_error * (
+                        1.0 - max(0.0, float(min_relative_improvement))
+                    )
+                    accepted = bool(
+                        torch.isfinite(shift)
+                        and torch.isfinite(identity_error)
+                        and torch.isfinite(fit_error)
+                        and float(identity_error) > 0.0
+                        and float(fit_error) < float(required)
+                    )
+                else:
+                    identity_error = source.new_tensor(float("inf"))
+                    fit_error = source.new_tensor(float("inf"))
+                    accepted = False
             if not bool(result.accepted[batch_idx]):
                 accepted = False
                 scale = scale.new_tensor(1.0)
@@ -1120,6 +1245,7 @@ def apply_selfi_dense_depth_shift(
             frame_diagnostics.append(
                 {
                     "frame_index": frame,
+                    "fit_mode": mode,
                     "scale": float(scale.detach().cpu()),
                     "shift": float(shift.detach().cpu()),
                     "support": support_count,
@@ -1137,6 +1263,7 @@ def apply_selfi_dense_depth_shift(
         diagnostics[batch_idx].update(
             {
                 "dense_depth_affine_applications": 1,
+                "dense_depth_update_mode": mode,
                 "dense_depth_output_floor": floor,
                 "dense_depth_output_max_clamp": None,
                 "depth_affine_frames": frame_diagnostics,
@@ -1251,6 +1378,9 @@ class BlockSparseSphericalBA:
         step_tolerance: float = 1.0e-8,
         relative_objective_tolerance: float = 1.0e-6,
         affine_min_relative_improvement: float = 1.0e-3,
+        depth_parameterization: str = "sparse_logdepth",
+        max_depth_shift_ratio: float = 0.25,
+        max_depth_shift_step_ratio: float = 0.05,
     ) -> None:
         self.iterations = int(iterations)
         self.damping = float(damping)
@@ -1326,6 +1456,20 @@ class BlockSparseSphericalBA:
         self.affine_min_relative_improvement = max(
             0.0, float(affine_min_relative_improvement)
         )
+        self.depth_parameterization = str(depth_parameterization).strip().lower()
+        if self.depth_parameterization not in {
+            "sparse_logdepth",
+            "fixed",
+            "frame_shift",
+        }:
+            raise ValueError(
+                "depth_parameterization must be 'sparse_logdepth', 'fixed', "
+                "or 'frame_shift'."
+            )
+        self.max_depth_shift_ratio = max(0.0, float(max_depth_shift_ratio))
+        self.max_depth_shift_step_ratio = max(
+            0.0, float(max_depth_shift_step_ratio)
+        )
 
     def __call__(
         self,
@@ -1334,6 +1478,7 @@ class BlockSparseSphericalBA:
         cache: Stage3MatchCache,
         *,
         initial_sparse_depth: torch.Tensor | None = None,
+        pose_trust_region_reference: torch.Tensor | None = None,
     ) -> Stage3BAOutput:
         if poses_c2w.ndim != 4 or poses_c2w.shape[-2:] != (4, 4):
             raise ValueError("poses_c2w must have shape BxSx4x4.")
@@ -1345,6 +1490,13 @@ class BlockSparseSphericalBA:
         expected_sparse = (batch, views, cache.queries_per_source)
         if initial_sparse_depth is not None and tuple(initial_sparse_depth.shape) != expected_sparse:
             raise ValueError(f"initial_sparse_depth must have shape {expected_sparse}.")
+        if (
+            pose_trust_region_reference is not None
+            and tuple(pose_trust_region_reference.shape) != tuple(poses_c2w.shape)
+        ):
+            raise ValueError(
+                "pose_trust_region_reference must match poses_c2w shape"
+            )
         if self.pose_dof_mode == "rotation_then_translation":
             return self._run_rotation_then_translation(
                 poses_c2w,
@@ -1374,6 +1526,11 @@ class BlockSparseSphericalBA:
                     None
                     if initial_sparse_depth is None
                     else initial_sparse_depth[batch_idx].detach().float()
+                ),
+                pose_trust_region_reference=(
+                    None
+                    if pose_trust_region_reference is None
+                    else pose_trust_region_reference[batch_idx].detach().float()
                 ),
             )
             output_poses.append(result[0])
@@ -1508,8 +1665,14 @@ class BlockSparseSphericalBA:
         *,
         batch_idx: int,
         initial_sparse_depth: torch.Tensor | None = None,
+        pose_trust_region_reference: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool, float, float, dict[str, Any]]:
         device = poses.device
+        trust_region_poses = (
+            poses
+            if pose_trust_region_reference is None
+            else pose_trust_region_reference.to(device=device, dtype=poses.dtype)
+        )
         views, query_count = cache.num_views, cache.queries_per_source
         if initial_sparse_depth is None:
             source_depth = sample_erp_with_wrap(
@@ -1524,6 +1687,10 @@ class BlockSparseSphericalBA:
             source_depth = initial_sparse_depth.to(device=device, dtype=torch.float32).reshape(-1)
             if not bool(torch.isfinite(source_depth).all()) or bool((source_depth <= 0.0).any()):
                 raise ValueError("initial_sparse_depth must be finite and strictly positive")
+        source_depth_by_frame = source_depth.reshape(views, query_count)
+        frame_median_depth = source_depth_by_frame.median(dim=-1).values.clamp_min(
+            self.min_depth
+        )
         log0 = -source_depth.log()
         edges = cache.edges.to(device=device)
         src = edges[:, 0, None].expand(-1, query_count).reshape(-1)
@@ -1591,8 +1758,65 @@ class BlockSparseSphericalBA:
                 "num_factors": int(src.numel()),
             }
 
+        if self.depth_parameterization == "sparse_logdepth":
+            depth_state0 = log0.clone()
+        elif self.depth_parameterization == "frame_shift":
+            # The first frame is the depth gauge owner.  Only the remaining
+            # per-frame normalized shifts are observable variables.
+            depth_state0 = torch.zeros(
+                max(0, views - 1), device=device, dtype=torch.float32
+            )
+        else:
+            depth_state0 = torch.zeros(0, device=device, dtype=torch.float32)
+
+        def full_log_depth(depth_state: torch.Tensor) -> torch.Tensor | None:
+            if self.depth_parameterization == "sparse_logdepth":
+                return depth_state
+            if self.depth_parameterization == "fixed":
+                return log0
+            normalized_shift = torch.cat(
+                [depth_state.new_zeros(1), depth_state], dim=0
+            )
+            shifted = source_depth_by_frame + (
+                normalized_shift * frame_median_depth
+            )[:, None]
+            if (
+                not bool(torch.isfinite(shifted).all())
+                or bool((shifted <= 0.0).any())
+            ):
+                return None
+            return -shifted.reshape(-1).log()
+
+        def factor_depth_variables(
+            depth_state: torch.Tensor,
+            factor_depth_index: torch.Tensor,
+            factor_source: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+            log_depth = full_log_depth(depth_state)
+            if log_depth is None:
+                return None
+            factor_log = log_depth[factor_depth_index]
+            if self.depth_parameterization == "sparse_logdepth":
+                variable_index = factor_depth_index
+                derivative = torch.ones_like(factor_log)
+            elif self.depth_parameterization == "frame_shift":
+                variable_index = factor_source - 1
+                depth = torch.exp(-factor_log)
+                derivative = -frame_median_depth[factor_source] / depth.clamp_min(
+                    1.0e-8
+                )
+                derivative = torch.where(
+                    factor_source > 0, derivative, torch.zeros_like(derivative)
+                )
+            else:
+                variable_index = torch.full_like(factor_source, -1)
+                derivative = torch.zeros_like(factor_log)
+            return factor_log, variable_index, derivative
+
         cur_pose = poses.clone()
-        cur_log = log0.clone()
+        cur_depth_state = depth_state0.clone()
+        cur_log = full_log_depth(cur_depth_state)
+        assert cur_log is not None
         initial_angle = self._angular_residual(cur_pose, cur_log, src, tgt, depth_index, src_ray, tgt_ray)
         initial_median = float(torch.rad2deg(initial_angle).median().detach().cpu())
         if initial_median < self.min_initial_median_residual_deg:
@@ -1638,7 +1862,7 @@ class BlockSparseSphericalBA:
             )
         else:
             active_pose_index = torch.arange(pose_dim, device=device, dtype=torch.long)
-        depth_dim = views * query_count
+        depth_dim = int(cur_depth_state.numel())
         failed_reason: str | None = None
         current_damping = min(
             self.lm_damping_max,
@@ -1660,6 +1884,24 @@ class BlockSparseSphericalBA:
         analytic_autodiff_max_rel = 0.0
         termination_reason: str | None = None
         lm_nu = 2.0
+
+        def pose_within_cumulative_trust_region(candidate_pose: torch.Tensor) -> bool:
+            if views <= 1:
+                return True
+            relative = torch.linalg.inv(trust_region_poses[1:]) @ candidate_pose[1:]
+            cosine = (
+                relative[:, :3, :3].diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+                - 1.0
+            ) * 0.5
+            rotation = torch.acos(cosine.clamp(-1.0, 1.0))
+            translation = (
+                candidate_pose[1:, :3, 3] - trust_region_poses[1:, :3, 3]
+            ).norm(dim=-1)
+            return bool(
+                (rotation <= self.max_pose_update + 1.0e-7).all()
+                and (translation <= self.max_translation_update + 1.0e-7).all()
+            )
+
         initial_objective = self._objective(
             cur_pose,
             cur_log,
@@ -1671,6 +1913,8 @@ class BlockSparseSphericalBA:
             src_ray,
             tgt_ray,
             factor_weight,
+            depth_prior_state=cur_depth_state,
+            initial_depth_prior_state=depth_state0,
         )
         current_objective = initial_objective
 
@@ -1734,12 +1978,23 @@ class BlockSparseSphericalBA:
                 gp += self.pose_prior_weight * (prior_jacobian.T @ prior_residual)
             hpd = torch.zeros(depth_dim, pose_dim, device=device, dtype=torch.float32)
             hdd = torch.full((depth_dim,), self.depth_prior_weight, device=device, dtype=torch.float32)
-            gd = self.depth_prior_weight * (cur_log - log0)
+            gd = self.depth_prior_weight * (cur_depth_state - depth_state0)
 
             for start in range(0, int(src.numel()), self.factor_chunk_size):
                 stop = min(int(src.numel()), start + self.factor_chunk_size)
                 chunk_src, chunk_tgt = src[start:stop], tgt[start:stop]
                 chunk_depth = depth_index[start:stop]
+                chunk_depth_variables = factor_depth_variables(
+                    cur_depth_state,
+                    chunk_depth,
+                    chunk_src,
+                )
+                if chunk_depth_variables is None:
+                    failed_reason = "non_finite_shifted_depth"
+                    break
+                chunk_log_depth, chunk_variable_index, chunk_depth_chain = (
+                    chunk_depth_variables
+                )
                 local_zero = torch.zeros(stop - start, 13, device=device, dtype=torch.float32)
 
                 def single(delta, sp, tp, sr, tr, ld):
@@ -1759,7 +2014,7 @@ class BlockSparseSphericalBA:
                         cur_pose[chunk_tgt],
                         src_ray[start:stop],
                         tgt_ray[start:stop],
-                        cur_log[chunk_depth],
+                        chunk_log_depth,
                     )
                     if self.validate_analytic_jacobian:
                         with torch.enable_grad():
@@ -1770,7 +2025,7 @@ class BlockSparseSphericalBA:
                                 cur_pose[chunk_tgt],
                                 src_ray[start:stop],
                                 tgt_ray[start:stop],
-                                cur_log[chunk_depth],
+                                chunk_log_depth,
                             )
                             reference_jacobian = torch.func.vmap(jacobian_fn)(
                                 local_zero,
@@ -1778,7 +2033,7 @@ class BlockSparseSphericalBA:
                                 cur_pose[chunk_tgt],
                                 src_ray[start:stop],
                                 tgt_ray[start:stop],
-                                cur_log[chunk_depth],
+                                chunk_log_depth,
                             )
                         absolute = (jacobian - reference_jacobian).abs()
                         relative = absolute / reference_jacobian.abs().clamp_min(1.0e-8)
@@ -1811,7 +2066,7 @@ class BlockSparseSphericalBA:
                         cur_pose[chunk_tgt],
                         src_ray[start:stop],
                         tgt_ray[start:stop],
-                        cur_log[chunk_depth],
+                        chunk_log_depth,
                     )
                     jacobian = torch.func.vmap(jacobian_fn)(
                         local_zero,
@@ -1819,7 +2074,7 @@ class BlockSparseSphericalBA:
                         cur_pose[chunk_tgt],
                         src_ray[start:stop],
                         tgt_ray[start:stop],
-                        cur_log[chunk_depth],
+                        chunk_log_depth,
                     )
                 max_factor_jacobian_norm = max(
                     max_factor_jacobian_norm,
@@ -1839,12 +2094,27 @@ class BlockSparseSphericalBA:
                         jp[src_mask, :, frame_slice] += jacobian[src_mask, :, :6]
                     if tgt_mask.any():
                         jp[tgt_mask, :, frame_slice] += jacobian[tgt_mask, :, 6:12]
-                jd = jacobian[:, :, 12]
+                jd = jacobian[:, :, 12] * chunk_depth_chain[:, None]
                 hpp += torch.einsum("nrp,nrq->pq", jp, jp)
                 gp += torch.einsum("nrp,nr->p", jp, residual)
-                hpd.index_add_(0, chunk_depth, torch.einsum("nrp,nr->np", jp, jd))
-                hdd.index_add_(0, chunk_depth, jd.square().sum(dim=-1))
-                gd.index_add_(0, chunk_depth, (jd * residual).sum(dim=-1))
+                variable_mask = chunk_variable_index >= 0
+                if bool(variable_mask.any()):
+                    variable_index = chunk_variable_index[variable_mask]
+                    hpd.index_add_(
+                        0,
+                        variable_index,
+                        torch.einsum("nrp,nr->np", jp[variable_mask], jd[variable_mask]),
+                    )
+                    hdd.index_add_(
+                        0,
+                        variable_index,
+                        jd[variable_mask].square().sum(dim=-1),
+                    )
+                    gd.index_add_(
+                        0,
+                        variable_index,
+                        (jd[variable_mask] * residual[variable_mask]).sum(dim=-1),
+                    )
 
             if failed_reason is not None:
                 break
@@ -1866,7 +2136,11 @@ class BlockSparseSphericalBA:
                 else torch.zeros(0, device=device, dtype=torch.float32)
             )
             depth_diagonal = hdd.clamp_min(self.lm_diagonal_floor)
-            gauge_jacobian = self._baseline_gauge_jacobian(cur_pose, poses)
+            gauge_jacobian = (
+                self._baseline_gauge_jacobian(cur_pose, poses)
+                if self.depth_parameterization == "sparse_logdepth"
+                else None
+            )
 
             def solve_step(damping: float, *, diagonal: bool) -> tuple[torch.Tensor, torch.Tensor] | None:
                 active_pose_dim = int(active_pose_index.numel())
@@ -1921,6 +2195,15 @@ class BlockSparseSphericalBA:
                         torch.ones_like(rotation_norm),
                         rotation_norm.new_tensor(self.max_pose_update) / rotation_norm,
                     )[:, None]
+                if (
+                    self.depth_parameterization == "frame_shift"
+                    and depth_step.numel()
+                    and self.max_depth_shift_step_ratio > 0.0
+                ):
+                    depth_step = depth_step.clamp(
+                        -self.max_depth_shift_step_ratio,
+                        self.max_depth_shift_step_ratio,
+                    )
                 return pose_step, depth_step
 
             def build_trial(
@@ -1928,7 +2211,7 @@ class BlockSparseSphericalBA:
                 depth_step: torch.Tensor,
                 *,
                 step_scale: float,
-            ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None:
                 trial_pose = cur_pose.clone()
                 for frame in range(1, views):
                     transform = _se3_exp_out_of_place(float(step_scale) * pose_step[frame - 1])
@@ -1937,15 +2220,36 @@ class BlockSparseSphericalBA:
                         if self.pose_update_side == "right"
                         else transform @ cur_pose[frame]
                     )
-                trial_log = (
-                    cur_log + float(step_scale) * depth_step
-                ).clamp(log0 - self.max_logdepth_update, log0 + self.max_logdepth_update)
-                trial_pose, trial_log, gauge_scale, gauge_ok = self._apply_scale_gauge(
-                    trial_pose,
-                    trial_log,
-                    poses,
-                )
-                if not gauge_ok:
+                if self.depth_parameterization == "sparse_logdepth":
+                    trial_depth_state = (
+                        cur_depth_state + float(step_scale) * depth_step
+                    ).clamp(
+                        depth_state0 - self.max_logdepth_update,
+                        depth_state0 + self.max_logdepth_update,
+                    )
+                elif self.depth_parameterization == "frame_shift":
+                    trial_depth_state = (
+                        cur_depth_state + float(step_scale) * depth_step
+                    ).clamp(
+                        -self.max_depth_shift_ratio,
+                        self.max_depth_shift_ratio,
+                    )
+                else:
+                    trial_depth_state = cur_depth_state
+                trial_log = full_log_depth(trial_depth_state)
+                if trial_log is None:
+                    return None
+                gauge_scale = 1.0
+                if self.depth_parameterization == "sparse_logdepth":
+                    trial_pose, trial_log, gauge_scale, gauge_ok = self._apply_scale_gauge(
+                        trial_pose,
+                        trial_log,
+                        poses,
+                    )
+                    if not gauge_ok:
+                        return None
+                    trial_depth_state = trial_log
+                if not pose_within_cumulative_trust_region(trial_pose):
                     return None
                 trial_predicted = self._predicted_bearing(
                     trial_pose, trial_log, src, tgt, depth_index, src_ray
@@ -1954,7 +2258,7 @@ class BlockSparseSphericalBA:
                     return None
                 if bool(((trial_predicted * tgt_ray).sum(dim=-1) <= -0.99).any()):
                     return None
-                return trial_pose, trial_log, gauge_scale
+                return trial_pose, trial_depth_state, trial_log, gauge_scale
 
             accepted_step = False
             stop_after_accept = False
@@ -1979,7 +2283,7 @@ class BlockSparseSphericalBA:
                         current_damping = min(self.lm_damping_max, current_damping * lm_nu)
                         lm_nu *= 2.0
                         continue
-                    trial_pose, trial_log, gauge_scale = candidate
+                    trial_pose, trial_depth_state, trial_log, gauge_scale = candidate
                     trial_objective = self._objective(
                         trial_pose,
                         trial_log,
@@ -1991,6 +2295,8 @@ class BlockSparseSphericalBA:
                         src_ray,
                         tgt_ray,
                         factor_weight,
+                        depth_prior_state=trial_depth_state,
+                        initial_depth_prior_state=depth_state0,
                     )
                     relative_pose = (
                         torch.linalg.inv(cur_pose[1:]) @ trial_pose[1:]
@@ -2000,7 +2306,7 @@ class BlockSparseSphericalBA:
                     # Gauge projection changes translations after the raw LM
                     # step.  Use the effective tangent step after projection.
                     flat_pose = sim3_log(relative_pose)[..., :6].reshape(-1)
-                    effective_depth = trial_log - cur_log
+                    effective_depth = trial_depth_state - cur_depth_state
                     quadratic = (
                         (flat_pose @ (hpp @ flat_pose) if pose_dim else hpp.new_tensor(0.0))
                         + 2.0 * (effective_depth @ (hpd @ flat_pose) if pose_dim else hpp.new_tensor(0.0))
@@ -2027,6 +2333,7 @@ class BlockSparseSphericalBA:
                     ):
                         previous_objective = current_objective
                         cur_pose = trial_pose
+                        cur_depth_state = trial_depth_state
                         cur_log = trial_log
                         current_objective = trial_objective
                         gain_ratios.append(float(rho.detach().cpu()))
@@ -2060,7 +2367,7 @@ class BlockSparseSphericalBA:
                     candidate = build_trial(delta_pose, delta_depth, step_scale=step_scale)
                     if candidate is None:
                         continue
-                    trial_pose, trial_log, gauge_scale = candidate
+                    trial_pose, trial_depth_state, trial_log, gauge_scale = candidate
                     trial_objective = self._objective(
                         trial_pose,
                         trial_log,
@@ -2072,11 +2379,14 @@ class BlockSparseSphericalBA:
                         src_ray,
                         tgt_ray,
                         factor_weight,
+                        depth_prior_state=trial_depth_state,
+                        initial_depth_prior_state=depth_state0,
                     )
                     trial_objectives.append(float(trial_objective.detach().cpu()))
                     trial_dampings.append(float(current_damping))
                     if bool(torch.isfinite(trial_objective)) and float(trial_objective) < float(current_objective) - 1.0e-10:
                         cur_pose = trial_pose
+                        cur_depth_state = trial_depth_state
                         cur_log = trial_log
                         current_objective = trial_objective
                         gauge_scales.append(float(gauge_scale))
@@ -2098,10 +2408,18 @@ class BlockSparseSphericalBA:
         objective_improved = float(current_objective) < float(initial_objective) - 1.0e-10
         residual_limit = max(1.0e-6, initial_median * self.residual_worse_tolerance)
         residual_acceptable = final_median <= residual_limit
-        finite_state = bool(torch.isfinite(cur_pose).all()) and bool(torch.isfinite(cur_log).all())
+        finite_state = (
+            bool(torch.isfinite(cur_pose).all())
+            and bool(torch.isfinite(cur_log).all())
+            and bool(torch.isfinite(cur_depth_state).all())
+        )
         anchor_acceptable = bool(torch.allclose(cur_pose[0], poses[0], atol=1.0e-6, rtol=1.0e-6))
         gauge_error = 0.0
-        if self.gauge_mode == "initial_baseline" and views > 1:
+        if (
+            self.depth_parameterization == "sparse_logdepth"
+            and self.gauge_mode == "initial_baseline"
+            and views > 1
+        ):
             initial_offsets = poses[:, :3, 3] - poses[0, :3, 3]
             reference_index = int(initial_offsets.norm(dim=-1).argmax())
             initial_length = initial_offsets[reference_index].norm()
@@ -2112,6 +2430,7 @@ class BlockSparseSphericalBA:
                 .cpu()
             )
         gauge_acceptable = gauge_error <= 1.0e-5
+        cumulative_pose_acceptable = pose_within_cumulative_trust_region(cur_pose)
         accepted = (
             failed_reason is None
             and math.isfinite(final_median)
@@ -2120,15 +2439,17 @@ class BlockSparseSphericalBA:
             and finite_state
             and anchor_acceptable
             and gauge_acceptable
+            and cumulative_pose_acceptable
             and accepted_steps > 0
         )
         if not accepted:
             cur_pose = poses
+            cur_depth_state = depth_state0
             cur_log = log0
-        published_relative_pose = torch.linalg.inv(poses) @ cur_pose
+        published_relative_pose = torch.linalg.inv(trust_region_poses) @ cur_pose
         published_pose_twist = sim3_log(published_relative_pose)[..., :6]
         published_translation_update = (
-            cur_pose[:, :3, 3] - poses[:, :3, 3]
+            cur_pose[:, :3, 3] - trust_region_poses[:, :3, 3]
         ).norm(dim=-1)
         published_rotation_cosine = (
             published_relative_pose[:, :3, :3].diagonal(dim1=-2, dim2=-1).sum(dim=-1)
@@ -2145,6 +2466,11 @@ class BlockSparseSphericalBA:
         original_depth = source_depth.reshape(views, query_count)
         scales = torch.ones(views, device=device, dtype=torch.float32)
         shifts = torch.zeros(views, device=device, dtype=torch.float32)
+        if self.depth_parameterization == "frame_shift" and accepted:
+            normalized_shift = torch.cat(
+                [cur_depth_state.new_zeros(1), cur_depth_state], dim=0
+            )
+            shifts = normalized_shift * frame_median_depth
         affine_accepted = torch.zeros(views, device=device, dtype=torch.bool)
         affine_identity_error = torch.full(
             (views,), float("inf"), device=device, dtype=torch.float32
@@ -2152,7 +2478,11 @@ class BlockSparseSphericalBA:
         affine_fit_error = torch.full(
             (views,), float("inf"), device=device, dtype=torch.float32
         )
-        if accepted and self.dense_depth_mode == "affine":
+        if (
+            accepted
+            and self.dense_depth_mode == "affine"
+            and self.depth_parameterization == "sparse_logdepth"
+        ):
             for frame in range(views):
                 mask = cache.source_valid[batch_idx, frame].to(device=device)
                 support = int(mask.sum())
@@ -2205,6 +2535,7 @@ class BlockSparseSphericalBA:
             or ("non_finite_state" if not finite_state else None)
             or ("anchor_changed" if not anchor_acceptable else None)
             or ("gauge_violation" if not gauge_acceptable else None)
+            or ("cumulative_pose_trust_region" if not cumulative_pose_acceptable else None)
             or termination_reason
             or "objective_not_improved"
         )
@@ -2227,12 +2558,14 @@ class BlockSparseSphericalBA:
             "anchor_acceptable": bool(anchor_acceptable),
             "gauge_error": float(gauge_error),
             "gauge_acceptable": bool(gauge_acceptable),
+            "cumulative_pose_acceptable": bool(cumulative_pose_acceptable),
             "initial_objective": float(initial_objective.detach().cpu()),
             "final_objective": float(current_objective.detach().cpu()),
             "accepted_steps": int(accepted_steps),
             "final_damping": float(current_damping),
             "solver_mode": self.solver_mode,
             "dense_depth_mode": self.dense_depth_mode,
+            "depth_parameterization": self.depth_parameterization,
             "gauge_mode": self.gauge_mode,
             "pose_update_side": self.pose_update_side,
             "pose_dof_mode": self.pose_dof_mode,
@@ -2247,6 +2580,15 @@ class BlockSparseSphericalBA:
             "published_pose_twist_norms": published_pose_twist.norm(dim=-1).detach().cpu().tolist(),
             "published_translation_update_norms": published_translation_update.detach().cpu().tolist(),
             "published_rotation_update_deg": published_rotation_update_deg.detach().cpu().tolist(),
+            "normalized_depth_shift": (
+                torch.cat([cur_depth_state.new_zeros(1), cur_depth_state], dim=0)
+                .detach()
+                .cpu()
+                .tolist()
+                if self.depth_parameterization == "frame_shift"
+                else [0.0] * views
+            ),
+            "depth_shift": shifts.detach().cpu().tolist(),
             "trial_objectives": trial_objectives,
             "trial_dampings": trial_dampings,
             "trial_predicted_reductions": trial_predicted_reductions,
@@ -2275,6 +2617,9 @@ class BlockSparseSphericalBA:
         src_ray: torch.Tensor,
         tgt_ray: torch.Tensor,
         factor_weight: torch.Tensor,
+        *,
+        depth_prior_state: torch.Tensor | None = None,
+        initial_depth_prior_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         predicted = self._predicted_bearing(poses, log_depth, src, tgt, depth_index, src_ray)
         residual = spherical_tangent_residual(tgt_ray, predicted)
@@ -2290,7 +2635,14 @@ class BlockSparseSphericalBA:
             pose_prior = self._pose_prior_vector(poses, initial_poses)
             objective = objective + 0.5 * self.pose_prior_weight * pose_prior.square().sum()
         if self.depth_prior_weight > 0.0:
-            depth_prior = log_depth - initial_log_depth
+            if depth_prior_state is None:
+                depth_prior = log_depth - initial_log_depth
+            else:
+                if initial_depth_prior_state is None:
+                    raise ValueError(
+                        "initial_depth_prior_state is required with depth_prior_state"
+                    )
+                depth_prior = depth_prior_state - initial_depth_prior_state
             objective = objective + 0.5 * self.depth_prior_weight * depth_prior.square().sum()
         return objective
 

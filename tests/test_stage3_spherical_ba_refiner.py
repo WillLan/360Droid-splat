@@ -391,6 +391,64 @@ def test_deferred_selfi_affine_is_applied_once_without_upper_depth_clamp() -> No
     assert shifted.diagnostics[0]["dense_depth_output_max_clamp"] is None
 
 
+def test_deferred_selfi_shift_is_applied_once_without_upper_depth_clamp() -> None:
+    query_count = 64
+    source_sparse = torch.linspace(1.0, 4.0, query_count).view(1, 1, -1)
+    target_sparse = source_sparse + 0.25
+    dense = torch.tensor([[[[[-0.30, 2.0, 25.0]]]]])
+    cache = Stage3MatchCache(
+        source_uv=torch.zeros(1, 1, query_count, 2),
+        source_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(
+            1, 1, query_count, 1
+        ),
+        source_depth=source_sparse,
+        source_valid=torch.ones(1, 1, query_count, dtype=torch.bool),
+        edges=torch.tensor([[0, 0]]),
+        target_uv=torch.zeros(1, 1, query_count, 2),
+        target_ray=torch.tensor([0.0, 0.0, 1.0]).view(1, 1, 1, 3).repeat(
+            1, 1, query_count, 1
+        ),
+        top1_cosine=torch.zeros(1, 1, query_count),
+        top2_margin=torch.zeros(1, 1, query_count),
+        entropy=torch.zeros(1, 1, query_count),
+        valid_mask=torch.ones(1, 1, query_count, dtype=torch.bool),
+        factor_weight=torch.ones(1, 1, query_count),
+    )
+    result = Stage3BAOutput(
+        poses_c2w=torch.eye(4).view(1, 1, 4, 4),
+        dense_depth=dense.clone(),
+        sparse_depth=target_sparse,
+        depth_scale=torch.ones(1, 1),
+        depth_shift=torch.tensor([[0.25]]),
+        depth_affine_accepted=torch.zeros(1, 1, dtype=torch.bool),
+        depth_affine_identity_error=torch.full((1, 1), float("inf")),
+        depth_affine_fit_error=torch.full((1, 1), float("inf")),
+        accepted=torch.tensor([True]),
+        initial_median_residual_deg=torch.tensor([1.0]),
+        final_median_residual_deg=torch.tensor([0.5]),
+        diagnostics=[{}],
+    )
+
+    shifted = apply_selfi_dense_depth_shift(
+        result,
+        dense,
+        source_sparse,
+        cache,
+        min_support=64,
+        output_depth_floor=0.01,
+        fit_mode="shift",
+    )
+
+    assert bool(shifted.depth_affine_accepted[0, 0])
+    torch.testing.assert_close(shifted.depth_scale, torch.ones(1, 1))
+    torch.testing.assert_close(shifted.depth_shift, torch.tensor([[0.25]]))
+    assert float(shifted.dense_depth[0, 0, 0, 0, 0]) == pytest.approx(0.01)
+    assert float(shifted.dense_depth.max()) == pytest.approx(25.25)
+    assert shifted.diagnostics[0]["dense_depth_update_mode"] == "shift"
+    assert shifted.diagnostics[0]["dense_depth_affine_applications"] == 1
+    assert shifted.diagnostics[0]["dense_depth_output_max_clamp"] is None
+
+
 def test_gaussian_centers_and_footprints_follow_unbounded_shifted_depth() -> None:
     observation, _, _ = _observation(views=2, height=4, width=8)
     original_centers = observation.centers_camera()
@@ -689,6 +747,184 @@ def test_rotation_only_ba_requires_right_local_updates() -> None:
         BlockSparseSphericalBA(pose_update_side="left", pose_dof_mode="rotation_only")
     with pytest.raises(ValueError, match="requires pose_update_side='right'"):
         BlockSparseSphericalBA(pose_update_side="left", pose_dof_mode="translation_only")
+
+
+def _synthetic_two_frame_ba_scene(
+    *,
+    source_depth_offset: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Stage3MatchCache]:
+    height, width = 6, 12
+    query_count = height * width
+    poses_truth = torch.eye(4).repeat(2, 1, 1)
+    poses_truth[1] = se3_exp(
+        torch.tensor([0.20, -0.03, 0.02, 0.01, 0.08, -0.02])
+    )
+    truth_depth = torch.linspace(1.5, 5.0, query_count).reshape(
+        1, 1, height, width
+    ).repeat(2, 1, 1, 1)
+    input_depth = truth_depth.clone()
+    input_depth[1] += float(source_depth_offset)
+    rays = build_erp_ray_grid(height, width).reshape(query_count, 3)
+    source_ray = rays.view(1, 1, query_count, 3).repeat(1, 2, 1, 1)
+    source_uv = torch.stack(
+        torch.meshgrid(
+            torch.arange(width).float() + 0.5,
+            torch.arange(height).float() + 0.5,
+            indexing="ij",
+        ),
+        dim=-1,
+    ).permute(1, 0, 2).reshape(query_count, 2).view(
+        1, 1, query_count, 2
+    ).repeat(1, 2, 1, 1)
+    edges = all_directed_pairs(2)
+    target_rays = []
+    for source, target in edges.tolist():
+        source_depth = truth_depth[source, 0].reshape(-1)
+        source_point = source_depth[:, None] * rays
+        world_point = (
+            torch.einsum(
+                "ij,nj->ni", poses_truth[source, :3, :3], source_point
+            )
+            + poses_truth[source, :3, 3]
+        )
+        target_point = torch.einsum(
+            "ij,nj->ni",
+            poses_truth[target, :3, :3].T,
+            world_point - poses_truth[target, :3, 3],
+        )
+        target_rays.append(torch.nn.functional.normalize(target_point, dim=-1))
+    cache = Stage3MatchCache(
+        source_uv=source_uv,
+        source_ray=source_ray,
+        source_depth=input_depth[:, 0].reshape(1, 2, query_count),
+        source_valid=torch.ones(1, 2, query_count, dtype=torch.bool),
+        edges=edges,
+        target_uv=torch.zeros(1, 2, query_count, 2),
+        target_ray=torch.stack(target_rays).unsqueeze(0),
+        top1_cosine=torch.ones(1, 2, query_count),
+        top2_margin=torch.ones(1, 2, query_count),
+        entropy=torch.zeros(1, 2, query_count),
+        valid_mask=torch.ones(1, 2, query_count, dtype=torch.bool),
+        factor_weight=torch.ones(1, 2, query_count),
+    )
+    return poses_truth, truth_depth, input_depth, cache
+
+
+def test_pose_only_ba_has_no_depth_variables_and_preserves_sparse_depth() -> None:
+    poses_truth, _, input_depth, cache = _synthetic_two_frame_ba_scene()
+    poses_initial = poses_truth.clone()
+    poses_initial[1] = se3_exp(
+        torch.tensor([0.04, -0.02, 0.01, 0.02, -0.03, 0.015])
+    ) @ poses_initial[1]
+    initial_sparse = cache.source_depth.clone()
+    output = BlockSparseSphericalBA(
+        iterations=5,
+        damping=1.0e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1.0e-6,
+        depth_prior_weight=1.0e-2,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        depth_parameterization="fixed",
+        pose_update_side="right",
+        lm_max_trials=8,
+    )(
+        poses_initial.unsqueeze(0),
+        input_depth.unsqueeze(0),
+        cache,
+        initial_sparse_depth=initial_sparse,
+        pose_trust_region_reference=poses_initial.unsqueeze(0),
+    )
+
+    assert bool(output.accepted[0])
+    assert output.diagnostics[0]["num_depth_variables"] == 0
+    assert output.diagnostics[0]["depth_parameterization"] == "fixed"
+    torch.testing.assert_close(output.sparse_depth, initial_sparse)
+    assert output.diagnostics[0]["final_objective"] < output.diagnostics[0]["initial_objective"]
+
+
+def test_frame_shift_ba_recovers_per_frame_additive_depth_correction() -> None:
+    poses_truth, _, input_depth, cache = _synthetic_two_frame_ba_scene(
+        source_depth_offset=-0.25
+    )
+    initial_sparse = cache.source_depth.clone()
+    output = BlockSparseSphericalBA(
+        iterations=10,
+        damping=1.0e-4,
+        huber_delta_deg=5.0,
+        pose_prior_weight=10.0,
+        depth_prior_weight=1.0e-6,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        depth_parameterization="frame_shift",
+        max_depth_shift_ratio=0.25,
+        max_depth_shift_step_ratio=0.05,
+        pose_update_side="right",
+        lm_max_trials=8,
+    )(
+        poses_truth.unsqueeze(0),
+        input_depth.unsqueeze(0),
+        cache,
+        initial_sparse_depth=initial_sparse,
+        pose_trust_region_reference=poses_truth.unsqueeze(0),
+    )
+
+    assert bool(output.accepted[0])
+    assert output.diagnostics[0]["num_depth_variables"] == 1
+    assert float(output.depth_shift[0, 0]) == pytest.approx(0.0, abs=1.0e-7)
+    assert float(output.depth_shift[0, 1]) == pytest.approx(0.25, abs=1.5e-2)
+    torch.testing.assert_close(
+        output.sparse_depth[0, 1],
+        initial_sparse[0, 1] + output.depth_shift[0, 1],
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+
+
+def test_pose_trust_region_is_cumulative_from_window_input() -> None:
+    poses_truth, _, input_depth, cache = _synthetic_two_frame_ba_scene()
+    poses_initial = poses_truth.clone()
+    poses_initial[1, 0, 3] += 0.25
+    output = BlockSparseSphericalBA(
+        iterations=8,
+        damping=1.0e-6,
+        huber_delta_deg=5.0,
+        pose_prior_weight=1.0e-8,
+        depth_prior_weight=1.0e-2,
+        max_pose_update_deg=10.0,
+        max_translation_update=0.1,
+        min_factors=8,
+        factor_chunk_size=128,
+        residual_worse_tolerance=1.0,
+        solver_mode="standard_lm",
+        dense_depth_mode="none",
+        depth_parameterization="fixed",
+        pose_update_side="right",
+        lm_max_trials=8,
+    )(
+        poses_initial.unsqueeze(0),
+        input_depth.unsqueeze(0),
+        cache,
+        initial_sparse_depth=cache.source_depth,
+        pose_trust_region_reference=poses_initial.unsqueeze(0),
+    )
+
+    assert bool(output.accepted[0])
+    translation_update = (
+        output.poses_c2w[0, 1, :3, 3] - poses_initial[1, :3, 3]
+    ).norm()
+    assert float(translation_update) <= 0.100001
+    assert output.diagnostics[0]["cumulative_pose_acceptable"] is True
 
 
 def test_block_sparse_ba_recovers_known_pose_and_strictly_decreases_objective() -> None:

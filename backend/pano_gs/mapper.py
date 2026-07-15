@@ -23,7 +23,14 @@ from backend.pano_gs.pose_param import PoseDelta
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
 from geometry.pose import invert_c2w
+from geometry.sim3 import apply_sim3, sim3_components, sim3_inverse
 from mapping.gaussian_initializer import GaussianSeedBatch
+from models.per_pixel_gaussian_observation import (
+    matrix_to_quaternion,
+    normalize_quaternion,
+    quaternion_multiply,
+    real_sh_basis,
+)
 
 
 @dataclass
@@ -179,6 +186,10 @@ class PanoGaussianMap(nn.Module):
         self._anchor_visibility_count = torch.zeros(0, dtype=torch.int32)
         self._anchor_render_error_ema = torch.zeros(0, dtype=torch.float32)
         self._anchor_depth_selected_levels = False
+        self._lazy_owner_transforms_enabled = False
+        self._lazy_owner_reference_transforms: dict[int, torch.Tensor] = {}
+        self._lazy_owner_current_transforms: dict[int, torch.Tensor] = {}
+        self._lazy_sh_rotation_cache: dict[tuple[int, str, str, int], torch.Tensor] = {}
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
@@ -212,17 +223,40 @@ class PanoGaussianMap(nn.Module):
 
     @property
     def get_xyz(self) -> torch.Tensor:
-        return self.xyz
+        if not self._lazy_owner_transforms_enabled or self.xyz.numel() == 0:
+            return self.xyz
+        output = self.xyz.clone()
+        for owner, mask in self._lazy_owner_masks(device=output.device):
+            delta = self._lazy_owner_delta(owner, device=output.device, dtype=output.dtype)
+            output[mask] = apply_sim3(delta, self.xyz[mask])
+        return output
 
     @property
     def get_rotation(self) -> torch.Tensor:
-        if self.rotation.numel() == 0:
-            return self.rotation
-        return torch.nn.functional.normalize(self.rotation, dim=-1, eps=1e-12)
+        base = self._base_rotation()
+        if not self._lazy_owner_transforms_enabled or base.numel() == 0:
+            return base
+        output = base.clone()
+        for owner, mask in self._lazy_owner_masks(device=base.device):
+            delta = self._lazy_owner_delta(owner, device=base.device, dtype=base.dtype)
+            _, rotation, _ = sim3_components(delta)
+            quaternion = matrix_to_quaternion(rotation).view(1, 4)
+            output[mask] = normalize_quaternion(
+                quaternion_multiply(quaternion, base[mask])
+            )
+        return output
 
     @property
     def get_scaling(self) -> torch.Tensor:
-        return torch.nn.functional.softplus(self.scaling) + 1e-5
+        base = self._base_scaling()
+        if not self._lazy_owner_transforms_enabled or base.numel() == 0:
+            return base
+        output = base.clone()
+        for owner, mask in self._lazy_owner_masks(device=base.device):
+            delta = self._lazy_owner_delta(owner, device=base.device, dtype=base.dtype)
+            scale, _, _ = sim3_components(delta)
+            output[mask] = scale * base[mask]
+        return output
 
     @property
     def get_opacity(self) -> torch.Tensor:
@@ -234,12 +268,135 @@ class PanoGaussianMap(nn.Module):
 
     @property
     def get_sh_coefficients(self) -> torch.Tensor:
+        base = self._base_sh_coefficients()
+        if not self._lazy_owner_transforms_enabled or base.numel() == 0:
+            return base
+        output = base.clone()
+        for owner, mask in self._lazy_owner_masks(device=base.device):
+            matrix = self._lazy_sh_rotation_matrix(
+                owner,
+                device=base.device,
+                dtype=base.dtype,
+            )
+            output[mask] = torch.einsum("ij,njc->nic", matrix, base[mask])
+        return output
+
+    def _base_sh_coefficients(self) -> torch.Tensor:
         from backend.pano_gs.adapter import SH_C0
 
         dc = ((self.get_features - 0.5) / SH_C0).unsqueeze(1)
         if int(self.sh_rest.shape[1]) <= 0:
             return dc
         return torch.cat([dc, self.sh_rest.to(device=dc.device, dtype=dc.dtype)], dim=1)
+
+    def _base_rotation(self) -> torch.Tensor:
+        if self.rotation.numel() == 0:
+            return self.rotation
+        return torch.nn.functional.normalize(self.rotation, dim=-1, eps=1e-12)
+
+    def _base_scaling(self) -> torch.Tensor:
+        return torch.nn.functional.softplus(self.scaling) + 1e-5
+
+    def configure_lazy_owner_transforms(self, enabled: bool) -> None:
+        self._lazy_owner_transforms_enabled = bool(enabled)
+        self._lazy_sh_rotation_cache.clear()
+
+    def set_lazy_owner_transform(
+        self,
+        owner_window_id: int,
+        transform: torch.Tensor,
+        *,
+        set_reference: bool = False,
+    ) -> None:
+        owner = int(owner_window_id)
+        value = transform.detach().cpu().float().clone()
+        if tuple(value.shape) != (4, 4) or not bool(torch.isfinite(value).all()):
+            raise ValueError("Lazy owner transform must be a finite 4x4 Sim(3)")
+        scale, rotation, _ = sim3_components(value)
+        if float(scale) <= 0.0 or float(torch.linalg.det(rotation)) <= 0.0:
+            raise ValueError("Lazy owner transform must have positive scale and rotation determinant")
+        if set_reference or owner not in self._lazy_owner_reference_transforms:
+            self._lazy_owner_reference_transforms[owner] = value.clone()
+        self._lazy_owner_current_transforms[owner] = value
+        for key in list(self._lazy_sh_rotation_cache):
+            if key[0] == owner:
+                del self._lazy_sh_rotation_cache[key]
+
+    def lazy_owner_transform_state(self) -> dict[str, object]:
+        return {
+            "enabled": bool(self._lazy_owner_transforms_enabled),
+            "reference": {
+                int(owner): value.clone()
+                for owner, value in self._lazy_owner_reference_transforms.items()
+            },
+            "current": {
+                int(owner): value.clone()
+                for owner, value in self._lazy_owner_current_transforms.items()
+            },
+        }
+
+    def _lazy_owner_masks(
+        self,
+        *,
+        device: torch.device,
+    ) -> list[tuple[int, torch.Tensor]]:
+        if int(self._anchor_owner_window_id.numel()) != self.anchor_count():
+            return []
+        owners = self._anchor_owner_window_id.to(device=device, dtype=torch.long)
+        output: list[tuple[int, torch.Tensor]] = []
+        for owner in torch.unique(owners).detach().cpu().tolist():
+            owner_id = int(owner)
+            if (
+                owner_id < 0
+                or owner_id not in self._lazy_owner_reference_transforms
+                or owner_id not in self._lazy_owner_current_transforms
+            ):
+                continue
+            output.append((owner_id, owners == owner_id))
+        return output
+
+    def _lazy_owner_delta(
+        self,
+        owner: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        reference = self._lazy_owner_reference_transforms[int(owner)].to(
+            device=device, dtype=dtype
+        )
+        current = self._lazy_owner_current_transforms[int(owner)].to(
+            device=device, dtype=dtype
+        )
+        return current @ sim3_inverse(reference)
+
+    def _lazy_sh_rotation_matrix(
+        self,
+        owner: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (int(owner), str(device), str(dtype), int(self.active_sh_degree))
+        cached = self._lazy_sh_rotation_cache.get(key)
+        if cached is not None:
+            return cached
+        delta = self._lazy_owner_delta(owner, device=device, dtype=dtype)
+        _, rotation, _ = sim3_components(delta)
+        coefficient_count = (int(self.active_sh_degree) + 1) ** 2
+        count = max(32, coefficient_count * 4)
+        index = torch.arange(count, device=device, dtype=dtype)
+        y = 1.0 - 2.0 * (index + 0.5) / float(count)
+        radius = torch.sqrt((1.0 - y.square()).clamp_min(0.0))
+        angle = index * (math.pi * (3.0 - math.sqrt(5.0)))
+        target_direction = torch.stack(
+            [radius * torch.cos(angle), y, radius * torch.sin(angle)], dim=-1
+        )
+        target_basis = real_sh_basis(self.active_sh_degree, target_direction)
+        local_basis = real_sh_basis(self.active_sh_degree, target_direction @ rotation)
+        matrix = torch.linalg.pinv(target_basis) @ local_basis
+        self._lazy_sh_rotation_cache[key] = matrix
+        return matrix
 
     @staticmethod
     def _inv_sigmoid(x: torch.Tensor) -> torch.Tensor:
@@ -940,30 +1097,30 @@ class PanoGaussianMap(nn.Module):
     def save_checkpoint(self, path: str | Path) -> str:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": self.state_dict(),
-                "anchor_level": self._anchor_level,
-                "anchor_voxel_size": self._anchor_voxel_size,
-                "anchor_grid_coord": self._anchor_grid_coord,
-                "anchor_obs_count": self._anchor_obs_count,
-                "anchor_conf_accum": self._anchor_conf_accum,
-                "anchor_birth_frame": self._anchor_birth_frame,
-                "anchor_last_seen_kf": self._anchor_last_seen_kf,
-                "anchor_last_update_kf_ord": self._anchor_last_update_kf_ord,
-                "anchor_inlier_obs": self._anchor_inlier_obs,
-                "anchor_outlier_obs": self._anchor_outlier_obs,
-                "anchor_owner_window_id": self._anchor_owner_window_id,
-                "anchor_quality": self._anchor_quality,
-                "anchor_visibility_count": self._anchor_visibility_count,
-                "anchor_render_error_ema": self._anchor_render_error_ema,
-                "anchor_depth_selected_levels": bool(
-                    self._anchor_depth_selected_levels
-                ),
-                "config": self.config,
-            },
-            path,
-        )
+        payload = {
+            "state_dict": self.state_dict(),
+            "anchor_level": self._anchor_level,
+            "anchor_voxel_size": self._anchor_voxel_size,
+            "anchor_grid_coord": self._anchor_grid_coord,
+            "anchor_obs_count": self._anchor_obs_count,
+            "anchor_conf_accum": self._anchor_conf_accum,
+            "anchor_birth_frame": self._anchor_birth_frame,
+            "anchor_last_seen_kf": self._anchor_last_seen_kf,
+            "anchor_last_update_kf_ord": self._anchor_last_update_kf_ord,
+            "anchor_inlier_obs": self._anchor_inlier_obs,
+            "anchor_outlier_obs": self._anchor_outlier_obs,
+            "anchor_owner_window_id": self._anchor_owner_window_id,
+            "anchor_quality": self._anchor_quality,
+            "anchor_visibility_count": self._anchor_visibility_count,
+            "anchor_render_error_ema": self._anchor_render_error_ema,
+            "anchor_depth_selected_levels": bool(
+                self._anchor_depth_selected_levels
+            ),
+            "config": self.config,
+        }
+        if self._lazy_owner_transforms_enabled:
+            payload["lazy_owner_transforms"] = self.lazy_owner_transform_state()
+        torch.save(payload, path)
         return str(path)
 
 
