@@ -231,6 +231,37 @@ class VoxelAnchorWindowResult:
     metrics: dict[str, float]
 
 
+@dataclass(frozen=True)
+class ValidationVisualization:
+    """Detached CPU tensors retained from one validation window for logging."""
+
+    target: torch.Tensor
+    rendered_snapshots: dict[str, torch.Tensor]
+
+
+def _empty_cuda_cache(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    if device.index is None:
+        torch.cuda.empty_cache()
+        return
+    with torch.cuda.device(device.index):
+        torch.cuda.empty_cache()
+
+
+def _detach_validation_visualization(
+    result: VoxelAnchorWindowResult,
+    images: torch.Tensor,
+) -> ValidationVisualization:
+    return ValidationVisualization(
+        target=images.detach().float().cpu(),
+        rendered_snapshots={
+            name: rendered.detach().float().cpu()
+            for name, rendered in result.rendered_snapshots.items()
+        },
+    )
+
+
 def run_voxel_anchor_window(
     model: nn.Module,
     ba: BlockSparseSphericalBA,
@@ -389,6 +420,7 @@ def _render_metrics(result: VoxelAnchorWindowResult, images: torch.Tensor) -> di
     return metrics
 
 
+@torch.no_grad()
 def _validate(
     model: VoxelAnchorTrainableModel,
     wrapper: nn.Module,
@@ -402,23 +434,23 @@ def _validate(
     feature_device: torch.device,
     train_device: torch.device,
     step: int,
-) -> tuple[dict[str, float], VoxelAnchorWindowResult | None, torch.Tensor | None]:
+) -> tuple[dict[str, float], ValidationVisualization | None]:
+    was_training = model.training
     model.eval()
     aggregate: dict[str, float] = {}
     count = 0
-    first_result = None
-    first_images = None
-    for batch in loader:
-        features, images, initial_depth, poses = extract_frozen_inputs(
-            wrapper,
-            adapter,
-            batch["images"],
-            feature_device=feature_device,
-            train_device=train_device,
-            head_size=(int(config["image"]["head_height"]), int(config["image"]["head_width"])),
-            feature_amp=bool(config["train"].get("amp", False)),
-        )
-        with torch.no_grad():
+    first_visualization: ValidationVisualization | None = None
+    try:
+        for batch in loader:
+            features, images, initial_depth, poses = extract_frozen_inputs(
+                wrapper,
+                adapter,
+                batch["images"],
+                feature_device=feature_device,
+                train_device=train_device,
+                head_size=(int(config["image"]["head_height"]), int(config["image"]["head_width"])),
+                feature_amp=bool(config["train"].get("amp", False)),
+            )
             stage2 = head(
                 features,
                 images,
@@ -426,52 +458,51 @@ def _validate(
                 poses,
                 frame_ids=batch["frame_ids"].to(train_device),
             )
-        cache = _build_match_cache(
-            features,
-            stage2.refined_depth,
-            config,
-            step=step + count,
-            static_valid_mask=stage2.valid_mask,
-        )
-        with torch.enable_grad(), torch.amp.autocast(
-            device_type=train_device.type,
-            dtype=torch.bfloat16,
-            enabled=bool(config["train"].get("amp", False)) and train_device.type == "cuda",
-        ):
-            result = run_voxel_anchor_window(
-                model,
-                ba,
-                renderer,
-                stage2,
+            cache = _build_match_cache(
                 features,
-                images,
-                cache,
+                stage2.refined_depth,
                 config,
-                backward=False,
+                step=step + count,
+                static_valid_mask=stage2.valid_mask,
             )
-        values = _render_metrics(result, images)
-        values.update(
-            {
-                "stage3_rgb_l1": result.metrics["stage3/rgb_l1"],
-                "stage3_relative_ba0_depth": result.metrics["stage3/relative_ba0_depth"],
-            }
-        )
-        for key, value in values.items():
-            aggregate[key] = aggregate.get(key, 0.0) + float(value)
-        if first_result is None:
-            first_result = result
-            first_images = images.detach()
-        count += 1
-        if count >= int(config["train"].get("max_val_batches", 8)):
-            break
-    model.train()
+            with torch.amp.autocast(
+                device_type=train_device.type,
+                dtype=torch.bfloat16,
+                enabled=bool(config["train"].get("amp", False)) and train_device.type == "cuda",
+            ):
+                result = run_voxel_anchor_window(
+                    model,
+                    ba,
+                    renderer,
+                    stage2,
+                    features,
+                    images,
+                    cache,
+                    config,
+                    backward=False,
+                )
+            values = _render_metrics(result, images)
+            values.update(
+                {
+                    "stage3_rgb_l1": result.metrics["stage3/rgb_l1"],
+                    "stage3_relative_ba0_depth": result.metrics["stage3/relative_ba0_depth"],
+                }
+            )
+            for key, value in values.items():
+                aggregate[key] = aggregate.get(key, 0.0) + float(value)
+            if first_visualization is None:
+                first_visualization = _detach_validation_visualization(result, images)
+            count += 1
+            del result, cache, stage2, features, images, initial_depth, poses
+            _empty_cuda_cache(train_device)
+            if count >= int(config["train"].get("max_val_batches", 8)):
+                break
+    finally:
+        model.train(was_training)
+        _empty_cuda_cache(train_device)
     if count == 0:
-        return {}, first_result, first_images
-    return (
-        {f"val/{key}": value / count for key, value in aggregate.items()},
-        first_result,
-        first_images,
-    )
+        return {}, first_visualization
+    return ({f"val/{key}": value / count for key, value in aggregate.items()}, first_visualization)
 
 
 def train(config: dict[str, Any]) -> dict[str, Any]:
@@ -638,10 +669,15 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                     wandb_run.log({"diagnostics/voxel_anchor_refiner": wandb.Image(str(visual_path))}, step=step)
             val_interval = max(1, int(train_cfg.get("val_interval", 1000)))
             if step % val_interval == 0:
+                # Validation is a separate full-resolution workload. Drop the
+                # completed training window before either rank enters the
+                # barrier so its tensors cannot overlap the validation peak.
+                del result, cache, stage2, features, images, initial_depth, poses
+                _empty_cuda_cache(train_device)
                 if distributed.enabled:
                     dist.barrier()
                 if distributed.is_main and val_loader is not None:
-                    val_metrics, val_result, val_images = _validate(
+                    val_metrics, val_visualization = _validate(
                         _unwrap(trainable),
                         wrapper,
                         adapter,
@@ -659,16 +695,15 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                     if wandb_run is not None and val_metrics:
                         wandb_run.log(val_metrics, step=step)
                     if (
-                        val_result is not None
-                        and val_images is not None
+                        val_visualization is not None
                         and bool(config.get("Visualization", {}).get("enabled", False))
                     ):
                         val_path = save_stage3_snapshot_panel(
                             output_dir
                             / str(config["Visualization"].get("save_dir", "visualizations"))
                             / f"val_{step:07d}.png",
-                            target=val_images,
-                            rendered_snapshots=val_result.rendered_snapshots,
+                            target=val_visualization.target,
+                            rendered_snapshots=val_visualization.rendered_snapshots,
                         )
                         if wandb_run is not None:
                             import wandb
@@ -677,6 +712,8 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                                 {"validation/voxel_anchor_refiner": wandb.Image(str(val_path))},
                                 step=step,
                             )
+                    del val_visualization
+                    _empty_cuda_cache(train_device)
                     final_psnr = val_metrics.get("val/final_psnr")
                     if final_psnr is not None and final_psnr > best_psnr:
                         best_psnr = final_psnr

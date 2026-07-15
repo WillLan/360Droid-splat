@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -27,7 +28,10 @@ from models.spherical_voxel_anchor_refiner import (
     voxelize_per_pixel_gaussians,
 )
 from training.train_spherical_voxel_anchor_refiner import (
+    VoxelAnchorWindowResult,
     VoxelAnchorTrainableModel,
+    _detach_validation_visualization,
+    _validate,
     save_checkpoint,
 )
 
@@ -85,6 +89,105 @@ def _constant_feedback(anchors, values, alphas, target_valid=None):
         anchor_visibility=visibility,
         profiles={},
     ), target_valid
+
+
+def test_validation_visualization_is_detached_on_cpu() -> None:
+    target = torch.rand(1, 4, 3, 8, 16, requires_grad=True)
+    rendered = target * 0.5
+    result = VoxelAnchorWindowResult(
+        final=None,  # type: ignore[arg-type]
+        ba0_observation=None,  # type: ignore[arg-type]
+        snapshots={},
+        rendered_snapshots={"voxelized": rendered, "refine3": rendered + 0.1},
+        metrics={},
+    )
+    visualization = _detach_validation_visualization(result, target)
+    assert visualization.target.device.type == "cpu"
+    assert not visualization.target.requires_grad
+    for snapshot in visualization.rendered_snapshots.values():
+        assert snapshot.device.type == "cpu"
+        assert snapshot.dtype == torch.float32
+        assert not snapshot.requires_grad
+
+
+def test_validation_runs_without_grad_and_releases_batch_temporaries() -> None:
+    class Head(torch.nn.Module):
+        def forward(self, features, images, initial_depth, poses, *, frame_ids):
+            assert not torch.is_grad_enabled()
+            return SimpleNamespace(
+                refined_depth=torch.ones(1, 1, 1, 2, 4),
+                valid_mask=torch.ones(1, 1, 1, 2, 4, dtype=torch.bool),
+            )
+
+    model = torch.nn.Linear(1, 1)
+    model.train()
+    images = torch.rand(1, 1, 3, 2, 4)
+    extracted = (
+        torch.rand(1, 1, 24, 2, 4),
+        images,
+        torch.ones(1, 1, 1, 2, 4),
+        torch.eye(4).view(1, 1, 4, 4),
+    )
+    rendered = torch.rand(1, 1, 3, 2, 4)
+    result = VoxelAnchorWindowResult(
+        final=None,  # type: ignore[arg-type]
+        ba0_observation=None,  # type: ignore[arg-type]
+        snapshots={},
+        rendered_snapshots={"voxelized": rendered, "refine3": rendered},
+        metrics={
+            "stage3/rgb_l1": 0.2,
+            "stage3/relative_ba0_depth": 0.3,
+        },
+    )
+
+    def run_without_grad(*args, **kwargs):
+        assert not torch.is_grad_enabled()
+        assert kwargs["backward"] is False
+        return result
+
+    config = {
+        "image": {"head_height": 2, "head_width": 4},
+        "train": {"amp": False, "max_val_batches": 1},
+    }
+    batch = {"images": images, "frame_ids": torch.zeros(1, 1, dtype=torch.long)}
+    with (
+        patch(
+            "training.train_spherical_voxel_anchor_refiner.extract_frozen_inputs",
+            return_value=extracted,
+        ),
+        patch(
+            "training.train_spherical_voxel_anchor_refiner._build_match_cache",
+            return_value=object(),
+        ),
+        patch(
+            "training.train_spherical_voxel_anchor_refiner.run_voxel_anchor_window",
+            side_effect=run_without_grad,
+        ),
+        patch(
+            "training.train_spherical_voxel_anchor_refiner._render_metrics",
+            return_value={"final_psnr": 12.0},
+        ),
+        patch("training.train_spherical_voxel_anchor_refiner._empty_cuda_cache") as empty_cache,
+    ):
+        metrics, visualization = _validate(
+            model,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            Head(),
+            object(),  # type: ignore[arg-type]
+            object(),
+            [batch],  # type: ignore[arg-type]
+            config,
+            feature_device=torch.device("cpu"),
+            train_device=torch.device("cpu"),
+            step=1000,
+        )
+    assert model.training
+    assert metrics["val/final_psnr"] == 12.0
+    assert visualization is not None
+    assert visualization.target.device.type == "cpu"
+    assert not visualization.target.requires_grad
+    assert empty_cache.call_count == 2
 
 
 def test_depth_boundaries_select_the_coarser_level_exactly() -> None:
