@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from backend.pano_gs.adapter import PFGS360Renderer
 from geometry.pose import relative_c2w
 
 from frontend.pano_droid.interfaces import FrontendOutput, PanoDROIDFrontend, PanoFrame, ensure_chw_image, identity_pose
@@ -25,6 +26,14 @@ from models.spherical_selfi_stage3_ba import (
     filter_stage3_match_cache_robust,
 )
 from models.sphereglue_local_ba import SphereGlueLocalBAMatcher
+from models.spherical_voxel_anchor_refiner import (
+    VoxelAnchorObservation,
+    VoxelAnchorConfig,
+    VoxelAnchorStage3Model,
+    load_voxel_anchor_checkpoint,
+    render_voxel_anchor_group,
+    voxelize_per_pixel_gaussians,
+)
 from models.spherical_selfi_gaussian_head import erp_bilinear_resize
 from training.train_spherical_selfi_gaussian_head import (
     build_frozen_feature_stack,
@@ -152,6 +161,36 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.wrapper.eval()
         self.adapter.eval()
         self.head.eval()
+
+        voxel_cfg = dict(config.get("VoxelAnchorRefiner", {}) or {})
+        self.voxel_anchor_enabled = bool(voxel_cfg.get("enabled", False))
+        self.voxel_anchor_model: VoxelAnchorStage3Model | None = None
+        self.voxel_anchor_renderer: PFGS360Renderer | None = None
+        self.voxel_anchor_config: VoxelAnchorConfig | None = None
+        if self.voxel_anchor_enabled:
+            checkpoint = voxel_cfg.get("checkpoint")
+            if not checkpoint:
+                raise ValueError(
+                    "VoxelAnchorRefiner.checkpoint is required when VoxelAnchorRefiner.enabled=true"
+                )
+            self.voxel_anchor_config = VoxelAnchorConfig.from_mapping(voxel_cfg)
+            self.voxel_anchor_model = VoxelAnchorStage3Model(self.voxel_anchor_config).to(
+                self.head_device
+            )
+            load_voxel_anchor_checkpoint(
+                str(checkpoint),
+                model=self.voxel_anchor_model,
+                map_location=self.head_device,
+            )
+            self.voxel_anchor_model.eval()
+            renderer_cfg = dict(config.get("renderer", {}) or {})
+            self.voxel_anchor_renderer = PFGS360Renderer(
+                config=config,
+                extra_gsplat360_roots=list(
+                    renderer_cfg.get("extra_gsplat360_roots", []) or []
+                ),
+                allow_fallback=False,
+            )
 
         sky_cfg = dict(runtime.get("sky", {}) or {})
         self.sky_enabled = bool(sky_cfg.get("enabled", False))
@@ -491,6 +530,63 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         )
         return updated, published_cache, result, matching_sec, ba_sec
 
+    def _run_voxel_anchor_refiner(
+        self,
+        observation,
+        adapter_features: torch.Tensor,
+        images: torch.Tensor,
+        sky_prob: torch.Tensor | None,
+    ) -> VoxelAnchorObservation | None:
+        if not self.voxel_anchor_enabled:
+            return None
+        assert self.voxel_anchor_config is not None
+        assert self.voxel_anchor_model is not None
+        assert self.voxel_anchor_renderer is not None
+
+        target_images = images.to(self.head_device)
+        if tuple(target_images.shape[-2:]) != tuple(observation.image_size):
+            batch, views = int(target_images.shape[0]), int(target_images.shape[1])
+            target_images = erp_bilinear_resize(
+                target_images.reshape(batch * views, 3, *target_images.shape[-2:]),
+                observation.image_size,
+            ).reshape(batch, views, 3, *observation.image_size)
+        target_valid = observation.valid_mask.bool()
+        if sky_prob is not None:
+            resized_sky = sky_prob.to(target_valid.device)
+            if tuple(resized_sky.shape[-2:]) != tuple(observation.image_size):
+                batch, views = int(resized_sky.shape[0]), int(resized_sky.shape[1])
+                resized_sky = erp_bilinear_resize(
+                    resized_sky.reshape(batch * views, 1, *resized_sky.shape[-2:]),
+                    observation.image_size,
+                ).reshape(batch, views, 1, *observation.image_size)
+            target_valid = target_valid & (resized_sky < self.sky_threshold)
+
+        with torch.inference_mode():
+            current = voxelize_per_pixel_gaussians(
+                observation,
+                adapter_features.to(self.head_device),
+                target_images,
+                self.voxel_anchor_config,
+                valid_mask=target_valid,
+            )
+            reference = self.voxel_anchor_model.encode_references(target_images)
+            hidden = None
+            for iteration in range(self.voxel_anchor_config.iterations):
+                feedback = render_voxel_anchor_group(self.voxel_anchor_renderer, current)
+                output = self.voxel_anchor_model.forward_step(
+                    current,
+                    feedback,
+                    reference,
+                    target_valid,
+                    iteration_index=iteration,
+                    hidden=hidden,
+                )
+                current, hidden = output.observation, output.hidden
+                if iteration < self.voxel_anchor_config.iterations - 1:
+                    current = current.detach_parameters()
+                    hidden = hidden.detach()
+        return current.detach_for_backend()
+
     def _run_window(self, frames: list[PanoFrame]) -> None:
         images = torch.stack([ensure_chw_image(frame.image).float() for frame in frames], dim=0).unsqueeze(0)
         frame_ids = torch.tensor([[int(frame.frame_id) for frame in frames]], device=self.head_device)
@@ -551,6 +647,12 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             images,
             static_valid_mask=ba_valid,
         )
+        anchor_observation = self._run_voxel_anchor_refiner(
+            observation,
+            dense,
+            images,
+            sky_prob,
+        )
 
         gt_values = [
             None
@@ -609,6 +711,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             latitude_bands=self.latitude_bands,
             sky_prob=sky_prob,
             sky_threshold=self.sky_threshold,
+            anchor_observation=anchor_observation,
             boundary_matches=_boundary_matches_from_cache(
                 match_cache, observation.image_size
             ),
@@ -619,6 +722,10 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "local_ba_accepted": None if ba_result is None else bool(ba_result.accepted[0]),
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
                 "fibonacci": dict(self.fibonacci_config),
+                "voxel_anchor_refiner_enabled": self.voxel_anchor_enabled,
+                "voxel_anchor_count": (
+                    0 if anchor_observation is None else anchor_observation.num_anchors
+                ),
             },
         )
         self.enqueue_local_gaussian_window(packet)

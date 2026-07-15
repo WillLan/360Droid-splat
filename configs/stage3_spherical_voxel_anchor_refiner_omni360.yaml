@@ -1,0 +1,51 @@
+base_config: stage3_spherical_ba_recurrent_refiner_omni360.yaml
+
+stage: 3
+task: spherical_voxel_anchor_refiner
+experiment_name: stage3_spherical_voxel_anchor_refiner_omni360_fullres_20k
+
+stage3:
+  enabled: true
+
+VoxelAnchorRefiner:
+  enabled: true
+  checkpoint: null
+  iterations: 3
+  hidden_dim: 32
+  adapter_dim: 24
+  depth_boundaries: [5.0, 20.0, 40.0]
+  voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+  alpha_threshold: 0.05
+  depth_abs_threshold: 0.10
+  depth_rel_threshold: 0.05
+  tangent_scale_floor_ratio: 0.333333
+  normal_scale_floor_ratio: 0.05
+  use_resnet_error: true
+  pretrained_resnet: true
+
+# BA0 remains enabled; there are no BA1/BA2 pose/depth updates after anchors
+# are constructed, so FrontendOutput pose/depth stays equal to BA0.
+ba:
+  outer_schedule: [true, false, false]
+
+loss:
+  stage_weights: [0.64, 0.80, 1.0]
+  dssim: 0.0
+  depth: 0.05
+  alpha_hole: 0.05
+  update_regularization: 1.0e-4
+
+train:
+  output_dir: outputs/stage3_spherical_voxel_anchor_refiner_omni360_fullres_20k
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  mode: online
+  run_name: stage3_spherical_voxel_anchor_refiner_omni360_fullres_20k
+  tags: [stage3, voxel-anchor, depth-selected-voxel, resplat, omni360]
+
+Visualization:
+  enabled: true
+  interval: 200
+  save_dir: visualizations

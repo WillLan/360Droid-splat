@@ -242,6 +242,8 @@ class SphericalSelfiGlobalBackend:
             poses_c2w=poses.unsqueeze(0).to(packet.observation.poses_c2w),
             refined_depth=depth.to(packet.observation.refined_depth),
         )
+        if packet.anchor_observation is not None:
+            packet.anchor_observation = packet.anchor_observation.rescale_geometry(value)
         packet.metadata["global_alignment_local_scale"] = value
 
     def _shared_frame_alignment(

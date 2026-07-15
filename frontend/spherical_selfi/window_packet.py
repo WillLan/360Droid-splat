@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,9 @@ from models.per_pixel_gaussian_observation import (
     PerPixelGaussianObservation,
     normalize_quaternion,
 )
+
+if TYPE_CHECKING:
+    from models.spherical_voxel_anchor_refiner import VoxelAnchorObservation
 from models.spherical_selfi_gaussian_head import erp_bilinear_resize
 
 
@@ -191,6 +194,7 @@ class LocalGaussianWindowPacket:
     sky_mask: torch.Tensor
     static_mask: torch.Tensor
     geometry_consistency: torch.Tensor
+    anchor_observation: VoxelAnchorObservation | None = None
     boundary_matches: BoundaryMatchBlock | None = None
     match_quality: dict[str, torch.Tensor] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -214,6 +218,12 @@ class LocalGaussianWindowPacket:
                 raise ValueError(f"{name} must have shape {expected}")
         if not torch.equal(self.valid_mask.bool(), self.finite_gaussian_mask.bool()):
             raise ValueError("valid_mask must equal finite_gaussian_mask for backend compatibility")
+        if self.anchor_observation is not None:
+            anchors = self.anchor_observation
+            if anchors.batch_size != 1 or anchors.num_views != views:
+                raise ValueError("anchor_observation must be B=1 and match packet frame_ids")
+            if not torch.equal(anchors.frame_ids[0].to(self.observation.frame_ids), self.observation.frame_ids[0]):
+                raise ValueError("anchor_observation frame_ids must match the dense observation")
 
     @classmethod
     def from_observation(
@@ -230,6 +240,7 @@ class LocalGaussianWindowPacket:
         sky_threshold: float = 0.5,
         static_mask: torch.Tensor | None = None,
         geometry_consistency: torch.Tensor | None = None,
+        anchor_observation: VoxelAnchorObservation | None = None,
         boundary_matches: BoundaryMatchBlock | None = None,
         match_quality: dict[str, torch.Tensor] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -290,6 +301,7 @@ class LocalGaussianWindowPacket:
             sky_mask=sky,
             static_mask=static,
             geometry_consistency=consistent,
+            anchor_observation=anchor_observation,
             boundary_matches=boundary_matches,
             match_quality=dict(match_quality or {}),
             metadata=dict(metadata or {}),
@@ -393,6 +405,10 @@ class LocalGaussianWindowPacket:
             sky_mask=compact_mask(self.sky_mask),
             static_mask=compact_mask(self.static_mask),
             geometry_consistency=compact_mask(self.geometry_consistency),
+            # Historical packets retain only the low-resolution data needed
+            # for loop verification.  The explicit anchors have already been
+            # fused into the backend map before this compact copy is stored.
+            anchor_observation=None,
             boundary_matches=(
                 None
                 if self.boundary_matches is None

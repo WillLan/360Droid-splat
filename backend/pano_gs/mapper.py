@@ -178,6 +178,7 @@ class PanoGaussianMap(nn.Module):
         self._anchor_quality = torch.zeros(0, dtype=torch.float32)
         self._anchor_visibility_count = torch.zeros(0, dtype=torch.int32)
         self._anchor_render_error_ema = torch.zeros(0, dtype=torch.float32)
+        self._anchor_depth_selected_levels = False
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
@@ -956,6 +957,9 @@ class PanoGaussianMap(nn.Module):
                 "anchor_quality": self._anchor_quality,
                 "anchor_visibility_count": self._anchor_visibility_count,
                 "anchor_render_error_ema": self._anchor_render_error_ema,
+                "anchor_depth_selected_levels": bool(
+                    self._anchor_depth_selected_levels
+                ),
                 "config": self.config,
             },
             path,

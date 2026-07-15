@@ -46,6 +46,21 @@ adapter_checkpoint:
 stage2_checkpoint:
   path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage2_selfi_joint_gpu03_20260712_20k_r1/stage2_selfi_omniscene_joint_fullres_s4_ddp2_effbs4_20k_gpu03_20260712_r1/checkpoints/best_val_psnr.pt
 
+# Optional simplified Stage-3 path.  Disabled keeps the existing dense
+# per-pixel packet and scale-selected backend behavior byte-for-byte.
+VoxelAnchorRefiner:
+  enabled: false
+  checkpoint: null
+  iterations: 3
+  hidden_dim: 32
+  depth_boundaries: [5.0, 20.0, 40.0]
+  voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+  alpha_threshold: 0.05
+  depth_abs_threshold: 0.10
+  depth_rel_threshold: 0.05
+  tangent_scale_floor_ratio: 0.333333
+  normal_scale_floor_ratio: 0.05
+
 head:
   feature_dim: 24
   channels: [32, 64, 128, 256]
