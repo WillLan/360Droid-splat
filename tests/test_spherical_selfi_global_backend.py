@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import yaml
 
 from backend.pano_gs.mapper import MapperObservation, PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.sim3_graph import (
@@ -92,6 +93,44 @@ def _packet(
         frame_ids=frame_ids,
         verification_size=feature.shape[-2:],
     )
+
+
+def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rates() -> None:
+    config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    local_ba = config["SphericalSelfiRuntime"]["local_ba"]
+    outlier = local_ba["outlier_refinement"]
+    map_optimization = config["SphericalSelfiGlobalBackend"]["map_optimization"]
+    graph = config["SphericalSelfiGlobalBackend"]["global_graph"]
+
+    assert local_ba["iterations"] == 5
+    assert local_ba["lm_max_trials"] == 8
+    assert outlier["second_stage_iterations"] == 10
+    assert local_ba["matching"]["factor_weight_mode"] == "fibonacci_equal"
+    assert graph["optimization_start_nodes"] == 6
+    assert graph["optimization_interval_edges"] == 5
+    assert map_optimization["pose_lr"] == 2.0e-4
+    assert map_optimization["pose_refine_enable"] is True
+    assert map_optimization["separate_gaussian_lrs"] is True
+    assert map_optimization["scale_gaussian_parameter_updates"] is True
+    assert {
+        name: map_optimization[name]
+        for name in (
+            "xyz_lr",
+            "feature_lr",
+            "sh_rest_lr",
+            "opacity_lr",
+            "scaling_lr",
+            "rotation_lr",
+        )
+    } == {
+        "xyz_lr": 5.0e-4,
+        "feature_lr": 2.0e-3,
+        "sh_rest_lr": 1.0e-4,
+        "opacity_lr": 1.0e-3,
+        "scaling_lr": 1.0e-4,
+        "rotation_lr": 1.0e-4,
+    }
 
 
 def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
@@ -656,7 +695,7 @@ def test_shared_umeyama_rescales_all_new_chunk_geometry() -> None:
     assert abs(float(geometry[1].depth_scale) - 1.0) < 2.0e-3
 
 
-def test_boundary_map_optimization_freezes_all_pose_parameters() -> None:
+def test_boundary_map_optimization_refines_all_poses_and_passes_group_lrs() -> None:
     packet = _packet(0, torch.eye(4).repeat(2, 1, 1), (0, 1))
 
     class _Mapper:
@@ -678,6 +717,9 @@ def test_boundary_map_optimization_freezes_all_pose_parameters() -> None:
             self.extra_loss_fn = extra_loss_fn
             return {"steps": 3.0, "window_rollback": 0.0}
 
+        def refined_pose_c2w(self, frame_id: int):
+            return torch.eye(4)
+
         def commit_spherical_selfi_window(self) -> None:
             self.commits += 1
 
@@ -695,11 +737,60 @@ def test_boundary_map_optimization_freezes_all_pose_parameters() -> None:
 
     metrics = backend._run_map_optimization(0, packet.frame_ids, 3)
 
-    assert metrics["pose_refine_enabled"] == 0.0
-    assert mapper.settings["pose_lr"] == 0.0
-    assert mapper.settings["pose_refine_enable"] is False
-    assert mapper.extra_loss_fn is None
+    assert metrics["pose_refine_enabled"] == 1.0
+    assert mapper.settings["pose_lr"] == 1.0e-3
+    assert mapper.settings["pose_refine_enable"] is True
+    assert mapper.settings["fixed_pose_frame_ids"] == []
+    assert callable(mapper.extra_loss_fn)
     assert mapper.commits == 1
+
+
+def test_separate_gaussian_groups_and_true_adam_update_scaling() -> None:
+    gaussian_map = PanoGaussianMap(
+        config={"SphericalSelfiGlobalBackend": {"enabled": True, "rgb_sh_degree": 2}},
+        device="cpu",
+    )
+    gaussian_map.xyz = torch.nn.Parameter(torch.zeros(2, 3))
+    gaussian_map.rotation = torch.nn.Parameter(torch.zeros(2, 4))
+    gaussian_map.scaling = torch.nn.Parameter(torch.zeros(2, 3))
+    gaussian_map.opacity_logit = torch.nn.Parameter(torch.zeros(2, 1))
+    gaussian_map.features = torch.nn.Parameter(torch.zeros(2, 3))
+    gaussian_map.sh_rest = torch.nn.Parameter(torch.zeros(2, 8, 3))
+    mapper = PanoGaussianMapper(gaussian_map)
+    mapper.optim_cfg.update(
+        {
+            "separate_gaussian_lrs": True,
+            "xyz_lr": 5.0e-4,
+            "feature_lr": 2.0e-3,
+            "sh_rest_lr": 1.0e-4,
+            "opacity_lr": 1.0e-3,
+            "scaling_lr": 1.0e-4,
+            "rotation_lr": 1.0e-4,
+            "optimize_skybox": False,
+        }
+    )
+    groups = mapper._map_param_groups(gaussian_enabled=True, phase="feedforward_window")
+    rates = {str(group["name"]): float(group["lr"]) for group in groups}
+    assert rates == {
+        "xyz": 5.0e-4,
+        "features": 2.0e-3,
+        "sh_rest": 1.0e-4,
+        "opacity": 1.0e-3,
+        "scaling": 1.0e-4,
+        "rotation": 1.0e-4,
+    }
+
+    optimizer = torch.optim.AdamW(
+        [{"params": [gaussian_map.xyz], "lr": 1.0e-2}], weight_decay=0.0
+    )
+    gaussian_map.xyz.grad = torch.ones_like(gaussian_map.xyz)
+    optimizer.step()
+    mapper._apply_gaussian_adamw_update_scales(
+        optimizer, torch.tensor([1.0, 0.1])
+    )
+    owner_step = gaussian_map.xyz.detach()[0].abs().mean()
+    neighbor_step = gaussian_map.xyz.detach()[1].abs().mean()
+    torch.testing.assert_close(neighbor_step, owner_step * 0.1, atol=1.0e-7, rtol=1.0e-5)
 
 
 def test_global_graph_rolls_back_transaction_on_non_finite_factor() -> None:
@@ -785,6 +876,54 @@ def test_joint_pose_sync_rebases_scale_and_updates_both_overlap_packets() -> Non
     assert geometry[1].depth_owner_window_id == 0
     assert geometry[1].depth_scale == 1.0
     assert geometry[1].depth_scales_by_window == {0: 1.0, 1: 2.0}
+
+
+def test_boundary_pose_sync_updates_nodes_and_rebases_shared_window_coordinates() -> None:
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 2.0
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[1, 0, 3] = 1.0
+    packet0 = _packet(0, poses0, (0, 1))
+    packet1 = _packet(1, poses1, (1, 2))
+    optimized = {1: torch.eye(4), 2: torch.eye(4)}
+    optimized[1][0, 3] = 2.2
+    optimized[2][0, 3] = 4.4
+
+    class _Mapper:
+        def refined_pose_c2w(self, frame_id: int):
+            return optimized.get(int(frame_id))
+
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, mapper=_Mapper())
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(
+        1, sim3_from_components(2.0, torch.eye(3), torch.tensor([2.0, 0.0, 0.0]))
+    )
+    backend.graph.add_node(
+        2, sim3_from_components(2.0, torch.eye(3), torch.tensor([4.0, 0.0, 0.0]))
+    )
+    backend.window_anchor_nodes = {0: 0, 1: 1}
+    backend.boundary_node_order = [0, 1, 2]
+    backend.packets = {0: packet0, 1: packet1}
+    backend.window_order = [0, 1]
+    backend.frame_windows = {0: {0}, 1: {0, 1}, 2: {1}}
+    backend.frame_owner_window = {0: 0, 1: 0, 2: 1}
+    backend.frame_depth_owner_window = {0: 0, 1: 0, 2: 1}
+
+    backend._synchronize_joint_optimized_window(1)
+
+    node1_scale, _, node1_translation = sim3_components(backend.graph.transform(1))
+    node2_scale, _, node2_translation = sim3_components(backend.graph.transform(2))
+    torch.testing.assert_close(node1_scale, torch.tensor(2.0))
+    torch.testing.assert_close(node2_scale, torch.tensor(2.0))
+    torch.testing.assert_close(node1_translation, torch.tensor([2.2, 0.0, 0.0]))
+    torch.testing.assert_close(node2_translation, torch.tensor([4.4, 0.0, 0.0]))
+    torch.testing.assert_close(packet1.local_poses_c2w[0], torch.eye(4))
+    assert abs(float(packet1.local_poses_c2w[1, 0, 3]) - 1.1) < 1.0e-6
+    assert abs(float(packet0.local_poses_c2w[1, 0, 3]) - 2.2) < 1.0e-6
+    geometry = backend.pop_frame_geometry_updates()
+    torch.testing.assert_close(geometry[1].pose_c2w[:3, 3], node1_translation)
+    torch.testing.assert_close(geometry[2].pose_c2w[:3, 3], node2_translation)
 
 
 def test_mapper_geometry_updates_materialize_depth_from_immutable_local_value() -> None:

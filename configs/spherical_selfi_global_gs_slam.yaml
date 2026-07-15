@@ -91,7 +91,7 @@ SphericalSelfiRuntime:
     iterations: 5
     damping: 1.0e-4
     solver_mode: standard_lm
-    lm_max_trials: 6
+    lm_max_trials: 8
     lm_acceptance_eta: 1.0e-4
     lm_damping_min: 1.0e-8
     lm_damping_max: 1.0e8
@@ -119,6 +119,18 @@ SphericalSelfiRuntime:
     step_tolerance: 1.0e-8
     relative_objective_tolerance: 1.0e-6
     affine_min_relative_improvement: 1.0e-3
+    outlier_refinement:
+      enabled: true
+      second_stage_iterations: 10
+      angular_mad_scale: 3.0
+      angular_min_deg: 1.0
+      angular_max_deg: 5.0
+      sim3_irls_iterations: 3
+      sim3_mad_scale: 3.0
+      sim3_min_residual: 0.01
+      sim3_max_relative_depth: 0.05
+      min_inliers: 256
+      min_inlier_ratio: 0.3
     matching:
       type: adapter
       num_queries: 2048
@@ -131,6 +143,7 @@ SphericalSelfiRuntime:
       forward_backward: true
       fb_tolerance_deg: 1.0
       min_factor_weight: 0.01
+      factor_weight_mode: fibonacci_equal
 
 SphericalSelfiGlobalBackend:
   enabled: true
@@ -154,7 +167,7 @@ SphericalSelfiGlobalBackend:
     pcg_tolerance: 1.0e-6
     recent_windows: 32
     optimization_start_nodes: 6
-    optimization_interval_edges: 3
+    optimization_interval_edges: 5
     active_nodes: 6
     allow_boundary_matching_fallback: false
     expected_overlap_frames: 1
@@ -216,8 +229,17 @@ SphericalSelfiGlobalBackend:
     sample_observations_per_step: 1
     sampler: shuffled_cycle
     gaussian_lr: 0.002
-    pose_lr: 0.0
-    pose_prior_weight: 0.0
+    separate_gaussian_lrs: true
+    xyz_lr: 5.0e-4
+    feature_lr: 2.0e-3
+    sh_rest_lr: 1.0e-4
+    opacity_lr: 1.0e-3
+    scaling_lr: 1.0e-4
+    rotation_lr: 1.0e-4
+    scale_gaussian_parameter_updates: true
+    pose_refine_enable: true
+    pose_lr: 2.0e-4
+    pose_prior_weight: 1.0e-3
     pose_grad_clip: 0.001
     s2_loss_weight: 0.1
     match_depth_loss_weight: 0.01

@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from frontend.pano_droid.spherical_ba import skew, so3_exp
 from frontend.pano_droid.spherical_camera import tangent_basis
 from frontend.pano_vggt.spherical_correspondence import spherical_tangent_residual
-from geometry.sim3 import sim3_log
+from geometry.sim3 import sim3_components, sim3_log, weighted_umeyama
 from geometry.spherical_erp import (
     build_erp_ray_grid,
     erp_pixel_to_unit_ray,
@@ -133,6 +133,7 @@ def build_stage3_match_cache(
     forward_backward: bool = False,
     fb_tolerance_deg: float = 1.0,
     min_factor_weight: float = 0.01,
+    factor_weight_mode: str = "descriptor_confidence",
     reliability_keep_fraction: float = 1.0,
     distinctiveness_exclusion_deg: float = 0.0,
     subpixel_refine_radius: int = 0,
@@ -237,6 +238,11 @@ def build_stage3_match_cache(
         )
         local_offset_y = offset_y.reshape(1, -1)
         local_offset_x = offset_x.reshape(1, -1)
+    weight_mode = str(factor_weight_mode).strip().lower()
+    if weight_mode not in {"descriptor_confidence", "fibonacci_equal"}:
+        raise ValueError(
+            "factor_weight_mode must be 'descriptor_confidence' or 'fibonacci_equal'."
+        )
 
     for batch_idx in range(batch):
         for edge_idx, pair in enumerate(edges.tolist()):
@@ -334,19 +340,24 @@ def build_stage3_match_cache(
             cosine_score = ((top1_cosine[batch_idx, edge_idx] + 1.0) * 0.5).clamp(0.0, 1.0)
             margin_score = torch.sigmoid(top2_margin[batch_idx, edge_idx])
             entropy_score = (1.0 - normalized_entropy).clamp(0.0, 1.0)
-            factor_weight[batch_idx, edge_idx] = cosine_score * margin_score * entropy_score
+            match_quality = cosine_score * margin_score * entropy_score
+            factor_weight[batch_idx, edge_idx] = (
+                torch.ones_like(match_quality)
+                if weight_mode == "fibonacci_equal"
+                else match_quality
+            )
             valid[batch_idx, edge_idx] = (
                 source_valid[batch_idx, src]
                 & target_depth_valid[batch_idx, edge_idx]
                 & mutual[batch_idx, edge_idx]
-                & (factor_weight[batch_idx, edge_idx] >= float(min_factor_weight))
+                & (match_quality >= float(min_factor_weight))
             )
             if keep_fraction < 1.0:
                 candidates = torch.nonzero(valid[batch_idx, edge_idx], as_tuple=False).flatten()
                 if int(candidates.numel()) > 0:
                     keep_count = max(1, int(math.ceil(keep_fraction * int(candidates.numel()))))
                     ranked = torch.topk(
-                        factor_weight[batch_idx, edge_idx, candidates],
+                        match_quality[candidates],
                         k=keep_count,
                         largest=True,
                         sorted=False,
@@ -379,6 +390,7 @@ def build_stage3_match_cache(
             "forward_backward": bool(forward_backward),
             "fb_tolerance_deg": float(fb_tolerance_deg),
             "min_factor_weight": float(min_factor_weight),
+            "factor_weight_mode": weight_mode,
             "reliability_keep_fraction": keep_fraction,
             "distinctiveness_exclusion_deg": exclusion_deg,
             "subpixel_refine_radius": refine_radius,
@@ -386,6 +398,257 @@ def build_stage3_match_cache(
             "static_validity_filter": static_valid_mask is not None,
         },
     )
+
+
+def _mad_threshold(
+    values: torch.Tensor,
+    *,
+    scale: float,
+    lower: float,
+    upper: float | None = None,
+) -> torch.Tensor:
+    """Return a finite median/MAD gate in the units of ``values``."""
+
+    finite = values[torch.isfinite(values)]
+    if int(finite.numel()) == 0:
+        return values.new_tensor(float(lower))
+    median = finite.median()
+    sigma = 1.4826 * (finite - median).abs().median()
+    threshold = torch.maximum(median + float(scale) * sigma, values.new_tensor(float(lower)))
+    if upper is not None:
+        threshold = torch.minimum(threshold, values.new_tensor(float(upper)))
+    return threshold
+
+
+@torch.no_grad()
+def filter_stage3_match_cache_robust(
+    cache: Stage3MatchCache,
+    poses_c2w: torch.Tensor,
+    dense_depth: torch.Tensor,
+    *,
+    angular_mad_scale: float = 3.0,
+    angular_min_deg: float = 1.0,
+    angular_max_deg: float = 5.0,
+    sim3_irls_iterations: int = 3,
+    sim3_mad_scale: float = 3.0,
+    sim3_min_residual: float = 0.01,
+    sim3_max_relative_depth: float = 0.05,
+) -> tuple[Stage3MatchCache, list[dict[str, Any]]]:
+    """Hard-filter Stage-1 factors using spherical and per-edge Sim(3) residuals.
+
+    The angular gate is computed independently for every directed edge.  The
+    Sim(3) gate is then fit on that edge's angular inliers with equal weights,
+    so descriptor confidence does not enter either the robust fit or Stage-2
+    BA when the cache uses ``fibonacci_equal`` weights.
+    """
+
+    if tuple(poses_c2w.shape[:2]) != (cache.batch_size, cache.num_views):
+        raise ValueError("poses_c2w batch/view dimensions must match the match cache")
+    if poses_c2w.shape[-2:] != (4, 4):
+        raise ValueError("poses_c2w must have shape BxSx4x4")
+    if dense_depth.ndim != 5 or tuple(dense_depth.shape[:2]) != (
+        cache.batch_size,
+        cache.num_views,
+    ):
+        raise ValueError("dense_depth must have shape BxSx1xHxW matching the cache")
+
+    filtered = cache.detached_clone()
+    final_valid = torch.zeros_like(cache.valid_mask)
+    diagnostics: list[dict[str, Any]] = []
+    angular_lower = math.radians(float(angular_min_deg))
+    angular_upper = math.radians(float(angular_max_deg))
+    irls_iterations = max(1, int(sim3_irls_iterations))
+
+    for batch_idx in range(cache.batch_size):
+        batch_initial = int(cache.valid_mask[batch_idx].sum().detach().cpu())
+        angular_inliers_total = 0
+        sim3_candidates_total = 0
+        final_total = 0
+        angular_thresholds: list[float] = []
+        sim3_thresholds: list[float] = []
+        edge_counts: list[dict[str, int | float | str]] = []
+        for edge_idx, pair in enumerate(cache.edges.tolist()):
+            src, tgt = int(pair[0]), int(pair[1])
+            valid = cache.valid_mask[batch_idx, edge_idx].clone()
+            edge_initial = int(valid.sum().detach().cpu())
+            if edge_initial == 0:
+                edge_counts.append(
+                    {
+                        "source": src,
+                        "target": tgt,
+                        "initial": 0,
+                        "angular_inliers": 0,
+                        "sim3_inliers": 0,
+                        "reason": "empty_edge",
+                    }
+                )
+                continue
+
+            source_uv = cache.source_uv[batch_idx, src].unsqueeze(0)
+            target_uv = cache.target_uv[batch_idx, edge_idx].unsqueeze(0)
+            source_depth = sample_erp_with_wrap(
+                dense_depth[batch_idx : batch_idx + 1, src], source_uv
+            )[0, ..., 0]
+            target_depth = sample_erp_with_wrap(
+                dense_depth[batch_idx : batch_idx + 1, tgt], target_uv
+            )[0, ..., 0]
+            source_camera = cache.source_ray[batch_idx, src] * source_depth[:, None]
+            target_camera_observed = cache.target_ray[batch_idx, edge_idx] * target_depth[:, None]
+
+            source_pose = poses_c2w[batch_idx, src]
+            target_pose = poses_c2w[batch_idx, tgt]
+            world = source_camera @ source_pose[:3, :3].transpose(0, 1) + source_pose[:3, 3]
+            target_camera_predicted = (world - target_pose[:3, 3]) @ target_pose[:3, :3]
+            predicted_depth = torch.linalg.norm(target_camera_predicted, dim=-1)
+            predicted_bearing = target_camera_predicted / predicted_depth[:, None].clamp_min(1.0e-8)
+            angular_residual = torch.atan2(
+                torch.cross(
+                    cache.target_ray[batch_idx, edge_idx], predicted_bearing, dim=-1
+                ).norm(dim=-1),
+                (
+                    cache.target_ray[batch_idx, edge_idx] * predicted_bearing
+                ).sum(dim=-1).clamp(-1.0, 1.0),
+            )
+            angular_finite = (
+                torch.isfinite(angular_residual)
+                & torch.isfinite(source_depth)
+                & torch.isfinite(target_depth)
+                & (source_depth > 0.0)
+                & (target_depth > 0.0)
+                & (predicted_depth > 1.0e-8)
+            )
+            angular_values = angular_residual[valid & angular_finite]
+            angular_threshold = _mad_threshold(
+                angular_values,
+                scale=float(angular_mad_scale),
+                lower=angular_lower,
+                upper=angular_upper,
+            )
+            angular_keep = valid & angular_finite & (angular_residual <= angular_threshold)
+            angular_count = int(angular_keep.sum().detach().cpu())
+            angular_inliers_total += angular_count
+            angular_thresholds.append(float(torch.rad2deg(angular_threshold).detach().cpu()))
+
+            sim3_keep = torch.zeros_like(valid)
+            sim3_candidates = torch.nonzero(angular_keep, as_tuple=False).flatten()
+            sim3_candidate_count = int(sim3_candidates.numel())
+            sim3_candidates_total += sim3_candidate_count
+            reason = "ok"
+            sim3_threshold_value = float("nan")
+            if sim3_candidate_count >= 3:
+                source_points = source_camera.index_select(0, sim3_candidates)
+                target_points = target_camera_observed.index_select(0, sim3_candidates)
+                weights = torch.ones(
+                    sim3_candidate_count,
+                    device=source_points.device,
+                    dtype=source_points.dtype,
+                )
+                try:
+                    transform = weighted_umeyama(source_points, target_points, weights)
+                    residual = source_points.new_full((sim3_candidate_count,), float("inf"))
+                    for _ in range(irls_iterations):
+                        scale, rotation, translation = sim3_components(transform)
+                        aligned = scale * (source_points @ rotation.transpose(0, 1)) + translation
+                        residual = torch.linalg.norm(aligned - target_points, dim=-1)
+                        scene_depth = torch.cat(
+                            [
+                                source_points.norm(dim=-1),
+                                target_points.norm(dim=-1),
+                            ]
+                        )
+                        robust_gate = _mad_threshold(
+                            residual,
+                            scale=float(sim3_mad_scale),
+                            lower=float(sim3_min_residual),
+                        )
+                        relative_cap = float(sim3_max_relative_depth) * scene_depth.median()
+                        robust_gate = torch.maximum(
+                            residual.new_tensor(float(sim3_min_residual)),
+                            torch.minimum(robust_gate, relative_cap),
+                        )
+                        weights = torch.minimum(
+                            torch.ones_like(residual),
+                            robust_gate / residual.clamp_min(1.0e-8),
+                        )
+                        transform = weighted_umeyama(source_points, target_points, weights)
+                    scale, rotation, translation = sim3_components(transform)
+                    aligned = scale * (source_points @ rotation.transpose(0, 1)) + translation
+                    residual = torch.linalg.norm(aligned - target_points, dim=-1)
+                    scene_depth = torch.cat(
+                        [source_points.norm(dim=-1), target_points.norm(dim=-1)]
+                    )
+                    sim3_threshold = _mad_threshold(
+                        residual,
+                        scale=float(sim3_mad_scale),
+                        lower=float(sim3_min_residual),
+                    )
+                    sim3_threshold = torch.maximum(
+                        residual.new_tensor(float(sim3_min_residual)),
+                        torch.minimum(
+                            sim3_threshold,
+                            float(sim3_max_relative_depth) * scene_depth.median(),
+                        ),
+                    )
+                    sim3_threshold_value = float(sim3_threshold.detach().cpu())
+                    sim3_thresholds.append(sim3_threshold_value)
+                    sim3_inlier_rows = sim3_candidates[residual <= sim3_threshold]
+                    sim3_keep[sim3_inlier_rows] = True
+                except (RuntimeError, ValueError):
+                    reason = "sim3_fit_failed"
+            else:
+                reason = "insufficient_sim3_support"
+
+            final_valid[batch_idx, edge_idx] = angular_keep & sim3_keep
+            edge_final = int(final_valid[batch_idx, edge_idx].sum().detach().cpu())
+            final_total += edge_final
+            edge_counts.append(
+                {
+                    "source": src,
+                    "target": tgt,
+                    "initial": edge_initial,
+                    "angular_inliers": angular_count,
+                    "sim3_inliers": edge_final,
+                    "angular_threshold_deg": float(
+                        torch.rad2deg(angular_threshold).detach().cpu()
+                    ),
+                    "sim3_threshold": sim3_threshold_value,
+                    "reason": reason,
+                }
+            )
+
+        ratio = float(final_total) / float(max(1, batch_initial))
+        diagnostics.append(
+            {
+                "pre_filter_factors": batch_initial,
+                "angular_inliers": angular_inliers_total,
+                "angular_outliers": max(0, batch_initial - angular_inliers_total),
+                "sim3_candidates": sim3_candidates_total,
+                "post_filter_inliers": final_total,
+                "sim3_outliers": max(0, sim3_candidates_total - final_total),
+                "post_filter_inlier_ratio": ratio,
+                "angular_threshold_deg_median": (
+                    float(torch.tensor(angular_thresholds).median())
+                    if angular_thresholds
+                    else None
+                ),
+                "sim3_threshold_median": (
+                    float(torch.tensor(sim3_thresholds).median())
+                    if sim3_thresholds
+                    else None
+                ),
+                "edge_filter_counts": edge_counts,
+            }
+        )
+
+    filtered.valid_mask = final_valid
+    filtered.metadata.update(
+        {
+            "robust_outlier_filter": "angular_mad_then_per_edge_sim3_mad",
+            "post_filter_inliers": int(final_valid.sum().detach().cpu()),
+            "pre_filter_factors": int(cache.valid_mask.sum().detach().cpu()),
+        }
+    )
+    return filtered, diagnostics
 
 
 @dataclass

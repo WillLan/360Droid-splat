@@ -466,6 +466,8 @@ class SphericalSelfiGlobalBackend:
         )
         count = int(keep.sum())
         diagnostics = {
+            "source_window_id": int(packet.window_id),
+            "target_window_id": int(packet.window_id),
             "source_frame_id": int(packet.frame_ids[0]),
             "target_frame_id": int(packet.frame_ids[-1]),
             "raw_boundary_matches": int(matches.count),
@@ -789,15 +791,23 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError(
                     f"window {window_id} has {prepared}/{len(frame_ids)} registered RGB observations"
                 )
-            fixed_frame_ids = [int(self.packets[self.window_order[0]].frame_ids[0])] if self.window_order else []
+            fixed_frame_ids: list[int] = []
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
-                "pose_lr": (
-                    0.0
-                    if self.boundary_frame_graph
-                    else float(self.map_optimize_config.get("pose_lr", 1.0e-3))
+                "separate_gaussian_lrs": bool(self.map_optimize_config.get("separate_gaussian_lrs", False)),
+                "xyz_lr": float(self.map_optimize_config.get("xyz_lr", 5.0e-4)),
+                "feature_lr": float(self.map_optimize_config.get("feature_lr", 2.0e-3)),
+                "sh_rest_lr": float(self.map_optimize_config.get("sh_rest_lr", 1.0e-4)),
+                "opacity_lr": float(self.map_optimize_config.get("opacity_lr", 1.0e-3)),
+                "scaling_lr": float(self.map_optimize_config.get("scaling_lr", 1.0e-4)),
+                "rotation_lr": float(self.map_optimize_config.get("rotation_lr", 1.0e-4)),
+                "scale_gaussian_parameter_updates": bool(
+                    self.map_optimize_config.get("scale_gaussian_parameter_updates", False)
                 ),
-                "pose_refine_enable": not self.boundary_frame_graph,
+                "pose_lr": float(self.map_optimize_config.get("pose_lr", 1.0e-3)),
+                "pose_refine_enable": bool(
+                    self.map_optimize_config.get("pose_refine_enable", True)
+                ),
                 "pose_prior_weight": float(self.map_optimize_config.get("pose_prior_weight", 0.0)),
                 "pose_grad_clip": float(self.map_optimize_config.get("pose_grad_clip", 1.0e-3)),
                 "visible_neighbor_lr_scale": float(self.map_optimize_config.get("visible_neighbor_lr_scale", 0.1)),
@@ -810,21 +820,16 @@ class SphericalSelfiGlobalBackend:
                 iters=int(steps),
                 settings=settings,
                 extra_loss_fn=(
-                    None
-                    if self.boundary_frame_graph
-                    else lambda trainable_pose_ids: self._joint_graph_pose_loss(
+                    lambda trainable_pose_ids: self._joint_graph_pose_loss(
                         int(window_id), trainable_pose_ids
                     )
                 ),
             )
-            if self.boundary_frame_graph:
-                if float(metrics.get("window_rollback", 0.0)) == 0.0:
-                    self.mapper.commit_spherical_selfi_window()
-                metrics["pose_refine_enabled"] = 0.0
-            elif float(metrics.get("window_rollback", 0.0)) == 0.0:
+            metrics["pose_refine_enabled"] = float(settings["pose_refine_enable"])
+            if float(metrics.get("window_rollback", 0.0)) == 0.0:
                 try:
                     self._synchronize_joint_optimized_window(int(window_id))
-                except (RuntimeError, ValueError) as exc:
+                except (RuntimeError, ValueError, KeyError) as exc:
                     if self.geometry_rollback_on_failure:
                         self.mapper.rollback_spherical_selfi_window()
                     else:
@@ -838,7 +843,7 @@ class SphericalSelfiGlobalBackend:
                 else:
                     self.mapper.commit_spherical_selfi_window()
             return metrics
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, KeyError) as exc:
             if self.geometry_rollback_on_failure:
                 self.mapper.rollback_spherical_selfi_window()
             else:
@@ -865,14 +870,21 @@ class SphericalSelfiGlobalBackend:
             pose = pose_delta()
             return pose if int(frame_id) in trainable_pose_ids else pose.detach()
 
+        packet = self.packets.get(int(window_id))
+        window_frames = set() if packet is None else {int(value) for value in packet.frame_ids}
         for factor in self.graph.edges:
             if not isinstance(factor, DenseSphericalFactorBlock):
-                continue
-            if int(factor.source) != int(window_id) and int(factor.target) != int(window_id):
                 continue
             source_frame_id = factor.metadata.get("source_frame_id")
             target_frame_id = factor.metadata.get("target_frame_id")
             if source_frame_id is None or target_frame_id is None:
+                continue
+            if (
+                int(source_frame_id) not in window_frames
+                and int(target_frame_id) not in window_frames
+                and int(source_frame_id) not in trainable_pose_ids
+                and int(target_frame_id) not in trainable_pose_ids
+            ):
                 continue
             source_pose = camera_pose(int(source_frame_id))
             target_pose = camera_pose(int(target_frame_id))
@@ -949,6 +961,22 @@ class SphericalSelfiGlobalBackend:
         for factor in self.graph.edges:
             if not isinstance(factor, (DenseSphericalFactorBlock, CoincidentPanoramaFactor)):
                 continue
+            if self.boundary_frame_graph:
+                source_window = factor.metadata.get("source_window_id")
+                target_window = factor.metadata.get("target_window_id")
+                if source_window is not None and int(source_window) in affected_windows:
+                    factor.source_local_pose = torch.eye(
+                        4,
+                        device=factor.source_local_pose.device,
+                        dtype=factor.source_local_pose.dtype,
+                    )
+                if target_window is not None and int(target_window) in affected_windows:
+                    factor.target_local_pose = torch.eye(
+                        4,
+                        device=factor.target_local_pose.device,
+                        dtype=factor.target_local_pose.dtype,
+                    )
+                continue
             if int(factor.source) in affected_windows:
                 packet = self.packets[int(factor.source)]
                 frame_id = int(factor.metadata.get("source_frame_id", packet.frame_ids[0]))
@@ -992,6 +1020,9 @@ class SphericalSelfiGlobalBackend:
     def _synchronize_joint_optimized_window(self, window_id: int) -> None:
         """Transactionally rebase optimized SE(3) poses while graph scale stays authoritative."""
 
+        if self.boundary_frame_graph:
+            self._synchronize_boundary_optimized_window(window_id)
+            return
         if self.mapper is None or int(window_id) not in self.packets:
             return
         packet = self.packets[int(window_id)]
@@ -1005,6 +1036,7 @@ class SphericalSelfiGlobalBackend:
             optimized_by_frame[int(frame_id)] = pose.float()
 
         old_nodes = {node: value.clone() for node, value in self.graph.nodes.items()}
+        geometry_snapshot = dict(self._geometry_updates)
         affected_windows = {
             int(owner)
             for frame_id in optimized_by_frame
@@ -1072,10 +1104,111 @@ class SphericalSelfiGlobalBackend:
             self._refresh_geometry_updates()
         except Exception:
             self.graph.nodes = {node: value.clone() for node, value in old_nodes.items()}
+            self._geometry_updates = geometry_snapshot
             for variant, local_poses, observation in packet_snapshots.values():
                 variant.local_poses_c2w = local_poses
                 variant.observation = observation
             self._refresh_factor_local_poses(affected_windows)
+            raise
+
+    def _synchronize_boundary_optimized_window(self, window_id: int) -> None:
+        """Synchronize global render-optimized poses with boundary nodes and packets."""
+
+        if self.mapper is None or int(window_id) not in self.packets:
+            return
+        packet = self.packets[int(window_id)]
+        optimized_by_frame: dict[int, torch.Tensor] = {}
+        for frame_id in packet.frame_ids:
+            pose = self.mapper.refined_pose_c2w(int(frame_id))
+            if pose is None:
+                raise RuntimeError(f"missing optimized pose for frame {frame_id}")
+            if tuple(pose.shape) != (4, 4) or not bool(torch.isfinite(pose).all()):
+                raise RuntimeError(f"invalid optimized pose for frame {frame_id}")
+            optimized_by_frame[int(frame_id)] = pose.float()
+
+        affected_windows = {
+            int(owner)
+            for frame_id in optimized_by_frame
+            for owner in self.frame_windows.get(int(frame_id), {int(window_id)})
+        }
+        old_nodes = {node: value.clone() for node, value in self.graph.nodes.items()}
+        geometry_snapshot = dict(self._geometry_updates)
+        packet_snapshots = {
+            id(variant): (variant, variant.local_poses_c2w.clone(), variant.observation)
+            for owner in affected_windows
+            for variant in self._packet_variants(owner)
+        }
+        factor_snapshots = {
+            id(factor): (
+                factor,
+                factor.source_local_pose.clone(),
+                factor.target_local_pose.clone(),
+            )
+            for factor in self.graph.edges
+            if isinstance(factor, (DenseSphericalFactorBlock, CoincidentPanoramaFactor))
+        }
+
+        try:
+            # Boundary-node scale remains the Sim(3) gauge authority; render BA
+            # contributes only the optimized global SE(3) rotation/translation.
+            for frame_id, global_pose in optimized_by_frame.items():
+                if int(frame_id) not in self.graph.nodes:
+                    continue
+                current = self.graph.transform(int(frame_id))
+                scale, _, _ = sim3_components(current)
+                pose = global_pose.to(current)
+                self.graph.nodes[int(frame_id)] = sim3_from_components(
+                    scale,
+                    pose[:3, :3],
+                    pose[:3, 3],
+                ).detach()
+
+            for owner in affected_windows:
+                anchor_node = self.window_anchor_nodes[int(owner)]
+                transform = self.graph.transform(anchor_node)
+                for variant in self._packet_variants(owner):
+                    local_poses = variant.local_poses_c2w.clone()
+                    changed = False
+                    for frame_id, global_pose in optimized_by_frame.items():
+                        if frame_id not in variant.frame_ids:
+                            continue
+                        index = variant.frame_index(frame_id)
+                        local = rebase_c2w_to_sim3_anchor(
+                            transform.to(local_poses), global_pose.to(local_poses)
+                        )
+                        if int(frame_id) == int(anchor_node):
+                            local = torch.eye(4, device=local.device, dtype=local.dtype)
+                        self._validate_pose_round_trip(
+                            transform,
+                            local,
+                            global_pose,
+                            frame_id=frame_id,
+                            window_id=owner,
+                        )
+                        local_poses[index] = local
+                        changed = True
+                    if changed:
+                        variant.local_poses_c2w = local_poses.detach()
+                        variant.observation = variant.observation.with_geometry(
+                            poses_c2w=local_poses.unsqueeze(0).to(
+                                variant.observation.poses_c2w
+                            )
+                        )
+
+            self._refresh_factor_local_poses(affected_windows)
+            # The graph BA cadence stays governed by optimization_start_nodes /
+            # optimization_interval_edges.  Synchronization itself must not turn
+            # the configured five-window graph BA into an every-window solve.
+            self._refresh_geometry_updates()
+        except Exception:
+            self.graph.nodes = {node: value.clone() for node, value in old_nodes.items()}
+            self._geometry_updates = geometry_snapshot
+            for variant, local_poses, observation in packet_snapshots.values():
+                variant.local_poses_c2w = local_poses
+                variant.observation = observation
+            for factor, source_pose, target_pose in factor_snapshots.values():
+                factor.source_local_pose = source_pose
+                factor.target_local_pose = target_pose
             raise
 
     def _merge_loop_dense_factors(

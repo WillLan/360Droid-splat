@@ -2775,6 +2775,38 @@ class PanoDroidGSSlamSystem:
                             ba_diagnostic.get("final_objective")
                         ),
                         "accepted_steps": ba_diagnostic.get("accepted_steps"),
+                        "stage1_accepted": bool(
+                            ba_diagnostic.get("stage1_accepted", diagnostic["accepted"])
+                        ),
+                        "stage1_reason": ba_diagnostic.get("stage1_reason"),
+                        "stage2_attempted": bool(
+                            ba_diagnostic.get("stage2_attempted", False)
+                        ),
+                        "stage2_accepted": bool(
+                            ba_diagnostic.get("stage2_accepted", False)
+                        ),
+                        "stage2_reason": ba_diagnostic.get("stage2_reason"),
+                        "pre_filter_factors": int(
+                            ba_diagnostic.get("pre_filter_factors", diagnostic["num_factors"])
+                        ),
+                        "angular_inliers": int(
+                            ba_diagnostic.get("angular_inliers", diagnostic["num_factors"])
+                        ),
+                        "angular_outliers": int(
+                            ba_diagnostic.get("angular_outliers", 0)
+                        ),
+                        "sim3_candidates": int(
+                            ba_diagnostic.get("sim3_candidates", diagnostic["num_factors"])
+                        ),
+                        "sim3_outliers": int(
+                            ba_diagnostic.get("sim3_outliers", 0)
+                        ),
+                        "post_filter_inliers": int(
+                            ba_diagnostic.get("post_filter_inliers", diagnostic["num_factors"])
+                        ),
+                        "post_filter_inlier_ratio": finite_optional(
+                            ba_diagnostic.get("post_filter_inlier_ratio")
+                        ),
                         "jacobian_mode": ba_diagnostic.get("jacobian_mode"),
                         "max_factor_jacobian_norm": finite_optional(
                             ba_diagnostic.get("max_factor_jacobian_norm")
@@ -2805,6 +2837,15 @@ class PanoDroidGSSlamSystem:
                         "local_ba/matching_sec": record["matching_sec"],
                         "local_ba/ba_sec": record["ba_sec"],
                         "local_ba/accepted_steps": int(record["accepted_steps"] or 0),
+                        "local_ba/stage1_accepted": int(record["stage1_accepted"]),
+                        "local_ba/stage2_attempted": int(record["stage2_attempted"]),
+                        "local_ba/stage2_accepted": int(record["stage2_accepted"]),
+                        "local_ba/pre_filter_factors": record["pre_filter_factors"],
+                        "local_ba/angular_inliers": record["angular_inliers"],
+                        "local_ba/angular_outliers": record["angular_outliers"],
+                        "local_ba/sim3_candidates": record["sim3_candidates"],
+                        "local_ba/sim3_outliers": record["sim3_outliers"],
+                        "local_ba/post_filter_inliers": record["post_filter_inliers"],
                         "local_ba/affine_accepted_frames": int(
                             sum(record["depth_affine_accepted"])
                         ),
@@ -2816,6 +2857,9 @@ class PanoDroidGSSlamSystem:
                         "local_ba/max_factor_jacobian_norm": record["max_factor_jacobian_norm"],
                         "local_ba/analytic_autodiff_max_abs": record["analytic_autodiff_max_abs"],
                         "local_ba/final_damping": record["final_damping"],
+                        "local_ba/post_filter_inlier_ratio": record[
+                            "post_filter_inlier_ratio"
+                        ],
                         "local_ba/gradient_norm": gradient_norms[-1] if gradient_norms else None,
                         "local_ba/pose_step_norm": max(pose_step_norms) if pose_step_norms else None,
                         "local_ba/depth_step_norm": max(depth_step_norms) if depth_step_norms else None,

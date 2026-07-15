@@ -1317,6 +1317,14 @@ class PanoGaussianMapper:
                 "pose_prior_weight",
                 "pose_grad_clip",
                 "gaussian_lr",
+                "separate_gaussian_lrs",
+                "xyz_lr",
+                "feature_lr",
+                "sh_rest_lr",
+                "opacity_lr",
+                "scaling_lr",
+                "rotation_lr",
+                "scale_gaussian_parameter_updates",
                 "fixed_pose_frame_ids",
             )
         }
@@ -3526,7 +3534,14 @@ class PanoGaussianMapper:
             if loss.requires_grad:
                 section_start = time.perf_counter()
                 loss.backward()
-                if gaussian_enabled and gaussian_scales is not None:
+                true_update_scaling = bool(
+                    self.optim_cfg.get("scale_gaussian_parameter_updates", False)
+                )
+                if (
+                    gaussian_enabled
+                    and gaussian_scales is not None
+                    and not true_update_scaling
+                ):
                     self._apply_gaussian_grad_scales(gaussian_scales)
                 pose_grad_clip = float(self.optim_cfg.get("pose_grad_clip", 0.0))
                 if pose_params and pose_grad_clip > 0.0:
@@ -3540,6 +3555,8 @@ class PanoGaussianMapper:
                     non_finite_window = True
                     break
                 optimizer.step()
+                if gaussian_enabled and gaussian_scales is not None and true_update_scaling:
+                    self._apply_gaussian_adamw_update_scales(optimizer, gaussian_scales)
                 with torch.no_grad():
                     if hasattr(self.map, "rotation") and torch.is_tensor(self.map.rotation):
                         self.map.rotation.copy_(F.normalize(self.map.rotation, dim=-1, eps=1.0e-8))
@@ -4388,13 +4405,22 @@ class PanoGaussianMapper:
         if gaussian_enabled:
             if hasattr(self.map, "get_optimizer_param_groups"):
                 groups.extend(self.map.get_optimizer_param_groups())
-            elif self.pfgs360_replace_fuse_enabled:
+            elif self.pfgs360_replace_fuse_enabled or bool(
+                self.optim_cfg.get("separate_gaussian_lrs", False)
+            ):
                 feature_params = [self.map.features]
                 sh_rest = getattr(self.map, "sh_rest", None)
-                if torch.is_tensor(sh_rest) and sh_rest.ndim == 3 and int(sh_rest.shape[1]) > 0:
+                combine_sh_rest = self.pfgs360_replace_fuse_enabled and not bool(
+                    self.optim_cfg.get("separate_gaussian_lrs", False)
+                )
+                if (
+                    combine_sh_rest
+                    and torch.is_tensor(sh_rest)
+                    and sh_rest.ndim == 3
+                    and int(sh_rest.shape[1]) > 0
+                ):
                     feature_params.append(sh_rest)
-                groups.extend(
-                    [
+                gaussian_groups = [
                         {
                             "params": [self.map.xyz],
                             "lr": float(self.optim_cfg.get("xyz_lr", 5.0e-4)),
@@ -4421,7 +4447,21 @@ class PanoGaussianMapper:
                             "name": "rotation",
                         },
                     ]
-                )
+                if (
+                    not combine_sh_rest
+                    and torch.is_tensor(sh_rest)
+                    and sh_rest.ndim == 3
+                    and int(sh_rest.shape[1]) > 0
+                ):
+                    gaussian_groups.insert(
+                        2,
+                        {
+                            "params": [sh_rest],
+                            "lr": float(self.optim_cfg.get("sh_rest_lr", 1.0e-4)),
+                            "name": "sh_rest",
+                        },
+                    )
+                groups.extend(gaussian_groups)
             else:
                 groups.append(
                     {
@@ -4679,6 +4719,62 @@ class PanoGaussianMapper:
                 continue
             view_shape = (scales.shape[0],) + (1,) * (param.grad.ndim - 1)
             param.grad.mul_(scales.view(view_shape).to(device=param.grad.device, dtype=param.grad.dtype))
+
+    @torch.no_grad()
+    def _apply_gaussian_adamw_update_scales(
+        self,
+        optimizer: torch.optim.AdamW,
+        scales: torch.Tensor,
+    ) -> None:
+        """Scale the realized AdamW step per Gaussian row.
+
+        Scaling an Adam gradient by a constant is largely cancelled by the
+        adaptive denominator.  This correction is applied after ``step()`` to
+        the actual bias-corrected Adam update, making a neighbor scale of 0.1
+        produce a true one-tenth parameter step without copying the full map.
+        """
+
+        if int(scales.numel()) != self.map.anchor_count():
+            return
+        gaussian_ids = {id(value) for value in self.map.gaussian_parameters()}
+        for group in optimizer.param_groups:
+            weight_decay = float(group.get("weight_decay", 0.0))
+            gaussian_params = [value for value in group["params"] if id(value) in gaussian_ids]
+            if gaussian_params and weight_decay != 0.0:
+                raise ValueError(
+                    "scale_gaussian_parameter_updates requires weight_decay=0 for exact AdamW scaling"
+                )
+            beta1, beta2 = group.get("betas", (0.9, 0.999))
+            epsilon = float(group.get("eps", 1.0e-8))
+            learning_rate = float(group["lr"])
+            amsgrad = bool(group.get("amsgrad", False))
+            for parameter in gaussian_params:
+                if parameter.grad is None:
+                    continue
+                if parameter.ndim == 0 or int(parameter.shape[0]) != int(scales.numel()):
+                    continue
+                state = optimizer.state.get(parameter, {})
+                exp_avg = state.get("exp_avg")
+                exp_avg_sq = state.get("exp_avg_sq")
+                step_value = state.get("step")
+                if exp_avg is None or exp_avg_sq is None or step_value is None:
+                    continue
+                step = float(step_value.detach().cpu()) if torch.is_tensor(step_value) else float(step_value)
+                if step <= 0.0:
+                    continue
+                denominator_source = state.get("max_exp_avg_sq", exp_avg_sq) if amsgrad else exp_avg_sq
+                bias_correction1 = 1.0 - float(beta1) ** step
+                bias_correction2_sqrt = math.sqrt(1.0 - float(beta2) ** step)
+                denominator = denominator_source.sqrt() / bias_correction2_sqrt
+                denominator = denominator.add(epsilon)
+                adam_delta = exp_avg / denominator
+                adam_delta.mul_(-learning_rate / bias_correction1)
+                view_shape = (int(scales.numel()),) + (1,) * (parameter.ndim - 1)
+                correction = scales.to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                ).view(view_shape) - 1.0
+                parameter.add_(adam_delta.to(parameter) * correction)
 
     def _pose_delta_norm(self, frame_ids: set[int] | None = None) -> float:
         deltas = []

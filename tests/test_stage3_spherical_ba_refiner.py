@@ -32,6 +32,7 @@ from models.spherical_selfi_stage3_ba import (
     all_directed_pairs,
     build_stage3_match_cache,
     directed_pairs_for_topology,
+    filter_stage3_match_cache_robust,
 )
 from geometry.spherical_erp import build_erp_ray_grid, erp_pixel_to_unit_ray
 from frontend.pano_droid.spherical_ba import se3_exp
@@ -114,6 +115,61 @@ def test_star_forward_match_cache_uses_anchor_edges_only() -> None:
     assert cache.target_uv.shape == (1, 3, 4, 2)
     assert cache.num_factors == 12
     assert cache.metadata["edge_topology"] == "star_forward"
+
+
+def test_fibonacci_equal_match_weights_keep_hard_quality_gate_but_remove_confidence_weighting() -> None:
+    observation, feature, _ = _observation(views=2, height=4, width=8)
+    cache = build_stage3_match_cache(
+        feature,
+        observation.refined_depth,
+        num_queries=8,
+        query_chunk_size=4,
+        factor_weight_mode="fibonacci_equal",
+    )
+
+    assert cache.metadata["factor_weight_mode"] == "fibonacci_equal"
+    assert cache.factor_weight is not None
+    assert torch.equal(cache.factor_weight, torch.ones_like(cache.factor_weight))
+
+
+def test_robust_match_filter_rejects_angular_and_per_edge_sim3_outliers() -> None:
+    height, width = 8, 16
+    uv = torch.stack(
+        [
+            torch.arange(32, dtype=torch.float32).remainder(width) + 0.5,
+            torch.div(torch.arange(32), width, rounding_mode="floor").float() + 2.5,
+        ],
+        dim=-1,
+    )
+    rays = erp_pixel_to_unit_ray(uv, height, width)
+    target_rays = rays.clone()
+    target_rays[0] = -target_rays[0]
+    depth = torch.full((1, 2, 1, height, width), 2.0)
+    depth[0, 1, 0, int(uv[1, 1] - 0.5), int(uv[1, 0] - 0.5)] = 8.0
+    cache = Stage3MatchCache(
+        source_uv=uv.view(1, 1, 32, 2).repeat(1, 2, 1, 1),
+        source_ray=rays.view(1, 1, 32, 3).repeat(1, 2, 1, 1),
+        source_depth=torch.full((1, 2, 32), 2.0),
+        source_valid=torch.ones(1, 2, 32, dtype=torch.bool),
+        edges=torch.tensor([[0, 1]]),
+        target_uv=uv.view(1, 1, 32, 2),
+        target_ray=target_rays.view(1, 1, 32, 3),
+        top1_cosine=torch.ones(1, 1, 32),
+        top2_margin=torch.ones(1, 1, 32),
+        entropy=torch.zeros(1, 1, 32),
+        valid_mask=torch.ones(1, 1, 32, dtype=torch.bool),
+        factor_weight=torch.ones(1, 1, 32),
+    )
+    poses = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+
+    filtered, diagnostics = filter_stage3_match_cache_robust(cache, poses, depth)
+
+    assert not bool(filtered.valid_mask[0, 0, 0])
+    assert not bool(filtered.valid_mask[0, 0, 1])
+    assert int(filtered.valid_mask.sum()) >= 28
+    assert diagnostics[0]["angular_outliers"] >= 1
+    assert diagnostics[0]["sim3_outliers"] >= 1
+    assert diagnostics[0]["post_filter_inliers"] == filtered.num_factors
 
 
 def test_match_cache_filters_static_source_and_target_pixels() -> None:

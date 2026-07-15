@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 import time
@@ -21,6 +22,7 @@ from models.spherical_selfi_stage3_ba import (
     BlockSparseSphericalBA,
     Stage3MatchCache,
     build_stage3_match_cache,
+    filter_stage3_match_cache_robust,
 )
 from models.sphereglue_local_ba import SphereGlueLocalBAMatcher
 from models.spherical_selfi_gaussian_head import erp_bilinear_resize
@@ -241,6 +243,14 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 local_ba.get("affine_min_relative_improvement", 1.0e-3)
             ),
         )
+        self.local_ba_outlier_config = dict(local_ba.get("outlier_refinement", {}) or {})
+        self.local_ba_outlier_enabled = bool(
+            self.local_ba_outlier_config.get("enabled", False)
+        )
+        self.local_ba_second = copy.copy(self.local_ba)
+        self.local_ba_second.iterations = int(
+            self.local_ba_outlier_config.get("second_stage_iterations", 10)
+        )
         self.frames: list[PanoFrame] = []
         self.frame_buffer_start = 0
         self.next_window_start = 0
@@ -342,6 +352,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                     forward_backward=bool(cfg.get("forward_backward", True)),
                     fb_tolerance_deg=float(cfg.get("fb_tolerance_deg", 1.0)),
                     min_factor_weight=float(cfg.get("min_factor_weight", 0.01)),
+                    factor_weight_mode=str(
+                        cfg.get("factor_weight_mode", "descriptor_confidence")
+                    ),
                     static_valid_mask=combined_valid,
                     generator=generator,
                 )
@@ -356,10 +369,119 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             ba_cache = cache.detached_clone()
             if self.local_ba.jacobian_mode == "autodiff_reference":
                 with torch.enable_grad():
-                    result = self.local_ba(ba_poses, ba_depth, ba_cache)
+                    stage1_result = self.local_ba(ba_poses, ba_depth, ba_cache)
             else:
                 with torch.no_grad():
-                    result = self.local_ba(ba_poses, ba_depth, ba_cache)
+                    stage1_result = self.local_ba(ba_poses, ba_depth, ba_cache)
+            result = stage1_result
+            published_cache = cache
+            if self.local_ba_outlier_enabled:
+                filter_cfg = self.local_ba_outlier_config
+                filtered_cache, filter_diagnostics = filter_stage3_match_cache_robust(
+                    ba_cache,
+                    stage1_result.poses_c2w.detach(),
+                    stage1_result.dense_depth.detach(),
+                    angular_mad_scale=float(filter_cfg.get("angular_mad_scale", 3.0)),
+                    angular_min_deg=float(filter_cfg.get("angular_min_deg", 1.0)),
+                    angular_max_deg=float(filter_cfg.get("angular_max_deg", 5.0)),
+                    sim3_irls_iterations=int(filter_cfg.get("sim3_irls_iterations", 3)),
+                    sim3_mad_scale=float(filter_cfg.get("sim3_mad_scale", 3.0)),
+                    sim3_min_residual=float(filter_cfg.get("sim3_min_residual", 0.01)),
+                    sim3_max_relative_depth=float(
+                        filter_cfg.get("sim3_max_relative_depth", 0.05)
+                    ),
+                )
+                min_inliers = max(
+                    self.local_ba_second.min_factors,
+                    int(filter_cfg.get("min_inliers", self.local_ba_second.min_factors)),
+                )
+                min_ratio = float(filter_cfg.get("min_inlier_ratio", 0.3))
+                stage2_supported = all(
+                    int(value["post_filter_inliers"]) >= min_inliers
+                    and float(value["post_filter_inlier_ratio"]) >= min_ratio
+                    for value in filter_diagnostics
+                )
+                if stage2_supported:
+                    published_cache = filtered_cache
+                    if self.local_ba_second.jacobian_mode == "autodiff_reference":
+                        with torch.enable_grad():
+                            stage2_result = self.local_ba_second(
+                                stage1_result.poses_c2w.detach().clone(),
+                                stage1_result.dense_depth.detach().clone(),
+                                filtered_cache,
+                            )
+                    else:
+                        with torch.no_grad():
+                            stage2_result = self.local_ba_second(
+                                stage1_result.poses_c2w.detach().clone(),
+                                stage1_result.dense_depth.detach().clone(),
+                                filtered_cache,
+                            )
+                    raw_stage2_accepted = stage2_result.accepted.clone()
+                    stage2_result.accepted = stage1_result.accepted | raw_stage2_accepted
+                    stage2_result.initial_median_residual_deg = (
+                        stage1_result.initial_median_residual_deg
+                    )
+                    for batch_idx, filter_diag in enumerate(filter_diagnostics):
+                        stage1_diag = dict(stage1_result.diagnostics[batch_idx])
+                        stage2_diag = dict(stage2_result.diagnostics[batch_idx])
+                        stage2_accepted = bool(raw_stage2_accepted[batch_idx])
+                        combined = dict(stage2_diag)
+                        combined.update(filter_diag)
+                        combined.update(
+                            {
+                                "stage1_iterations": int(self.local_ba.iterations),
+                                "stage1_accepted": bool(stage1_result.accepted[batch_idx]),
+                                "stage1_reason": stage1_diag.get("reason"),
+                                "stage2_attempted": True,
+                                "stage2_iterations": int(self.local_ba_second.iterations),
+                                "stage2_accepted": stage2_accepted,
+                                "stage2_reason": stage2_diag.get("reason"),
+                                "stage2_min_inliers": min_inliers,
+                                "stage2_min_inlier_ratio": min_ratio,
+                                "accepted_steps": int(stage1_diag.get("accepted_steps", 0))
+                                + int(stage2_diag.get("accepted_steps", 0)),
+                                "gradient_norms": list(stage1_diag.get("gradient_norms", []))
+                                + list(stage2_diag.get("gradient_norms", [])),
+                                "pose_step_norms": list(stage1_diag.get("pose_step_norms", []))
+                                + list(stage2_diag.get("pose_step_norms", [])),
+                                "depth_step_norms": list(stage1_diag.get("depth_step_norms", []))
+                                + list(stage2_diag.get("depth_step_norms", [])),
+                                "trial_gain_ratios": list(
+                                    stage1_diag.get("trial_gain_ratios", [])
+                                )
+                                + list(stage2_diag.get("trial_gain_ratios", [])),
+                                "published_pose_updated": bool(
+                                    stage1_diag.get("published_pose_updated", False)
+                                    or stage2_diag.get("published_pose_updated", False)
+                                ),
+                            }
+                        )
+                        if stage2_accepted:
+                            combined["reason"] = "accepted_two_stage"
+                        elif bool(stage1_result.accepted[batch_idx]):
+                            combined["reason"] = "stage2_rejected_stage1_retained"
+                        stage2_result.diagnostics[batch_idx] = combined
+                    result = stage2_result
+                else:
+                    for batch_idx, filter_diag in enumerate(filter_diagnostics):
+                        stage1_result.diagnostics[batch_idx].update(filter_diag)
+                        stage1_result.diagnostics[batch_idx].update(
+                            {
+                                "stage1_iterations": int(self.local_ba.iterations),
+                                "stage1_accepted": bool(stage1_result.accepted[batch_idx]),
+                                "stage1_reason": stage1_result.diagnostics[batch_idx].get(
+                                    "reason"
+                                ),
+                                "stage2_attempted": False,
+                                "stage2_iterations": int(self.local_ba_second.iterations),
+                                "stage2_accepted": False,
+                                "stage2_reason": "insufficient_post_filter_inliers",
+                                "stage2_min_inliers": min_inliers,
+                                "stage2_min_inlier_ratio": min_ratio,
+                                "reason": "insufficient_post_filter_inliers_stage1_retained",
+                            }
+                        )
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         ba_sec = float(time.perf_counter() - ba_start)
@@ -367,7 +489,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             poses_c2w=result.poses_c2w.detach(),
             refined_depth=result.dense_depth.detach(),
         )
-        return updated, cache, result, matching_sec, ba_sec
+        return updated, published_cache, result, matching_sec, ba_sec
 
     def _run_window(self, frames: list[PanoFrame]) -> None:
         images = torch.stack([ensure_chw_image(frame.image).float() for frame in frames], dim=0).unsqueeze(0)
