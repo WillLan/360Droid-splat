@@ -1142,11 +1142,27 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         descriptor_cpu = descriptor.detach().cpu().float().flatten()
         descriptor_cpu = descriptor_cpu / descriptor_cpu.norm().clamp_min(1.0e-8)
         pose_cpu = pose_c2w.detach().cpu().float()
-        static_valid = valid_mask.detach().cpu().bool() & ~sky_mask.detach().cpu().bool()
+        valid_map = valid_mask.detach().cpu().bool()
+        sky_map = sky_mask.detach().cpu().bool()
+        depth_map = depth.detach().cpu().float()
+        while valid_map.ndim > 2 and int(valid_map.shape[0]) == 1:
+            valid_map = valid_map[0]
+        while sky_map.ndim > 2 and int(sky_map.shape[0]) == 1:
+            sky_map = sky_map[0]
+        while depth_map.ndim > 2 and int(depth_map.shape[0]) == 1:
+            depth_map = depth_map[0]
+        if valid_map.ndim != 2 or sky_map.ndim != 2 or depth_map.ndim != 2:
+            raise ValueError(
+                "Keyframe depth, validity, and sky inputs must reduce to HxW"
+            )
+        if not (
+            tuple(valid_map.shape) == tuple(sky_map.shape) == tuple(depth_map.shape)
+        ):
+            raise ValueError(
+                "Keyframe depth, validity, and sky maps must share HxW"
+            )
+        static_valid = valid_map & ~sky_map
         coverage = float(static_valid.float().mean().item())
-        depth_map = depth.detach().cpu().float().squeeze()
-        if tuple(depth_map.shape) != tuple(static_valid.shape):
-            raise ValueError("Keyframe depth and spherical validity mask must share HxW")
         valid_depth = depth_map[static_valid]
         median_depth = (
             float(valid_depth.median().item()) if int(valid_depth.numel()) > 0 else 1.0

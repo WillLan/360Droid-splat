@@ -217,10 +217,10 @@ def test_spherical_keyframe_policy_combines_gap_descriptor_coverage_and_parallax
     frontend._last_keyframe_descriptor = None
     frontend._last_keyframe_pose = None
     frontend._last_keyframe_coverage = 0.0
-    valid = torch.ones(4, 8, dtype=torch.bool)
+    valid = torch.ones(1, 4, 8, dtype=torch.bool)
     sky = torch.zeros_like(valid)
-    confidence = torch.ones(4, 8) * 0.9
-    depth = torch.ones(4, 8) * 2.0
+    confidence = torch.ones(1, 4, 8) * 0.9
+    depth = torch.ones(1, 4, 8) * 2.0
     first_pose = torch.eye(4)
     descriptor = torch.nn.functional.normalize(torch.randn(32), dim=0)
 
