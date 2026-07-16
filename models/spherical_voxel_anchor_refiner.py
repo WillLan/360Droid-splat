@@ -11,7 +11,9 @@ parameters without changing camera poses or dense depth.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import math
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -405,16 +407,18 @@ class VoxelAnchorObservation:
         value = float(scale)
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError("Anchor geometry scale must be positive and finite.")
+        scaled_voxel_size = self.voxel_size * value
         floor = torch.cat(
             [
-                float(self.config.normal_scale_floor_ratio) * self.voxel_size,
-                float(self.config.tangent_scale_floor_ratio) * self.voxel_size,
-                float(self.config.tangent_scale_floor_ratio) * self.voxel_size,
+                float(self.config.normal_scale_floor_ratio) * scaled_voxel_size,
+                float(self.config.tangent_scale_floor_ratio) * scaled_voxel_size,
+                float(self.config.tangent_scale_floor_ratio) * scaled_voxel_size,
             ],
             dim=-1,
         ).clamp_min(1.0e-6)
-        base_scales = torch.maximum(torch.exp(self.base_log_scales) * value, floor)
-        current_scales = torch.maximum(self.scaling * value, floor)
+        min_scales = torch.maximum(self.min_scales * value, floor)
+        base_scales = torch.maximum(torch.exp(self.base_log_scales) * value, min_scales)
+        current_scales = torch.maximum(self.scaling * value, min_scales)
         poses = self.local_poses_c2w.clone()
         poses[:, :, :3, 3] *= value
         return replace(
@@ -424,8 +428,9 @@ class VoxelAnchorObservation:
             voxel_center=self.voxel_center * value,
             base_log_scales=base_scales.log(),
             log_scales=current_scales.log(),
-            min_scales=floor,
+            min_scales=min_scales,
             max_scales=torch.maximum(self.max_scales * value, current_scales),
+            voxel_size=scaled_voxel_size,
             local_poses_c2w=poses,
             membership=replace(
                 self.membership,
@@ -1023,9 +1028,67 @@ def load_voxel_anchor_checkpoint(
     *,
     model: VoxelAnchorStage3Model,
     map_location: torch.device | str = "cpu",
+    expected_sha256: str | None = None,
+    expected_adapter_sha256: str | None = None,
+    expected_stage2_checkpoint_sha256: str | None = None,
+    expected_config: VoxelAnchorConfig | None = None,
 ) -> dict[str, Any]:
+    checkpoint_path = Path(path)
+    if expected_sha256:
+        digest = hashlib.sha256()
+        with checkpoint_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256.lower() != str(expected_sha256).strip().lower():
+            raise ValueError(
+                "Voxel-anchor checkpoint SHA256 mismatch: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
     payload = torch.load(path, map_location=map_location, weights_only=False)
     if not isinstance(payload, dict) or payload.get("format") != "spherical_voxel_anchor_refiner_v1":
         raise ValueError(f"Unsupported voxel-anchor refiner checkpoint: {path}.")
+    if expected_adapter_sha256 is not None and str(
+        payload.get("adapter_sha256", "")
+    ) != str(expected_adapter_sha256):
+        raise ValueError(
+            "Voxel-anchor checkpoint was trained with a different adapter checkpoint"
+        )
+    if expected_stage2_checkpoint_sha256 is not None and str(
+        payload.get("stage2_checkpoint_sha256", "")
+    ) != str(expected_stage2_checkpoint_sha256):
+        raise ValueError(
+            "Voxel-anchor checkpoint was trained with a different Stage-2 checkpoint"
+        )
+    if expected_config is not None:
+        training_config = payload.get("training_config")
+        if not isinstance(training_config, dict) or not isinstance(
+            training_config.get("VoxelAnchorRefiner"), dict
+        ):
+            raise ValueError(
+                "Voxel-anchor checkpoint is missing its training VoxelAnchorRefiner config"
+            )
+        trained = VoxelAnchorConfig.from_mapping(
+            training_config["VoxelAnchorRefiner"]
+        )
+        for name in (
+            "depth_boundaries",
+            "voxel_sizes",
+            "alpha_threshold",
+            "depth_abs_threshold",
+            "depth_rel_threshold",
+            "tangent_scale_floor_ratio",
+            "normal_scale_floor_ratio",
+            "hidden_dim",
+            "adapter_dim",
+            "iterations",
+            "use_resnet_error",
+        ):
+            if getattr(trained, name) != getattr(expected_config, name):
+                raise ValueError(
+                    "Voxel-anchor checkpoint config mismatch for "
+                    f"{name}: trained={getattr(trained, name)!r}, "
+                    f"runtime={getattr(expected_config, name)!r}"
+                )
     model.load_state_dict(payload["model"], strict=True)
     return payload

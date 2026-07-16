@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 import math
+import time
 from typing import Any
 
 import torch
@@ -30,6 +32,7 @@ from geometry.sim3 import (
 )
 from models.spherical_voxel_anchor_refiner import voxelize_per_pixel_gaussians
 
+from .adapter import PanoRenderCamera, PFGS360Renderer
 from .mapper import PanoGaussianMap, PanoGaussianMapper
 from .sim3_graph import (
     CoincidentPanoramaFactor,
@@ -80,16 +83,47 @@ class HierarchicalSubmapRecord:
     compressed_dense_factors: int = 0
 
 
+@dataclass(frozen=True)
+class RenderedSharedFrame:
+    depth: torch.Tensor
+    alpha: torch.Tensor
+    anchor_visibility: torch.Tensor
+    render_seconds: float
+
+
 class SphericalSelfiGlobalBackend:
+    _MAP_TRANSACTION_METADATA = (
+        "_anchor_level",
+        "_anchor_voxel_size",
+        "_anchor_grid_coord",
+        "_anchor_obs_count",
+        "_anchor_conf_accum",
+        "_anchor_birth_frame",
+        "_anchor_last_seen_kf",
+        "_anchor_last_update_kf_ord",
+        "_anchor_source_window_id",
+        "_anchor_source_frame_start",
+        "_anchor_source_frame_end",
+        "_anchor_inlier_obs",
+        "_anchor_outlier_obs",
+        "_anchor_owner_window_id",
+        "_anchor_quality",
+        "_anchor_visibility_count",
+        "_anchor_render_error_ema",
+        "_anchor_depth_selected_levels",
+    )
+
     def __init__(
         self,
         gaussian_map: PanoGaussianMap,
         *,
         mapper: PanoGaussianMapper | None = None,
+        renderer: PFGS360Renderer | None = None,
         config: dict[str, Any] | None = None,
     ) -> None:
         self.map = gaussian_map
         self.mapper = mapper
+        self.renderer = renderer if renderer is not None else getattr(mapper, "renderer", None)
         self.config = dict(config or {})
         graph_cfg = dict(self.config.get("global_graph", {}) or {})
         loop_cfg = dict(self.config.get("loop_closure", {}) or {})
@@ -102,7 +136,118 @@ class SphericalSelfiGlobalBackend:
         optimize_cfg = dict(self.config.get("map_optimization", {}) or {})
         lazy_map_cfg = dict(optimize_cfg.get("lazy_submap_transforms", {}) or {})
         validation_cfg = dict(self.config.get("geometry_validation", {}) or {})
+        rendered_alignment_cfg = dict(
+            self.config.get("rendered_overlap_alignment", {}) or {}
+        )
+        insertion_dedup_cfg = dict(self.config.get("insertion_dedup", {}) or {})
         self.enabled = bool(self.config.get("enabled", False))
+        self.voxel_anchor_refiner_enabled = bool(
+            self.config.get("_voxel_anchor_refiner_enabled", False)
+        )
+        self.rendered_overlap_alignment_enabled = bool(
+            rendered_alignment_cfg.get("enabled", False)
+        )
+        self.rendered_overlap_alignment_mode = str(
+            rendered_alignment_cfg.get("mode", "shared_frame_scale_only")
+        ).strip().lower()
+        if (
+            self.rendered_overlap_alignment_enabled
+            and self.rendered_overlap_alignment_mode != "shared_frame_scale_only"
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment.mode must be 'shared_frame_scale_only'"
+            )
+        self.rendered_alignment_min_points = max(
+            3, int(rendered_alignment_cfg.get("min_points", 256))
+        )
+        self.rendered_alignment_max_points = max(
+            self.rendered_alignment_min_points,
+            int(rendered_alignment_cfg.get("max_points", 4096)),
+        )
+        self.rendered_alignment_alpha_threshold = float(
+            rendered_alignment_cfg.get("alpha_threshold", 0.05)
+        )
+        self.rendered_alignment_min_inlier_ratio = float(
+            rendered_alignment_cfg.get("min_inlier_ratio", 0.35)
+        )
+        self.rendered_alignment_max_median_relative_error = float(
+            rendered_alignment_cfg.get("max_median_relative_error", 0.10)
+        )
+        self.rendered_alignment_max_scale_change = float(
+            rendered_alignment_cfg.get("max_scale_change", 2.5)
+        )
+        if not 0.0 <= self.rendered_alignment_alpha_threshold <= 1.0:
+            raise ValueError(
+                "rendered_overlap_alignment.alpha_threshold must be in [0, 1]"
+            )
+        if not 0.0 <= self.rendered_alignment_min_inlier_ratio <= 1.0:
+            raise ValueError(
+                "rendered_overlap_alignment.min_inlier_ratio must be in [0, 1]"
+            )
+        if (
+            not math.isfinite(
+                self.rendered_alignment_max_median_relative_error
+            )
+            or self.rendered_alignment_max_median_relative_error < 0.0
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment.max_median_relative_error must be non-negative"
+            )
+        if (
+            not math.isfinite(self.rendered_alignment_max_scale_change)
+            or self.rendered_alignment_max_scale_change < 1.0
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment.max_scale_change must be at least 1"
+            )
+        self.rendered_alignment_failure_policy = str(
+            rendered_alignment_cfg.get("failure_policy", "error")
+        ).strip().lower()
+        if (
+            self.rendered_overlap_alignment_enabled
+            and self.rendered_alignment_failure_policy != "error"
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment.failure_policy must be 'error'"
+            )
+        self.insertion_dedup_enabled = bool(
+            insertion_dedup_cfg.get("enabled", False)
+        )
+        self.insertion_dedup_visible_only = bool(
+            insertion_dedup_cfg.get("visible_only", True)
+        )
+        self.insertion_dedup_same_level_only = bool(
+            insertion_dedup_cfg.get("same_level_only", True)
+        )
+        self.insertion_dedup_radius_voxels = float(
+            insertion_dedup_cfg.get("radius_voxels", 1.0)
+        )
+        if self.insertion_dedup_enabled and (
+            not math.isfinite(self.insertion_dedup_radius_voxels)
+            or self.insertion_dedup_radius_voxels <= 0.0
+        ):
+            raise ValueError("insertion_dedup.radius_voxels must be positive")
+        self.insertion_dedup_compare_existing_only = bool(
+            insertion_dedup_cfg.get("compare_existing_only", True)
+        )
+        self.insertion_dedup_permanent_drop = bool(
+            insertion_dedup_cfg.get("permanent_drop", True)
+        )
+        self.insertion_dedup_update_existing_statistics = bool(
+            insertion_dedup_cfg.get("update_existing_statistics", True)
+        )
+        if self.insertion_dedup_enabled and not all(
+            (
+                self.insertion_dedup_visible_only,
+                self.insertion_dedup_same_level_only,
+                self.insertion_dedup_compare_existing_only,
+                self.insertion_dedup_permanent_drop,
+            )
+        ):
+            raise ValueError(
+                "The supported insertion_dedup mode requires visible_only, "
+                "same_level_only, compare_existing_only, and permanent_drop"
+            )
         self.node_mode = str(graph_cfg.get("node_mode", "window_anchor")).lower()
         if self.node_mode not in {"window_anchor", "boundary_frame"}:
             raise ValueError("global_graph.node_mode must be 'window_anchor' or 'boundary_frame'")
@@ -176,6 +321,28 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(
                 "map_optimization.lazy_submap_transforms requires hierarchical_submaps.enabled"
             )
+        if self.voxel_anchor_refiner_enabled:
+            if not self.boundary_frame_graph:
+                raise ValueError(
+                    "VoxelAnchorRefiner requires global_graph.node_mode=boundary_frame"
+                )
+            if not self.rendered_overlap_alignment_enabled:
+                raise ValueError(
+                    "VoxelAnchorRefiner requires rendered_overlap_alignment.enabled=true"
+                )
+            if not self.insertion_dedup_enabled:
+                raise ValueError(
+                    "VoxelAnchorRefiner requires insertion_dedup.enabled=true"
+                )
+            if self.renderer is None:
+                raise ValueError(
+                    "VoxelAnchorRefiner rendered alignment requires a PFGS360 renderer"
+                )
+            if not self.lazy_submap_transforms_enabled:
+                raise ValueError(
+                    "VoxelAnchorRefiner requires "
+                    "map_optimization.lazy_submap_transforms.enabled=true"
+                )
         self.geometry_validation_enabled = bool(validation_cfg.get("enabled", True))
         self.geometry_tolerance = float(validation_cfg.get("tolerance", 1.0e-5))
         self.geometry_rollback_on_failure = bool(validation_cfg.get("rollback_on_failure", True))
@@ -375,7 +542,172 @@ class SphericalSelfiGlobalBackend:
         self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
         self._pending_seam_owner_windows: set[int] = set()
+        self._last_rendered_overlap_diagnostic: dict[str, torch.Tensor] | None = None
         self.results: list[GlobalWindowBackendResult] = []
+
+    @staticmethod
+    def _snapshot_graph_state(graph: GlobalSim3FactorGraph | None) -> dict[str, Any] | None:
+        if graph is None:
+            return None
+        return {
+            "nodes": {
+                int(node): transform.clone()
+                for node, transform in graph.nodes.items()
+            },
+            "edges": list(graph.edges),
+            "edge_metadata": [
+                copy.deepcopy(getattr(edge, "metadata", None))
+                for edge in graph.edges
+            ],
+            "fixed_node_id": graph.fixed_node_id,
+            "damping": float(graph.damping),
+            "last_pcg_iterations": int(graph._last_pcg_iterations),
+            "last_pcg_relative_residual": float(
+                graph._last_pcg_relative_residual
+            ),
+            "last_normal_condition_estimate": float(
+                graph._last_normal_condition_estimate
+            ),
+        }
+
+    @staticmethod
+    def _restore_graph_state(
+        graph: GlobalSim3FactorGraph | None,
+        state: dict[str, Any] | None,
+    ) -> None:
+        if graph is None or state is None:
+            return
+        graph.nodes = state["nodes"]
+        graph.edges = state["edges"]
+        for edge, metadata in zip(graph.edges, state["edge_metadata"]):
+            if metadata is not None and hasattr(edge, "metadata"):
+                edge.metadata.clear()
+                edge.metadata.update(metadata)
+        graph.fixed_node_id = state["fixed_node_id"]
+        graph.damping = state["damping"]
+        graph._last_pcg_iterations = state["last_pcg_iterations"]
+        graph._last_pcg_relative_residual = state[
+            "last_pcg_relative_residual"
+        ]
+        graph._last_normal_condition_estimate = state[
+            "last_normal_condition_estimate"
+        ]
+
+    def _snapshot_refined_transaction(self) -> dict[str, Any]:
+        loop_database = getattr(self.loop_detector, "_descriptor_database", None)
+        return {
+            "graph": self._snapshot_graph_state(self.graph),
+            "submap_graph": self._snapshot_graph_state(self.submap_graph),
+            "packets": dict(self.packets),
+            "accepted_loop_pairs": set(self.accepted_loop_pairs),
+            "submaps": copy.deepcopy(self.submaps),
+            "window_to_submap": dict(self.window_to_submap),
+            "active_submap_id": self._active_submap_id,
+            "last_full_packet": self._last_full_packet,
+            "window_order": list(self.window_order),
+            "frame_owner_window": dict(self.frame_owner_window),
+            "frame_depth_owner_window": dict(self.frame_depth_owner_window),
+            "frame_windows": {
+                int(frame): set(windows)
+                for frame, windows in self.frame_windows.items()
+            },
+            "window_anchor_nodes": dict(self.window_anchor_nodes),
+            "boundary_node_order": list(self.boundary_node_order),
+            "sequential_edges": self._sequential_edges_since_optimization,
+            "has_run_global_ba": self._has_run_global_ba,
+            "geometry_updates": dict(self._geometry_updates),
+            "pending_map_optimization": list(self._pending_map_optimization),
+            "optimization_packets": dict(self._optimization_packets),
+            "pending_seam_owner_windows": set(
+                self._pending_seam_owner_windows
+            ),
+            "results": list(self.results),
+            "rendered_overlap_diagnostic": self._last_rendered_overlap_diagnostic,
+            "fusion_depth_selected_mode": self.fusion._depth_selected_mode,
+            "fusion_last_pre_cap_count": self.fusion.last_pre_cap_count,
+            "fusion_last_saturated": self.fusion.last_saturated,
+            "map_parameters": dict(self.map._parameters),
+            "map_metadata": {
+                name: getattr(self.map, name)
+                for name in self._MAP_TRANSACTION_METADATA
+            },
+            "map_lazy_reference": {
+                int(owner): value.clone()
+                for owner, value in self.map._lazy_owner_reference_transforms.items()
+            },
+            "map_lazy_current": {
+                int(owner): value.clone()
+                for owner, value in self.map._lazy_owner_current_transforms.items()
+            },
+            "map_lazy_sh_cache": dict(self.map._lazy_sh_rotation_cache),
+            "loop_memory": list(self.loop_detector.memory),
+            "loop_descriptor_offsets": list(
+                getattr(self.loop_detector, "_descriptor_offsets", [])
+            ),
+            "loop_descriptor_rows": int(
+                getattr(self.loop_detector, "_descriptor_rows", 0)
+            ),
+            "loop_descriptor_database": loop_database,
+            "mapper_optimizer": (
+                None if self.mapper is None else self.mapper.optimizer
+            ),
+            "mapper_anchor_count": (
+                None
+                if self.mapper is None
+                else int(self.mapper.stats.n_anchors)
+            ),
+        }
+
+    def _restore_refined_transaction(self, state: dict[str, Any]) -> None:
+        self._restore_graph_state(self.graph, state["graph"])
+        self._restore_graph_state(self.submap_graph, state["submap_graph"])
+        self.packets = state["packets"]
+        self.accepted_loop_pairs = state["accepted_loop_pairs"]
+        self.submaps = state["submaps"]
+        self.window_to_submap = state["window_to_submap"]
+        self._active_submap_id = state["active_submap_id"]
+        self._last_full_packet = state["last_full_packet"]
+        self.window_order = state["window_order"]
+        self.frame_owner_window = state["frame_owner_window"]
+        self.frame_depth_owner_window = state["frame_depth_owner_window"]
+        self.frame_windows = state["frame_windows"]
+        self.window_anchor_nodes = state["window_anchor_nodes"]
+        self.boundary_node_order = state["boundary_node_order"]
+        self._sequential_edges_since_optimization = state["sequential_edges"]
+        self._has_run_global_ba = state["has_run_global_ba"]
+        self._geometry_updates = state["geometry_updates"]
+        self._pending_map_optimization = state["pending_map_optimization"]
+        self._optimization_packets = state["optimization_packets"]
+        self._pending_seam_owner_windows = state[
+            "pending_seam_owner_windows"
+        ]
+        self.results = state["results"]
+        self._last_rendered_overlap_diagnostic = state[
+            "rendered_overlap_diagnostic"
+        ]
+        self.fusion._depth_selected_mode = state["fusion_depth_selected_mode"]
+        self.fusion.last_pre_cap_count = state["fusion_last_pre_cap_count"]
+        self.fusion.last_saturated = state["fusion_last_saturated"]
+        self.map._parameters.clear()
+        self.map._parameters.update(state["map_parameters"])
+        for name, value in state["map_metadata"].items():
+            setattr(self.map, name, value)
+        self.map._lazy_owner_reference_transforms = state[
+            "map_lazy_reference"
+        ]
+        self.map._lazy_owner_current_transforms = state["map_lazy_current"]
+        self.map._lazy_sh_rotation_cache = state["map_lazy_sh_cache"]
+        self.loop_detector.memory = state["loop_memory"]
+        self.loop_detector._descriptor_offsets = state[
+            "loop_descriptor_offsets"
+        ]
+        self.loop_detector._descriptor_rows = state["loop_descriptor_rows"]
+        self.loop_detector._descriptor_database = state[
+            "loop_descriptor_database"
+        ]
+        if self.mapper is not None:
+            self.mapper.optimizer = state["mapper_optimizer"]
+            self.mapper.stats.n_anchors = state["mapper_anchor_count"]
 
     def _dense_factor_information_options(self) -> dict[str, bool | float]:
         return {
@@ -612,11 +944,459 @@ class SphericalSelfiGlobalBackend:
         packet.metadata["global_alignment_local_scale"] = value
 
     @staticmethod
+    def _rescaled_packet_copy(
+        packet: LocalGaussianWindowPacket,
+        scale: float,
+    ) -> LocalGaussianWindowPacket:
+        """Return an isolated packet whose complete geometry uses ``scale``."""
+
+        value = float(scale)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Invalid chunk scale normalization: {value}")
+        poses = packet.local_poses_c2w.detach().clone()
+        poses[:, :3, 3] *= value
+        poses[0] = torch.eye(4, device=poses.device, dtype=poses.dtype)
+        depth = packet.observation.refined_depth.detach().clone() * value
+        initial_depth = packet.observation.initial_depth.detach().clone() * value
+        geometry = packet.observation.with_geometry(
+            poses_c2w=poses.unsqueeze(0).to(packet.observation.poses_c2w),
+            refined_depth=depth.to(packet.observation.refined_depth),
+        )
+        observation = replace(
+            geometry,
+            initial_depth=initial_depth.to(geometry.initial_depth),
+            depth_residual=(
+                depth.to(geometry.refined_depth)
+                - initial_depth.to(geometry.refined_depth)
+            ),
+        )
+        metadata = dict(packet.metadata)
+        metadata["global_alignment_local_scale"] = value
+        return replace(
+            packet,
+            local_poses_c2w=poses,
+            observation=observation,
+            pre_depth_shift_depth=(
+                None
+                if packet.pre_depth_shift_depth is None
+                else packet.pre_depth_shift_depth.detach().clone() * value
+            ),
+            anchor_observation=(
+                None
+                if packet.anchor_observation is None
+                else packet.anchor_observation.rescale_geometry(value)
+            ),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _packet_uses_voxel_refiner(packet: LocalGaussianWindowPacket) -> bool:
+        return bool(packet.metadata.get("voxel_anchor_refiner_enabled", False))
+
+    def _validate_refined_packet(self, packet: LocalGaussianWindowPacket) -> bool:
+        refined = self._packet_uses_voxel_refiner(packet)
+        if self.voxel_anchor_refiner_enabled and not refined:
+            raise RuntimeError(
+                "VoxelAnchorRefiner is enabled but the frontend packet is not marked refined"
+            )
+        if not refined:
+            return False
+        if packet.anchor_observation is None:
+            raise RuntimeError(
+                "A refined frontend packet must contain anchor_observation"
+            )
+        if not self.rendered_overlap_alignment_enabled:
+            raise RuntimeError(
+                "Refined packets require rendered_overlap_alignment.enabled=true"
+            )
+        if not self.insertion_dedup_enabled:
+            raise RuntimeError(
+                "Refined packets require insertion_dedup.enabled=true"
+            )
+        if self.renderer is None:
+            raise RuntimeError("Rendered refined-anchor alignment requires a renderer")
+        return True
+
+    @staticmethod
+    def _single_camera_render_tensor(
+        package: dict[str, Any],
+        name: str,
+    ) -> torch.Tensor:
+        value = package.get(name)
+        if not torch.is_tensor(value):
+            raise RuntimeError(f"Renderer package is missing tensor {name!r}")
+        if value.ndim == 4:
+            if int(value.shape[0]) != 1:
+                raise RuntimeError(f"Single-camera {name} must have a leading size of one")
+            value = value[0]
+        if value.ndim == 2:
+            value = value.unsqueeze(0)
+        if value.ndim != 3 or int(value.shape[0]) != 1:
+            raise RuntimeError(
+                f"Single-camera {name} must have shape 1xHxW, got {tuple(value.shape)}"
+            )
+        return value
+
+    @staticmethod
+    def _single_camera_visibility(
+        package: dict[str, Any],
+        *,
+        expected_count: int,
+        require_accumulated: bool = False,
+    ) -> torch.Tensor:
+        accumulated = package.get("accum_visible")
+        if require_accumulated and not torch.is_tensor(accumulated):
+            raise RuntimeError(
+                "Rendered alignment/hash requires gsplat360 accum_visible"
+            )
+        value = (
+            accumulated
+            if torch.is_tensor(accumulated)
+            else package.get("visibility_filter")
+        )
+        if not torch.is_tensor(value):
+            raise RuntimeError("Renderer package is missing visibility_filter")
+        if value.ndim == 2:
+            if int(value.shape[0]) != 1:
+                raise RuntimeError(
+                    "Single-camera visibility_filter must have a leading size of one"
+                )
+            value = value[0]
+        value = value.bool().reshape(-1)
+        if int(value.numel()) != int(expected_count):
+            raise RuntimeError(
+                "Renderer visibility_filter does not match the Gaussian count: "
+                f"{int(value.numel())} != {int(expected_count)}"
+            )
+        return value
+
+    def _render_refined_anchor_shared_frame(
+        self,
+        packet: LocalGaussianWindowPacket,
+    ) -> RenderedSharedFrame:
+        if self.renderer is None or packet.anchor_observation is None:
+            raise RuntimeError("Refined-anchor rendering requires anchors and a renderer")
+        anchor = packet.anchor_observation
+        height, width = anchor.image_size
+        identity = torch.eye(4, device=anchor.xyz.device, dtype=anchor.xyz.dtype)
+        camera = PanoRenderCamera(height, width, identity)
+        explicit = anchor.materialize_batch([camera], batch_index=0)
+        if anchor.xyz.device.type == "cuda":
+            torch.cuda.synchronize(anchor.xyz.device)
+        start = time.perf_counter()
+        with torch.inference_mode():
+            package = self.renderer.render_cameras([camera], explicit)
+        if anchor.xyz.device.type == "cuda":
+            torch.cuda.synchronize(anchor.xyz.device)
+        elapsed = float(time.perf_counter() - start)
+        explicit_visibility = self._single_camera_visibility(
+            package,
+            expected_count=int(explicit.anchor_indices.numel()),
+            require_accumulated=isinstance(self.renderer, PFGS360Renderer),
+        )
+        visibility = torch.zeros(
+            anchor.num_anchors,
+            device=anchor.xyz.device,
+            dtype=torch.bool,
+        )
+        visibility[explicit.anchor_indices] = explicit_visibility.to(visibility.device)
+        return RenderedSharedFrame(
+            depth=self._single_camera_render_tensor(package, "depth"),
+            alpha=self._single_camera_render_tensor(package, "alpha"),
+            anchor_visibility=visibility,
+            render_seconds=elapsed,
+        )
+
+    def _render_global_shared_frame(
+        self,
+        shared_transform: torch.Tensor,
+        *,
+        image_size: tuple[int, int],
+    ) -> RenderedSharedFrame:
+        if self.renderer is None:
+            raise RuntimeError("Global shared-frame rendering requires a renderer")
+        height, width = (int(value) for value in image_size)
+        device, dtype = self.map.xyz.device, self.map.xyz.dtype
+        _, rotation, translation = sim3_components(
+            shared_transform.to(device=device, dtype=dtype)
+        )
+        c2w = torch.eye(4, device=device, dtype=dtype)
+        c2w[:3, :3] = rotation
+        c2w[:3, 3] = translation
+        camera = PanoRenderCamera(height, width, c2w)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        with torch.inference_mode():
+            package = self.renderer.render_cameras([camera], self.map)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = float(time.perf_counter() - start)
+        return RenderedSharedFrame(
+            depth=self._single_camera_render_tensor(package, "depth"),
+            alpha=self._single_camera_render_tensor(package, "alpha"),
+            anchor_visibility=self._single_camera_visibility(
+                package,
+                expected_count=self.map.anchor_count(),
+                require_accumulated=isinstance(self.renderer, PFGS360Renderer),
+            ),
+            render_seconds=elapsed,
+        )
+
+    def _estimate_rendered_depth_scale(
+        self,
+        local_depth: torch.Tensor,
+        global_depth: torch.Tensor,
+        *,
+        local_valid: torch.Tensor,
+        global_valid: torch.Tensor,
+        local_sky_probability: torch.Tensor | None,
+        global_sky_probability: torch.Tensor | None,
+        shared_scale: float,
+        seed: int,
+    ) -> tuple[float | None, dict[str, Any], torch.Tensor, torch.Tensor]:
+        """Estimate the absolute local-to-world scale from shared-frame depth."""
+
+        shared = float(shared_scale)
+        if not math.isfinite(shared) or shared <= 0.0:
+            raise ValueError("The shared graph-node scale must be positive and finite")
+        solve_start = time.perf_counter()
+        samples = sample_joint_valid_fibonacci_uv(
+            local_depth,
+            global_depth,
+            count=self.rendered_alignment_max_points,
+            oversample_factor=self.fibonacci_oversample_factor,
+            min_depth=self.fibonacci_min_depth,
+            max_depth=self.fibonacci_max_depth,
+            source_valid=local_valid,
+            target_valid=global_valid,
+            source_sky_probability=local_sky_probability,
+            target_sky_probability=global_sky_probability,
+            sky_threshold=self.sky_threshold,
+            seed=int(seed),
+        )
+        count = int(samples.source_depth.numel())
+        diagnostics: dict[str, Any] = {
+            "mode": "shared_frame_scale_only",
+            "shared_scale": shared,
+            "s_shared": shared,
+            "valid_points": count,
+            "fibonacci_seed": int(samples.seed),
+            "fibonacci_longitude_phase": float(samples.longitude_phase),
+        }
+        empty_inliers = torch.zeros(count, device=samples.source_depth.device, dtype=torch.bool)
+        if count < self.rendered_alignment_min_points:
+            diagnostics.update(
+                {
+                    "reason": "insufficient_rendered_overlap_support",
+                    "accepted": False,
+                    "scale_solve_seconds": float(time.perf_counter() - solve_start),
+                }
+            )
+            return None, diagnostics, samples.uv, empty_inliers
+
+        log_ratio = (
+            samples.target_depth.clamp_min(1.0e-8).log()
+            - samples.source_depth.clamp_min(1.0e-8).log()
+        )
+        estimate = log_ratio.median()
+        for _ in range(3):
+            residual = log_ratio - estimate
+            centered = residual - residual.median()
+            mad = centered.abs().median()
+            robust_sigma = (1.4826 * mad).clamp_min(1.0e-6)
+            huber_delta = (1.345 * robust_sigma).clamp_min(1.0e-4)
+            weights = torch.where(
+                residual.abs() <= huber_delta,
+                torch.ones_like(residual),
+                huber_delta / residual.abs().clamp_min(1.0e-8),
+            )
+            estimate = (weights * log_ratio).sum() / weights.sum().clamp_min(1.0e-8)
+
+        absolute_scale_tensor = estimate.exp()
+        absolute_scale = float(absolute_scale_tensor.detach().cpu())
+        correction = absolute_scale / shared
+        aligned_local = samples.source_depth * absolute_scale_tensor
+        relative_error = (
+            (aligned_local - samples.target_depth).abs()
+            / samples.target_depth.abs().clamp_min(1.0e-6)
+        )
+        inliers = (
+            relative_error <= self.rendered_alignment_max_median_relative_error
+        )
+        inlier_ratio = float(inliers.float().mean().detach().cpu())
+        median_error = float(relative_error.median().detach().cpu())
+        p90_error = float(
+            torch.quantile(relative_error.float(), 0.90).detach().cpu()
+        )
+        scale_ok = (
+            math.isfinite(correction)
+            and 1.0 / self.rendered_alignment_max_scale_change
+            <= correction
+            <= self.rendered_alignment_max_scale_change
+        )
+        accepted = (
+            scale_ok
+            and inlier_ratio >= self.rendered_alignment_min_inlier_ratio
+            and median_error <= self.rendered_alignment_max_median_relative_error
+        )
+        diagnostics.update(
+            {
+                "absolute_scale": absolute_scale,
+                "s_absolute": absolute_scale,
+                "chunk_scale_normalization": correction,
+                "c": correction,
+                "inlier_points": int(inliers.sum().item()),
+                "inlier_ratio": inlier_ratio,
+                "median_relative_error": median_error,
+                "p90_relative_error": p90_error,
+                "accepted": bool(accepted),
+                "reason": "accepted" if accepted else "rendered_scale_gate_rejected",
+                "scale_solve_seconds": float(time.perf_counter() - solve_start),
+            }
+        )
+        return (
+            correction if accepted else None,
+            diagnostics,
+            samples.uv,
+            inliers,
+        )
+
+    def _rendered_shared_frame_alignment(
+        self,
+        previous: LocalGaussianWindowPacket,
+        target: LocalGaussianWindowPacket,
+        shared_transform: torch.Tensor,
+    ) -> tuple[float | None, dict[str, Any]]:
+        if target.anchor_observation is None:
+            raise RuntimeError("Rendered overlap alignment requires refined anchors")
+        frame_id = int(target.frame_ids[0])
+        if int(previous.frame_ids[-1]) != frame_id:
+            raise RuntimeError(
+                "Rendered overlap alignment requires previous last == current first"
+            )
+        previous_index = previous.frame_index(frame_id)
+        target_index = target.frame_index(frame_id)
+        local_render = self._render_refined_anchor_shared_frame(target)
+        global_render = self._render_global_shared_frame(
+            shared_transform,
+            image_size=target.anchor_observation.image_size,
+        )
+        global_depth = global_render.depth.to(local_render.depth)
+        global_alpha = global_render.alpha.to(local_render.alpha)
+        local_semantic_valid = (
+            target.finite_gaussian_mask[0, target_index]
+            & target.static_mask[0, target_index]
+            & target.geometry_consistency[0, target_index]
+            & ~target.sky_mask[0, target_index]
+        ).to(local_render.depth.device)
+        global_semantic_valid = (
+            previous.finite_gaussian_mask[0, previous_index]
+            & previous.static_mask[0, previous_index]
+            & previous.geometry_consistency[0, previous_index]
+            & ~previous.sky_mask[0, previous_index]
+        ).to(local_render.depth.device)
+        local_valid = (
+            local_semantic_valid
+            & torch.isfinite(local_render.depth)
+            & (local_render.depth > 0.0)
+            & torch.isfinite(local_render.alpha)
+            & (local_render.alpha >= self.rendered_alignment_alpha_threshold)
+        )
+        global_valid = (
+            global_semantic_valid
+            & torch.isfinite(global_depth)
+            & (global_depth > 0.0)
+            & torch.isfinite(global_alpha)
+            & (global_alpha >= self.rendered_alignment_alpha_threshold)
+        )
+        shared_scale, _, _ = sim3_components(shared_transform)
+        seed = (
+            self.fibonacci_seed
+            + 1_000_003 * int(previous.window_id)
+            + 10_007 * int(target.window_id)
+            + 101 * frame_id
+        ) & 0x7FFFFFFF
+        correction, diagnostics, sampled_uv, inliers = (
+            self._estimate_rendered_depth_scale(
+                local_render.depth,
+                global_depth,
+                local_valid=local_valid,
+                global_valid=global_valid,
+                local_sky_probability=target.sky_prob[0, target_index].to(
+                    local_render.depth
+                ),
+                global_sky_probability=previous.sky_prob[0, previous_index].to(
+                    local_render.depth
+                ),
+                shared_scale=float(shared_scale.detach().cpu()),
+                seed=seed,
+            )
+        )
+        diagnostics.update(
+            {
+                "source_window_id": int(previous.window_id),
+                "target_window_id": int(target.window_id),
+                "shared_frame_id": frame_id,
+                "local_render_seconds": local_render.render_seconds,
+                "global_render_seconds": global_render.render_seconds,
+                "render_seconds": (
+                    local_render.render_seconds + global_render.render_seconds
+                ),
+                "canonical_rotation_mismatch_deg": 0.0,
+                "canonical_translation_mismatch": 0.0,
+            }
+        )
+        inlier_map = torch.zeros_like(local_render.depth, dtype=torch.bool)
+        if int(sampled_uv.numel()) > 0 and bool(inliers.any()):
+            uv = sampled_uv[inliers]
+            columns = torch.floor(uv[:, 0]).long().clamp(
+                0, int(inlier_map.shape[-1]) - 1
+            )
+            rows = torch.floor(uv[:, 1]).long().clamp(
+                0, int(inlier_map.shape[-2]) - 1
+            )
+            inlier_map[0, rows, columns] = True
+        sky_union = (
+            target.sky_mask[0, target_index]
+            | previous.sky_mask[0, previous_index].to(target.sky_mask.device)
+        )
+        absolute_scale = float(diagnostics.get("absolute_scale", 1.0))
+        aligned_local_depth = local_render.depth * absolute_scale
+        relative_error = (
+            (aligned_local_depth - global_depth).abs()
+            / global_depth.abs().clamp_min(1.0e-6)
+        )
+        self._last_rendered_overlap_diagnostic = {
+            "local_depth": local_render.depth.detach().cpu().float(),
+            "aligned_local_depth": aligned_local_depth.detach().cpu().float(),
+            "global_depth": global_depth.detach().cpu().float(),
+            "relative_error": relative_error.detach().cpu().float(),
+            "local_alpha": local_render.alpha.detach().cpu().float(),
+            "global_alpha": global_alpha.detach().cpu().float(),
+            "sky_mask": sky_union.detach().cpu().bool(),
+            "valid_mask": (local_valid & global_valid).detach().cpu().bool(),
+            "inlier_mask": inlier_map.detach().cpu().bool(),
+        }
+        return correction, diagnostics
+
+    def consume_rendered_overlap_diagnostic(
+        self,
+    ) -> dict[str, torch.Tensor] | None:
+        diagnostic = self._last_rendered_overlap_diagnostic
+        self._last_rendered_overlap_diagnostic = None
+        return diagnostic
+
+    @staticmethod
     def _rebuild_packet_anchor_geometry(packet: LocalGaussianWindowPacket) -> bool:
         """Re-voxelize anchors after a non-uniform per-frame depth replacement."""
 
         if packet.anchor_observation is None:
             return False
+        if bool(packet.metadata.get("voxel_anchor_refiner_enabled", False)):
+            raise RuntimeError(
+                "Refined anchor packets must never be re-voxelized in the backend"
+            )
         config = packet.anchor_observation.config
         observation = packet.observation
         images = observation.refined_depth.new_zeros(
@@ -2169,7 +2949,7 @@ class SphericalSelfiGlobalBackend:
             metadata=metadata,
         )
 
-    def _process_boundary_packet(
+    def _process_boundary_packet_impl(
         self,
         packet: LocalGaussianWindowPacket,
     ) -> GlobalWindowBackendResult:
@@ -2180,6 +2960,11 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(f"Duplicate local Gaussian window id {window_id}")
         if len(packet.frame_ids) < 2:
             raise ValueError("Boundary-frame graph requires at least two frames per window")
+        refined_packet = self._validate_refined_packet(packet)
+        if refined_packet:
+            # Keep the frontend-owned packet immutable even for the first
+            # chunk or for failures after alignment has succeeded.
+            packet = self._rescaled_packet_copy(packet, 1.0)
 
         start_frame = int(packet.frame_ids[0])
         end_frame = int(packet.frame_ids[-1])
@@ -2187,7 +2972,19 @@ class SphericalSelfiGlobalBackend:
         if not self.window_order:
             aligned = True
             start_transform = sim3_identity(device=packet.local_poses_c2w.device)
-            alignment_diagnostics = {"reason": "first_window", "chunk_scale_normalization": 1.0}
+            alignment_diagnostics = {
+                "reason": "first_window",
+                "mode": (
+                    "shared_frame_scale_only" if refined_packet else "legacy_sim3"
+                ),
+                "shared_scale": 1.0,
+                "s_shared": 1.0,
+                "absolute_scale": 1.0,
+                "s_absolute": 1.0,
+                "chunk_scale_normalization": 1.0,
+                "c": 1.0,
+                "accepted": True,
+            }
         else:
             previous_id = int(self.window_order[-1])
             previous_packet = self._last_full_packet
@@ -2200,86 +2997,104 @@ class SphericalSelfiGlobalBackend:
                 )
             if start_frame not in self.graph.nodes:
                 raise RuntimeError(f"Shared boundary node {start_frame} is missing")
-            alignment_attempts: list[dict[str, Any]] = []
-            measurement, attempt_diagnostics = self._shared_frame_alignment(
-                previous_packet, packet
-            )
-            alignment_attempts.append(
-                {"stage": "ba_pose_shifted_depth", **attempt_diagnostics}
-            )
-            recovery_stage = "ba_pose_shifted_depth"
-            if measurement is None and self._restore_packet_pre_shift_depth(packet):
-                measurement, attempt_diagnostics = self._shared_frame_alignment(
-                    previous_packet, packet
+            if refined_packet:
+                start_transform = self.graph.transform(start_frame).clone()
+                local_scale, alignment_diagnostics = (
+                    self._rendered_shared_frame_alignment(
+                        previous_packet,
+                        packet,
+                        start_transform,
+                    )
                 )
-                alignment_attempts.append(
-                    {"stage": "ba_pose_depth_shift_rollback", **attempt_diagnostics}
-                )
-                recovery_stage = "ba_pose_depth_shift_rollback"
-            if measurement is None:
-                self._synchronize_shared_canonical_depth(
-                    previous_packet,
-                    packet,
-                    start_frame,
-                )
-                measurement, attempt_diagnostics = self._shared_frame_alignment(
-                    previous_packet, packet
-                )
-                alignment_attempts.append(
-                    {"stage": "canonical_depth_retry", **attempt_diagnostics}
-                )
-                recovery_stage = "canonical_depth_retry"
-            alignment_diagnostics = dict(attempt_diagnostics)
-            alignment_diagnostics.update(
-                {
-                    "alignment_attempts": alignment_attempts,
-                    "alignment_recovery_stage": recovery_stage,
-                    "depth_shift_rollback": bool(
-                        packet.metadata.get("depth_shift_rollback", False)
-                    ),
-                }
-            )
-            if measurement is None:
-                if not self.allow_unaligned_fallback:
+                if local_scale is None:
                     raise RuntimeError(
-                        f"Window {window_id} cannot be aligned to previous window {previous_id}: "
+                        f"Window {window_id} rendered shared-frame scale alignment failed: "
                         f"{alignment_diagnostics.get('reason', 'unknown')}"
                     )
-                start_transform = self.graph.transform(start_frame).clone()
-                aligned = False
-            else:
-                previous_anchor = self.window_anchor_nodes[previous_id]
-                raw_start_transform = (
-                    self.graph.transform(previous_anchor)
-                    @ measurement.to(self.graph.transform(previous_anchor))
-                )
-                start_transform = self.graph.transform(start_frame).clone()
-                canonicalization = sim3_inverse(start_transform) @ raw_start_transform
-                scale, rotation, translation = sim3_components(canonicalization)
-                local_scale = float(scale.detach().cpu())
-                self._rescale_packet_geometry(packet, local_scale)
-                self._synchronize_shared_canonical_depth(
-                    previous_packet,
-                    packet,
-                    start_frame,
-                )
+                packet = self._rescaled_packet_copy(packet, local_scale)
                 packet.pre_depth_shift_depth = None
-                rotation_trace = rotation.diagonal().sum()
-                rotation_angle = torch.acos(
-                    ((rotation_trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+                aligned = True
+            else:
+                alignment_attempts: list[dict[str, Any]] = []
+                measurement, attempt_diagnostics = self._shared_frame_alignment(
+                    previous_packet, packet
                 )
+                alignment_attempts.append(
+                    {"stage": "ba_pose_shifted_depth", **attempt_diagnostics}
+                )
+                recovery_stage = "ba_pose_shifted_depth"
+                if measurement is None and self._restore_packet_pre_shift_depth(packet):
+                    measurement, attempt_diagnostics = self._shared_frame_alignment(
+                        previous_packet, packet
+                    )
+                    alignment_attempts.append(
+                        {"stage": "ba_pose_depth_shift_rollback", **attempt_diagnostics}
+                    )
+                    recovery_stage = "ba_pose_depth_shift_rollback"
+                if measurement is None:
+                    self._synchronize_shared_canonical_depth(
+                        previous_packet,
+                        packet,
+                        start_frame,
+                    )
+                    measurement, attempt_diagnostics = self._shared_frame_alignment(
+                        previous_packet, packet
+                    )
+                    alignment_attempts.append(
+                        {"stage": "canonical_depth_retry", **attempt_diagnostics}
+                    )
+                    recovery_stage = "canonical_depth_retry"
+                alignment_diagnostics = dict(attempt_diagnostics)
                 alignment_diagnostics.update(
                     {
-                        "chunk_scale_normalization": local_scale,
-                        "canonical_rotation_mismatch_deg": float(
-                            torch.rad2deg(rotation_angle).detach().cpu()
-                        ),
-                        "canonical_translation_mismatch": float(
-                            translation.norm().detach().cpu()
+                        "alignment_attempts": alignment_attempts,
+                        "alignment_recovery_stage": recovery_stage,
+                        "depth_shift_rollback": bool(
+                            packet.metadata.get("depth_shift_rollback", False)
                         ),
                     }
                 )
-                aligned = True
+                if measurement is None:
+                    if not self.allow_unaligned_fallback:
+                        raise RuntimeError(
+                            f"Window {window_id} cannot be aligned to previous window {previous_id}: "
+                            f"{alignment_diagnostics.get('reason', 'unknown')}"
+                        )
+                    start_transform = self.graph.transform(start_frame).clone()
+                    aligned = False
+                else:
+                    previous_anchor = self.window_anchor_nodes[previous_id]
+                    raw_start_transform = (
+                        self.graph.transform(previous_anchor)
+                        @ measurement.to(self.graph.transform(previous_anchor))
+                    )
+                    start_transform = self.graph.transform(start_frame).clone()
+                    canonicalization = sim3_inverse(start_transform) @ raw_start_transform
+                    scale, rotation, translation = sim3_components(canonicalization)
+                    local_scale = float(scale.detach().cpu())
+                    self._rescale_packet_geometry(packet, local_scale)
+                    self._synchronize_shared_canonical_depth(
+                        previous_packet,
+                        packet,
+                        start_frame,
+                    )
+                    packet.pre_depth_shift_depth = None
+                    rotation_trace = rotation.diagonal().sum()
+                    rotation_angle = torch.acos(
+                        ((rotation_trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+                    )
+                    alignment_diagnostics.update(
+                        {
+                            "chunk_scale_normalization": local_scale,
+                            "canonical_rotation_mismatch_deg": float(
+                                torch.rad2deg(rotation_angle).detach().cpu()
+                            ),
+                            "canonical_translation_mismatch": float(
+                                translation.norm().detach().cpu()
+                            ),
+                        }
+                    )
+                    aligned = True
 
         # Recovery state is needed only while this packet is the incoming
         # target.  Once admitted it becomes the canonical source for the next
@@ -2476,6 +3291,78 @@ class SphericalSelfiGlobalBackend:
             else {"moved": 0, "deduplicated": 0}
         )
 
+        window_transform = self._window_anchor_transforms()[window_id]
+        if refined_packet:
+            prepare_start = time.perf_counter()
+            prepared = self.fusion.prepare_packet_batch(packet, window_transform)
+            prepare_seconds = float(time.perf_counter() - prepare_start)
+            hash_stats: dict[str, int | float] = {
+                "hash_requested": int(prepared.requested),
+                "hash_candidates": len(prepared.batch),
+                "hash_visible_incoming": 0,
+                "hash_visible_existing": 0,
+                "hash_hits": 0,
+                "hash_kept": len(prepared.batch),
+                "hash_radius_voxels": self.insertion_dedup_radius_voxels,
+            }
+            for level in range(len(self.fusion.voxel_sizes)):
+                level_incoming = int(
+                    (prepared.batch.level == level).sum().detach().cpu()
+                )
+                hash_stats[f"hash_level_{level}_incoming"] = level_incoming
+                hash_stats[f"hash_level_{level}_visible"] = 0
+                hash_stats[f"hash_level_{level}_hits"] = 0
+                hash_stats[f"hash_level_{level}_kept"] = level_incoming
+            evidence_update = None
+            insertion_render_seconds = 0.0
+            hash_seconds = 0.0
+            if self.insertion_dedup_enabled and self.map.anchor_count() > 0:
+                incoming_render = self._render_refined_anchor_shared_frame(packet)
+                existing_render = self._render_global_shared_frame(
+                    self.graph.transform(start_frame),
+                    image_size=packet.anchor_observation.image_size,
+                )
+                insertion_render_seconds = (
+                    incoming_render.render_seconds + existing_render.render_seconds
+                )
+                hash_start = time.perf_counter()
+                prepared, hash_stats, evidence_update = (
+                    self.fusion.filter_against_visible_map(
+                        prepared,
+                        incoming_anchor_visibility=incoming_render.anchor_visibility,
+                        existing_anchor_visibility=existing_render.anchor_visibility,
+                        radius_voxels=self.insertion_dedup_radius_voxels,
+                        update_existing_statistics=(
+                            self.insertion_dedup_update_existing_statistics
+                        ),
+                    )
+                )
+                hash_seconds = float(time.perf_counter() - hash_start)
+            commit_start = time.perf_counter()
+            fusion_stats = self.fusion.commit_prepared_packet(
+                packet,
+                window_transform,
+                prepared,
+                evidence_update=evidence_update,
+                extra_stats={
+                    **hash_stats,
+                    "fusion_prepare_seconds": prepare_seconds,
+                    "insertion_render_seconds": insertion_render_seconds,
+                    "insertion_hash_seconds": hash_seconds,
+                    "refiner_seconds": float(
+                        packet.metadata.get("voxel_anchor_refiner_seconds", 0.0)
+                    ),
+                },
+            )
+            fusion_stats["fusion_commit_seconds"] = float(
+                time.perf_counter() - commit_start
+            )
+        else:
+            fusion_stats = self.fusion.fuse_packet(
+                packet,
+                window_transform,
+            )
+
         compact_packet = packet.compact_for_memory()
         self.packets[window_id] = compact_packet
         self._last_full_packet = packet
@@ -2486,10 +3373,6 @@ class SphericalSelfiGlobalBackend:
             self.frame_owner_window.setdefault(frame, window_id)
             self.frame_depth_owner_window.setdefault(frame, window_id)
 
-        fusion_stats = self.fusion.fuse_packet(
-            packet,
-            self._window_anchor_transforms()[window_id],
-        )
         if self.lifecycle_prune_interval > 0 and (
             len(self.window_order) % self.lifecycle_prune_interval == 0
         ):
@@ -2562,6 +3445,19 @@ class SphericalSelfiGlobalBackend:
         )
         self.results.append(result)
         return result
+
+    def _process_boundary_packet(
+        self,
+        packet: LocalGaussianWindowPacket,
+    ) -> GlobalWindowBackendResult:
+        if not self._packet_uses_voxel_refiner(packet):
+            return self._process_boundary_packet_impl(packet)
+        transaction = self._snapshot_refined_transaction()
+        try:
+            return self._process_boundary_packet_impl(packet)
+        except Exception:
+            self._restore_refined_transaction(transaction)
+            raise
 
     def process_packet(self, packet: LocalGaussianWindowPacket) -> GlobalWindowBackendResult:
         if self.boundary_frame_graph:

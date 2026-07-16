@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import hashlib
 import math
 from pathlib import Path
 import time
@@ -60,6 +61,14 @@ def _finite_optional_float(value: Any) -> float | None:
         return None
     scalar = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
     return scalar if math.isfinite(scalar) else None
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _split_stage3_cache_for_validation(
@@ -287,23 +296,39 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.voxel_anchor_model: VoxelAnchorStage3Model | None = None
         self.voxel_anchor_renderer: PFGS360Renderer | None = None
         self.voxel_anchor_config: VoxelAnchorConfig | None = None
+        self.voxel_anchor_last_seconds = 0.0
         if self.voxel_anchor_enabled:
             checkpoint = voxel_cfg.get("checkpoint")
             if not checkpoint:
                 raise ValueError(
                     "VoxelAnchorRefiner.checkpoint is required when VoxelAnchorRefiner.enabled=true"
                 )
+            if not voxel_cfg.get("sha256"):
+                raise ValueError(
+                    "VoxelAnchorRefiner.sha256 is required for formal runtime validation"
+                )
             self.voxel_anchor_config = VoxelAnchorConfig.from_mapping(voxel_cfg)
-            self.voxel_anchor_model = VoxelAnchorStage3Model(self.voxel_anchor_config).to(
-                self.head_device
+            runtime_voxel_config = replace(
+                self.voxel_anchor_config,
+                pretrained_resnet=False,
             )
+            self.voxel_anchor_model = VoxelAnchorStage3Model(
+                runtime_voxel_config
+            ).to(self.head_device)
+            stage2_sha = _sha256_file(checkpoint_cfg["path"])
             load_voxel_anchor_checkpoint(
                 str(checkpoint),
                 model=self.voxel_anchor_model,
                 map_location=self.head_device,
+                expected_sha256=voxel_cfg.get("sha256"),
+                expected_adapter_sha256=self.adapter_sha,
+                expected_stage2_checkpoint_sha256=stage2_sha,
+                expected_config=self.voxel_anchor_config,
             )
             self.voxel_anchor_model.eval()
-            renderer_cfg = dict(config.get("renderer", {}) or {})
+            renderer_cfg = dict(
+                config.get("Renderer", config.get("renderer", {})) or {}
+            )
             self.voxel_anchor_renderer = PFGS360Renderer(
                 config=config,
                 extra_gsplat360_roots=list(
@@ -1077,6 +1102,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         assert self.voxel_anchor_config is not None
         assert self.voxel_anchor_model is not None
         assert self.voxel_anchor_renderer is not None
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        refiner_start = time.perf_counter()
 
         target_images = images.to(self.head_device)
         if tuple(target_images.shape[-2:]) != tuple(observation.image_size):
@@ -1120,7 +1148,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 if iteration < self.voxel_anchor_config.iterations - 1:
                     current = current.detach_parameters()
                     hidden = hidden.detach()
-        return current.detach_for_backend()
+        result = current.detach_for_backend()
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        self.voxel_anchor_last_seconds = float(time.perf_counter() - refiner_start)
+        return result
 
     def _spherical_keyframe_decision(
         self,
@@ -1401,6 +1433,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "voxel_anchor_count": (
                     0 if anchor_observation is None else anchor_observation.num_anchors
                 ),
+                "voxel_anchor_refiner_seconds": self.voxel_anchor_last_seconds,
             },
         )
         self.enqueue_local_gaussian_window(packet)

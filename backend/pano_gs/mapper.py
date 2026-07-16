@@ -335,6 +335,32 @@ class PanoGaussianMap(nn.Module):
             },
         }
 
+    def materialized_anchor_voxel_size(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Return per-anchor voxel sizes after lazy owner Sim(3) corrections."""
+
+        target_device = self.xyz.device if device is None else torch.device(device)
+        target_dtype = self.xyz.dtype if dtype is None else dtype
+        output = self._anchor_voxel_size.to(
+            device=target_device,
+            dtype=target_dtype,
+        ).clone()
+        if not self._lazy_owner_transforms_enabled or output.numel() == 0:
+            return output
+        for owner, mask in self._lazy_owner_masks(device=target_device):
+            delta = self._lazy_owner_delta(
+                owner,
+                device=target_device,
+                dtype=target_dtype,
+            )
+            scale, _, _ = sim3_components(delta)
+            output[mask] *= scale
+        return output
+
     def _lazy_owner_masks(
         self,
         *,

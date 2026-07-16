@@ -1201,6 +1201,93 @@ class SlamRuntimeLogger:
         except Exception:
             return
 
+    def observe_rendered_overlap_alignment(
+        self,
+        diagnostic: dict[str, torch.Tensor] | None,
+        *,
+        window_id: int,
+        step: int | None = None,
+    ) -> Path | None:
+        if not diagnostic:
+            return None
+
+        def scalar_panel(name: str, label: str, *, positive: bool = False) -> Image.Image:
+            value = diagnostic.get(name)
+            if not torch.is_tensor(value):
+                panel = Image.new("RGB", (640, 320), "black")
+            else:
+                tensor = value.detach().cpu().float()
+                while tensor.ndim > 2:
+                    tensor = tensor[0]
+                valid = torch.isfinite(tensor)
+                if positive:
+                    valid &= tensor > 0.0
+                panel = Image.fromarray(
+                    _scalar_to_rgb(tensor.numpy(), valid.numpy()),
+                    mode="RGB",
+                )
+            ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
+            return panel
+
+        def mask_overlay() -> Image.Image:
+            sky = diagnostic["sky_mask"].detach().cpu().bool()
+            valid = diagnostic["valid_mask"].detach().cpu().bool()
+            inlier = diagnostic["inlier_mask"].detach().cpu().bool()
+            while sky.ndim > 2:
+                sky = sky[0]
+                valid = valid[0]
+                inlier = inlier[0]
+            rgb = np.zeros((*sky.shape, 3), dtype=np.uint8)
+            rgb[valid.numpy()] = np.array([64, 128, 255], dtype=np.uint8)
+            rgb[sky.numpy()] = np.array([255, 160, 0], dtype=np.uint8)
+            rgb[inlier.numpy()] = np.array([0, 255, 64], dtype=np.uint8)
+            panel = Image.fromarray(rgb, mode="RGB")
+            ImageDraw.Draw(panel).text(
+                (8, 8),
+                "mask: orange=sky blue=valid green=inlier",
+                fill=(255, 255, 255),
+            )
+            return panel
+
+        panels = [
+            scalar_panel("local_depth", "raw local depth", positive=True),
+            scalar_panel("aligned_local_depth", "aligned local depth", positive=True),
+            scalar_panel("global_depth", "global-map depth", positive=True),
+            scalar_panel("relative_error", "relative depth error"),
+            scalar_panel("local_alpha", "local anchor alpha"),
+            scalar_panel("global_alpha", "global-map alpha"),
+            mask_overlay(),
+            Image.new("RGB", (640, 320), "black"),
+        ]
+        target_size = panels[0].size
+        panels = [
+            panel
+            if panel.size == target_size
+            else panel.resize(target_size, Image.Resampling.NEAREST)
+            for panel in panels
+        ]
+        width, height = target_size
+        canvas = Image.new("RGB", (4 * width, 2 * height), "black")
+        for index, panel in enumerate(panels):
+            canvas.paste(panel, ((index % 4) * width, (index // 4) * height))
+        canvas = _resize_to_max_width(canvas, max(960, self.kf_opt_max_width))
+        path = None
+        if self.save_local:
+            directory = self.visualization_dir / "rendered_overlap_alignment"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"window_{int(window_id):06d}.png"
+            canvas.save(path)
+        if self.run is not None and self._wandb is not None:
+            payload = {
+                "backend/rendered_overlap_alignment": self._wandb.Image(
+                    str(path) if path is not None else canvas
+                )
+            }
+            if path is not None and self.log_image_paths:
+                payload["backend/rendered_overlap_alignment_png"] = str(path)
+            self._log_wandb_payload(payload, step=step)
+        return path
+
     def log_artifact_file(self, path: Path) -> None:
         if self.run is None:
             return
@@ -1739,10 +1826,74 @@ class PanoDroidGSSlamSystem:
                 if value is not None:
                     graph_cfg.setdefault(key, value)
             spherical_global_cfg["global_graph"] = graph_cfg
+            voxel_cfg = dict(config.get("VoxelAnchorRefiner", {}) or {})
+            voxel_refiner_enabled = bool(voxel_cfg.get("enabled", False))
+            spherical_global_cfg["_voxel_anchor_refiner_enabled"] = (
+                voxel_refiner_enabled
+            )
+            if voxel_refiner_enabled:
+                rendered_cfg = dict(
+                    spherical_global_cfg.get("rendered_overlap_alignment", {}) or {}
+                )
+                dedup_cfg = dict(
+                    spherical_global_cfg.get("insertion_dedup", {}) or {}
+                )
+                if not bool(rendered_cfg.get("enabled", False)):
+                    raise ValueError(
+                        "VoxelAnchorRefiner requires "
+                        "SphericalSelfiGlobalBackend.rendered_overlap_alignment.enabled=true"
+                    )
+                if not bool(dedup_cfg.get("enabled", False)):
+                    raise ValueError(
+                        "VoxelAnchorRefiner requires "
+                        "SphericalSelfiGlobalBackend.insertion_dedup.enabled=true"
+                    )
+                voxel_sizes = tuple(
+                    float(value)
+                    for value in voxel_cfg.get(
+                        "voxel_sizes", (0.04, 0.08, 0.16, 0.32)
+                    )
+                )
+                fusion_sizes = tuple(
+                    float(value)
+                    for value in (
+                        spherical_global_cfg.get("voxel_fusion", {}) or {}
+                    ).get("voxel_sizes", (0.04, 0.08, 0.16, 0.32))
+                )
+                if voxel_sizes != fusion_sizes:
+                    raise ValueError(
+                        "VoxelAnchorRefiner.voxel_sizes must exactly match "
+                        "SphericalSelfiGlobalBackend.voxel_fusion.voxel_sizes"
+                    )
+                adapter_dim = int(voxel_cfg.get("adapter_dim", 24))
+                head_cfg = dict(config.get("head", {}) or {})
+                if int(head_cfg.get("feature_dim", 24)) != adapter_dim:
+                    raise ValueError(
+                        "VoxelAnchorRefiner.adapter_dim must match head.feature_dim"
+                    )
+                if int(voxel_cfg.get("iterations", 3)) != 3:
+                    raise ValueError(
+                        "VoxelAnchorRefiner requires exactly three refinement iterations"
+                    )
+                if int(head_cfg.get("rgb_sh_degree", 2)) != 2:
+                    raise ValueError(
+                        "VoxelAnchorRefiner requires head.rgb_sh_degree=2"
+                    )
+                if int(spherical_global_cfg.get("rgb_sh_degree", 2)) != 2:
+                    raise ValueError(
+                        "VoxelAnchorRefiner requires "
+                        "SphericalSelfiGlobalBackend.rgb_sh_degree=2"
+                    )
+                if bool(render_cfg.get("allow_smoke_fallback", True)):
+                    raise ValueError(
+                        "VoxelAnchorRefiner formal integration requires the real "
+                        "gsplat360 renderer (Renderer.allow_smoke_fallback=false)"
+                    )
 
             self.spherical_selfi_global_backend = SphericalSelfiGlobalBackend(
                 self.map,
                 mapper=self.mapper,
+                renderer=self.renderer,
                 config=spherical_global_cfg,
             )
 
@@ -2659,6 +2810,14 @@ class PanoDroidGSSlamSystem:
                         if self.map.get_xyz.device.type == "cuda"
                         else 0.0
                     )
+                    gpu_peak_memory_mb = (
+                        float(
+                            torch.cuda.max_memory_allocated(self.map.get_xyz.device)
+                            / (1024.0 * 1024.0)
+                        )
+                        if self.map.get_xyz.device.type == "cuda"
+                        else 0.0
+                    )
                     write_profile(
                         "backend_spherical_selfi_window",
                         window_id=float(result.window_id),
@@ -2670,6 +2829,7 @@ class PanoDroidGSSlamSystem:
                         anchors_after=float(result.fusion.get("anchors_after", self.map.anchor_count())),
                         moved=float(result.correction.get("moved", 0)),
                         gpu_memory_mb=gpu_memory_mb,
+                        gpu_peak_memory_mb=gpu_peak_memory_mb,
                         total_sec=elapsed,
                         **fusion_profile,
                     )
@@ -2691,6 +2851,7 @@ class PanoDroidGSSlamSystem:
                         "backend/selfi_global_ba_scheduled": int(bool(result.diagnostics.get("global_ba_scheduled", False))),
                         "backend/selfi_map_saturated": int(result.fusion.get("map_saturated", 0)),
                         "backend/selfi_gpu_memory_mb": gpu_memory_mb,
+                        "backend/selfi_gpu_peak_memory_mb": gpu_peak_memory_mb,
                     }
                     alignment_diag = dict(result.diagnostics.get("alignment", {}) or {})
                     boundary_diag = dict(result.diagnostics.get("boundary_factor", {}) or {})
@@ -2700,6 +2861,20 @@ class PanoDroidGSSlamSystem:
                         ("canonical_translation_mismatch", "canonical_translation_mismatch"),
                         ("overlap_residual", "overlap_residual"),
                         ("overlap_inlier_ratio", "overlap_inlier_ratio"),
+                        ("shared_scale", "shared_scale"),
+                        ("absolute_scale", "absolute_scale"),
+                        ("s_shared", "s_shared"),
+                        ("s_absolute", "s_absolute"),
+                        ("scale_c", "c"),
+                        ("rendered_valid_points", "valid_points"),
+                        ("rendered_inlier_ratio", "inlier_ratio"),
+                        (
+                            "rendered_median_relative_error",
+                            "median_relative_error",
+                        ),
+                        ("rendered_p90_relative_error", "p90_relative_error"),
+                        ("rendered_render_seconds", "render_seconds"),
+                        ("rendered_scale_solve_seconds", "scale_solve_seconds"),
                     ):
                         value = alignment_diag.get(source_name)
                         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -2723,6 +2898,17 @@ class PanoDroidGSSlamSystem:
                         wandb_payload,
                         step=max(1, int(logger._step) + 1),
                     )
+                    consume_overlap = getattr(
+                        self.spherical_selfi_global_backend,
+                        "consume_rendered_overlap_diagnostic",
+                        None,
+                    )
+                    if callable(consume_overlap):
+                        logger.observe_rendered_overlap_alignment(
+                            consume_overlap(),
+                            window_id=result.window_id,
+                            step=max(1, int(logger._step) + 1),
+                        )
             consume_ba = getattr(self.frontend, "consume_local_ba_diagnostics", None)
             if callable(consume_ba):
                 for diagnostic in consume_ba():

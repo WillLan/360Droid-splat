@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import yaml
 
@@ -56,6 +57,10 @@ from geometry.spherical_erp import erp_pixel_to_unit_ray
 from models.per_pixel_gaussian_observation import real_sh_basis
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from models.spherical_selfi_stage3_ba import Stage3MatchCache
+from models.spherical_voxel_anchor_refiner import (
+    VoxelAnchorConfig,
+    voxelize_per_pixel_gaussians,
+)
 from training.train_spherical_selfi_gaussian_head import default_config as stage2_default_config
 
 
@@ -108,6 +113,86 @@ def _packet(
     )
 
 
+def _refined_packet(
+    window_id: int,
+    poses: torch.Tensor,
+    frame_ids: tuple[int, ...],
+    *,
+    feature_by_frame: dict[int, torch.Tensor] | None = None,
+) -> LocalGaussianWindowPacket:
+    packet = _packet(
+        window_id,
+        poses,
+        frame_ids,
+        feature_by_frame=feature_by_frame,
+    )
+    anchor_config = VoxelAnchorConfig(
+        use_resnet_error=False,
+        pretrained_resnet=False,
+    )
+    images = torch.zeros(
+        1,
+        len(frame_ids),
+        3,
+        *packet.observation.image_size,
+        device=packet.observation.refined_depth.device,
+        dtype=packet.observation.refined_depth.dtype,
+    )
+    packet.anchor_observation = voxelize_per_pixel_gaussians(
+        packet.observation,
+        packet.adapter_features,
+        images,
+        anchor_config,
+        valid_mask=packet.finite_gaussian_mask,
+    ).detach_for_backend()
+    packet.metadata["voxel_anchor_refiner_enabled"] = True
+    packet.metadata["voxel_anchor_count"] = packet.anchor_observation.num_anchors
+    return packet
+
+
+class _SyntheticSharedDepthRenderer:
+    def __init__(
+        self,
+        *,
+        local_depth: float,
+        global_depth: float,
+        alpha: float = 1.0,
+        fail_on_call: int | None = None,
+    ):
+        self.local_depth = float(local_depth)
+        self.global_depth = float(global_depth)
+        self.alpha = float(alpha)
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+
+    def render_cameras(self, cameras, gaussians):
+        self.calls += 1
+        if self.fail_on_call is not None and self.calls == int(self.fail_on_call):
+            raise RuntimeError("synthetic renderer failure")
+        camera = cameras[0]
+        count = int(gaussians.get_xyz.shape[0])
+        is_local_anchor = hasattr(gaussians, "anchor_indices")
+        depth_value = self.local_depth if is_local_anchor else self.global_depth
+        device, dtype = gaussians.get_xyz.device, gaussians.get_xyz.dtype
+        depth = torch.full(
+            (1, 1, int(camera.image_height), int(camera.image_width)),
+            depth_value,
+            device=device,
+            dtype=dtype,
+        )
+        alpha = torch.full_like(depth, self.alpha)
+        return {
+            "depth": depth,
+            "alpha": alpha,
+            "visibility_filter": torch.ones(
+                1,
+                count,
+                device=device,
+                dtype=torch.bool,
+            ),
+        }
+
+
 def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rates() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -151,6 +236,26 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert global_backend["loop_closure"]["insert_pose_factor"] is True
     assert global_backend["loop_closure"]["verification"]["mode"] == "spherical_so3"
     assert global_backend["keyframe_selection"]["enabled"] is True
+    assert global_backend["rendered_overlap_alignment"] == {
+        "enabled": True,
+        "mode": "shared_frame_scale_only",
+        "min_points": 256,
+        "max_points": 4096,
+        "alpha_threshold": 0.05,
+        "min_inlier_ratio": 0.35,
+        "max_median_relative_error": 0.10,
+        "max_scale_change": 2.5,
+        "failure_policy": "error",
+    }
+    assert global_backend["insertion_dedup"] == {
+        "enabled": True,
+        "visible_only": True,
+        "same_level_only": True,
+        "radius_voxels": 1.0,
+        "compare_existing_only": True,
+        "permanent_drop": True,
+        "update_existing_statistics": True,
+    }
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
     assert map_optimization["loop_neighborhood_refinement"] is True
     assert map_optimization["loop_seam_deduplication"] is True
@@ -877,6 +982,241 @@ def _boundary_backend(
             "map_optimization": {"steps_per_window": 0, "final_steps": 0},
         },
     )
+
+
+def _refined_boundary_backend(
+    gaussian_map: PanoGaussianMap,
+    renderer,
+) -> SphericalSelfiGlobalBackend:
+    return SphericalSelfiGlobalBackend(
+        gaussian_map,
+        renderer=renderer,
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "boundary_frame",
+                "min_overlap_points": 8,
+                "max_overlap_points": 128,
+                "min_dense_factors": 8,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "forward_backward": False,
+                "allow_boundary_matching_fallback": True,
+                "allow_unaligned_fallback": False,
+                "optimization_start_nodes": 100,
+                "optimization_interval_edges": 100,
+                "active_nodes": 6,
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+            },
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "shared_frame_scale_only",
+                "min_points": 16,
+                "max_points": 64,
+                "alpha_threshold": 0.05,
+                "min_inlier_ratio": 0.35,
+                "max_median_relative_error": 0.10,
+                "max_scale_change": 2.5,
+                "failure_policy": "error",
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "radius_voxels": 1.0,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "update_existing_statistics": True,
+            },
+            "loop_closure": {
+                "exclude_recent_windows": 100,
+                "min_matches": 8,
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+
+def test_rendered_depth_scale_recovers_absolute_and_local_correction() -> None:
+    backend = _refined_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        _SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=3.0),
+    )
+    local = torch.full((1, 32, 64), 2.0)
+    global_depth = torch.full_like(local, 3.0)
+    local_valid = torch.ones_like(local, dtype=torch.bool)
+    global_valid = torch.ones_like(local, dtype=torch.bool)
+    sky = torch.zeros_like(local)
+    # Invalid sky/alpha/hole regions contain adversarial depths and must not
+    # influence the robust scale estimate.
+    local_valid[:, :8] = False
+    global_valid[:, :8] = False
+    sky[:, :8] = 1.0
+    global_depth[:, :8] = 19.0
+
+    correction, diagnostics, _, inliers = backend._estimate_rendered_depth_scale(
+        local,
+        global_depth,
+        local_valid=local_valid,
+        global_valid=global_valid,
+        local_sky_probability=sky,
+        global_sky_probability=sky,
+        shared_scale=0.75,
+        seed=7,
+    )
+
+    assert correction == pytest.approx(2.0, rel=1.0e-5)
+    assert diagnostics["absolute_scale"] == pytest.approx(1.5, rel=1.0e-5)
+    assert diagnostics["shared_scale"] == pytest.approx(0.75)
+    assert diagnostics["inlier_ratio"] > 0.95
+    assert diagnostics["median_relative_error"] < 1.0e-5
+    assert float(inliers.float().mean()) > 0.95
+
+
+def test_refined_rendered_alignment_scales_complete_chunk_without_moving_shared_pose() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.15
+    packet0 = _refined_packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _refined_packet(1, poses1, (1, 2), feature_by_frame=features)
+    original_depth = packet1.observation.refined_depth.clone()
+    original_initial_depth = packet1.observation.initial_depth.clone()
+    original_voxel_size = packet1.anchor_observation.voxel_size.clone()
+    original_translation = packet1.local_poses_c2w[-1, :3, 3].clone()
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _refined_boundary_backend(
+        gaussian_map,
+        _SyntheticSharedDepthRenderer(local_depth=1.0, global_depth=2.0),
+    )
+
+    backend.process_packet(packet0)
+    shared_before = backend.graph.transform(1).clone()
+    result = backend.process_packet(packet1)
+    shared_after = backend.graph.transform(1)
+    stored = backend._last_full_packet
+
+    assert result.aligned
+    assert result.diagnostics["alignment"]["absolute_scale"] == pytest.approx(2.0)
+    assert result.diagnostics["alignment"]["chunk_scale_normalization"] == pytest.approx(2.0)
+    torch.testing.assert_close(shared_after, shared_before)
+    # Scaling is transactional: the caller's packet remains unchanged while
+    # the admitted backend packet contains the normalized geometry.
+    torch.testing.assert_close(packet1.observation.refined_depth, original_depth)
+    torch.testing.assert_close(packet1.local_poses_c2w[-1, :3, 3], original_translation)
+    assert stored is not None
+    torch.testing.assert_close(
+        stored.observation.refined_depth,
+        original_depth * 2.0,
+    )
+    torch.testing.assert_close(
+        stored.observation.initial_depth,
+        original_initial_depth * 2.0,
+    )
+    torch.testing.assert_close(
+        stored.local_poses_c2w[-1, :3, 3],
+        original_translation * 2.0,
+    )
+    torch.testing.assert_close(
+        stored.anchor_observation.voxel_size,
+        original_voxel_size * 2.0,
+    )
+    assert result.fusion["hash_hits"] >= 0
+
+
+def test_rendered_alignment_failure_leaves_packet_graph_and_map_unchanged() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.2
+    packet0 = _refined_packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _refined_packet(1, poses1, (1, 2), feature_by_frame=features)
+    packet_depth = packet1.observation.refined_depth.clone()
+    packet_xyz = packet1.anchor_observation.xyz.clone()
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _refined_boundary_backend(
+        gaussian_map,
+        _SyntheticSharedDepthRenderer(local_depth=1.0, global_depth=10.0),
+    )
+    backend.process_packet(packet0)
+    graph_nodes = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    graph_edge_count = len(backend.graph.edges)
+    map_xyz = gaussian_map.get_xyz.detach().clone()
+    map_count = gaussian_map.anchor_count()
+    window_order = list(backend.window_order)
+
+    with pytest.raises(RuntimeError, match="rendered shared-frame scale alignment failed"):
+        backend.process_packet(packet1)
+
+    assert backend.window_order == window_order
+    assert len(backend.graph.edges) == graph_edge_count
+    assert set(backend.graph.nodes) == set(graph_nodes)
+    for node, transform in graph_nodes.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    assert gaussian_map.anchor_count() == map_count
+    torch.testing.assert_close(gaussian_map.get_xyz, map_xyz)
+    torch.testing.assert_close(packet1.observation.refined_depth, packet_depth)
+    torch.testing.assert_close(packet1.anchor_observation.xyz, packet_xyz)
+
+
+def test_hash_render_failure_rolls_back_graph_owner_and_window_transaction() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(3)}
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 0.1
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[0, 0, 3] = 0.1
+    poses1[1, 0, 3] = 0.15
+    packet0 = _refined_packet(0, poses0, (0, 1), feature_by_frame=features)
+    packet1 = _refined_packet(1, poses1, (1, 2), feature_by_frame=features)
+    renderer = _SyntheticSharedDepthRenderer(
+        local_depth=1.0,
+        global_depth=2.0,
+        fail_on_call=4,
+    )
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _refined_boundary_backend(gaussian_map, renderer)
+    backend.process_packet(packet0)
+    nodes_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    edges_before = list(backend.graph.edges)
+    map_parameters_before = {
+        name: parameter
+        for name, parameter in gaussian_map._parameters.items()
+    }
+    map_xyz_before = gaussian_map.get_xyz.detach().clone()
+    window_order_before = list(backend.window_order)
+    anchor_nodes_before = dict(backend.window_anchor_nodes)
+
+    with pytest.raises(RuntimeError, match="synthetic renderer failure"):
+        backend.process_packet(packet1)
+
+    assert backend.window_order == window_order_before
+    assert backend.window_anchor_nodes == anchor_nodes_before
+    assert len(backend.graph.edges) == len(edges_before)
+    assert all(actual is expected for actual, expected in zip(backend.graph.edges, edges_before))
+    assert set(backend.graph.nodes) == set(nodes_before)
+    for node, transform in nodes_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    for name, parameter in map_parameters_before.items():
+        assert gaussian_map._parameters[name] is parameter
+    torch.testing.assert_close(gaussian_map.get_xyz, map_xyz_before)
 
 
 def test_boundary_frame_graph_reuses_shared_node_and_uses_one_dense_factor_per_window() -> None:

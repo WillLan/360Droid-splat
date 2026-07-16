@@ -404,7 +404,14 @@ def test_no_feedback_is_exact_identity_and_position_stays_inside_voxel() -> None
     assert bool(((current.xyz >= lower) & (current.xyz <= upper)).all())
     assert bool((current.scaling >= current.min_scales - 1.0e-8).all())
     rescaled = current.rescale_geometry(0.01)
-    torch.testing.assert_close(rescaled.voxel_size, current.voxel_size)
+    torch.testing.assert_close(rescaled.voxel_size, current.voxel_size * 0.01)
+    torch.testing.assert_close(rescaled.base_xyz, current.base_xyz * 0.01)
+    torch.testing.assert_close(rescaled.xyz, current.xyz * 0.01)
+    torch.testing.assert_close(rescaled.voxel_center, current.voxel_center * 0.01)
+    torch.testing.assert_close(rescaled.scaling, current.scaling * 0.01)
+    torch.testing.assert_close(rescaled.min_scales, current.min_scales * 0.01)
+    torch.testing.assert_close(rescaled.max_scales, current.max_scales * 0.01)
+    assert torch.equal(rescaled.grid_coord, current.grid_coord)
     assert bool((rescaled.scaling >= rescaled.min_scales - 1.0e-8).all())
 
 
@@ -436,11 +443,164 @@ def test_backend_preserves_depth_selected_level_after_fusion_and_correction() ->
     torch.testing.assert_close(gaussian_map._anchor_voxel_size, torch.tensor([0.04]))
 
 
+def test_world_voxel_size_tracks_packet_and_lazy_owner_sim3_scale() -> None:
+    observation, features, _, anchors = _single_member_anchor(views=1)
+    packet = LocalGaussianWindowPacket.from_observation(
+        window_id=0,
+        observation=observation,
+        adapter_features=features,
+        frame_ids=(0,),
+        verification_size=observation.image_size,
+        anchor_observation=anchors.detach_for_backend(),
+    )
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        lazy_owner_transforms=True,
+    )
+    initial_transform = sim3_from_components(
+        2.0,
+        torch.eye(3),
+        torch.zeros(3),
+    )
+    fusion.fuse_packet(packet, initial_transform)
+    torch.testing.assert_close(
+        gaussian_map._anchor_voxel_size,
+        torch.tensor([0.08]),
+    )
+
+    corrected_transform = sim3_from_components(
+        3.0,
+        torch.eye(3),
+        torch.zeros(3),
+    )
+    fusion.apply_owner_corrections(
+        {0: initial_transform},
+        {0: corrected_transform},
+    )
+    torch.testing.assert_close(
+        gaussian_map._anchor_voxel_size,
+        torch.tensor([0.08]),
+    )
+    torch.testing.assert_close(
+        gaussian_map.materialized_anchor_voxel_size(),
+        torch.tensor([0.12]),
+    )
+
+
+def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> None:
+    observation, features, _, anchors = _single_member_anchor(views=1)
+    anchors = anchors.detach_for_backend()
+
+    def packet(window_id: int, value) -> LocalGaussianWindowPacket:
+        return LocalGaussianWindowPacket.from_observation(
+            window_id=window_id,
+            observation=observation,
+            adapter_features=features,
+            frame_ids=(0,),
+            verification_size=observation.image_size,
+            anchor_observation=value,
+        )
+
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        lazy_owner_transforms=True,
+    )
+    fusion.fuse_packet(packet(0, anchors), sim3_identity())
+    original_observation_count = int(gaussian_map._anchor_obs_count[0])
+    original_confidence = float(gaussian_map._anchor_conf_accum[0])
+
+    existing_xyz = anchors.xyz[0]
+    positions = torch.stack(
+        [
+            existing_xyz,
+            existing_xyz,
+            existing_xyz,
+            existing_xyz + torch.tensor([0.041, 0.0, 0.0]),
+            torch.tensor([10.01, 0.0, 2.0]),
+            torch.tensor([10.05, 0.0, 2.0]),
+        ]
+    )
+    levels = torch.tensor([0, 0, 1, 0, 0, 0], dtype=torch.long)
+    voxel_sizes = torch.tensor(
+        [[0.04], [0.04], [0.08], [0.04], [0.04], [0.04]]
+    )
+    count = int(positions.shape[0])
+
+    def repeated(value: torch.Tensor) -> torch.Tensor:
+        return value[:1].repeat((count,) + (1,) * (value.ndim - 1))
+
+    incoming = replace(
+        anchors,
+        base_xyz=positions.clone(),
+        xyz=positions.clone(),
+        voxel_center=positions.clone(),
+        position_latent=torch.zeros_like(positions),
+        base_rotation=repeated(anchors.base_rotation),
+        rotation=repeated(anchors.rotation),
+        base_log_scales=repeated(anchors.base_log_scales),
+        log_scales=repeated(anchors.log_scales),
+        min_scales=repeated(anchors.min_scales),
+        max_scales=repeated(anchors.max_scales),
+        base_opacity_logit=repeated(anchors.base_opacity_logit),
+        opacity_logit=repeated(anchors.opacity_logit),
+        base_sh_coefficients=repeated(anchors.base_sh_coefficients),
+        sh_coefficients=repeated(anchors.sh_coefficients),
+        static_input=repeated(anchors.static_input),
+        quality=repeated(anchors.quality),
+        level=levels,
+        voxel_size=voxel_sizes,
+        grid_coord=torch.floor(positions / voxel_sizes).long(),
+        member_count=repeated(anchors.member_count),
+        batch_index=torch.zeros(count, dtype=torch.long),
+    )
+    incoming_packet = packet(1, incoming)
+    prepared = fusion.prepare_packet_batch(incoming_packet, sim3_identity())
+    filtered, stats, evidence = fusion.filter_against_visible_map(
+        prepared,
+        incoming_anchor_visibility=torch.tensor(
+            [True, False, True, True, True, True]
+        ),
+        existing_anchor_visibility=torch.tensor([True]),
+        radius_voxels=1.0,
+        update_existing_statistics=True,
+    )
+
+    assert stats["hash_hits"] == 1
+    assert stats["hash_kept"] == 5
+    assert filtered.source_anchor_indices.tolist() == [1, 2, 3, 4, 5]
+    assert evidence is not None
+    assert evidence.indices.tolist() == [0]
+    # The two adjacent incoming voxels survive because this hash never compares
+    # anchors against other anchors in the same incoming batch.
+    assert {4, 5}.issubset(set(filtered.source_anchor_indices.tolist()))
+
+    fusion.commit_prepared_packet(
+        incoming_packet,
+        sim3_identity(),
+        filtered,
+        evidence_update=evidence,
+        extra_stats=stats,
+    )
+    assert gaussian_map.anchor_count() == 6
+    assert int(gaussian_map._anchor_obs_count[0]) > original_observation_count
+    assert float(gaussian_map._anchor_conf_accum[0]) > original_confidence
+
+
 def test_formal_runtime_config_keeps_new_path_disabled_by_default() -> None:
     path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     voxel = config["VoxelAnchorRefiner"]
     assert voxel["enabled"] is False
+    assert voxel["sha256"] is None
+    assert voxel["adapter_dim"] == 24
     assert voxel["depth_boundaries"] == [5.0, 20.0, 40.0]
     assert voxel["voxel_sizes"] == [0.04, 0.08, 0.16, 0.32]
 
@@ -467,3 +627,15 @@ def test_training_checkpoint_loads_directly_into_runtime_model(tmp_path: Path) -
     assert payload["global_step"] == 7
     for expected, actual in zip(training_model.parameters(), runtime_model.parameters()):
         torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="adapter checkpoint"):
+        load_voxel_anchor_checkpoint(
+            checkpoint,
+            model=runtime_model,
+            expected_adapter_sha256="different-adapter",
+        )
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        load_voxel_anchor_checkpoint(
+            checkpoint,
+            model=runtime_model,
+            expected_sha256="0" * 64,
+        )

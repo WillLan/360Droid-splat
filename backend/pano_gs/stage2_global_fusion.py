@@ -50,6 +50,33 @@ class GlobalExplicitGaussianBatch:
         )
 
 
+@dataclass(frozen=True)
+class PreparedPacketFusion:
+    batch: GlobalExplicitGaussianBatch
+    source_anchor_indices: torch.Tensor | None
+    requested: int
+    depth_selected: bool
+
+    def index(self, selected: torch.Tensor) -> "PreparedPacketFusion":
+        source = self.source_anchor_indices
+        return PreparedPacketFusion(
+            batch=self.batch.index(selected),
+            source_anchor_indices=(
+                None if source is None else source.index_select(0, selected.to(source.device))
+            ),
+            requested=int(self.requested),
+            depth_selected=bool(self.depth_selected),
+        )
+
+
+@dataclass(frozen=True)
+class ExistingAnchorEvidenceUpdate:
+    indices: torch.Tensor
+    observation_count_delta: torch.Tensor
+    confidence_accum_delta: torch.Tensor
+    last_seen_frame: torch.Tensor
+
+
 def _fibonacci_directions(count: int, *, device, dtype) -> torch.Tensor:
     index = torch.arange(max(16, int(count)), device=device, dtype=dtype)
     z = 1.0 - 2.0 * (index + 0.5) / float(index.numel())
@@ -527,11 +554,11 @@ class Stage2GlobalMapFusion:
         self.map._anchor_render_error_ema = batch.render_error_ema.detach().cpu().float()
         self.map._anchor_depth_selected_levels = bool(self._depth_selected_mode)
 
-    def anchor_packet_to_global_batch(
+    def _anchor_packet_to_global_batch_with_indices(
         self,
         packet: LocalGaussianWindowPacket,
         anchor_to_global: torch.Tensor,
-    ) -> GlobalExplicitGaussianBatch:
+    ) -> tuple[GlobalExplicitGaussianBatch, torch.Tensor]:
         """Transform refined voxel anchors without scale-based re-leveling."""
 
         anchor = packet.anchor_observation
@@ -564,7 +591,7 @@ class Stage2GlobalMapFusion:
         opacity = anchor.opacity.to(device=device, dtype=dtype)
         quality = anchor.quality[:, 0].to(device=device, dtype=dtype)
         level = anchor.level.to(device=device, dtype=torch.long)
-        voxel_size = anchor.voxel_size.to(device=device, dtype=dtype)
+        voxel_size = global_scale * anchor.voxel_size.to(device=device, dtype=dtype)
         count = anchor.member_count[:, 0].round().clamp_min(1).to(device=device, dtype=torch.long)
         keep = (
             torch.isfinite(xyz).all(dim=-1)
@@ -577,11 +604,11 @@ class Stage2GlobalMapFusion:
             & (opacity[:, 0] >= self.min_opacity)
             & (voxel_size[:, 0] > 0.0)
             & (level >= 0)
-            & (level < 4)
+            & (level < len(self.voxel_sizes))
         )
         selected = torch.nonzero(keep, as_tuple=False).flatten()
         if int(selected.numel()) == 0:
-            return self._empty(device, dtype, target_sh_count)
+            return self._empty(device, dtype, target_sh_count), selected
         xyz = xyz.index_select(0, selected)
         voxel_size = voxel_size.index_select(0, selected)
         level = level.index_select(0, selected)
@@ -589,52 +616,275 @@ class Stage2GlobalMapFusion:
         count = count.index_select(0, selected)
         grid = torch.floor(xyz / voxel_size.clamp_min(1.0e-8)).long()
         size = int(selected.numel())
-        return GlobalExplicitGaussianBatch(
-            xyz=xyz,
-            scale=scale.index_select(0, selected),
-            rotation=rotation.index_select(0, selected),
-            opacity=opacity.index_select(0, selected),
-            sh_coefficients=coefficients.index_select(0, selected),
-            quality=quality,
-            owner_window_id=torch.full((size,), int(packet.window_id), device=device, dtype=torch.long),
-            level=level,
-            voxel_size=voxel_size,
-            grid_coord=grid,
-            observation_count=count,
-            confidence_accum=quality * count.to(dtype),
-            birth_frame=torch.full((size,), int(packet.frame_ids[0]), device=device, dtype=torch.long),
-            last_seen_frame=torch.full((size,), int(packet.frame_ids[-1]), device=device, dtype=torch.long),
-            visibility_count=torch.ones(size, device=device, dtype=torch.long),
-            render_error_ema=torch.zeros(size, device=device, dtype=dtype),
+        return (
+            GlobalExplicitGaussianBatch(
+                xyz=xyz,
+                scale=scale.index_select(0, selected),
+                rotation=rotation.index_select(0, selected),
+                opacity=opacity.index_select(0, selected),
+                sh_coefficients=coefficients.index_select(0, selected),
+                quality=quality,
+                owner_window_id=torch.full((size,), int(packet.window_id), device=device, dtype=torch.long),
+                level=level,
+                voxel_size=voxel_size,
+                grid_coord=grid,
+                observation_count=count,
+                confidence_accum=quality * count.to(dtype),
+                birth_frame=torch.full((size,), int(packet.frame_ids[0]), device=device, dtype=torch.long),
+                last_seen_frame=torch.full((size,), int(packet.frame_ids[-1]), device=device, dtype=torch.long),
+                visibility_count=torch.ones(size, device=device, dtype=torch.long),
+                render_error_ema=torch.zeros(size, device=device, dtype=dtype),
+            ),
+            selected,
         )
 
-    def fuse_packet(
+    def anchor_packet_to_global_batch(
         self,
         packet: LocalGaussianWindowPacket,
         anchor_to_global: torch.Tensor,
+    ) -> GlobalExplicitGaussianBatch:
+        batch, _ = self._anchor_packet_to_global_batch_with_indices(
+            packet,
+            anchor_to_global,
+        )
+        return batch
+
+    def prepare_packet_batch(
+        self,
+        packet: LocalGaussianWindowPacket,
+        anchor_to_global: torch.Tensor,
+    ) -> PreparedPacketFusion:
+        depth_selected = packet.anchor_observation is not None
+        if self._depth_selected_mode and not depth_selected and self.map.anchor_count() > 0:
+            raise ValueError(
+                "Cannot mix legacy scale-selected packets into a depth-selected voxel-anchor map"
+            )
+        if depth_selected:
+            batch, source_indices = self._anchor_packet_to_global_batch_with_indices(
+                packet,
+                anchor_to_global,
+            )
+        else:
+            batch = self.packet_to_global_batch(packet, anchor_to_global)
+            source_indices = None
+        return PreparedPacketFusion(
+            batch=batch,
+            source_anchor_indices=source_indices,
+            requested=len(batch),
+            depth_selected=depth_selected,
+        )
+
+    def filter_against_visible_map(
+        self,
+        prepared: PreparedPacketFusion,
+        *,
+        incoming_anchor_visibility: torch.Tensor,
+        existing_anchor_visibility: torch.Tensor,
+        radius_voxels: float = 1.0,
+        update_existing_statistics: bool = True,
+    ) -> tuple[
+        PreparedPacketFusion,
+        dict[str, int | float],
+        ExistingAnchorEvidenceUpdate | None,
+    ]:
+        """Drop visible same-level incoming anchors near visible existing anchors."""
+
+        if not prepared.depth_selected or prepared.source_anchor_indices is None:
+            raise ValueError("Visible-map hash filtering requires a refined anchor packet")
+        incoming_visibility = incoming_anchor_visibility.detach().bool().reshape(-1)
+        existing_visibility = existing_anchor_visibility.detach().bool().reshape(-1)
+        source_indices = prepared.source_anchor_indices
+        if int(source_indices.numel()) != len(prepared.batch):
+            raise ValueError("Prepared source-anchor indices must match the incoming batch")
+        if int(source_indices.numel()) > 0 and int(source_indices.max()) >= int(incoming_visibility.numel()):
+            raise ValueError("Incoming anchor visibility does not cover all prepared anchors")
+        if int(existing_visibility.numel()) != self.map.anchor_count():
+            raise ValueError("Existing anchor visibility must match the current global map")
+
+        stats: dict[str, int | float] = {
+            "hash_requested": int(prepared.requested),
+            "hash_candidates": len(prepared.batch),
+            "hash_visible_incoming": 0,
+            "hash_visible_existing": int(existing_visibility.sum().item()),
+            "hash_hits": 0,
+            "hash_kept": len(prepared.batch),
+            "hash_radius_voxels": float(radius_voxels),
+        }
+        incoming_level_all = prepared.batch.level.detach().cpu().long()
+        for level in range(len(self.voxel_sizes)):
+            level_incoming = int((incoming_level_all == level).sum().item())
+            stats[f"hash_level_{level}_incoming"] = level_incoming
+            stats[f"hash_level_{level}_visible"] = 0
+            stats[f"hash_level_{level}_hits"] = 0
+            stats[f"hash_level_{level}_kept"] = level_incoming
+        if len(prepared.batch) == 0 or self.map.anchor_count() == 0:
+            return prepared, stats, None
+
+        incoming_visible = incoming_visibility.index_select(
+            0,
+            source_indices.to(incoming_visibility.device),
+        )
+        stats["hash_visible_incoming"] = int(incoming_visible.sum().item())
+        keep = torch.ones(len(prepared.batch), dtype=torch.bool)
+        incoming_xyz = prepared.batch.xyz.detach().cpu().float()
+        incoming_level = prepared.batch.level.detach().cpu().long()
+        incoming_voxel = prepared.batch.voxel_size[:, 0].detach().cpu().float()
+        incoming_observation_count = prepared.batch.observation_count.detach().cpu().long()
+        incoming_confidence = prepared.batch.confidence_accum.detach().cpu().float()
+        incoming_last_seen = prepared.batch.last_seen_frame.detach().cpu().long()
+        incoming_visible_cpu = incoming_visible.detach().cpu().bool()
+
+        existing_xyz = self.map.get_xyz.detach().cpu().float()
+        existing_level = self.map._anchor_level.detach().cpu().long()
+        existing_quality = self.map._anchor_quality.detach().cpu().float()
+        existing_visible_cpu = existing_visibility.detach().cpu().bool()
+        radius_scale = max(0.0, float(radius_voxels))
+        radius_cells = max(0, int(math.ceil(radius_scale)))
+        evidence: dict[int, tuple[int, float, int]] = {}
+
+        for level in range(len(self.voxel_sizes)):
+            level_new = torch.nonzero(
+                incoming_visible_cpu & (incoming_level == level),
+                as_tuple=False,
+            ).flatten()
+            level_old = torch.nonzero(
+                existing_visible_cpu & (existing_level == level),
+                as_tuple=False,
+            ).flatten()
+            level_hits = 0
+            stats[f"hash_level_{level}_visible"] = int(level_new.numel())
+            if int(level_new.numel()) > 0 and int(level_old.numel()) > 0 and radius_scale > 0.0:
+                cell_size = float(
+                    incoming_voxel.index_select(0, level_new).max().clamp_min(1.0e-8)
+                )
+                old_grid = torch.floor(
+                    existing_xyz.index_select(0, level_old) / cell_size
+                ).to(torch.int64)
+                occupied: dict[tuple[int, int, int], list[int]] = {}
+                for local_row, coord in enumerate(old_grid.tolist()):
+                    occupied.setdefault(
+                        (int(coord[0]), int(coord[1]), int(coord[2])),
+                        [],
+                    ).append(int(level_old[local_row]))
+
+                for new_row in level_new.tolist():
+                    candidate_xyz = incoming_xyz[int(new_row)]
+                    coord = torch.floor(candidate_xyz / cell_size).to(torch.int64)
+                    candidates: list[int] = []
+                    for dx in range(-radius_cells, radius_cells + 1):
+                        for dy in range(-radius_cells, radius_cells + 1):
+                            for dz in range(-radius_cells, radius_cells + 1):
+                                candidates.extend(
+                                    occupied.get(
+                                        (
+                                            int(coord[0]) + dx,
+                                            int(coord[1]) + dy,
+                                            int(coord[2]) + dz,
+                                        ),
+                                        (),
+                                    )
+                                )
+                    if not candidates:
+                        continue
+                    candidate_rows = torch.tensor(candidates, dtype=torch.long)
+                    distances = torch.linalg.norm(
+                        existing_xyz.index_select(0, candidate_rows) - candidate_xyz,
+                        dim=-1,
+                    )
+                    radius = radius_scale * float(incoming_voxel[int(new_row)])
+                    within = torch.nonzero(
+                        distances <= radius + 1.0e-8,
+                        as_tuple=False,
+                    ).flatten()
+                    if int(within.numel()) == 0:
+                        continue
+                    eligible_rows = candidate_rows.index_select(0, within)
+                    eligible_distances = distances.index_select(0, within)
+                    min_distance = eligible_distances.min()
+                    nearest = torch.nonzero(
+                        eligible_distances <= min_distance + 1.0e-8,
+                        as_tuple=False,
+                    ).flatten()
+                    nearest_rows = eligible_rows.index_select(0, nearest)
+                    nearest_quality = existing_quality.index_select(0, nearest_rows)
+                    best_quality = nearest_quality.max()
+                    quality_winners = nearest_rows[
+                        nearest_quality >= best_quality - 1.0e-12
+                    ]
+                    hit = int(quality_winners.min())
+                    keep[int(new_row)] = False
+                    level_hits += 1
+                    if update_existing_statistics:
+                        previous = evidence.get(hit, (0, 0.0, 0))
+                        evidence[hit] = (
+                            previous[0] + int(incoming_observation_count[int(new_row)]),
+                            previous[1] + float(incoming_confidence[int(new_row)]),
+                            max(previous[2], int(incoming_last_seen[int(new_row)])),
+                        )
+            stats[f"hash_level_{level}_hits"] = int(level_hits)
+            stats[f"hash_level_{level}_kept"] = (
+                int(stats[f"hash_level_{level}_incoming"]) - int(level_hits)
+            )
+
+        kept = torch.nonzero(keep, as_tuple=False).flatten()
+        filtered = prepared.index(kept.to(prepared.batch.xyz.device))
+        hit_count = int((~keep).sum().item())
+        stats["hash_hits"] = hit_count
+        stats["hash_kept"] = len(filtered.batch)
+        if not evidence:
+            return filtered, stats, None
+        evidence_rows = sorted(evidence)
+        evidence_update = ExistingAnchorEvidenceUpdate(
+            indices=torch.tensor(evidence_rows, dtype=torch.long),
+            observation_count_delta=torch.tensor(
+                [evidence[index][0] for index in evidence_rows],
+                dtype=torch.long,
+            ),
+            confidence_accum_delta=torch.tensor(
+                [evidence[index][1] for index in evidence_rows],
+                dtype=torch.float32,
+            ),
+            last_seen_frame=torch.tensor(
+                [evidence[index][2] for index in evidence_rows],
+                dtype=torch.long,
+            ),
+        )
+        return filtered, stats, evidence_update
+
+    def commit_prepared_packet(
+        self,
+        packet: LocalGaussianWindowPacket,
+        anchor_to_global: torch.Tensor,
+        prepared: PreparedPacketFusion,
+        *,
+        evidence_update: ExistingAnchorEvidenceUpdate | None = None,
+        extra_stats: dict[str, int | float] | None = None,
     ) -> dict[str, int | float]:
         before = self.map.anchor_count()
-        if self.lazy_owner_transforms:
-            self.map.set_lazy_owner_transform(
-                int(packet.window_id),
-                anchor_to_global,
-                set_reference=int(packet.window_id)
-                not in self.map._lazy_owner_reference_transforms,
-            )
-        depth_selected = packet.anchor_observation is not None
+        depth_selected = bool(prepared.depth_selected)
         if self._depth_selected_mode and not depth_selected and before > 0:
             raise ValueError(
                 "Cannot mix legacy scale-selected packets into a depth-selected voxel-anchor map"
             )
         if depth_selected:
-            self._depth_selected_mode = True
-            incoming_raw = self.anchor_packet_to_global_batch(packet, anchor_to_global)
-            # Voxelization already emitted exactly one Gaussian per local key.
-            incoming = incoming_raw
+            incoming = prepared.batch
         else:
-            incoming_raw = self.packet_to_global_batch(packet, anchor_to_global)
-            incoming = self.compact_within_window(incoming_raw)
+            incoming = self.compact_within_window(prepared.batch)
         existing = self._batch_from_map(preserve_levels=depth_selected)
+        if evidence_update is not None:
+            rows = evidence_update.indices.to(existing.observation_count.device)
+            if int(rows.numel()) > 0 and int(rows.max()) >= len(existing):
+                raise ValueError("Existing-anchor evidence update is outside the current map")
+            existing.observation_count[rows] += evidence_update.observation_count_delta.to(
+                existing.observation_count
+            )
+            existing.confidence_accum[rows] += evidence_update.confidence_accum_delta.to(
+                existing.confidence_accum
+            )
+            existing.last_seen_frame[rows] = torch.maximum(
+                existing.last_seen_frame[rows],
+                evidence_update.last_seen_frame.to(existing.last_seen_frame),
+            )
         combined = incoming if len(existing) == 0 else self._concatenate([existing, incoming])
         compacted = (
             self._winner_take_owner_voxel(combined, preserve_levels=depth_selected)
@@ -643,11 +893,20 @@ class Stage2GlobalMapFusion:
         )
         pre_cap_count = int(self.last_pre_cap_count)
         saturated = bool(self.last_saturated)
+        if self.lazy_owner_transforms:
+            self.map.set_lazy_owner_transform(
+                int(packet.window_id),
+                anchor_to_global,
+                set_reference=int(packet.window_id)
+                not in self.map._lazy_owner_reference_transforms,
+            )
+        if depth_selected:
+            self._depth_selected_mode = True
         self._write_map(compacted)
         after = len(compacted)
         inserted_or_replaced = max(0, after - before)
         stats: dict[str, int | float] = {
-            "requested": len(incoming_raw),
+            "requested": int(prepared.requested),
             "window_compacted": len(incoming),
             "inserted": inserted_or_replaced,
             "deduplicated": max(0, len(combined) - after),
@@ -656,11 +915,25 @@ class Stage2GlobalMapFusion:
             "anchors_before_safety_cap": pre_cap_count,
             "map_saturated": int(saturated),
         }
-        stats.update(self._quality_diagnostics(packet, incoming_raw))
+        stats.update(self._quality_diagnostics(packet, prepared.batch))
+        if extra_stats:
+            stats.update(extra_stats)
         for level in range(len(self.voxel_sizes)):
             stats[f"incoming_level_{level}"] = int((incoming.level == level).sum().detach().cpu())
             stats[f"global_level_{level}"] = int((compacted.level == level).sum().detach().cpu())
         return stats
+
+    def fuse_packet(
+        self,
+        packet: LocalGaussianWindowPacket,
+        anchor_to_global: torch.Tensor,
+    ) -> dict[str, int | float]:
+        prepared = self.prepare_packet_batch(packet, anchor_to_global)
+        return self.commit_prepared_packet(
+            packet,
+            anchor_to_global,
+            prepared,
+        )
 
     def apply_owner_corrections(
         self,
@@ -695,6 +968,7 @@ class Stage2GlobalMapFusion:
                 quaternion_multiply(delta_quaternion, batch.rotation[mask])
             )
             batch.scale[mask] = delta_scale * batch.scale[mask]
+            batch.voxel_size[mask] = delta_scale * batch.voxel_size[mask]
             batch.sh_coefficients[mask] = rotate_sh_coefficients(
                 batch.sh_coefficients[mask], delta_rotation, self.map.active_sh_degree
             )

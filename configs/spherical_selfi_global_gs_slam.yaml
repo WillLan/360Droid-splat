@@ -51,8 +51,10 @@ stage2_checkpoint:
 VoxelAnchorRefiner:
   enabled: false
   checkpoint: null
+  sha256: null
   iterations: 3
   hidden_dim: 32
+  adapter_dim: 24
   depth_boundaries: [5.0, 20.0, 40.0]
   voxel_sizes: [0.04, 0.08, 0.16, 0.32]
   alpha_threshold: 0.05
@@ -174,6 +176,24 @@ SphericalSelfiRuntime:
 SphericalSelfiGlobalBackend:
   enabled: true
   rgb_sh_degree: 2
+  rendered_overlap_alignment:
+    enabled: true
+    mode: shared_frame_scale_only
+    min_points: 256
+    max_points: 4096
+    alpha_threshold: 0.05
+    min_inlier_ratio: 0.35
+    max_median_relative_error: 0.10
+    max_scale_change: 2.5
+    failure_policy: error
+  insertion_dedup:
+    enabled: true
+    visible_only: true
+    same_level_only: true
+    radius_voxels: 1.0
+    compare_existing_only: true
+    permanent_drop: true
+    update_existing_statistics: true
   geometry_validation:
     enabled: true
     tolerance: 1.0e-5
