@@ -1321,6 +1321,53 @@ def test_two_frame_scale_pose_fallback_rejects_inconsistent_shared_poses() -> No
     assert diagnostics["pose_pair_translation"] > 0.15
 
 
+def test_overlap2_rejection_preserves_scalar_failure_diagnostics() -> None:
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _packet(0, poses0, (0, 1, 2, 3))
+    packet1 = _packet(1, poses1, (2, 3, 4, 5))
+    expected = sim3_from_components(
+        1.1,
+        torch.eye(3),
+        torch.tensor([0.1, 0.0, 0.0]),
+    )
+    frames = [
+        replace(frame, frame_id=frame_id)
+        for frame, frame_id in zip(
+            _known_two_frame_geometry(expected, planar=True),
+            (2, 3),
+        )
+    ]
+    frames[1] = replace(
+        frames[1],
+        previous_pose=frames[1].previous_pose.clone(),
+    )
+    frames[1].previous_pose[:3, 3] += torch.tensor([0.4, 0.0, 0.0])
+    by_frame = {frame.frame_id: frame for frame in frames}
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        covariance_min_ratio=1.0e-3,
+    )
+    backend.process_packet(packet0)
+    backend._collect_overlap_frame_geometry = (
+        lambda _previous, _current, frame_id, *, use_rendered_anchors: by_frame[
+            int(frame_id)
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="two-frame alignment failed"):
+        backend.process_packet(packet1)
+
+    diagnostics = backend.consume_overlap_alignment_failure()
+    assert diagnostics is not None
+    assert diagnostics["accepted"] is False
+    assert diagnostics["fallback_accepted"] is False
+    assert diagnostics["pose_pair_translation"] > 0.15
+    assert backend.consume_overlap_alignment_failure() is None
+
+
 def test_overlap2_scale_pose_mode_exposes_the_requested_scale_only_ablation() -> None:
     poses0 = torch.eye(4).repeat(4, 1, 1)
     poses1 = torch.eye(4).repeat(4, 1, 1)

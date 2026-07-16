@@ -698,6 +698,7 @@ class SphericalSelfiGlobalBackend:
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
         self._pending_seam_owner_windows: set[int] = set()
         self._last_rendered_overlap_diagnostic: dict[str, torch.Tensor] | None = None
+        self._last_overlap_alignment_failure: dict[str, Any] | None = None
         self.results: list[GlobalWindowBackendResult] = []
 
     @staticmethod
@@ -779,6 +780,7 @@ class SphericalSelfiGlobalBackend:
             ),
             "results": list(self.results),
             "rendered_overlap_diagnostic": self._last_rendered_overlap_diagnostic,
+            "overlap_alignment_failure": self._last_overlap_alignment_failure,
             "fusion_depth_selected_mode": self.fusion._depth_selected_mode,
             "fusion_last_pre_cap_count": self.fusion.last_pre_cap_count,
             "fusion_last_saturated": self.fusion.last_saturated,
@@ -841,6 +843,9 @@ class SphericalSelfiGlobalBackend:
         self.results = state["results"]
         self._last_rendered_overlap_diagnostic = state[
             "rendered_overlap_diagnostic"
+        ]
+        self._last_overlap_alignment_failure = state[
+            "overlap_alignment_failure"
         ]
         self.fusion._depth_selected_mode = state["fusion_depth_selected_mode"]
         self.fusion.last_pre_cap_count = state["fusion_last_pre_cap_count"]
@@ -2814,6 +2819,13 @@ class SphericalSelfiGlobalBackend:
         self._last_rendered_overlap_diagnostic = None
         return diagnostic
 
+    def consume_overlap_alignment_failure(
+        self,
+    ) -> dict[str, Any] | None:
+        diagnostic = self._last_overlap_alignment_failure
+        self._last_overlap_alignment_failure = None
+        return diagnostic
+
     @staticmethod
     def _rebuild_packet_anchor_geometry(packet: LocalGaussianWindowPacket) -> bool:
         """Re-voxelize anchors after a non-uniform per-frame depth replacement."""
@@ -4441,6 +4453,9 @@ class SphericalSelfiGlobalBackend:
                     use_rendered_anchors=refined_packet,
                 )
                 if sequential_overlap_edge is None:
+                    self._last_overlap_alignment_failure = copy.deepcopy(
+                        alignment_diagnostics
+                    )
                     raise RuntimeError(
                         f"Window {window_id} two-frame alignment failed: "
                         f"{alignment_diagnostics.get('reason', 'unknown')}"
@@ -5023,8 +5038,10 @@ class SphericalSelfiGlobalBackend:
             return self._process_boundary_packet_impl(packet)
         except Exception:
             failure_diagnostic = self._last_rendered_overlap_diagnostic
+            failure_alignment = self._last_overlap_alignment_failure
             self._restore_boundary_transaction(transaction)
             self._last_rendered_overlap_diagnostic = failure_diagnostic
+            self._last_overlap_alignment_failure = failure_alignment
             raise
 
     def process_packet(self, packet: LocalGaussianWindowPacket) -> GlobalWindowBackendResult:

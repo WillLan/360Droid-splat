@@ -2867,6 +2867,60 @@ class PanoDroidGSSlamSystem:
                     except Exception as exc:
                         elapsed = float(time.perf_counter() - section_start)
                         try:
+                            failure_payload: dict[str, Any] = {}
+                            consume_failure = getattr(
+                                self.spherical_selfi_global_backend,
+                                "consume_overlap_alignment_failure",
+                                None,
+                            )
+                            failure_diagnostic = (
+                                consume_failure()
+                                if callable(consume_failure)
+                                else None
+                            )
+                            if isinstance(failure_diagnostic, dict):
+                                failure_dir = (
+                                    logger.visualization_dir
+                                    / "alignment_failures"
+                                )
+                                failure_dir.mkdir(parents=True, exist_ok=True)
+                                failure_path = (
+                                    failure_dir
+                                    / f"window_{int(packet.window_id):06d}.json"
+                                )
+                                failure_path.write_text(
+                                    json.dumps(
+                                        failure_diagnostic,
+                                        indent=2,
+                                        sort_keys=True,
+                                        default=str,
+                                    ),
+                                    encoding="utf-8",
+                                )
+                                failure_payload[
+                                    "backend/selfi_failure_diagnostics_json"
+                                ] = str(failure_path)
+                                for key, value in failure_diagnostic.items():
+                                    metric = (
+                                        "backend/selfi_failure_"
+                                        f"{str(key).strip().lower()}"
+                                    )
+                                    if isinstance(value, bool):
+                                        failure_payload[metric] = int(value)
+                                    elif isinstance(value, (int, float)):
+                                        failure_payload[metric] = float(value)
+                                    elif isinstance(value, str):
+                                        failure_payload[metric] = value
+                                    elif isinstance(value, (list, tuple)):
+                                        for index, item in enumerate(value):
+                                            if isinstance(item, bool):
+                                                failure_payload[
+                                                    f"{metric}_{index}"
+                                                ] = int(item)
+                                            elif isinstance(item, (int, float)):
+                                                failure_payload[
+                                                    f"{metric}_{index}"
+                                                ] = float(item)
                             consume_overlap = getattr(
                                 self.spherical_selfi_global_backend,
                                 "consume_rendered_overlap_diagnostic",
@@ -2886,6 +2940,7 @@ class PanoDroidGSSlamSystem:
                                     "backend/selfi_window_failed": 1,
                                     "backend/selfi_failure": repr(exc),
                                     "backend/selfi_failure_seconds": elapsed,
+                                    **failure_payload,
                                 },
                                 step=max(1, int(logger._step) + 1),
                             )
