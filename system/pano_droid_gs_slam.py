@@ -163,13 +163,17 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
         files = discover_erp_images(root, sequence=ds_cfg.get("sequence"))
     begin = int(ds_cfg.get("begin", 0))
     end = ds_cfg.get("end")
-    files = files[begin:end]
+    end = None if end is None else int(end)
+    frame_stride = int(ds_cfg.get("frame_stride", 1))
+    if frame_stride <= 0:
+        raise ValueError("Dataset.frame_stride must be a positive integer.")
+    files = files[begin:end:frame_stride]
     h = ds_cfg.get("erp_resize_height")
     w = ds_cfg.get("erp_resize_width")
     resize = (int(h), int(w)) if h is not None and w is not None else None
     gt_poses = {} if dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"} else _load_panocity_gt_poses(root)
     for local_idx, path in enumerate(files):
-        frame_id = begin + local_idx
+        frame_id = begin + local_idx * frame_stride
         gt = gt_poses.get(str(Path(path).resolve()))
         if gt is None:
             gt = gt_poses.get(Path(path).name)

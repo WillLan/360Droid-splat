@@ -702,6 +702,64 @@ def test_boundary_map_optimization_freezes_all_pose_parameters() -> None:
     assert mapper.commits == 1
 
 
+def test_boundary_map_optimization_can_enable_pose_refinement() -> None:
+    packet = _packet(0, torch.eye(4).repeat(2, 1, 1), (0, 1))
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.settings = None
+            self.extra_loss_fn = None
+            self.commits = 0
+
+        def set_spherical_selfi_observation_geometry(self, *args, **kwargs) -> None:
+            return None
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_window(self, *, settings, extra_loss_fn, **kwargs):
+            self.settings = dict(settings)
+            self.extra_loss_fn = extra_loss_fn
+            return {"steps": 3.0, "window_rollback": 0.0}
+
+        def refined_pose_c2w(self, frame_id: int):
+            return torch.eye(4)
+
+        def commit_spherical_selfi_window(self) -> None:
+            self.commits += 1
+
+        def rollback_spherical_selfi_window(self) -> None:
+            raise AssertionError("finite pose refinement should not roll back")
+
+    mapper = _Mapper()
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, mapper=mapper)
+    backend.map_optimize_config.update(
+        {"pose_refine_enable": True, "pose_lr": 2.0e-4}
+    )
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(1, sim3_identity())
+    backend.window_anchor_nodes[0] = 0
+    backend.boundary_node_order = [0, 1]
+    backend.window_order = [0]
+    backend.frame_windows = {0: {0}, 1: {0}}
+    backend.frame_owner_window = {0: 0, 1: 0}
+    backend.frame_depth_owner_window = {0: 0, 1: 0}
+    backend.packets[0] = packet.compact_for_memory()
+    backend._optimization_packets[0] = packet
+
+    metrics = backend._run_map_optimization(0, packet.frame_ids, 3)
+
+    assert metrics["pose_refine_enabled"] == 1.0
+    assert mapper.settings["pose_lr"] == 2.0e-4
+    assert mapper.settings["pose_refine_enable"] is True
+    assert mapper.settings["fixed_pose_frame_ids"] == []
+    assert callable(mapper.extra_loss_fn)
+    assert mapper.commits == 1
+
+
 def test_global_graph_rolls_back_transaction_on_non_finite_factor() -> None:
     graph = GlobalSim3FactorGraph(max_iterations=3)
     graph.add_node(0, sim3_identity())
@@ -785,6 +843,54 @@ def test_joint_pose_sync_rebases_scale_and_updates_both_overlap_packets() -> Non
     assert geometry[1].depth_owner_window_id == 0
     assert geometry[1].depth_scale == 1.0
     assert geometry[1].depth_scales_by_window == {0: 1.0, 1: 2.0}
+
+
+def test_boundary_pose_sync_updates_nodes_and_shared_window_coordinates() -> None:
+    poses0 = torch.eye(4).repeat(2, 1, 1)
+    poses0[1, 0, 3] = 2.0
+    poses1 = torch.eye(4).repeat(2, 1, 1)
+    poses1[1, 0, 3] = 1.0
+    packet0 = _packet(0, poses0, (0, 1))
+    packet1 = _packet(1, poses1, (1, 2))
+    optimized = {1: torch.eye(4), 2: torch.eye(4)}
+    optimized[1][0, 3] = 2.2
+    optimized[2][0, 3] = 4.4
+
+    class _Mapper:
+        def refined_pose_c2w(self, frame_id: int):
+            return optimized.get(int(frame_id))
+
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, mapper=_Mapper())
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(
+        1, sim3_from_components(2.0, torch.eye(3), torch.tensor([2.0, 0.0, 0.0]))
+    )
+    backend.graph.add_node(
+        2, sim3_from_components(2.0, torch.eye(3), torch.tensor([4.0, 0.0, 0.0]))
+    )
+    backend.window_anchor_nodes = {0: 0, 1: 1}
+    backend.boundary_node_order = [0, 1, 2]
+    backend.packets = {0: packet0, 1: packet1}
+    backend.window_order = [0, 1]
+    backend.frame_windows = {0: {0}, 1: {0, 1}, 2: {1}}
+    backend.frame_owner_window = {0: 0, 1: 0, 2: 1}
+    backend.frame_depth_owner_window = {0: 0, 1: 0, 2: 1}
+
+    backend._synchronize_joint_optimized_window(1)
+
+    node1_scale, _, node1_translation = sim3_components(backend.graph.transform(1))
+    node2_scale, _, node2_translation = sim3_components(backend.graph.transform(2))
+    torch.testing.assert_close(node1_scale, torch.tensor(2.0))
+    torch.testing.assert_close(node2_scale, torch.tensor(2.0))
+    torch.testing.assert_close(node1_translation, torch.tensor([2.2, 0.0, 0.0]))
+    torch.testing.assert_close(node2_translation, torch.tensor([4.4, 0.0, 0.0]))
+    torch.testing.assert_close(packet1.local_poses_c2w[0], torch.eye(4))
+    assert abs(float(packet1.local_poses_c2w[1, 0, 3]) - 1.1) < 1.0e-6
+    assert abs(float(packet0.local_poses_c2w[1, 0, 3]) - 2.2) < 1.0e-6
+    geometry = backend.pop_frame_geometry_updates()
+    torch.testing.assert_close(geometry[1].pose_c2w[:3, 3], node1_translation)
+    torch.testing.assert_close(geometry[2].pose_c2w[:3, 3], node2_translation)
 
 
 def test_mapper_geometry_updates_materialize_depth_from_immutable_local_value() -> None:

@@ -1,0 +1,18 @@
+base_config: boundary_globalba100_margin0_abd6213_base.yaml
+
+Dataset:
+  frame_stride: 4
+
+WeightsAndBiases:
+  run_name: boundary_globalba25_stride4_margin0_abd6213_norefiner_20260716
+  tags:
+    - spherical-selfi
+    - adapter-ba
+    - boundary-frame
+    - abd6213-repro
+    - no-refiner
+    - stride4
+    - sparse25
+
+Results:
+  save_dir: outputs/boundary_globalba25_stride4_margin0_abd6213_norefiner_20260716

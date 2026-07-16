@@ -323,6 +323,47 @@ def test_panocity_gt_pose_is_attached_to_runtime_frames(tmp_path: Path):
     assert torch.allclose(frame.meta["gt_c2w"], pose)
 
 
+def test_runtime_frame_stride_preserves_original_sequence_ids(tmp_path: Path):
+    image_dir = tmp_path / "pano_images"
+    for frame_id in range(10):
+        _write_rgb(image_dir / f"{frame_id:06d}.png")
+
+    cfg = {
+        "Dataset": {
+            "dataset_path": str(image_dir),
+            "begin": 1,
+            "end": 10,
+            "frame_stride": 4,
+        }
+    }
+    frames = list(iter_sequence_frames(cfg))
+
+    assert [frame.frame_id for frame in frames] == [1, 5, 9]
+    assert [frame.timestamp for frame in frames] == [1.0, 5.0, 9.0]
+    assert [Path(frame.meta["path"]).name for frame in frames] == [
+        "000001.png",
+        "000005.png",
+        "000009.png",
+    ]
+
+
+def test_runtime_frame_stride_rejects_non_positive_values(tmp_path: Path):
+    image_dir = tmp_path / "pano_images"
+    _write_rgb(image_dir / "000000.png")
+
+    with pytest.raises(ValueError, match="frame_stride"):
+        list(
+            iter_sequence_frames(
+                {
+                    "Dataset": {
+                        "dataset_path": str(image_dir),
+                        "frame_stride": 0,
+                    }
+                }
+            )
+        )
+
+
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 16, "width": 32},

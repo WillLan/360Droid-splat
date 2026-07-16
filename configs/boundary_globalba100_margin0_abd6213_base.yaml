@@ -1,0 +1,50 @@
+base_config: spherical_selfi_global_gs_slam.yaml
+
+# Exact experiment baseline reconstructed from
+# boundary_globalba100_margin0_force_gpu2_20260715_1032.
+Dataset:
+  synthetic: false
+  dataset_path: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D/OB3D
+  type: ob3d
+  scene: sponza
+  split: Non-Egocentric
+  begin: 0
+  end: 100
+  frame_stride: 1
+  height: 504
+  width: 1008
+  erp_resize_height: 504
+  erp_resize_width: 1008
+
+SphericalSelfiRuntime:
+  local_ba:
+    iterations: 5
+    matching:
+      type: adapter
+      num_queries: 1024
+
+SphericalSelfiGlobalBackend:
+  global_graph:
+    min_match_margin: 0.0
+    umeyama_irls_iterations: 3
+  map_optimization:
+    pose_refine_enable: false
+    pose_lr: 0.0
+
+WeightsAndBiases:
+  enabled: true
+  project: 360Droid-splat
+  mode: online
+  group: ob3d-sponza-boundary-abd6213-repro
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  post_opt_all_frames: true
+  post_opt_log_depth: false
+
+Results:
+  render_final_all_frames: true
