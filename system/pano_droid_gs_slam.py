@@ -1211,14 +1211,38 @@ class SlamRuntimeLogger:
         if not diagnostic:
             return None
 
-        def scalar_panel(name: str, label: str, *, positive: bool = False) -> Image.Image:
+        frame_ids_tensor = diagnostic.get("frame_ids")
+        frame_ids = (
+            [int(value) for value in frame_ids_tensor.detach().cpu().reshape(-1)]
+            if torch.is_tensor(frame_ids_tensor)
+            else [None]
+        )
+        frame_count = max(1, len(frame_ids))
+
+        def frame_tensor(value: torch.Tensor, frame_index: int) -> torch.Tensor:
+            tensor = value.detach().cpu()
+            if (
+                frame_count > 1
+                and tensor.ndim >= 3
+                and int(tensor.shape[0]) == frame_count
+            ):
+                tensor = tensor[frame_index]
+            while tensor.ndim > 2:
+                tensor = tensor[0]
+            return tensor
+
+        def scalar_panel(
+            name: str,
+            label: str,
+            *,
+            frame_index: int,
+            positive: bool = False,
+        ) -> Image.Image:
             value = diagnostic.get(name)
             if not torch.is_tensor(value):
                 panel = Image.new("RGB", (640, 320), "black")
             else:
-                tensor = value.detach().cpu().float()
-                while tensor.ndim > 2:
-                    tensor = tensor[0]
+                tensor = frame_tensor(value, frame_index).float()
                 valid = torch.isfinite(tensor)
                 if positive:
                     valid &= tensor > 0.0
@@ -1229,14 +1253,10 @@ class SlamRuntimeLogger:
             ImageDraw.Draw(panel).text((8, 8), label, fill=(255, 255, 255))
             return panel
 
-        def mask_overlay() -> Image.Image:
-            sky = diagnostic["sky_mask"].detach().cpu().bool()
-            valid = diagnostic["valid_mask"].detach().cpu().bool()
-            inlier = diagnostic["inlier_mask"].detach().cpu().bool()
-            while sky.ndim > 2:
-                sky = sky[0]
-                valid = valid[0]
-                inlier = inlier[0]
+        def mask_overlay(frame_index: int, label: str) -> Image.Image:
+            sky = frame_tensor(diagnostic["sky_mask"], frame_index).bool()
+            valid = frame_tensor(diagnostic["valid_mask"], frame_index).bool()
+            inlier = frame_tensor(diagnostic["inlier_mask"], frame_index).bool()
             rgb = np.zeros((*sky.shape, 3), dtype=np.uint8)
             rgb[valid.numpy()] = np.array([64, 128, 255], dtype=np.uint8)
             rgb[sky.numpy()] = np.array([255, 160, 0], dtype=np.uint8)
@@ -1244,21 +1264,57 @@ class SlamRuntimeLogger:
             panel = Image.fromarray(rgb, mode="RGB")
             ImageDraw.Draw(panel).text(
                 (8, 8),
-                "mask: orange=sky blue=valid green=inlier",
+                f"{label} mask: orange=sky blue=valid green=inlier",
                 fill=(255, 255, 255),
             )
             return panel
 
-        panels = [
-            scalar_panel("local_depth", "raw local depth", positive=True),
-            scalar_panel("aligned_local_depth", "aligned local depth", positive=True),
-            scalar_panel("global_depth", "global-map depth", positive=True),
-            scalar_panel("relative_error", "relative depth error"),
-            scalar_panel("local_alpha", "local anchor alpha"),
-            scalar_panel("global_alpha", "global-map alpha"),
-            mask_overlay(),
-            Image.new("RGB", (640, 320), "black"),
-        ]
+        panels: list[Image.Image] = []
+        for frame_index, frame_id in enumerate(frame_ids):
+            prefix = (
+                f"frame {frame_id}"
+                if frame_id is not None
+                else "shared frame"
+            )
+            panels.extend(
+                [
+                    scalar_panel(
+                        "local_depth",
+                        f"{prefix}: current depth",
+                        frame_index=frame_index,
+                        positive=True,
+                    ),
+                    scalar_panel(
+                        "aligned_local_depth",
+                        f"{prefix}: scale-aligned current depth",
+                        frame_index=frame_index,
+                        positive=True,
+                    ),
+                    scalar_panel(
+                        "global_depth",
+                        f"{prefix}: previous depth",
+                        frame_index=frame_index,
+                        positive=True,
+                    ),
+                    scalar_panel(
+                        "relative_error",
+                        f"{prefix}: relative depth error",
+                        frame_index=frame_index,
+                    ),
+                    scalar_panel(
+                        "local_alpha",
+                        f"{prefix}: current alpha",
+                        frame_index=frame_index,
+                    ),
+                    scalar_panel(
+                        "global_alpha",
+                        f"{prefix}: previous alpha",
+                        frame_index=frame_index,
+                    ),
+                    mask_overlay(frame_index, prefix),
+                    Image.new("RGB", (640, 320), "black"),
+                ]
+            )
         target_size = panels[0].size
         panels = [
             panel
@@ -1267,7 +1323,11 @@ class SlamRuntimeLogger:
             for panel in panels
         ]
         width, height = target_size
-        canvas = Image.new("RGB", (4 * width, 2 * height), "black")
+        canvas = Image.new(
+            "RGB",
+            (4 * width, 2 * frame_count * height),
+            "black",
+        )
         for index, panel in enumerate(panels):
             canvas.paste(panel, ((index % 4) * width, (index // 4) * height))
         canvas = _resize_to_max_width(canvas, max(960, self.kf_opt_max_width))
@@ -2798,7 +2858,45 @@ class PanoDroidGSSlamSystem:
                     )
                 for packet in consume():
                     section_start = time.perf_counter()
-                    result = self.spherical_selfi_global_backend.process_packet(packet)
+                    try:
+                        result = (
+                            self.spherical_selfi_global_backend.process_packet(
+                                packet
+                            )
+                        )
+                    except Exception as exc:
+                        elapsed = float(time.perf_counter() - section_start)
+                        try:
+                            consume_overlap = getattr(
+                                self.spherical_selfi_global_backend,
+                                "consume_rendered_overlap_diagnostic",
+                                None,
+                            )
+                            if callable(consume_overlap):
+                                logger.observe_rendered_overlap_alignment(
+                                    consume_overlap(),
+                                    window_id=int(packet.window_id),
+                                    step=max(1, int(logger._step) + 1),
+                                )
+                            logger._log_wandb_payload(
+                                {
+                                    "backend/selfi_window_id": int(
+                                        packet.window_id
+                                    ),
+                                    "backend/selfi_window_failed": 1,
+                                    "backend/selfi_failure": repr(exc),
+                                    "backend/selfi_failure_seconds": elapsed,
+                                },
+                                step=max(1, int(logger._step) + 1),
+                            )
+                            write_profile(
+                                "backend_spherical_selfi_window_failure",
+                                window_id=float(packet.window_id),
+                                total_sec=elapsed,
+                            )
+                        except Exception:
+                            pass
+                        raise
                     elapsed = float(time.perf_counter() - section_start)
                     fusion_profile = {
                         f"fusion_{key}": float(value)
@@ -2875,10 +2973,118 @@ class PanoDroidGSSlamSystem:
                         ("rendered_p90_relative_error", "p90_relative_error"),
                         ("rendered_render_seconds", "render_seconds"),
                         ("rendered_scale_solve_seconds", "scale_solve_seconds"),
+                        ("alignment_seconds", "alignment_seconds"),
+                        ("measurement_scale", "measurement_scale"),
+                        ("measurement_rotation_deg", "measurement_rotation_deg"),
+                        (
+                            "measurement_translation_norm",
+                            "measurement_translation_norm",
+                        ),
+                        (
+                            "full_sim3_current_covariance_ratio",
+                            "full_sim3_current_covariance_ratio",
+                        ),
+                        (
+                            "full_sim3_previous_covariance_ratio",
+                            "full_sim3_previous_covariance_ratio",
+                        ),
+                        (
+                            "full_sim3_raw_current_covariance_ratio",
+                            "full_sim3_raw_current_covariance_ratio",
+                        ),
+                        (
+                            "full_sim3_raw_previous_covariance_ratio",
+                            "full_sim3_raw_previous_covariance_ratio",
+                        ),
+                        (
+                            "full_sim3_train_inlier_ratio",
+                            "full_sim3_train_inlier_ratio",
+                        ),
+                        (
+                            "full_sim3_holdout_inlier_ratio",
+                            "full_sim3_holdout_inlier_ratio",
+                        ),
+                        (
+                            "full_sim3_holdout_median_residual",
+                            "full_sim3_holdout_median_residual",
+                        ),
+                        (
+                            "full_sim3_rotation_correction_deg",
+                            "full_sim3_rotation_correction_deg",
+                        ),
+                        (
+                            "full_sim3_translation_correction",
+                            "full_sim3_translation_correction",
+                        ),
+                        (
+                            "fallback_train_inlier_ratio",
+                            "fallback_train_inlier_ratio",
+                        ),
+                        (
+                            "fallback_holdout_inlier_ratio",
+                            "fallback_holdout_inlier_ratio",
+                        ),
                     ):
                         value = alignment_diag.get(source_name)
                         if isinstance(value, (int, float)) and not isinstance(value, bool):
                             wandb_payload[f"backend/selfi_{metric_name}"] = float(value)
+                    wandb_payload["backend/selfi_alignment_accepted"] = int(
+                        bool(alignment_diag.get("accepted", False))
+                    )
+                    wandb_payload["backend/selfi_full_sim3_accepted"] = int(
+                        bool(alignment_diag.get("full_sim3_accepted", False))
+                    )
+                    wandb_payload["backend/selfi_fallback_accepted"] = int(
+                        bool(alignment_diag.get("fallback_accepted", False))
+                    )
+                    wandb_payload["backend/selfi_alignment_method"] = str(
+                        alignment_diag.get("alignment_method", "none")
+                    )
+                    for source_name in (
+                        "full_sim3_current_singular_values",
+                        "full_sim3_previous_singular_values",
+                        "full_sim3_raw_current_singular_values",
+                        "full_sim3_raw_previous_singular_values",
+                        "per_frame_valid_points",
+                        "per_frame_inlier_ratio",
+                        "full_sim3_per_frame_inlier_ratio",
+                        "full_sim3_per_frame_median_residual",
+                        "full_sim3_shared_rotation_errors_deg",
+                        "full_sim3_shared_center_errors",
+                        "fallback_per_frame_inlier_ratio",
+                        "fallback_shared_rotation_errors_deg",
+                        "fallback_shared_center_errors",
+                        "pose_frame_scale",
+                        "pose_frame_rotation_deg",
+                        "pose_frame_translation_norm",
+                    ):
+                        values = alignment_diag.get(source_name)
+                        if not isinstance(values, (list, tuple)):
+                            continue
+                        for frame_index, value in enumerate(values):
+                            if isinstance(value, (int, float)) and not isinstance(
+                                value, bool
+                            ):
+                                wandb_payload[
+                                    f"backend/selfi_{source_name}_{frame_index}"
+                                ] = float(value)
+                    pose_translations = alignment_diag.get(
+                        "pose_frame_translation"
+                    )
+                    if isinstance(pose_translations, (list, tuple)):
+                        for frame_index, translation in enumerate(
+                            pose_translations
+                        ):
+                            if not isinstance(translation, (list, tuple)):
+                                continue
+                            for axis, value in zip("xyz", translation):
+                                if isinstance(value, (int, float)) and not isinstance(
+                                    value, bool
+                                ):
+                                    wandb_payload[
+                                        "backend/selfi_pose_frame_"
+                                        f"translation_{axis}_{frame_index}"
+                                    ] = float(value)
                     for metric_name in (
                         "raw_boundary_matches",
                         "hard_gated_boundary_matches",

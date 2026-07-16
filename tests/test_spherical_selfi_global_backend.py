@@ -17,7 +17,10 @@ from backend.pano_gs.sim3_graph import (
     Sim3GraphEdge,
     s2_log_tangent_coordinates,
 )
-from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
+from backend.pano_gs.spherical_selfi_global import (
+    OverlapFrameGeometry,
+    SphericalSelfiGlobalBackend,
+)
 from backend.pano_gs.stage2_global_fusion import (
     Stage2GlobalMapFusion,
     rotate_sh_coefficients,
@@ -193,6 +196,24 @@ class _SyntheticSharedDepthRenderer:
         }
 
 
+class _TwoViewUnionRenderer(_SyntheticSharedDepthRenderer):
+    """Expose complementary anchor halves in the two dedup views."""
+
+    def render_cameras(self, cameras, gaussians):
+        package = super().render_cameras(cameras, gaussians)
+        if self.calls < 5:
+            return package
+        visibility = package["visibility_filter"]
+        count = int(visibility.shape[-1])
+        visibility.zero_()
+        split = count // 2
+        if self.calls in {5, 6}:
+            visibility[..., :split] = True
+        else:
+            visibility[..., split:] = True
+        return package
+
+
 def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rates() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -201,6 +222,7 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     map_optimization = config["SphericalSelfiGlobalBackend"]["map_optimization"]
     graph = config["SphericalSelfiGlobalBackend"]["global_graph"]
     global_backend = config["SphericalSelfiGlobalBackend"]
+    window = config["SphericalSelfiRuntime"]["window"]
 
     assert local_ba["iterations"] == 5
     assert local_ba["lm_max_trials"] == 8
@@ -224,12 +246,17 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert outlier["validation_residual_worse_tolerance"] == 1.0
     assert outlier["validation_sim3_worse_tolerance"] == 1.05
     assert local_ba["matching"]["factor_weight_mode"] == "fibonacci_equal"
+    assert window["size"] == 4
+    assert window["stride"] == 2
+    assert window["expected_overlap_frames"] == 2
     assert graph["optimization_start_nodes"] == 6
-    assert graph["optimization_interval_edges"] == 5
+    assert graph["optimization_interval_edges"] == 8
+    assert graph["expected_overlap_frames"] == 2
     assert graph["normalize_dense_information_by_count"] is True
     assert graph["analytic_dense_linearization"] is True
     assert graph["restrict_objective_to_active_factors"] is True
     assert global_backend["hierarchical_submaps"]["enabled"] is True
+    assert global_backend["hierarchical_submaps"]["windows_per_submap"] == 8
     assert global_backend["hierarchical_submaps"]["local_camera_model"] == "se3_shared_scale"
     assert global_backend["hierarchical_submaps"]["compress_frozen_dense_factors"] is True
     assert global_backend["loop_closure"]["descriptor"]["mode"] == "so3_sh_gram"
@@ -238,15 +265,25 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert global_backend["keyframe_selection"]["enabled"] is True
     assert global_backend["rendered_overlap_alignment"] == {
         "enabled": True,
-        "mode": "shared_frame_scale_only",
+        "mode": "two_frame_full_sim3",
         "min_points": 256,
         "max_points": 4096,
+        "min_points_per_frame": 256,
+        "max_points_per_frame": 2048,
         "alpha_threshold": 0.05,
         "min_inlier_ratio": 0.35,
         "max_median_relative_error": 0.10,
         "max_scale_change": 2.5,
-        "failure_policy": "error",
+        "irls_iterations": 5,
+        "holdout_stride": 5,
+        "covariance_min_ratio": 1.0e-4,
+        "max_rotation_correction_deg": 10.0,
+        "max_translation_correction": 1.0,
+        "max_shared_rotation_error_deg": 2.0,
+        "max_shared_center_error": 0.15,
+        "failure_policy": "scale_pose_then_error",
     }
+    assert global_backend["loop_closure"]["exclude_recent_windows"] == 5
     assert global_backend["insertion_dedup"] == {
         "enabled": True,
         "visible_only": True,
@@ -1042,6 +1079,517 @@ def _refined_boundary_backend(
             "map_optimization": {"steps_per_window": 0, "final_steps": 0},
         },
     )
+
+
+def _two_frame_boundary_backend(
+    gaussian_map: PanoGaussianMap,
+    renderer=None,
+    *,
+    covariance_min_ratio: float = 1.0e-4,
+    mode: str = "two_frame_full_sim3",
+) -> SphericalSelfiGlobalBackend:
+    return SphericalSelfiGlobalBackend(
+        gaussian_map,
+        renderer=renderer,
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "boundary_frame",
+                "expected_overlap_frames": 2,
+                "enforce_exact_overlap": True,
+                "min_overlap_points": 8,
+                "max_overlap_points": 128,
+                "max_overlap_residual": 0.05,
+                "min_overlap_inlier_ratio": 0.35,
+                "min_dense_factors": 8,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "forward_backward": False,
+                "allow_boundary_matching_fallback": True,
+                "allow_unaligned_fallback": False,
+                "optimization_start_nodes": 100,
+                "optimization_interval_edges": 100,
+                "active_nodes": 6,
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+            },
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": mode,
+                "min_points": 16,
+                "max_points": 128,
+                "min_points_per_frame": 16,
+                "max_points_per_frame": 64,
+                "alpha_threshold": 0.05,
+                "min_inlier_ratio": 0.35,
+                "max_median_relative_error": 0.10,
+                "max_scale_change": 2.5,
+                "irls_iterations": 5,
+                "holdout_stride": 5,
+                "covariance_min_ratio": covariance_min_ratio,
+                "max_rotation_correction_deg": 10.0,
+                "max_translation_correction": 1.0,
+                "max_shared_rotation_error_deg": 2.0,
+                "max_shared_center_error": 0.15,
+                "failure_policy": "scale_pose_then_error",
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "radius_voxels": 1.0,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "update_existing_statistics": True,
+            },
+            "loop_closure": {
+                "exclude_recent_windows": 100,
+                "min_matches": 8,
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {
+                "steps_per_window": 0,
+                "final_steps": 0,
+            },
+        },
+    )
+
+
+def _known_two_frame_geometry(
+    transform: torch.Tensor,
+    *,
+    planar: bool = False,
+    add_training_outliers: bool = False,
+) -> list[OverlapFrameGeometry]:
+    torch.manual_seed(19)
+    scale, _, _ = sim3_components(transform)
+    frames: list[OverlapFrameGeometry] = []
+    count = 80
+    for frame_offset in range(2):
+        if planar:
+            side = int(math.ceil(math.sqrt(count)))
+            axis = torch.linspace(-1.0, 1.0, side)
+            grid_x, grid_y = torch.meshgrid(axis, axis, indexing="ij")
+            current_points = torch.stack(
+                [
+                    grid_x.reshape(-1),
+                    grid_y.reshape(-1),
+                    torch.full((side * side,), 2.0),
+                ],
+                dim=-1,
+            )[:count]
+        else:
+            current_points = torch.randn(count, 3)
+            current_points[:, 2] += 3.0
+        current_pose = torch.eye(4)
+        current_pose[:3, 3] = torch.tensor(
+            [0.25 * frame_offset, 0.04 * frame_offset, 0.0]
+        )
+        previous_pose = apply_sim3_to_c2w(transform, current_pose)
+        previous_points = apply_sim3(transform, current_points)
+        holdout = torch.arange(count) % 5 == 0
+        if add_training_outliers:
+            candidates = torch.nonzero(~holdout, as_tuple=False).flatten()[:6]
+            previous_points[candidates] += torch.tensor([2.0, -1.5, 0.75])
+        current_depth = torch.linspace(1.0, 3.0, count)
+        previous_depth = current_depth * scale
+        frames.append(
+            OverlapFrameGeometry(
+                frame_id=10 + frame_offset,
+                previous_index=frame_offset,
+                current_index=frame_offset,
+                bearing=torch.nn.functional.normalize(
+                    current_points - current_pose[:3, 3],
+                    dim=-1,
+                ),
+                uv=torch.stack(
+                    [
+                        torch.arange(count, dtype=torch.float32),
+                        torch.full((count,), float(frame_offset)),
+                    ],
+                    dim=-1,
+                ),
+                previous_depth=previous_depth,
+                current_depth=current_depth,
+                previous_points=previous_points,
+                current_points=current_points,
+                previous_pose=previous_pose,
+                current_pose=current_pose,
+                holdout_mask=holdout,
+            )
+        )
+    return frames
+
+
+def test_two_frame_full_sim3_recovers_known_transform_with_training_outliers() -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu")
+    )
+    angle = torch.deg2rad(torch.tensor(4.0))
+    rotation = torch.tensor(
+        [
+            [torch.cos(angle), 0.0, torch.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-torch.sin(angle), 0.0, torch.cos(angle)],
+        ]
+    )
+    expected = sim3_from_components(
+        1.2,
+        rotation,
+        torch.tensor([0.20, -0.08, 0.04]),
+    )
+    frames = _known_two_frame_geometry(
+        expected,
+        add_training_outliers=True,
+    )
+
+    estimated, inliers, diagnostics = backend._fit_two_frame_full_sim3(frames)
+
+    assert estimated is not None, diagnostics
+    assert diagnostics["full_sim3_accepted"] is True
+    assert diagnostics["full_sim3_holdout_inlier_ratio"] > 0.95
+    assert all(float(mask.float().mean()) > 0.85 for mask in inliers)
+    error = sim3_log(sim3_inverse(expected) @ estimated)
+    assert float(torch.linalg.norm(error)) < 1.0e-3
+
+
+def test_planar_two_frame_geometry_rejects_full_sim3_and_uses_pose_scale_fallback() -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        covariance_min_ratio=1.0e-3,
+    )
+    angle = torch.deg2rad(torch.tensor(3.0))
+    rotation = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle), 0.0],
+            [torch.sin(angle), torch.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    expected = sim3_from_components(
+        1.15,
+        rotation,
+        torch.tensor([0.12, -0.03, 0.02]),
+    )
+    frames = _known_two_frame_geometry(
+        expected,
+        planar=True,
+        add_training_outliers=True,
+    )
+
+    full, _, full_diagnostics = backend._fit_two_frame_full_sim3(frames)
+    fallback, _, fallback_diagnostics = (
+        backend._fit_two_frame_scale_pose_fallback(frames)
+    )
+
+    assert full is None
+    assert full_diagnostics["full_sim3_reason"] == "covariance_degenerate"
+    assert fallback is not None, fallback_diagnostics
+    assert fallback_diagnostics["fallback_accepted"] is True
+    error = sim3_log(sim3_inverse(expected) @ fallback)
+    assert float(torch.linalg.norm(error)) < 1.0e-5
+
+
+def test_two_frame_scale_pose_fallback_rejects_inconsistent_shared_poses() -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        covariance_min_ratio=1.0e-3,
+    )
+    expected = sim3_from_components(
+        1.1,
+        torch.eye(3),
+        torch.tensor([0.1, 0.0, 0.0]),
+    )
+    frames = _known_two_frame_geometry(expected, planar=True)
+    frames[1] = replace(
+        frames[1],
+        previous_pose=frames[1].previous_pose.clone(),
+    )
+    frames[1].previous_pose[:3, 3] += torch.tensor([0.4, 0.0, 0.0])
+
+    fallback, _, diagnostics = backend._fit_two_frame_scale_pose_fallback(
+        frames
+    )
+
+    assert fallback is None
+    assert diagnostics["fallback_accepted"] is False
+    assert diagnostics["pose_pair_translation"] > 0.15
+
+
+def test_overlap2_scale_pose_mode_exposes_the_requested_scale_only_ablation() -> None:
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _packet(0, poses0, (0, 1, 2, 3))
+    packet1 = _packet(1, poses1, (2, 3, 4, 5))
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        mode="two_frame_scale_pose",
+    )
+
+    edge, dense, pose, diagnostics = backend._two_frame_overlap_constraints(
+        packet0,
+        packet1,
+        previous_anchor_node=0,
+        current_anchor_node=2,
+        use_rendered_anchors=False,
+    )
+
+    assert edge is not None, diagnostics
+    assert len(dense) == 2
+    assert len(pose) == 2
+    assert diagnostics["mode"] == "two_frame_scale_pose"
+    assert diagnostics["alignment_method"] == "scale_pose_only"
+    assert diagnostics["full_sim3_reason"] == "disabled_by_mode"
+    assert diagnostics["fallback_accepted"] is True
+
+
+def test_overlap2_full_sim3_automatically_uses_scale_pose_fallback_on_degeneracy() -> None:
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _packet(0, poses0, (0, 1, 2, 3))
+    packet1 = _packet(1, poses1, (2, 3, 4, 5))
+    expected = sim3_from_components(
+        1.1,
+        torch.eye(3),
+        torch.tensor([0.2, 0.0, 0.0]),
+    )
+    frames = [
+        replace(frame, frame_id=frame_id)
+        for frame, frame_id in zip(
+            _known_two_frame_geometry(expected, planar=True),
+            (2, 3),
+        )
+    ]
+    by_frame = {frame.frame_id: frame for frame in frames}
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        covariance_min_ratio=1.0e-3,
+    )
+    backend._collect_overlap_frame_geometry = (
+        lambda _previous, _current, frame_id, *, use_rendered_anchors: by_frame[
+            int(frame_id)
+        ]
+    )
+
+    edge, dense, pose, diagnostics = backend._two_frame_overlap_constraints(
+        packet0,
+        packet1,
+        previous_anchor_node=0,
+        current_anchor_node=2,
+        use_rendered_anchors=False,
+    )
+
+    assert edge is not None, diagnostics
+    assert len(dense) == 2
+    assert len(pose) == 2
+    assert diagnostics["alignment_method"] == "scale_pose_fallback"
+    assert diagnostics["full_sim3_reason"] == "covariance_degenerate"
+    assert diagnostics["fallback_accepted"] is True
+
+
+def test_two_frame_sampling_excludes_bilateral_sky() -> None:
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _packet(0, poses0, (0, 1, 2, 3))
+    packet1 = _packet(1, poses1, (2, 3, 4, 5))
+    for packet, frame_id in ((packet0, 2), (packet1, 2)):
+        index = packet.frame_index(frame_id)
+        packet.sky_mask[0, index, :, :3, :] = True
+        packet.sky_prob[0, index, :, :3, :] = 1.0
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu")
+    )
+
+    geometry = backend._collect_overlap_frame_geometry(
+        packet0,
+        packet1,
+        2,
+        use_rendered_anchors=False,
+    )
+
+    assert int(geometry.current_points.shape[0]) >= 16
+    assert bool((geometry.uv[:, 1] >= 3.0).all())
+    assert geometry.sky_union_image is not None
+    assert bool(geometry.sky_union_image[..., :3, :].all())
+
+
+def test_overlap2_boundary_graph_uses_independent_chunk_nodes_and_two_frame_factors() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(6)}
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _refined_packet(
+        0, poses0, (0, 1, 2, 3), feature_by_frame=features
+    )
+    packet1 = _refined_packet(
+        1, poses1, (2, 3, 4, 5), feature_by_frame=features
+    )
+    original_depth = packet1.observation.refined_depth.clone()
+    original_xyz = packet1.anchor_observation.xyz.clone()
+    original_voxel = packet1.anchor_observation.voxel_size.clone()
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        _TwoViewUnionRenderer(local_depth=2.0, global_depth=2.0),
+    )
+
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+
+    assert result.aligned
+    assert result.diagnostics["alignment"]["alignment_method"] == "full_sim3"
+    assert result.diagnostics["alignment"]["full_sim3_accepted"] is True
+    assert backend.window_anchor_nodes == {0: 0, 1: 2}
+    assert backend.window_end_nodes == {0: 3, 1: 5}
+    assert set(backend.graph.nodes) == {0, 2, 3, 5}
+    edge_types = [factor.edge_type for factor in backend.graph.edges]
+    assert edge_types.count("boundary_dense_spherical") == 2
+    assert edge_types.count("overlap_two_frame_sim3") == 1
+    assert edge_types.count("overlap_dense_spherical") == 2
+    assert edge_types.count("overlap_shared_pose_consistency") == 2
+    assert result.fusion["hash_visibility_views"] == 2
+    assert (
+        result.fusion["hash_visible_incoming"]
+        == packet1.anchor_observation.num_anchors
+    )
+    assert result.fusion["hash_visible_existing"] == result.fusion["anchors_before"]
+    torch.testing.assert_close(packet1.observation.refined_depth, original_depth)
+    torch.testing.assert_close(packet1.anchor_observation.xyz, original_xyz)
+    torch.testing.assert_close(packet1.anchor_observation.voxel_size, original_voxel)
+    stored = backend._last_full_packet
+    assert stored is not None
+    torch.testing.assert_close(stored.observation.refined_depth, original_depth)
+    torch.testing.assert_close(stored.anchor_observation.xyz, original_xyz)
+    torch.testing.assert_close(stored.anchor_observation.voxel_size, original_voxel)
+    backend.submaps[0] = SimpleNamespace(
+        frozen=True,
+        boundary_node_ids=[0, 3],
+    )
+    compressed = backend._compress_frozen_submap_factors(
+        SimpleNamespace(
+            submap_id=1,
+            boundary_node_ids=[2, 5],
+        )
+    )
+    assert compressed == 3
+    assert not any(
+        isinstance(factor, DenseSphericalFactorBlock)
+        and factor.edge_type == "overlap_dense_spherical"
+        for factor in backend.graph.edges
+    )
+    remaining_boundaries = [
+        factor
+        for factor in backend.graph.edges
+        if isinstance(factor, DenseSphericalFactorBlock)
+        and factor.edge_type == "boundary_dense_spherical"
+    ]
+    assert len(remaining_boundaries) == 1
+    assert {
+        remaining_boundaries[0].source,
+        remaining_boundaries[0].target,
+    } == {0, 3}
+
+
+def test_full_sim3_owner_applies_nonunit_parent_scale_once_without_packet_rescale() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    poses[:, 0, 3] = torch.arange(4) * 0.1
+    packet = _refined_packet(0, poses, (0, 1, 2, 3))
+    assert packet.anchor_observation is not None
+    original_xyz = packet.anchor_observation.xyz.clone()
+    original_scale = packet.anchor_observation.scaling.clone()
+    original_voxel = packet.anchor_observation.voxel_size.clone()
+    angle = torch.deg2rad(torch.tensor(5.0))
+    rotation = torch.tensor(
+        [
+            [torch.cos(angle), 0.0, torch.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-torch.sin(angle), 0.0, torch.cos(angle)],
+        ]
+    )
+    owner = sim3_from_components(
+        2.0,
+        rotation,
+        torch.tensor([0.3, -0.2, 0.1]),
+    )
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu")
+    )
+
+    prepared = backend.fusion.prepare_packet_batch(packet, owner)
+
+    assert prepared.source_anchor_indices is not None
+    selected = prepared.source_anchor_indices
+    torch.testing.assert_close(
+        prepared.batch.xyz,
+        apply_sim3(owner, original_xyz.index_select(0, selected)),
+    )
+    torch.testing.assert_close(
+        prepared.batch.scale,
+        2.0 * original_scale.index_select(0, selected),
+    )
+    torch.testing.assert_close(
+        prepared.batch.voxel_size,
+        2.0 * original_voxel.index_select(0, selected),
+    )
+    torch.testing.assert_close(packet.anchor_observation.xyz, original_xyz)
+    torch.testing.assert_close(packet.anchor_observation.scaling, original_scale)
+    torch.testing.assert_close(packet.anchor_observation.voxel_size, original_voxel)
+
+
+def test_overlap2_failure_after_graph_insertion_rolls_back_independent_nodes() -> None:
+    shared_feature = torch.randn(24, 6, 12)
+    features = {frame_id: shared_feature for frame_id in range(6)}
+    poses0 = torch.eye(4).repeat(4, 1, 1)
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses0[:, 0, 3] = torch.arange(4) * 0.1
+    poses1[:, 0, 3] = torch.arange(2, 6) * 0.1
+    packet0 = _refined_packet(
+        0, poses0, (0, 1, 2, 3), feature_by_frame=features
+    )
+    packet1 = _refined_packet(
+        1, poses1, (2, 3, 4, 5), feature_by_frame=features
+    )
+    renderer = _SyntheticSharedDepthRenderer(
+        local_depth=2.0,
+        global_depth=2.0,
+        fail_on_call=7,
+    )
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _two_frame_boundary_backend(gaussian_map, renderer)
+    backend.process_packet(packet0)
+    nodes_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    edges_before = list(backend.graph.edges)
+    windows_before = list(backend.window_order)
+    anchors_before = gaussian_map.anchor_count()
+
+    with pytest.raises(RuntimeError, match="synthetic renderer failure"):
+        backend.process_packet(packet1)
+
+    assert backend.window_order == windows_before
+    assert backend.window_anchor_nodes == {0: 0}
+    assert backend.window_end_nodes == {0: 3}
+    assert len(backend.graph.edges) == len(edges_before)
+    assert set(backend.graph.nodes) == set(nodes_before)
+    for node, transform in nodes_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    assert gaussian_map.anchor_count() == anchors_before
+    diagnostic = backend.consume_rendered_overlap_diagnostic()
+    assert diagnostic is not None
+    assert diagnostic["frame_ids"].tolist() == [2, 3]
 
 
 def test_rendered_depth_scale_recovers_absolute_and_local_correction() -> None:
@@ -2339,6 +2887,81 @@ def test_window_scheduler_has_exact_one_frame_overlap_and_partial_flush(tmp_path
     assert all(torch.equal(packet.local_poses_c2w[0], torch.eye(4)) for packet in packets)
     assert set(packets[0].frame_ids) & set(packets[1].frame_ids) == {3}
     assert set(packets[1].frame_ids) & set(packets[2].frame_ids) == {6}
+
+
+def test_window_scheduler_overlap2_emits_two_new_frames_and_validates_partial(
+    tmp_path: Path,
+) -> None:
+    config = stage2_default_config()
+    config["image"] = {
+        "height": 8,
+        "width": 16,
+        "head_height": 8,
+        "head_width": 16,
+    }
+    config["head"].update(
+        {"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12}
+    )
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_stride2.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {
+            "size": 4,
+            "stride": 2,
+            "expected_overlap_frames": 2,
+            "enforce_exact_overlap": True,
+            "verification_size": [4, 8],
+        },
+        "local_ba": {"enabled": False},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    packets = []
+    emitted: list[int] = []
+    for frame_id in range(9):
+        frontend.track(
+            PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id)
+        )
+        emitted.extend(
+            int(output.frame_id) for output in frontend.pop_ready_outputs()
+        )
+        packets.extend(frontend.consume_local_gaussian_windows())
+    emitted.extend(int(output.frame_id) for output in frontend.flush())
+    packets.extend(frontend.consume_local_gaussian_windows())
+    frontend.flush()
+
+    assert [packet.frame_ids for packet in packets] == [
+        (0, 1, 2, 3),
+        (2, 3, 4, 5),
+        (4, 5, 6, 7),
+        (6, 7, 8),
+    ]
+    assert emitted == list(range(9))
+    assert len(emitted) == len(set(emitted))
+    assert all(
+        torch.equal(packet.local_poses_c2w[0], torch.eye(4))
+        for packet in packets
+    )
+    for previous, current in zip(packets, packets[1:]):
+        assert (
+            set(previous.frame_ids) & set(current.frame_ids)
+            == set(current.frame_ids[:2])
+        )
 
 
 def test_packet_hard_sky_defines_finite_gaussian_mask() -> None:

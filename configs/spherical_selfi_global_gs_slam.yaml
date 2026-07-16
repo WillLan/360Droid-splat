@@ -86,8 +86,8 @@ SphericalSelfiRuntime:
   feature_amp: true
   window:
     size: 4
-    stride: 3
-    expected_overlap_frames: 1
+    stride: 2
+    expected_overlap_frames: 2
     enforce_exact_overlap: true
     verification_size: [32, 64]
     latitude_bands: 8
@@ -178,14 +178,25 @@ SphericalSelfiGlobalBackend:
   rgb_sh_degree: 2
   rendered_overlap_alignment:
     enabled: true
-    mode: shared_frame_scale_only
+    # Ablation: use two_frame_scale_pose to keep the same overlap-2 graph and
+    # estimate only scale from depth while deriving R/t from shared-frame poses.
+    mode: two_frame_full_sim3
     min_points: 256
     max_points: 4096
+    min_points_per_frame: 256
+    max_points_per_frame: 2048
     alpha_threshold: 0.05
     min_inlier_ratio: 0.35
     max_median_relative_error: 0.10
     max_scale_change: 2.5
-    failure_policy: error
+    irls_iterations: 5
+    holdout_stride: 5
+    covariance_min_ratio: 1.0e-4
+    max_rotation_correction_deg: 10.0
+    max_translation_correction: 1.0
+    max_shared_rotation_error_deg: 2.0
+    max_shared_center_error: 0.15
+    failure_policy: scale_pose_then_error
   insertion_dedup:
     enabled: true
     visible_only: true
@@ -210,7 +221,7 @@ SphericalSelfiGlobalBackend:
     path_max_log_scale: 1.0986122887
   hierarchical_submaps:
     enabled: true
-    windows_per_submap: 5
+    windows_per_submap: 8
     shared_boundary_nodes: 1
     local_camera_model: se3_shared_scale
     compress_frozen_dense_factors: true
@@ -234,10 +245,10 @@ SphericalSelfiGlobalBackend:
     dense_information_reference_count: 64
     recent_windows: 32
     optimization_start_nodes: 6
-    optimization_interval_edges: 5
+    optimization_interval_edges: 8
     active_nodes: 6
     allow_boundary_matching_fallback: false
-    expected_overlap_frames: 1
+    expected_overlap_frames: 2
     enforce_exact_overlap: true
     overlap_num_queries: 4096
     factor_queries_per_direction: 2048
@@ -293,7 +304,7 @@ SphericalSelfiGlobalBackend:
       max_rotation_consistency_deg: 3.0
       max_normalized_alignment_residual: 0.10
     top_k: 5  # Legacy fallback; ignored by retrieval.top_k above.
-    exclude_recent_windows: 3
+    exclude_recent_windows: 5
     min_retrieval_score: 0.35
     min_match_cosine: 0.45
     min_matches: 64

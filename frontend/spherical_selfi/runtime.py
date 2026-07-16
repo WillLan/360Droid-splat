@@ -509,6 +509,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.sky_mask_by_frame: dict[int, torch.Tensor] = {}
         self._local_ba_diagnostics: list[dict[str, Any]] = []
         self.last_processed_frame_id: int | None = None
+        self.last_window_frame_ids: tuple[int, ...] | None = None
         self._keyframe_decisions: dict[int, tuple[bool, float]] = {}
         self._last_keyframe_id: int | None = None
         self._last_keyframe_descriptor: torch.Tensor | None = None
@@ -531,6 +532,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self._local_ba_diagnostics.clear()
         self._local_gaussian_windows.clear()
         self.last_processed_frame_id = None
+        self.last_window_frame_ids = None
         self._keyframe_decisions.clear()
         self._last_keyframe_id = None
         self._last_keyframe_descriptor = None
@@ -1490,6 +1492,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             )
         self.window_index += 1
         self.last_processed_frame_id = int(frames[-1].frame_id)
+        self.last_window_frame_ids = tuple(int(frame.frame_id) for frame in frames)
 
     def _emit_oldest(self, count: int) -> None:
         candidates = sorted(
@@ -1506,13 +1509,15 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         while self.frame_buffer_start + len(self.frames) >= self.next_window_start + self.window_size:
             local_start = self.next_window_start - self.frame_buffer_start
             stop = local_start + self.window_size
+            first_window = self.window_index == 0
             self._run_window(self.frames[local_start:stop])
             self.next_window_start += self.window_stride
-            # Emit the first complete window in full.  Later windows naturally
-            # emit only their three unseen frames because the overlap frame is
-            # already marked emitted.  This registers all four RGB targets
-            # before the backend starts that window's 20-step optimization.
-            self._emit_oldest(self.window_size)
+            # The first window publishes every frame. Later windows publish
+            # exactly ``stride`` unseen frames; overlap outputs remain owned by
+            # the earlier window and are not emitted twice.
+            self._emit_oldest(
+                self.window_size if first_window else self.window_stride
+            )
             prune = self.next_window_start - self.frame_buffer_start
             if prune > 0:
                 del self.frames[:prune]
@@ -1569,14 +1574,38 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
     def flush(self) -> list[FrontendOutput]:
         absolute_end = self.frame_buffer_start + len(self.frames)
         remaining = absolute_end - self.next_window_start
-        if remaining >= 2:
+        minimum_partial = (
+            2
+            if self.window_index == 0
+            else max(2, self.expected_overlap + 1)
+        )
+        if remaining >= minimum_partial:
             local_start = self.next_window_start - self.frame_buffer_start
             partial = self.frames[local_start:]
-            if self.last_processed_frame_id != int(partial[-1].frame_id):
-                self._run_window(partial)
-                self.next_window_start = absolute_end
-                self.frames.clear()
-                self.frame_buffer_start = absolute_end
+            if self.window_index > 0:
+                if self.last_window_frame_ids is None:
+                    raise RuntimeError(
+                        "Partial-window validation requires the previous window"
+                    )
+                expected = (
+                    ()
+                    if self.expected_overlap == 0
+                    else self.last_window_frame_ids[-self.expected_overlap :]
+                )
+                actual = tuple(
+                    int(frame.frame_id)
+                    for frame in partial[: self.expected_overlap]
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        "Partial spherical window does not preserve the configured "
+                        f"{self.expected_overlap}-frame overlap: "
+                        f"expected {expected}, got {actual}"
+                    )
+            self._run_window(partial)
+            self.next_window_start = absolute_end
+            self.frames.clear()
+            self.frame_buffer_start = absolute_end
         self._emit_oldest(len(self.pending_outputs))
         return self.pop_ready_outputs()
 
