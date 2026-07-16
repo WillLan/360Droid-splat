@@ -2382,12 +2382,6 @@ class SphericalSelfiGlobalBackend:
             <= scale
             <= self.rendered_alignment_max_scale_change
         )
-        pose_pair_ok = (
-            pose_pair["pose_pair_rotation_deg"]
-            <= self.rendered_alignment_max_shared_rotation_error_deg
-            and pose_pair["pose_pair_translation"]
-            <= self.rendered_alignment_max_shared_center_error
-        )
         train_ratio = sum(
             float(
                 (
@@ -2424,7 +2418,6 @@ class SphericalSelfiGlobalBackend:
         ) / float(len(holdout_error_parts))
         accepted = (
             scale_ok
-            and pose_pair_ok
             and train_ratio >= self.rendered_alignment_min_inlier_ratio
             and holdout_ratio >= self.rendered_alignment_min_inlier_ratio
             and train_median
@@ -2436,6 +2429,30 @@ class SphericalSelfiGlobalBackend:
             and max(shared_center_errors, default=0.0)
             <= self.rendered_alignment_max_shared_center_error
         )
+        if not scale_ok:
+            reason = "scale_gate_rejected"
+        elif train_ratio < self.rendered_alignment_min_inlier_ratio:
+            reason = "training_inlier_gate_rejected"
+        elif (
+            train_median
+            > self.rendered_alignment_max_median_relative_error
+        ):
+            reason = "training_residual_gate_rejected"
+        elif (
+            holdout_ratio < self.rendered_alignment_min_inlier_ratio
+            or holdout_median
+            > self.rendered_alignment_max_median_relative_error
+        ):
+            reason = "holdout_gate_rejected"
+        elif (
+            max(shared_rotation_errors, default=0.0)
+            > self.rendered_alignment_max_shared_rotation_error_deg
+            or max(shared_center_errors, default=0.0)
+            > self.rendered_alignment_max_shared_center_error
+        ):
+            reason = "shared_pose_gate_rejected"
+        else:
+            reason = "accepted"
         diagnostics = {
             "fallback_scale": scale,
             "fallback_train_inlier_ratio": train_ratio,
@@ -2446,11 +2463,7 @@ class SphericalSelfiGlobalBackend:
             "fallback_shared_rotation_errors_deg": shared_rotation_errors,
             "fallback_shared_center_errors": shared_center_errors,
             "fallback_accepted": bool(accepted),
-            "fallback_reason": (
-                "accepted"
-                if accepted
-                else "scale_or_pose_consistency_gate_rejected"
-            ),
+            "fallback_reason": reason,
             **pose_pair,
         }
         return (

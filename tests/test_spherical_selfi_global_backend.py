@@ -1321,6 +1321,43 @@ def test_two_frame_scale_pose_fallback_rejects_inconsistent_shared_poses() -> No
     assert diagnostics["pose_pair_translation"] > 0.15
 
 
+def test_two_frame_scale_pose_accepts_pair_disagreement_when_mean_pose_passes() -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        covariance_min_ratio=1.0e-3,
+    )
+    expected = sim3_from_components(
+        1.1,
+        torch.eye(3),
+        torch.tensor([0.1, 0.0, 0.0]),
+    )
+    frames = _known_two_frame_geometry(expected, planar=True)
+    for index, angle_deg in enumerate((1.7, -1.7)):
+        angle = torch.deg2rad(torch.tensor(angle_deg))
+        delta = torch.tensor(
+            [
+                [torch.cos(angle), -torch.sin(angle), 0.0],
+                [torch.sin(angle), torch.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        previous_pose = frames[index].previous_pose.clone()
+        previous_pose[:3, :3] = delta @ previous_pose[:3, :3]
+        frames[index] = replace(
+            frames[index],
+            previous_pose=previous_pose,
+        )
+
+    fallback, _, diagnostics = backend._fit_two_frame_scale_pose_fallback(
+        frames
+    )
+
+    assert diagnostics["pose_pair_rotation_deg"] > 2.0
+    assert max(diagnostics["fallback_shared_rotation_errors_deg"]) < 2.0
+    assert fallback is not None, diagnostics
+    assert diagnostics["fallback_accepted"] is True
+
+
 def test_overlap2_rejection_preserves_scalar_failure_diagnostics() -> None:
     poses0 = torch.eye(4).repeat(4, 1, 1)
     poses1 = torch.eye(4).repeat(4, 1, 1)
