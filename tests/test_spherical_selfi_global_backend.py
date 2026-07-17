@@ -255,6 +255,7 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
     assert window["expected_overlap_frames"] == 2
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 8
+    assert graph["optimization_enabled"] is True
     assert graph["expected_overlap_frames"] == 2
     assert graph["normalize_dense_information_by_count"] is True
     assert graph["analytic_dense_linearization"] is True
@@ -477,6 +478,60 @@ def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
     assert result.accepted
     assert result.final_objective < result.initial_objective
     torch.testing.assert_close(graph.transform(1), truth, atol=2e-4, rtol=2e-4)
+
+
+def test_sim3_graph_optimization_can_be_disabled_without_mutating_nodes() -> None:
+    tangent = torch.tensor([0.3, -0.2, 0.1, 0.03, -0.04, 0.02, math.log(1.2)])
+    truth = sim3_exp(tangent)
+    graph = GlobalSim3FactorGraph(
+        max_iterations=10,
+        pcg_iterations=32,
+        optimization_enabled=False,
+    )
+    graph.add_node(0, sim3_identity())
+    initial = sim3_exp(
+        tangent + torch.tensor([0.15, 0.0, 0.0, 0.0, 0.02, 0.0, 0.1])
+    )
+    graph.add_node(1, initial)
+    graph.add_edge(
+        Sim3GraphEdge(
+            source=0,
+            target=1,
+            measurement_target_to_source=truth,
+            information_diag=torch.ones(7),
+        )
+    )
+
+    result = graph.optimize()
+
+    assert result.accepted is False
+    assert result.iterations == 0
+    assert result.reason == "optimization_disabled"
+    assert result.final_objective == pytest.approx(result.initial_objective)
+    torch.testing.assert_close(graph.transform(1), initial)
+
+
+def test_no_graph_100_frame_ablation_only_disables_graph_optimization() -> None:
+    root = Path(__file__).parents[1]
+    base = yaml.safe_load(
+        (root / "configs" / "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml")
+        .read_text(encoding="utf-8")
+    )
+    ablation = yaml.safe_load(
+        (
+            root
+            / "configs"
+            / "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_nograph_100.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert ablation["base_config"] == (
+        "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml"
+    )
+    assert base["Dataset"] == {"begin": 0, "end": 100, "frame_stride": 1}
+    assert ablation["SphericalSelfiGlobalBackend"] == {
+        "global_graph": {"optimization_enabled": False}
+    }
 
 
 def test_sim3_log_identity_jacobians_are_finite() -> None:

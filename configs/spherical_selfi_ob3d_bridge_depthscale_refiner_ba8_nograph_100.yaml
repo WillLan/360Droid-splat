@@ -1,0 +1,21 @@
+base_config: spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml
+
+SphericalSelfiGlobalBackend:
+  global_graph:
+    optimization_enabled: false
+
+WeightsAndBiases:
+  group: ob3d-sponza-known-pose-bridge-refiner-ba8-graph-ablation-100
+  run_name: ob3d100_bridge_depthscale_refiner_ba8_nograph
+  tags:
+    - spherical-selfi
+    - adapter-ba
+    - localba8-single-stage
+    - refiner-post-bridge
+    - overlap2
+    - depth-scale-only
+    - global-graph-optimization-off
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_bridge_depthscale_refiner_ba8_nograph

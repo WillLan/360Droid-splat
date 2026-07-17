@@ -197,6 +197,9 @@ class SphericalSelfiGlobalBackend:
         self.packet_refiner_release = packet_refiner_release
         self.config = dict(config or {})
         graph_cfg = dict(self.config.get("global_graph", {}) or {})
+        self.global_graph_optimization_enabled = bool(
+            graph_cfg.get("optimization_enabled", True)
+        )
         loop_cfg = dict(self.config.get("loop_closure", {}) or {})
         descriptor_cfg = dict(loop_cfg.get("descriptor", {}) or {})
         retrieval_cfg = dict(loop_cfg.get("retrieval", {}) or {})
@@ -698,6 +701,7 @@ class SphericalSelfiGlobalBackend:
             restrict_objective_to_active_factors=bool(
                 graph_cfg.get("restrict_objective_to_active_factors", False)
             ),
+            optimization_enabled=self.global_graph_optimization_enabled,
         )
         self.submap_graph = (
             GlobalSim3FactorGraph(
@@ -737,6 +741,7 @@ class SphericalSelfiGlobalBackend:
                         graph_cfg.get("restrict_objective_to_active_factors", False),
                     )
                 ),
+                optimization_enabled=self.global_graph_optimization_enabled,
             )
             if self.hierarchical_submaps_enabled
             else None
@@ -6198,7 +6203,8 @@ class SphericalSelfiGlobalBackend:
         }
         recent_window_count = len(self.window_order) + 1
         should_optimize_recent = (
-            (
+            self.global_graph_optimization_enabled
+            and (
                 recent_window_count >= self.global_ba_start_nodes
                 if self.two_frame_overlap_enabled
                 else len(self.boundary_node_order) >= self.global_ba_start_nodes
@@ -6577,6 +6583,9 @@ class SphericalSelfiGlobalBackend:
                 "boundary_factor": boundary_diagnostics,
                 "loops": [self._loop_summary(value) for value in loop_results],
                 "graph_node_mode": "boundary_frame",
+                "global_graph_optimization_enabled": (
+                    self.global_graph_optimization_enabled
+                ),
                 "global_ba_scheduled": graph_result is not None,
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,
                 "local_camera_model": self.local_camera_model,
@@ -6898,7 +6907,8 @@ class SphericalSelfiGlobalBackend:
                 if self._active_submap_id is not None:
                     self._update_submap_local_geometry(self._active_submap_id)
                 graph_result = self.submap_graph.optimize()
-                self._apply_submap_graph_to_boundary_graph()
+                if self.global_graph_optimization_enabled:
+                    self._apply_submap_graph_to_boundary_graph()
             else:
                 graph_result = self.graph.optimize()
             new_transforms = self._window_anchor_transforms()
@@ -6923,6 +6933,9 @@ class SphericalSelfiGlobalBackend:
                 "graph_final_objective": graph_result.final_objective,
                 "graph_iterations": graph_result.iterations,
                 "graph_reason": graph_result.reason,
+                "global_graph_optimization_enabled": (
+                    self.global_graph_optimization_enabled
+                ),
                 "graph_node_mode": "boundary_frame",
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,
                 "local_camera_model": self.local_camera_model,

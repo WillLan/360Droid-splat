@@ -224,6 +224,7 @@ class GlobalSim3FactorGraph:
         lock_scale_updates: bool = False,
         analytic_dense_linearization: bool = False,
         restrict_objective_to_active_factors: bool = False,
+        optimization_enabled: bool = True,
     ) -> None:
         self.nodes: dict[int, torch.Tensor] = {}
         self.edges: list[GraphFactor] = []
@@ -245,6 +246,7 @@ class GlobalSim3FactorGraph:
         self.restrict_objective_to_active_factors = bool(
             restrict_objective_to_active_factors
         )
+        self.optimization_enabled = bool(optimization_enabled)
         self.fixed_node_id: int | None = None
         self._last_pcg_iterations = 0
         self._last_pcg_relative_residual = 0.0
@@ -796,6 +798,19 @@ class GlobalSim3FactorGraph:
         *,
         fixed_node_ids: Iterable[int] | None = None,
     ) -> Sim3GraphOptimizeResult:
+        if not self.optimization_enabled:
+            with torch.no_grad():
+                value = float(self.objective().detach().cpu())
+            return Sim3GraphOptimizeResult(
+                accepted=False,
+                iterations=0,
+                initial_objective=value,
+                final_objective=value,
+                max_update_norm=0.0,
+                optimized_node_ids=(),
+                reason="optimization_disabled",
+                final_damping=float(self.damping),
+            )
         # Explicitly leave any caller inference context. Factor constants are
         # ordinary cloned tensors, while jacfwd owns the local differentiable
         # tangent variables used for each block linearization.

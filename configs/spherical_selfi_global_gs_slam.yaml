@@ -237,6 +237,7 @@ SphericalSelfiGlobalBackend:
     local_camera_model: se3_shared_scale
     compress_frozen_dense_factors: true
   global_graph:
+    optimization_enabled: true
     node_mode: boundary_frame
     factor_mode: dense_spherical
     sampling: fibonacci_depth_filtered
