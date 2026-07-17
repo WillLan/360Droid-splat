@@ -4229,6 +4229,52 @@ class SphericalSelfiGlobalBackend:
         )
         return factor, diagnostics
 
+    @staticmethod
+    def _boundary_local_pose_fallback_edge(
+        packet: LocalGaussianWindowPacket,
+        diagnostics: dict[str, Any],
+    ) -> Sim3GraphEdge:
+        """Keep a chunk connected when its optional first/last match block fails.
+
+        The local S2 BA pose is already the accepted odometry estimate for the
+        window.  It is therefore a safer bounded fallback than either dropping
+        the window or leaving its end node disconnected.  Scale remains one in
+        chunk coordinates; the owner Sim(3) applies the selected bridge scale
+        exactly once when the chunk is placed in the global frame.
+        """
+
+        relative_pose = packet.local_poses_c2w[-1].detach()
+        if relative_pose.shape != (4, 4) or not bool(
+            torch.isfinite(relative_pose).all()
+        ):
+            raise RuntimeError("Local BA boundary pose must be a finite 4x4 matrix")
+        measurement = sim3_from_components(
+            1.0,
+            relative_pose[:3, :3],
+            relative_pose[:3, 3],
+        )
+        metadata = dict(diagnostics)
+        metadata.update(
+            {
+                "accepted": True,
+                "fallback_used": True,
+                "fallback_reason": diagnostics.get("reason", "unknown"),
+                "reason": "local_ba_pose_fallback",
+                "source_frame_id": int(packet.frame_ids[0]),
+                "target_frame_id": int(packet.frame_ids[-1]),
+            }
+        )
+        return Sim3GraphEdge(
+            source=int(packet.frame_ids[0]),
+            target=int(packet.frame_ids[-1]),
+            measurement_target_to_source=measurement,
+            information_diag=measurement.new_tensor(
+                [0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 0.25]
+            ),
+            edge_type="boundary_local_ba_pose_fallback",
+            metadata=metadata,
+        )
+
     def _overlap_edge(
         self,
         source: LocalGaussianWindowPacket,
@@ -5856,11 +5902,19 @@ class SphericalSelfiGlobalBackend:
         packet.pre_depth_shift_depth = None
 
         boundary_factor, boundary_diagnostics = self._boundary_factor(packet)
-        if boundary_factor is None and not self.allow_unaligned_fallback:
-            raise RuntimeError(
-                f"Window {window_id} has no valid first/last spherical factor: "
-                f"{boundary_diagnostics.get('reason', 'unknown')}"
-            )
+        boundary_pose_fallback: Sim3GraphEdge | None = None
+        if boundary_factor is None:
+            if self.two_frame_known_pose_bridge_enabled:
+                boundary_pose_fallback = self._boundary_local_pose_fallback_edge(
+                    packet,
+                    boundary_diagnostics,
+                )
+                boundary_diagnostics = dict(boundary_pose_fallback.metadata)
+            elif not self.allow_unaligned_fallback:
+                raise RuntimeError(
+                    f"Window {window_id} has no valid first/last spherical factor: "
+                    f"{boundary_diagnostics.get('reason', 'unknown')}"
+                )
 
         if (
             self.two_frame_overlap_enabled
@@ -5904,7 +5958,13 @@ class SphericalSelfiGlobalBackend:
             self.graph.add_edge(factor)
         if boundary_factor is not None:
             self.graph.add_edge(boundary_factor)
-        if boundary_factor is not None or sequential_overlap_edge is not None:
+        elif boundary_pose_fallback is not None:
+            self.graph.add_edge(boundary_pose_fallback)
+        if (
+            boundary_factor is not None
+            or boundary_pose_fallback is not None
+            or sequential_overlap_edge is not None
+        ):
             self._sequential_edges_since_optimization += 1
         self._register_hierarchical_window(window_id, start_frame, end_frame)
 

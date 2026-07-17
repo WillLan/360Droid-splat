@@ -2483,6 +2483,31 @@ def test_boundary_factor_ignores_confidence_and_hard_excludes_sky() -> None:
     torch.testing.assert_close(factor.factor_weight, torch.ones_like(factor.factor_weight))
 
 
+def test_boundary_local_pose_fallback_keeps_chunk_connected_without_rescaling() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    poses[1, 0, 3] = 0.1
+    poses[2, 0, 3] = 0.25
+    poses[3, 0, 3] = 0.4
+    packet = _packet(0, poses, (0, 1, 2, 3))
+
+    edge = SphericalSelfiGlobalBackend._boundary_local_pose_fallback_edge(
+        packet,
+        {"reason": "insufficient_boundary_matches", "hard_gated_boundary_matches": 7},
+    )
+
+    assert edge.source == 0
+    assert edge.target == 3
+    assert edge.edge_type == "boundary_local_ba_pose_fallback"
+    scale, rotation, translation = sim3_components(
+        edge.measurement_target_to_source
+    )
+    torch.testing.assert_close(scale, torch.tensor(1.0))
+    torch.testing.assert_close(rotation, poses[-1, :3, :3])
+    torch.testing.assert_close(translation, poses[-1, :3, 3])
+    assert edge.metadata["fallback_used"] is True
+    assert edge.metadata["fallback_reason"] == "insufficient_boundary_matches"
+
+
 def test_global_graph_materializes_inference_factors_and_descends() -> None:
     graph = GlobalSim3FactorGraph(max_iterations=4)
     graph.add_node(0, sim3_identity())
