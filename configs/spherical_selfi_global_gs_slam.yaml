@@ -178,14 +178,15 @@ SphericalSelfiGlobalBackend:
   rgb_sh_degree: 2
   rendered_overlap_alignment:
     enabled: true
-    # Mainline: both shared global R/t poses are treated as known.  Only scale
-    # is estimated, then the local trajectory is canonicalized before Refiner.
+    # Mainline: scale is estimated only from canonical previous BA depth and
+    # current raw BA8 overlap depth.  Global-map rendering is diagnostic only.
     mode: two_frame_bridge_depth_scale
     min_points: 256
     max_points: 4096
     min_points_per_frame: 256
     max_points_per_frame: 2048
     alpha_threshold: 0.05
+    min_confidence: 0.05
     min_inlier_ratio: 0.35
     max_median_relative_error: 0.10
     max_scale_change: 2.5
@@ -199,7 +200,7 @@ SphericalSelfiGlobalBackend:
     global_map_consistency_max_relative_error: 0.15
     global_map_min_consistency_ratio: 0.35
     pose_baseline_min: 0.001
-    post_refiner_scale_recheck: true
+    post_refiner_scale_recheck: false
     post_refiner_scale_rerun_threshold: 0.02
     post_refiner_scale_max_relative_change: 0.10
     failure_policy: error
@@ -207,14 +208,23 @@ SphericalSelfiGlobalBackend:
     enabled: true
     visible_only: true
     same_level_only: true
+    # Ablation values: 1.0 / 1.25 / 1.5.  Keep 1.0 until the 20-frame
+    # coverage/map-growth sweep provides evidence for a larger radius.
     radius_voxels: 1.0
     compare_existing_only: true
     permanent_drop: true
     update_existing_statistics: true
     require_new_frame_support: true
+    # Conditional fallback only: set to 100000 in an experiment override if
+    # radius=1.5 still misses the per-chunk growth target.
+    max_new_gaussians_per_chunk: 0
+    coverage_coarse_cell_size: 0.64
+    # Four additional global-map renders per chunk. Keep disabled for normal
+    # runs; the radius20 sweep enables it to measure post-Hash coverage.
+    log_posthash_coverage: false
   post_optimization_seam_check:
     enabled: true
-    max_rotation_error_deg: 2.0
+    max_rotation_error_deg: 5.0
     max_center_error: 0.15
   geometry_validation:
     enabled: true
@@ -225,7 +235,7 @@ SphericalSelfiGlobalBackend:
     dcs_phi: 25.0
     transactional: true
     min_commit_dcs_scale: 0.05
-    max_nonloop_objective_ratio: 1.05
+    max_nonloop_objective_ratio: 1.02
     nonloop_objective_tolerance: 1.0e-6
     path_max_rotation_deg: 45.0
     path_max_translation: 5.0
@@ -238,7 +248,8 @@ SphericalSelfiGlobalBackend:
     compress_frozen_dense_factors: true
   global_graph:
     optimization_enabled: true
-    node_mode: boundary_frame
+    node_mode: chunk_first_stride
+    optimization_trigger: loop_only
     factor_mode: dense_spherical
     sampling: fibonacci_depth_filtered
     iterations: 8
@@ -262,6 +273,33 @@ SphericalSelfiGlobalBackend:
     allow_boundary_matching_fallback: false
     expected_overlap_frames: 2
     enforce_exact_overlap: true
+    chunk_stride:
+      target_index: 2
+      min_matches: 256
+      holdout_stride: 5
+      irls_iterations: 5
+      min_inlier_ratio: 0.35
+      covariance_min_ratio: 1.0e-4
+      max_scale_change: 2.5
+      max_rotation_error_deg: 5.0
+      max_translation_error: 1.0
+      max_translation_depth_ratio: 0.05
+      max_holdout_angular_deg: 2.0
+      max_holdout_relative_depth: 0.10
+      postopt_worse_ratio: 1.05
+    skip_edge:
+      enabled: true
+      num_queries: 2048
+      temperature: 0.07
+      query_chunk_size: 32
+      fibonacci_oversample_factor: 8
+      use_spherical_area_correction: true
+      forward_backward: true
+      fb_tolerance_deg: 1.0
+      min_factor_weight: 0.01
+      subpixel_refine_radius: 1
+      max_sequence_objective_ratio: 1.02
+      max_cumulative_scale_change: 1.25
     overlap_num_queries: 4096
     factor_queries_per_direction: 2048
     max_dense_factors_per_edge: 4096
@@ -290,7 +328,8 @@ SphericalSelfiGlobalBackend:
     max_scale_change: 2.5
     max_translation_update: 1.0
     max_rotation_update_deg: 10.0
-    max_log_scale_update: 0.25
+    # One accepted LM retraction changes scale by at most 5%.
+    max_log_scale_update: 0.04879016417
     allow_unaligned_fallback: false
   loop_closure:
     # Explicit opt-in to the arbitrary-orientation loop path. Code defaults
@@ -342,7 +381,11 @@ SphericalSelfiGlobalBackend:
     voxel_sizes: [0.04, 0.08, 0.16, 0.32]
     min_confidence: 0.05
     min_opacity: 0.02
+    # Retain the global long-sequence safety cap.  A no-cap run is allowed
+    # only as an explicit short-sequence ablation override.
     max_total_gaussians: 2000000
+    # This switch controls selection at the global 2M cap; it is independent
+    # of insertion_dedup.max_new_gaussians_per_chunk.
     coverage_aware_budget: true
     coverage_coarse_cell_size: 0.64
     lifecycle_prune_interval_windows: 8

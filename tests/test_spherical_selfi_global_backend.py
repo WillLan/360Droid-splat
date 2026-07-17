@@ -18,6 +18,7 @@ from backend.pano_gs.sim3_graph import (
     s2_log_tangent_coordinates,
 )
 from backend.pano_gs.spherical_selfi_global import (
+    ChunkStrideHoldout,
     KnownPoseBridgeFrame,
     OverlapFrameGeometry,
     RenderedSharedFrame,
@@ -41,6 +42,7 @@ from frontend.spherical_selfi.runtime import (
 )
 from frontend.spherical_selfi.window_packet import (
     BoundaryMatchBlock,
+    ChunkStrideMatchBlock,
     LocalGaussianWindowPacket,
     build_panorama_retrieval_descriptor,
 )
@@ -107,14 +109,108 @@ def _packet(
     frame_ids: tuple[int, ...],
     *,
     feature_by_frame: dict[int, torch.Tensor] | None = None,
+    height: int = 6,
+    width: int = 12,
 ) -> LocalGaussianWindowPacket:
-    observation, feature = _observation(poses, frame_ids, feature_by_frame=feature_by_frame)
+    observation, feature = _observation(
+        poses,
+        frame_ids,
+        height=height,
+        width=width,
+        feature_by_frame=feature_by_frame,
+    )
     return LocalGaussianWindowPacket.from_observation(
         window_id=window_id,
         observation=observation,
         adapter_features=feature,
         frame_ids=frame_ids,
         verification_size=feature.shape[-2:],
+    )
+
+
+def _chunk_stride_backend(*, min_matches: int = 256, skip: bool = False):
+    return SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        config={
+            "enabled": True,
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "optimization_trigger": "loop_only",
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "chunk_stride": {
+                    "target_index": 2,
+                    "min_matches": int(min_matches),
+                    "holdout_stride": 5,
+                    "irls_iterations": 5,
+                    "min_inlier_ratio": 0.35,
+                    "covariance_min_ratio": 1.0e-4,
+                    "max_scale_change": 2.5,
+                    "max_rotation_error_deg": 5.0,
+                    "max_translation_error": 1.0,
+                    "max_translation_depth_ratio": 0.05,
+                    "max_holdout_angular_deg": 2.0,
+                    "max_holdout_relative_depth": 0.10,
+                    "postopt_worse_ratio": 1.05,
+                },
+                "skip_edge": {
+                    "enabled": bool(skip),
+                    "num_queries": max(72, int(min_matches)),
+                    "forward_backward": True,
+                },
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+
+def _attach_identity_stride_matches(
+    packet: LocalGaussianWindowPacket,
+    *,
+    target_index: int = 2,
+) -> None:
+    height, width = packet.observation.image_size
+    row, column = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32) + 0.5,
+        torch.arange(width, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )
+    uv = torch.stack([column, row], dim=-1).reshape(-1, 2)
+    bearing = erp_pixel_to_unit_ray(uv, height, width)
+    uv = torch.cat([uv, uv], dim=0)
+    bearing = torch.cat([bearing, bearing], dim=0)
+    count = int(uv.shape[0])
+    direction = torch.cat(
+        [
+            torch.zeros(count // 2, dtype=torch.long),
+            torch.ones(count // 2, dtype=torch.long),
+        ]
+    )
+    packet.chunk_stride_matches = ChunkStrideMatchBlock(
+        source_index=0,
+        target_index=int(target_index),
+        source_uv=uv,
+        target_uv=uv.clone(),
+        source_bearing=bearing,
+        target_bearing=bearing.clone(),
+        top1_cosine=torch.ones(count),
+        top2_margin=torch.ones(count),
+        normalized_entropy=torch.zeros(count),
+        query_direction=direction,
+    )
+    packet.metadata.update(
+        {
+            "local_ba_accepted": True,
+            "local_ba_final_median_residual_deg": 0.1,
+            "local_ba_trust_region_touched": False,
+        }
     )
 
 
@@ -216,7 +312,7 @@ class _TwoViewUnionRenderer(_SyntheticSharedDepthRenderer):
         return package
 
 
-def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -> None:
+def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     local_ba = config["SphericalSelfiRuntime"]["local_ba"]
@@ -257,6 +353,15 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
     assert graph["optimization_interval_edges"] == 8
     assert graph["optimization_enabled"] is True
     assert graph["expected_overlap_frames"] == 2
+    assert graph["node_mode"] == "chunk_first_stride"
+    assert graph["optimization_trigger"] == "loop_only"
+    assert graph["chunk_stride"]["target_index"] == 2
+    assert graph["chunk_stride"]["min_matches"] == 256
+    assert graph["chunk_stride"]["max_holdout_angular_deg"] == 2.0
+    assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
+    assert graph["skip_edge"]["enabled"] is True
+    assert graph["skip_edge"]["max_sequence_objective_ratio"] == 1.02
+    assert graph["max_log_scale_update"] == pytest.approx(math.log(1.05))
     assert graph["normalize_dense_information_by_count"] is True
     assert graph["analytic_dense_linearization"] is True
     assert graph["restrict_objective_to_active_factors"] is True
@@ -276,6 +381,7 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
         "min_points_per_frame": 256,
         "max_points_per_frame": 2048,
         "alpha_threshold": 0.05,
+        "min_confidence": 0.05,
         "min_inlier_ratio": 0.35,
         "max_median_relative_error": 0.10,
         "max_scale_change": 2.5,
@@ -289,7 +395,7 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
         "global_map_consistency_max_relative_error": 0.15,
         "global_map_min_consistency_ratio": 0.35,
         "pose_baseline_min": 0.001,
-        "post_refiner_scale_recheck": True,
+        "post_refiner_scale_recheck": False,
         "post_refiner_scale_rerun_threshold": 0.02,
         "post_refiner_scale_max_relative_change": 0.10,
         "failure_policy": "error",
@@ -304,13 +410,17 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
         "permanent_drop": True,
         "update_existing_statistics": True,
         "require_new_frame_support": True,
+        "max_new_gaussians_per_chunk": 0,
+        "coverage_coarse_cell_size": 0.64,
+        "log_posthash_coverage": False,
     }
     assert global_backend["post_optimization_seam_check"] == {
         "enabled": True,
-        "max_rotation_error_deg": 2.0,
+        "max_rotation_error_deg": 5.0,
         "max_center_error": 0.15,
     }
     assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
+    assert global_backend["voxel_fusion"]["max_total_gaussians"] == 2_000_000
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
     assert map_optimization["loop_neighborhood_refinement"] is True
     assert map_optimization["loop_seam_deduplication"] is True
@@ -337,6 +447,824 @@ def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -
         "scaling_lr": 1.0e-4,
         "rotation_lr": 1.0e-4,
     }
+
+
+def test_hash_radius20_configs_only_sweep_the_radius_algorithmically() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    expected = {
+        "spherical_selfi_hash_radius20_r100.yaml": 1.0,
+        "spherical_selfi_hash_radius20_r125.yaml": 1.25,
+        "spherical_selfi_hash_radius20_r150.yaml": 1.5,
+    }
+    for name, radius in expected.items():
+        config = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+        assert config["base_config"] == (
+            "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml"
+        )
+        assert config["Dataset"] == {"begin": 0, "end": 20}
+        backend = config["SphericalSelfiGlobalBackend"]
+        assert backend == {
+            "insertion_dedup": {
+                "radius_voxels": radius,
+                "log_posthash_coverage": True,
+            }
+        }
+
+
+def test_chunk_stride_factor_uses_holdout_and_rejects_ba_trust_boundary() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64)
+
+    factor, measurement, holdout, diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+
+    assert factor is not None, diagnostics
+    assert measurement is not None
+    assert holdout is not None
+    assert factor.edge_type == "chunk_stride_dense_spherical"
+    assert holdout.edge_type == factor.edge_type
+    assert diagnostics["accepted"] is True
+    assert diagnostics["train_matches"] > diagnostics["holdout_matches"] > 0
+    assert diagnostics["information_confidence"] > 0.0
+    torch.testing.assert_close(measurement, sim3_identity(), atol=1.0e-4, rtol=1.0e-4)
+
+    packet.metadata["local_ba_trust_region_touched"] = True
+    rejected, _, _, rejected_diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+    assert rejected is None
+    assert rejected_diagnostics["reason"] == "local_ba_quality_gate_rejected"
+
+
+def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
+    monkeypatch,
+) -> None:
+    packet = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+        height=32,
+        width=64,
+    )
+    _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+    original_factor = backend._chunk_stride_factor
+
+    def stride_with_spurious_scale(packet, *, expected_target_index):
+        factor, measurement, holdout, diagnostics = original_factor(
+            packet,
+            expected_target_index=expected_target_index,
+        )
+        assert factor is not None and measurement is not None and holdout is not None
+        spurious_pose = se3_exp(
+            torch.tensor([0.8, -0.4, 0.3, 0.2, -0.1, 0.15])
+        )
+        return (
+            factor,
+            sim3_from_components(
+                1.75,
+                spurious_pose[:3, :3],
+                spurious_pose[:3, 3],
+            ),
+            holdout,
+            diagnostics,
+        )
+
+    monkeypatch.setattr(backend, "_chunk_stride_factor", stride_with_spurious_scale)
+    result = backend.process_packet(packet)
+
+    assert result.graph is None
+    scales = {
+        node: float(sim3_components(transform)[0])
+        for node, transform in backend.graph.nodes.items()
+    }
+    assert set(scales) == {0, 2}
+    assert scales[2] == pytest.approx(scales[0])
+    expected_next = (
+        backend.graph.transform(0)
+        @ packet.local_poses_c2w[2].to(backend.graph.transform(0))
+    )
+    torch.testing.assert_close(backend.graph.transform(2), expected_next)
+    stride_edges = [
+        edge
+        for edge in backend.graph.edges
+        if isinstance(edge, DenseSphericalFactorBlock)
+        and edge.edge_type == "chunk_stride_dense_spherical"
+    ]
+    assert len(stride_edges) == 1
+    assert stride_edges[0].use_depth is True
+    assert stride_edges[0].depth_factor_weight > 0.0
+
+
+def test_chunk_stride_holdout_validation_only_checks_affected_edges(
+    monkeypatch,
+) -> None:
+    backend = _chunk_stride_backend(min_matches=64, skip=True)
+    for node in (0, 2, 4, 6):
+        backend.graph.add_node(node, sim3_identity())
+
+    def holdout(source: int, target: int, marker: float) -> ChunkStrideHoldout:
+        bearing = torch.tensor([[marker, 0.0, 1.0]])
+        return ChunkStrideHoldout(
+            source=source,
+            target=target,
+            edge_type="chunk_stride_dense_spherical",
+            source_bearing=bearing,
+            target_bearing=bearing.clone(),
+            source_depth=torch.ones(1),
+            target_depth=torch.ones(1),
+            initial_angular_median_deg=0.1,
+            initial_relative_depth_median=0.01,
+        )
+
+    backend._chunk_stride_holdouts = {
+        (0, 2, "chunk_stride_dense_spherical"): holdout(0, 2, 9.0),
+        (4, 6, "chunk_stride_dense_spherical"): holdout(4, 6, 1.0),
+    }
+
+    def synthetic_errors(relative, source_bearing, *args):
+        is_bad = float(source_bearing[0, 0]) > 5.0
+        angular = source_bearing.new_tensor([5.0 if is_bad else 0.1])
+        depth = source_bearing.new_tensor([0.5 if is_bad else 0.01])
+        return angular, depth
+
+    monkeypatch.setattr(
+        backend,
+        "_chunk_stride_alignment_errors",
+        synthetic_errors,
+    )
+    affected = backend._chunk_stride_holdout_diagnostics(
+        affected_node_ids={4},
+    )
+    all_edges = backend._chunk_stride_holdout_diagnostics()
+
+    assert affected["factor_count"] == 1
+    assert affected["accepted"] is True
+    assert affected["per_edge"][0]["source"] == 4
+    assert all_edges["factor_count"] == 2
+    assert all_edges["accepted"] is False
+
+
+def test_overlap_scale_uses_only_canonical_and_raw_ba_depths() -> None:
+    previous = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    current = _packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    previous_depth = torch.full_like(previous.observation.refined_depth, 4.0)
+    current_depth = torch.full_like(current.observation.refined_depth, 2.0)
+    previous.observation = previous.observation.with_geometry(
+        refined_depth=previous_depth
+    )
+    current.observation = current.observation.with_geometry(
+        refined_depth=current_depth
+    )
+    backend = _chunk_stride_backend(min_matches=32)
+    backend.rendered_alignment_min_points_per_frame = 32
+    backend.rendered_alignment_max_points_per_frame = 64
+
+    scale, diagnostics = backend._estimate_canonical_ba_overlap_scale(
+        previous,
+        current,
+    )
+
+    assert scale == pytest.approx(2.0, rel=5.0e-5)
+    assert diagnostics["frame_weight"] == 0.5
+    assert diagnostics["irls_iterations"] == 5
+    assert diagnostics["global_render_used_for_scale"] is False
+    assert diagnostics["post_refiner_scale_recheck"] is False
+
+
+def test_overlap_scale_hard_rejects_low_confidence_depth_outliers() -> None:
+    previous = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    current = _packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    previous_depth = torch.full_like(previous.observation.refined_depth, 4.0)
+    current_depth = torch.full_like(current.observation.refined_depth, 2.0)
+    previous_confidence = torch.ones_like(previous.observation.confidence)
+    current_confidence = torch.ones_like(current.observation.confidence)
+    for frame_id in (2, 3):
+        previous_index = previous.frame_index(frame_id)
+        current_index = current.frame_index(frame_id)
+        previous_depth[0, previous_index, :, :2, :] = 18.0
+        current_depth[0, current_index, :, :2, :] = 1.0
+        previous_confidence[0, previous_index, :, :2, :] = 0.0
+        current_confidence[0, current_index, :, :2, :] = 0.0
+    previous.observation = replace(
+        previous.observation.with_geometry(refined_depth=previous_depth),
+        confidence=previous_confidence,
+    )
+    current.observation = replace(
+        current.observation.with_geometry(refined_depth=current_depth),
+        confidence=current_confidence,
+    )
+    backend = _chunk_stride_backend(min_matches=32)
+    backend.rendered_alignment_min_points_per_frame = 32
+    backend.rendered_alignment_max_points_per_frame = 64
+    backend.rendered_alignment_min_confidence = 0.05
+
+    scale, diagnostics = backend._estimate_canonical_ba_overlap_scale(
+        previous,
+        current,
+    )
+
+    assert scale == pytest.approx(2.0, rel=5.0e-5)
+    assert diagnostics["min_confidence"] == pytest.approx(0.05)
+    assert diagnostics["per_frame_confidence_rejected_pixels"] == [24, 24]
+    assert diagnostics["per_frame_confidence_support_pixels"] == [48, 48]
+
+
+def test_chunk_first_nodes_rigidly_publish_both_frames_in_each_segment() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    poses[1, 0, 3] = 0.1
+    poses[2, 0, 3] = 0.2
+    poses[3, 0, 3] = 0.3
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    backend = _chunk_stride_backend(min_matches=64)
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(
+        2,
+        sim3_from_components(
+            1.0,
+            torch.eye(3),
+            torch.tensor([0.2, 0.0, 0.0]),
+        ),
+    )
+    backend.window_order = [0]
+    backend.window_anchor_nodes[0] = 0
+    backend.packets[0] = packet
+    for frame_id in packet.frame_ids:
+        backend.frame_windows[int(frame_id)] = {0}
+        backend.frame_owner_window[int(frame_id)] = 0
+        backend.frame_depth_owner_window[int(frame_id)] = 0
+    diagnostics = backend._register_chunk_stride_segments(
+        packet,
+        source_node=0,
+        target_node=2,
+    )
+    assert diagnostics["registered_frames"] == 4
+    assert backend.frame_pose_owner_node == {0: 0, 1: 0, 2: 2, 3: 2}
+
+    backend._refresh_geometry_updates()
+    initial = backend.pop_frame_geometry_update_batch()
+    assert initial is not None and initial.complete_snapshot
+    node = backend.graph.transform(0).clone()
+    node[:3, 3] += torch.tensor([1.0, 0.0, 0.0])
+    backend.graph.nodes[0] = node
+    backend._refresh_geometry_updates()
+    updated = backend.pop_frame_geometry_update_batch()
+    assert updated is not None
+    for frame_id in (0, 1):
+        delta = (
+            updated.updates[frame_id].pose_c2w[:3, 3]
+            - initial.updates[frame_id].pose_c2w[:3, 3]
+        )
+        torch.testing.assert_close(delta, torch.tensor([1.0, 0.0, 0.0]))
+    for frame_id in (2, 3):
+        torch.testing.assert_close(
+            updated.updates[frame_id].pose_c2w,
+            initial.updates[frame_id].pose_c2w,
+        )
+
+
+def test_mapper_internal_frame_seam_failure_is_zero_state_commit() -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+    backend.post_optimization_seam_check_enabled = True
+    backend.post_optimization_seam_max_rotation_deg = 5.0
+    backend.post_optimization_seam_max_center_error = 0.15
+    backend.process_packet(packets[0])
+    backend.process_packet(packets[1])
+    backend.pop_frame_geometry_update_batch()
+
+    proposals: dict[int, torch.Tensor] = {}
+    for frame_id, owner in backend.frame_pose_owner_node.items():
+        local = backend.frame_local_pose_in_owner[frame_id]
+        proposals[frame_id] = apply_sim3_to_c2w(
+            backend.graph.transform(owner).to(local),
+            local,
+        )
+    proposals[3] = proposals[3].clone()
+    proposals[3][:3, 3] += torch.tensor([0.20, 0.0, 0.0])
+
+    class MapperProposal:
+        optimizer = None
+        stats = SimpleNamespace(n_anchors=backend.map.anchor_count())
+
+        def refined_pose_c2w(self, frame_id: int):
+            return proposals[int(frame_id)]
+
+    backend.mapper = MapperProposal()
+    graph_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    local_before = {
+        frame: pose.clone()
+        for frame, pose in backend.frame_local_pose_in_owner.items()
+    }
+    packet_before = {
+        window_id: packet.local_poses_c2w.clone()
+        for window_id, packet in backend.packets.items()
+    }
+    revision_before = backend._geometry_revision
+    map_lazy_before = {
+        owner: transform.clone()
+        for owner, transform in backend.map._lazy_owner_current_transforms.items()
+    }
+
+    with pytest.raises(RuntimeError, match="seam=False"):
+        backend._synchronize_chunk_stride_optimized_window(1)
+
+    assert backend._geometry_revision == revision_before
+    assert backend._pending_geometry_batch is None
+    for node, transform in graph_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    for frame, pose in local_before.items():
+        torch.testing.assert_close(backend.frame_local_pose_in_owner[frame], pose)
+    for window_id, poses in packet_before.items():
+        torch.testing.assert_close(
+            backend.packets[window_id].local_poses_c2w,
+            poses,
+        )
+    assert set(backend.map._lazy_owner_current_transforms) == set(map_lazy_before)
+    for owner, transform in map_lazy_before.items():
+        torch.testing.assert_close(
+            backend.map._lazy_owner_current_transforms[owner],
+            transform,
+        )
+
+
+def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch() -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+    backend.post_optimization_seam_check_enabled = True
+    backend.post_optimization_seam_max_rotation_deg = 5.0
+    backend.post_optimization_seam_max_center_error = 0.15
+    backend.process_packet(packets[0])
+    backend.process_packet(packets[1])
+    backend.pop_frame_geometry_update_batch()
+
+    proposals: dict[int, torch.Tensor] = {}
+    for frame_id, owner in backend.frame_pose_owner_node.items():
+        local = backend.frame_local_pose_in_owner[frame_id]
+        proposals[frame_id] = apply_sim3_to_c2w(
+            backend.graph.transform(owner).to(local),
+            local,
+        )
+    proposals[3] = proposals[3].clone()
+    proposals[3][:3, 3] += torch.tensor([0.05, 0.0, 0.0])
+
+    class MapperProposal:
+        optimizer = None
+        stats = SimpleNamespace(n_anchors=backend.map.anchor_count())
+
+        def refined_pose_c2w(self, frame_id: int):
+            return proposals[int(frame_id)]
+
+    backend.mapper = MapperProposal()
+    backend._synchronize_chunk_stride_optimized_window(1)
+
+    batch = backend.pop_frame_geometry_update_batch()
+    assert batch is not None and batch.complete_snapshot is True
+    assert set(batch.updates) == {0, 1, 2, 3, 4, 5}
+    torch.testing.assert_close(
+        batch.updates[3].pose_c2w[:3, 3],
+        proposals[3][:3, 3],
+    )
+    for window_id in (0, 1):
+        packet = backend.packets[window_id]
+        frame_index = packet.frame_index(3)
+        packet_pose = apply_sim3_to_c2w(
+            backend._window_anchor_transforms()[window_id].to(
+                packet.local_poses_c2w
+            ),
+            packet.local_poses_c2w[frame_index],
+        )
+        torch.testing.assert_close(packet_pose, proposals[3])
+
+
+def test_skip_factor_recomputes_independent_c0_to_c2_correspondences() -> None:
+    shared = torch.randn(24, 32, 64)
+    features = {0: shared, 4: shared}
+    previous = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+        feature_by_frame=features,
+        height=32,
+        width=64,
+    )
+    current = _packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+        feature_by_frame=features,
+        height=32,
+        width=64,
+    )
+    backend = _chunk_stride_backend(min_matches=32, skip=True)
+    backend.chunk_skip_forward_backward = False
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(4, sim3_identity())
+
+    factor, holdout, diagnostics = backend._independent_chunk_skip_factor(
+        previous,
+        current,
+    )
+
+    assert factor is not None, diagnostics
+    assert holdout is not None
+    assert factor.edge_type == "chunk_skip_dense_spherical"
+    assert (factor.source, factor.target) == (0, 4)
+    assert diagnostics["independent_from_sequential_and_overlap"] is True
+    assert diagnostics["accepted"] is True
+
+
+def test_post_hash_incoming_budget_is_coverage_first_and_level_separated() -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    fusion = Stage2GlobalMapFusion(
+        PanoGaussianMap(config={}, device="cpu"),
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    prepared = fusion.prepare_packet_batch(packet, sim3_identity())
+    assert len(prepared.batch) >= 6
+    prepared = prepared.index(torch.arange(6, device=prepared.batch.xyz.device))
+    prepared = replace(
+        prepared,
+        batch=replace(
+            prepared.batch,
+            xyz=torch.zeros_like(prepared.batch.xyz),
+            level=torch.tensor(
+                [0, 1, 0, 1, 0, 1],
+                device=prepared.batch.level.device,
+            ),
+            quality=torch.tensor(
+                [0.9, 0.8, 0.7, 0.6, 0.5, 0.4],
+                device=prepared.batch.quality.device,
+            ),
+        ),
+    )
+
+    limited, stats = fusion.limit_prepared_incoming_by_coverage(
+        prepared,
+        max_new_gaussians=2,
+        coarse_cell_size=0.64,
+    )
+
+    assert len(limited.batch) == 2
+    assert set(limited.batch.level.tolist()) == {0, 1}
+    assert stats["incoming_budget_dropped"] == 4
+    assert stats["incoming_budget_same_level_only"] == 1
+
+
+def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None:
+    packet0 = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    packet1 = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    for packet in (packet0, packet1):
+        packet.metadata["voxel_anchor_refiner_requested"] = True
+        packet.metadata["voxel_anchor_refiner_pending"] = True
+
+    def finalize_refiner(packet: LocalGaussianWindowPacket):
+        images = torch.zeros(
+            1,
+            len(packet.frame_ids),
+            3,
+            *packet.observation.image_size,
+        )
+        anchors = voxelize_per_pixel_gaussians(
+            packet.observation,
+            packet.adapter_features,
+            images,
+            VoxelAnchorConfig(
+                use_resnet_error=False,
+                pretrained_resnet=False,
+            ),
+            valid_mask=packet.finite_gaussian_mask,
+        ).detach_for_backend()
+        metadata = dict(packet.metadata)
+        metadata["voxel_anchor_refiner_pending"] = False
+        metadata["voxel_anchor_refiner_enabled"] = True
+        return replace(
+            packet,
+            anchor_observation=anchors,
+            metadata=metadata,
+        )
+    _attach_identity_stride_matches(packet0)
+    _attach_identity_stride_matches(packet1)
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        renderer=_SyntheticSharedDepthRenderer(
+            local_depth=2.0,
+            global_depth=2.0,
+        ),
+        pose_canonicalized_packet_refiner=finalize_refiner,
+        config={
+            "enabled": True,
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "two_frame_bridge_depth_scale",
+                "min_points": 32,
+                "max_points": 128,
+                "min_points_per_frame": 32,
+                "max_points_per_frame": 64,
+                "post_refiner_scale_recheck": False,
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "radius_voxels": 1.25,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "update_existing_statistics": True,
+                "require_new_frame_support": False,
+                "log_posthash_coverage": True,
+            },
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "optimization_trigger": "loop_only",
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+                "min_match_cosine": 0.2,
+                "min_match_margin": 0.0,
+                "max_match_entropy": 1.0,
+                "chunk_stride": {
+                    "target_index": 2,
+                    "min_matches": 64,
+                    "holdout_stride": 5,
+                },
+                "skip_edge": {"enabled": False},
+            },
+            "loop_closure": {"exclude_recent_windows": 100},
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+
+    assert result.fusion["hash_visibility_views"] == 4
+    assert result.fusion["prehash_overlap_view_count"] == 2
+    assert result.fusion["prehash_new_frame_view_count"] == 2
+    assert result.fusion["prehash_overlap_incoming_valid_coverage"] == pytest.approx(1.0)
+    assert result.fusion["prehash_new_frame_existing_valid_coverage"] == pytest.approx(1.0)
+    assert result.fusion["posthash_coverage_views"] == 4
+    assert result.fusion["posthash_overlap_view_count"] == 2
+    assert result.fusion["posthash_new_frame_view_count"] == 2
+    assert result.fusion["posthash_overlap_global_valid_coverage"] == pytest.approx(1.0)
+    assert result.fusion["posthash_new_frame_global_valid_coverage"] == pytest.approx(1.0)
+    assert result.fusion["posthash_overlap_valid_coverage_delta"] == pytest.approx(0.0)
+    assert result.fusion["posthash_new_frame_valid_coverage_delta"] == pytest.approx(0.0)
+    assert result.fusion["chunk_anchor_delta"] == (
+        result.fusion["anchors_after"] - result.fusion["anchors_before"]
+    )
+    alignment = result.diagnostics["alignment"]
+    assert alignment["global_render_used_for_scale"] is False
+    assert alignment["global_render_diagnostic_only"] is True
+    diagnostic = backend.consume_rendered_overlap_diagnostic()
+    assert diagnostic is not None
+    assert diagnostic["frame_ids"].tolist() == [2, 3]
+
+
+def test_chunk_first_process_builds_only_stride_and_independent_skip_cycle() -> None:
+    shared = torch.randn(24, 32, 64)
+    features = {0: shared, 4: shared}
+    packet0 = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+        feature_by_frame=features,
+        height=32,
+        width=64,
+    )
+    packet1 = _packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+        feature_by_frame=features,
+        height=32,
+        width=64,
+    )
+    _attach_identity_stride_matches(packet0)
+    _attach_identity_stride_matches(packet1)
+    backend = _chunk_stride_backend(min_matches=64, skip=True)
+    backend.chunk_skip_forward_backward = False
+
+    first = backend.process_packet(packet0)
+    second = backend.process_packet(packet1)
+
+    assert first.graph is None
+    assert set(backend.graph.nodes) == {0, 2, 4}
+    assert backend.window_anchor_nodes == {0: 0, 1: 2}
+    assert backend.window_end_nodes == {}
+    edge_types = [edge.edge_type for edge in backend.graph.edges]
+    assert edge_types.count("chunk_stride_dense_spherical") == 2
+    assert edge_types.count("chunk_skip_dense_spherical") == 1
+    assert not any("overlap" in edge_type for edge_type in edge_types)
+    assert second.graph is not None
+
+    backend.submaps[0] = SimpleNamespace(
+        frozen=True,
+        boundary_node_ids=[0, 2],
+        compressed_dense_factors=0,
+    )
+    compressed = backend._compress_frozen_submap_factors(
+        SimpleNamespace(submap_id=1, boundary_node_ids=[2, 4])
+    )
+    assert compressed == 1
+    assert not any(
+        isinstance(edge, DenseSphericalFactorBlock)
+        and edge.edge_type == "chunk_stride_dense_spherical"
+        and int(edge.source) == 2
+        and int(edge.target) == 4
+        for edge in backend.graph.edges
+    )
+    assert any(
+        isinstance(edge, DenseSphericalFactorBlock)
+        and edge.edge_type == "chunk_skip_dense_spherical"
+        and int(edge.source) == 0
+        and int(edge.target) == 4
+        for edge in backend.graph.edges
+    )
+    assert (2, 4, "chunk_stride_dense_spherical") not in (
+        backend._chunk_stride_holdouts
+    )
+    assert (0, 4, "chunk_skip_dense_spherical") in (
+        backend._chunk_stride_holdouts
+    )
+
+    nodes_before_finalize = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+
+    def fail_unvalidated_finalize_lm(*args, **kwargs):
+        raise AssertionError("chunk-first finalize must not run an unvalidated LM")
+
+    backend.graph.optimize = fail_unvalidated_finalize_lm
+    final = backend.finalize()
+    assert final["graph_reason"] == "chunk_first_stride_no_unvalidated_finalize_lm"
+    assert final["graph_node_mode"] == "chunk_first_stride"
+    for node, transform in nodes_before_finalize.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+
+
+def test_pure_chain_emits_incremental_geometry_then_optimization_emits_full() -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+
+    backend.process_packet(packets[0])
+    first = backend.pop_frame_geometry_update_batch()
+    assert first is not None and first.complete_snapshot is False
+    assert set(first.updates) == {0, 1, 2, 3}
+
+    backend.process_packet(packets[1])
+    second = backend.pop_frame_geometry_update_batch()
+    assert second is not None and second.complete_snapshot is False
+    assert set(second.updates) == {4, 5}
+    assert second.affected_node_ids == (4,)
+    node_scales = [
+        float(sim3_components(backend.graph.transform(node))[0])
+        for node in sorted(backend.graph.nodes)
+    ]
+    assert node_scales == pytest.approx([node_scales[0]] * len(node_scales))
+
+    backend._refresh_geometry_updates(
+        complete_snapshot=True,
+        affected_node_ids={0, 2, 4},
+        reason="synthetic_graph_commit",
+    )
+    complete = backend.pop_frame_geometry_update_batch()
+    assert complete is not None and complete.complete_snapshot is True
+    assert set(complete.updates) == {0, 1, 2, 3, 4, 5}
+
+
+def test_chunk_skip_cycle_never_runs_lm_when_graph_optimization_is_disabled() -> None:
+    shared = torch.randn(24, 32, 64)
+    features = {0: shared, 4: shared}
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            feature_by_frame=features,
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            feature_by_frame=features,
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=True)
+    backend.chunk_skip_forward_backward = False
+    backend.global_graph_optimization_enabled = False
+
+    def fail_disabled_lm(*args, **kwargs):
+        raise AssertionError("optimization_enabled=false must gate skip/loop LM")
+
+    backend.graph.optimize = fail_disabled_lm
+    first = backend.process_packet(packets[0])
+    second = backend.process_packet(packets[1])
+
+    assert first.graph is None and second.graph is None
+    assert any(
+        edge.edge_type == "chunk_skip_dense_spherical"
+        for edge in backend.graph.edges
+    )
 
 
 def test_new_so3_hierarchical_features_are_default_off_for_legacy_configs() -> None:
@@ -532,6 +1460,24 @@ def test_no_graph_100_frame_ablation_only_disables_graph_optimization() -> None:
     assert ablation["SphericalSelfiGlobalBackend"] == {
         "global_graph": {"optimization_enabled": False}
     }
+
+
+def test_posebaseline_ablation_explicitly_uses_legacy_boundary_graph() -> None:
+    root = Path(__file__).parents[1]
+    config = yaml.safe_load(
+        (
+            root
+            / "configs"
+            / "spherical_selfi_ob3d_bridge_posebaseline_refiner_ba8_100.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    backend = config["SphericalSelfiGlobalBackend"]
+    assert backend["global_graph"]["node_mode"] == "boundary_frame"
+    assert (
+        backend["rendered_overlap_alignment"]["mode"]
+        == "two_frame_bridge_pose_scale"
+    )
 
 
 def test_sim3_log_identity_jacobians_are_finite() -> None:
@@ -3008,6 +3954,51 @@ def test_mapper_geometry_updates_materialize_depth_from_immutable_local_value() 
     torch.testing.assert_close(
         mapper.observations[5].target_depth_local, torch.full((1, 4, 8), 2.0)
     )
+
+
+def test_mapper_complete_geometry_snapshot_validates_before_atomic_commit() -> None:
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map)
+    for frame_id in (5, 6):
+        mapper.observations[frame_id] = MapperObservation(
+            frame_id=frame_id,
+            image=torch.zeros(3, 4, 8),
+            pose_c2w=torch.eye(4),
+            target_depth=torch.full((1, 4, 8), 2.0),
+            target_depth_local=torch.full((1, 4, 8), 2.0),
+            owner_window_id=0,
+        )
+
+    def update(frame_id: int, x: float, scale: float):
+        pose = torch.eye(4)
+        pose[0, 3] = x
+        return SimpleNamespace(
+            pose_c2w=pose,
+            depth_scale=scale,
+            owner_window_id=0,
+            depth_owner_window_id=0,
+            depth_scales_by_window={0: scale},
+        )
+
+    mapper.apply_frontend_geometry_snapshot(
+        {5: update(5, 1.0, 2.0), 6: update(6, 2.0, 3.0)}
+    )
+    before_pose = mapper.refined_pose_c2w(5).clone()
+    before_depth = mapper.observations[5].target_depth.clone()
+    with pytest.raises(ValueError, match="Invalid complete-snapshot depth scale"):
+        mapper.apply_frontend_geometry_snapshot(
+            {5: update(5, 9.0, 4.0), 6: update(6, 10.0, -1.0)}
+        )
+    torch.testing.assert_close(mapper.refined_pose_c2w(5), before_pose)
+    torch.testing.assert_close(mapper.observations[5].target_depth, before_depth)
+
+    transaction = mapper.snapshot_frontend_geometry_state()
+    mapper.apply_frontend_geometry_snapshot(
+        {5: update(5, 7.0, 4.0), 6: update(6, 8.0, 5.0)}
+    )
+    mapper.restore_frontend_geometry_state(transaction)
+    torch.testing.assert_close(mapper.refined_pose_c2w(5), before_pose)
+    torch.testing.assert_close(mapper.observations[5].target_depth, before_depth)
 
 
 def test_overlap_pose_owner_does_not_rescale_depth_from_another_window() -> None:

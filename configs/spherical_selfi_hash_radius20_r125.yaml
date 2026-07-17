@@ -1,0 +1,18 @@
+base_config: spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml
+
+# Twenty-frame diagnostic sweep. The only algorithmic override is Hash radius.
+Dataset:
+  begin: 0
+  end: 20
+
+SphericalSelfiGlobalBackend:
+  insertion_dedup:
+    radius_voxels: 1.25
+    log_posthash_coverage: true
+
+WeightsAndBiases:
+  group: spherical-selfi-hash-radius20
+  run_name: hash_radius20_r125
+
+Results:
+  save_dir: outputs/hash_radius20_r125

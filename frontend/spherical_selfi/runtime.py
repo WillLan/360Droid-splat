@@ -46,7 +46,12 @@ from training.train_spherical_selfi_gaussian_head import (
     load_stage2_checkpoint,
 )
 
-from .window_packet import BoundaryMatchBlock, LocalGaussianWindowPacket, LocalGaussianWindowQueue
+from .window_packet import (
+    BoundaryMatchBlock,
+    LocalGaussianWindowPacket,
+    LocalGaussianWindowQueue,
+    chunk_stride_matches_from_cache,
+)
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -1507,6 +1512,30 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
 
         match_quality = {}
         ba_diagnostics = {} if ba_result is None else dict(ba_result.diagnostics[0])
+        published_translation_updates = tuple(
+            float(value)
+            for value in ba_diagnostics.get(
+                "published_translation_update_norms", ()
+            )
+        )
+        published_rotation_updates = tuple(
+            float(value)
+            for value in ba_diagnostics.get(
+                "published_rotation_update_deg", ()
+            )
+        )
+        local_ba_trust_region_touched = bool(
+            ba_result is not None
+            and (
+                not bool(
+                    ba_diagnostics.get("cumulative_pose_acceptable", True)
+                )
+                or max(published_translation_updates, default=0.0)
+                >= 0.999 * float(self.local_ba.max_translation_update)
+                or max(published_rotation_updates, default=0.0)
+                >= 0.999 * math.degrees(float(self.local_ba.max_pose_update))
+            )
+        )
         if match_cache is not None:
             match_quality = {
                 "top1_cosine": match_cache.top1_cosine.detach(),
@@ -1534,6 +1563,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             boundary_matches=_boundary_matches_from_cache(
                 match_cache, observation.image_size
             ),
+            chunk_stride_matches=chunk_stride_matches_from_cache(
+                match_cache,
+                observation.image_size,
+                stride=self.window_stride,
+            ),
             match_quality=match_quality,
             metadata={
                 "local_ba_enabled": self.local_ba_enabled,
@@ -1544,6 +1578,16 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "local_ba_stage2_accepted": ba_diagnostics.get("stage2_accepted"),
                 "local_ba_validation_passed": ba_diagnostics.get(
                     "validation_passed"
+                ),
+                "local_ba_final_median_residual_deg": (
+                    None
+                    if ba_result is None
+                    else _finite_optional_float(
+                        ba_result.final_median_residual_deg[0]
+                    )
+                ),
+                "local_ba_trust_region_touched": (
+                    local_ba_trust_region_touched
                 ),
                 "local_ba_published_pose_updated": ba_diagnostics.get(
                     "published_pose_updated", False

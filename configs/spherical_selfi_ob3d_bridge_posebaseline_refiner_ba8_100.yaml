@@ -6,6 +6,10 @@ Dataset:
   frame_stride: 1
 
 SphericalSelfiGlobalBackend:
+  # Preserve the historical pose-baseline bridge semantics explicitly.  The
+  # chunk_first_stride mainline always uses canonical BA-overlap depth scale.
+  global_graph:
+    node_mode: boundary_frame
   rendered_overlap_alignment:
     mode: two_frame_bridge_pose_scale
     max_median_relative_error: 0.20

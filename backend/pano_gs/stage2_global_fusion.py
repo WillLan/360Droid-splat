@@ -212,6 +212,104 @@ class Stage2GlobalMapFusion:
         )
         return batch.index(torch.cat([coverage, fill], dim=0))
 
+    @staticmethod
+    def _coverage_first_rows(
+        batch: GlobalExplicitGaussianBatch,
+        *,
+        limit: int,
+        coarse_cell_size: float,
+    ) -> torch.Tensor:
+        """Select incoming rows without merging anchors across depth levels."""
+
+        budget = max(0, int(limit))
+        if budget <= 0 or len(batch) <= budget:
+            return torch.arange(
+                len(batch), device=batch.xyz.device, dtype=torch.long
+            )
+        if not math.isfinite(float(coarse_cell_size)) or coarse_cell_size <= 0.0:
+            raise ValueError("Incoming coverage cell size must be positive")
+        coarse = torch.floor(batch.xyz / float(coarse_cell_size)).to(torch.int64)
+        # Level is part of the key: coarse coverage never collapses anchors
+        # from different voxel/depth levels into one representative.
+        key = torch.cat([batch.level.long()[:, None], coarse], dim=-1)
+        unique, inverse = torch.unique(key, dim=0, return_inverse=True, sorted=True)
+        max_quality = batch.quality.new_full((int(unique.shape[0]),), -torch.inf)
+        max_quality.scatter_reduce_(
+            0, inverse, batch.quality, reduce="amax", include_self=True
+        )
+        rows = torch.arange(len(batch), device=batch.xyz.device, dtype=torch.long)
+        candidates = torch.where(
+            batch.quality >= max_quality[inverse] - 1.0e-12,
+            rows,
+            torch.full_like(rows, len(batch)),
+        )
+        coverage = torch.full(
+            (int(unique.shape[0]),),
+            len(batch),
+            device=batch.xyz.device,
+            dtype=torch.long,
+        )
+        coverage.scatter_reduce_(
+            0, inverse, candidates, reduce="amin", include_self=True
+        )
+        coverage = coverage[coverage < len(batch)]
+        if int(coverage.numel()) >= budget:
+            order = torch.argsort(
+                batch.quality.index_select(0, coverage),
+                descending=True,
+                stable=True,
+            )[:budget]
+            return coverage.index_select(0, order)
+        selected_mask = torch.zeros(
+            len(batch), device=batch.xyz.device, dtype=torch.bool
+        )
+        selected_mask[coverage] = True
+        remaining = torch.nonzero(~selected_mask, as_tuple=False).flatten()
+        fill_count = budget - int(coverage.numel())
+        fill_order = torch.argsort(
+            batch.quality.index_select(0, remaining),
+            descending=True,
+            stable=True,
+        )[:fill_count]
+        return torch.cat(
+            [coverage, remaining.index_select(0, fill_order)], dim=0
+        )
+
+    def limit_prepared_incoming_by_coverage(
+        self,
+        prepared: PreparedPacketFusion,
+        *,
+        max_new_gaussians: int,
+        coarse_cell_size: float,
+    ) -> tuple[PreparedPacketFusion, dict[str, int | float]]:
+        """Apply an optional post-Hash per-chunk incoming safety budget."""
+
+        before = len(prepared.batch)
+        limit = max(0, int(max_new_gaussians))
+        selected = self._coverage_first_rows(
+            prepared.batch,
+            limit=limit,
+            coarse_cell_size=coarse_cell_size,
+        )
+        limited = prepared.index(selected)
+        stats: dict[str, int | float] = {
+            "incoming_budget_enabled": int(limit > 0),
+            "incoming_budget_limit": limit,
+            "incoming_budget_before": before,
+            "incoming_budget_after": len(limited.batch),
+            "incoming_budget_dropped": before - len(limited.batch),
+            "incoming_budget_coarse_cell_size": float(coarse_cell_size),
+            "incoming_budget_same_level_only": 1,
+        }
+        for level in range(len(self.voxel_sizes)):
+            stats[f"incoming_budget_level_{level}_before"] = int(
+                (prepared.batch.level == level).sum().detach().cpu()
+            )
+            stats[f"incoming_budget_level_{level}_after"] = int(
+                (limited.batch.level == level).sum().detach().cpu()
+            )
+        return limited, stats
+
     def _levels_and_grid(self, xyz: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sizes = xyz.new_tensor(self.voxel_sizes)
         characteristic = scale.clamp_min(1.0e-8).prod(dim=-1).pow(1.0 / 3.0)

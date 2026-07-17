@@ -220,6 +220,157 @@ class BoundaryMatchBlock:
 
 
 @dataclass
+class ChunkStrideMatchBlock:
+    """Canonical matches between consecutive chunk-anchor frames."""
+
+    source_index: int
+    target_index: int
+    source_uv: torch.Tensor
+    target_uv: torch.Tensor
+    source_bearing: torch.Tensor
+    target_bearing: torch.Tensor
+    top1_cosine: torch.Tensor
+    top2_margin: torch.Tensor
+    normalized_entropy: torch.Tensor
+    query_direction: torch.Tensor  # N, 0=source->target, 1=target->source
+
+    def __post_init__(self) -> None:
+        if int(self.source_index) < 0 or int(self.target_index) <= int(
+            self.source_index
+        ):
+            raise ValueError(
+                "Chunk stride match indices must satisfy 0 <= source < target"
+            )
+        count = int(self.source_uv.shape[0])
+        if tuple(self.source_uv.shape) != (count, 2) or tuple(
+            self.target_uv.shape
+        ) != (count, 2):
+            raise ValueError("Chunk stride match UV arrays must have shape Nx2")
+        if tuple(self.source_bearing.shape) != (count, 3) or tuple(
+            self.target_bearing.shape
+        ) != (count, 3):
+            raise ValueError(
+                "Chunk stride match bearings must have shape Nx3"
+            )
+        for name in (
+            "top1_cosine",
+            "top2_margin",
+            "normalized_entropy",
+            "query_direction",
+        ):
+            if tuple(getattr(self, name).shape) != (count,):
+                raise ValueError(f"Chunk stride match {name} must have shape N")
+        if count > 0 and not bool(
+            ((self.query_direction == 0) | (self.query_direction == 1)).all()
+        ):
+            raise ValueError("Chunk stride query_direction must contain only 0/1")
+
+    @property
+    def count(self) -> int:
+        return int(self.source_uv.shape[0])
+
+    def detached_clone(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> "ChunkStrideMatchBlock":
+        def clone(value: torch.Tensor) -> torch.Tensor:
+            result = value.detach().clone()
+            return result if device is None else result.to(device)
+
+        return ChunkStrideMatchBlock(
+            source_index=int(self.source_index),
+            target_index=int(self.target_index),
+            source_uv=clone(self.source_uv),
+            target_uv=clone(self.target_uv),
+            source_bearing=clone(self.source_bearing),
+            target_bearing=clone(self.target_bearing),
+            top1_cosine=clone(self.top1_cosine),
+            top2_margin=clone(self.top2_margin),
+            normalized_entropy=clone(self.normalized_entropy),
+            query_direction=clone(self.query_direction).long(),
+        )
+
+
+def chunk_stride_matches_from_cache(
+    cache: Any,
+    image_size: tuple[int, int],
+    *,
+    stride: int,
+) -> ChunkStrideMatchBlock | None:
+    """Canonicalize cached bidirectional ``0 <-> stride`` correspondences."""
+
+    target = int(stride)
+    if (
+        cache is None
+        or int(cache.batch_size) != 1
+        or target <= 0
+        or target >= int(cache.num_views)
+    ):
+        return None
+    height, width = (int(value) for value in image_size)
+    entropy_scale = max(math.log(max(2, height * width)), 1.0e-8)
+    values: dict[str, list[torch.Tensor]] = {
+        "source_uv": [],
+        "target_uv": [],
+        "source_bearing": [],
+        "target_bearing": [],
+        "top1_cosine": [],
+        "top2_margin": [],
+        "normalized_entropy": [],
+        "query_direction": [],
+    }
+    for edge_index, pair in enumerate(cache.edges.detach().cpu().tolist()):
+        source_index, target_index = int(pair[0]), int(pair[1])
+        if (source_index, target_index) not in {(0, target), (target, 0)}:
+            continue
+        keep = cache.valid_mask[0, edge_index].bool()
+        if not bool(keep.any()):
+            continue
+        if source_index == 0:
+            source_uv = cache.source_uv[0, 0, keep]
+            target_uv = cache.target_uv[0, edge_index, keep]
+            source_bearing = cache.source_ray[0, 0, keep]
+            target_bearing = cache.target_ray[0, edge_index, keep]
+            direction = 0
+        else:
+            source_uv = cache.target_uv[0, edge_index, keep]
+            target_uv = cache.source_uv[0, target, keep]
+            source_bearing = cache.target_ray[0, edge_index, keep]
+            target_bearing = cache.source_ray[0, target, keep]
+            direction = 1
+        count = int(source_uv.shape[0])
+        values["source_uv"].append(source_uv)
+        values["target_uv"].append(target_uv)
+        values["source_bearing"].append(source_bearing)
+        values["target_bearing"].append(target_bearing)
+        values["top1_cosine"].append(cache.top1_cosine[0, edge_index, keep])
+        values["top2_margin"].append(cache.top2_margin[0, edge_index, keep])
+        values["normalized_entropy"].append(
+            (cache.entropy[0, edge_index, keep] / entropy_scale).clamp(0.0, 1.0)
+        )
+        values["query_direction"].append(
+            torch.full(
+                (count,),
+                direction,
+                device=source_uv.device,
+                dtype=torch.long,
+            )
+        )
+    if not values["source_uv"]:
+        return None
+    with torch.inference_mode(False):
+        return ChunkStrideMatchBlock(
+            source_index=0,
+            target_index=target,
+            **{
+                name: torch.cat(parts, dim=0).detach().clone()
+                for name, parts in values.items()
+            },
+        )
+
+
+@dataclass
 class LocalGaussianWindowPacket:
     window_id: int
     anchor_frame_id: int
@@ -238,6 +389,7 @@ class LocalGaussianWindowPacket:
     pre_depth_shift_depth: torch.Tensor | None = None
     anchor_observation: VoxelAnchorObservation | None = None
     boundary_matches: BoundaryMatchBlock | None = None
+    chunk_stride_matches: ChunkStrideMatchBlock | None = None
     match_quality: dict[str, torch.Tensor] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -295,6 +447,7 @@ class LocalGaussianWindowPacket:
         pre_depth_shift_depth: torch.Tensor | None = None,
         anchor_observation: VoxelAnchorObservation | None = None,
         boundary_matches: BoundaryMatchBlock | None = None,
+        chunk_stride_matches: ChunkStrideMatchBlock | None = None,
         match_quality: dict[str, torch.Tensor] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "LocalGaussianWindowPacket":
@@ -380,6 +533,7 @@ class LocalGaussianWindowPacket:
             ),
             anchor_observation=anchor_observation,
             boundary_matches=boundary_matches,
+            chunk_stride_matches=chunk_stride_matches,
             match_quality=dict(match_quality or {}),
             metadata=packet_metadata,
         )
@@ -495,6 +649,11 @@ class LocalGaussianWindowPacket:
                 None
                 if self.boundary_matches is None
                 else self.boundary_matches.detached_clone(device="cpu")
+            ),
+            chunk_stride_matches=(
+                None
+                if self.chunk_stride_matches is None
+                else self.chunk_stride_matches.detached_clone(device="cpu")
             ),
             match_quality={key: value.detach().cpu() for key, value in self.match_quality.items()},
             metadata=compact_metadata,

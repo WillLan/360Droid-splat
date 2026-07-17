@@ -12,7 +12,12 @@ import torch
 
 from frontend.pano_vggt.alignment import SubmapAligner
 from frontend.spherical_selfi.panorama_loop import PanoramaLoopDetector
-from frontend.spherical_selfi.window_packet import BoundaryMatchBlock, LocalGaussianWindowPacket
+from frontend.spherical_selfi.window_packet import (
+    BoundaryMatchBlock,
+    ChunkStrideMatchBlock,
+    LocalGaussianWindowPacket,
+    chunk_stride_matches_from_cache,
+)
 from geometry.pose import invert_c2w
 from geometry.panorama_loop_contracts import (
     DenseSphericalLoopMeasurement,
@@ -34,6 +39,7 @@ from geometry.sim3 import (
     sim3_log,
     weighted_umeyama,
 )
+from models.spherical_selfi_stage3_ba import build_stage3_match_cache
 from models.spherical_voxel_anchor_refiner import voxelize_per_pixel_gaussians
 
 from .adapter import PanoRenderCamera, PFGS360Renderer
@@ -70,7 +76,32 @@ class FrameGeometryUpdate:
     depth_scale: float
     owner_window_id: int
     depth_owner_window_id: int
+    pose_owner_node_id: int | None = None
     depth_scales_by_window: dict[int, float] = field(default_factory=dict, compare=False)
+
+
+@dataclass(frozen=True)
+class FrameGeometryUpdateBatch:
+    """Atomic private snapshot of every admitted frame geometry."""
+
+    revision: int
+    complete_snapshot: bool
+    updates: dict[int, FrameGeometryUpdate]
+    affected_node_ids: tuple[int, ...] = ()
+    reason: str = "geometry_refresh"
+
+
+@dataclass(frozen=True)
+class ChunkStrideHoldout:
+    source: int
+    target: int
+    edge_type: str
+    source_bearing: torch.Tensor
+    target_bearing: torch.Tensor
+    source_depth: torch.Tensor
+    target_depth: torch.Tensor
+    initial_angular_median_deg: float
+    initial_relative_depth_median: float
 
 
 @dataclass
@@ -306,6 +337,9 @@ class SphericalSelfiGlobalBackend:
         self.rendered_alignment_alpha_threshold = float(
             rendered_alignment_cfg.get("alpha_threshold", 0.05)
         )
+        self.rendered_alignment_min_confidence = float(
+            rendered_alignment_cfg.get("min_confidence", 0.05)
+        )
         self.rendered_alignment_min_inlier_ratio = float(
             rendered_alignment_cfg.get("min_inlier_ratio", 0.35)
         )
@@ -359,6 +393,10 @@ class SphericalSelfiGlobalBackend:
         if not 0.0 <= self.rendered_alignment_alpha_threshold <= 1.0:
             raise ValueError(
                 "rendered_overlap_alignment.alpha_threshold must be in [0, 1]"
+            )
+        if not 0.0 <= self.rendered_alignment_min_confidence <= 1.0:
+            raise ValueError(
+                "rendered_overlap_alignment.min_confidence must be in [0, 1]"
             )
         if not 0.0 <= self.rendered_alignment_min_inlier_ratio <= 1.0:
             raise ValueError(
@@ -498,6 +536,23 @@ class SphericalSelfiGlobalBackend:
         self.insertion_dedup_require_new_frame_support = bool(
             insertion_dedup_cfg.get("require_new_frame_support", False)
         )
+        self.insertion_dedup_max_new_gaussians_per_chunk = max(
+            0,
+            int(insertion_dedup_cfg.get("max_new_gaussians_per_chunk", 0)),
+        )
+        self.insertion_dedup_coverage_coarse_cell_size = float(
+            insertion_dedup_cfg.get("coverage_coarse_cell_size", 0.64)
+        )
+        self.insertion_dedup_log_posthash_coverage = bool(
+            insertion_dedup_cfg.get("log_posthash_coverage", False)
+        )
+        if self.insertion_dedup_max_new_gaussians_per_chunk > 0 and (
+            not math.isfinite(self.insertion_dedup_coverage_coarse_cell_size)
+            or self.insertion_dedup_coverage_coarse_cell_size <= 0.0
+        ):
+            raise ValueError(
+                "insertion_dedup.coverage_coarse_cell_size must be positive"
+            )
         if self.insertion_dedup_enabled and not all(
             (
                 self.insertion_dedup_visible_only,
@@ -511,9 +566,31 @@ class SphericalSelfiGlobalBackend:
                 "same_level_only, compare_existing_only, and permanent_drop"
             )
         self.node_mode = str(graph_cfg.get("node_mode", "window_anchor")).lower()
-        if self.node_mode not in {"window_anchor", "boundary_frame"}:
-            raise ValueError("global_graph.node_mode must be 'window_anchor' or 'boundary_frame'")
-        self.boundary_frame_graph = self.node_mode == "boundary_frame"
+        if self.node_mode not in {
+            "window_anchor",
+            "boundary_frame",
+            "chunk_first_stride",
+        }:
+            raise ValueError(
+                "global_graph.node_mode must be 'window_anchor', "
+                "'boundary_frame', or 'chunk_first_stride'"
+            )
+        self.chunk_first_stride_graph = self.node_mode == "chunk_first_stride"
+        if (
+            self.chunk_first_stride_graph
+            and self.rendered_overlap_alignment_enabled
+            and self.rendered_overlap_alignment_mode
+            != "two_frame_bridge_depth_scale"
+        ):
+            raise ValueError(
+                "chunk_first_stride requires "
+                "rendered_overlap_alignment.mode=two_frame_bridge_depth_scale; "
+                "pose-baseline bridge ablations must use node_mode=boundary_frame"
+            )
+        self.boundary_frame_graph = self.node_mode in {
+            "boundary_frame",
+            "chunk_first_stride",
+        }
         self.hierarchical_submaps_enabled = bool(hierarchical_cfg.get("enabled", False))
         if self.hierarchical_submaps_enabled and not self.boundary_frame_graph:
             raise ValueError("hierarchical_submaps currently requires global_graph.node_mode=boundary_frame")
@@ -541,6 +618,105 @@ class SphericalSelfiGlobalBackend:
         )
         self.expected_overlap_frames = int(graph_cfg.get("expected_overlap_frames", 1))
         self.enforce_exact_overlap = bool(graph_cfg.get("enforce_exact_overlap", True))
+        stride_cfg = dict(graph_cfg.get("chunk_stride", {}) or {})
+        self.chunk_stride_target_index = max(
+            1, int(stride_cfg.get("target_index", 2))
+        )
+        self.chunk_stride_min_matches = max(
+            3, int(stride_cfg.get("min_matches", 256))
+        )
+        self.chunk_stride_holdout_stride = max(
+            2, int(stride_cfg.get("holdout_stride", 5))
+        )
+        self.chunk_stride_irls_iterations = max(
+            1, int(stride_cfg.get("irls_iterations", 5))
+        )
+        self.chunk_stride_min_inlier_ratio = float(
+            stride_cfg.get("min_inlier_ratio", 0.35)
+        )
+        self.chunk_stride_covariance_min_ratio = float(
+            stride_cfg.get("covariance_min_ratio", 1.0e-4)
+        )
+        self.chunk_stride_max_scale_change = float(
+            stride_cfg.get("max_scale_change", 2.5)
+        )
+        self.chunk_stride_max_rotation_error_deg = float(
+            stride_cfg.get("max_rotation_error_deg", 5.0)
+        )
+        self.chunk_stride_max_translation_error = float(
+            stride_cfg.get("max_translation_error", 1.0)
+        )
+        self.chunk_stride_max_translation_depth_ratio = float(
+            stride_cfg.get("max_translation_depth_ratio", 0.05)
+        )
+        self.chunk_stride_max_holdout_angular_deg = float(
+            stride_cfg.get("max_holdout_angular_deg", 2.0)
+        )
+        self.chunk_stride_max_holdout_relative_depth = float(
+            stride_cfg.get("max_holdout_relative_depth", 0.10)
+        )
+        self.chunk_stride_postopt_worse_ratio = max(
+            1.0, float(stride_cfg.get("postopt_worse_ratio", 1.05))
+        )
+        skip_cfg = dict(graph_cfg.get("skip_edge", {}) or {})
+        self.chunk_skip_enabled = bool(skip_cfg.get("enabled", False))
+        self.chunk_skip_num_queries = max(
+            self.chunk_stride_min_matches,
+            int(skip_cfg.get("num_queries", 2048)),
+        )
+        self.chunk_skip_temperature = float(skip_cfg.get("temperature", 0.07))
+        self.chunk_skip_query_chunk_size = max(
+            1, int(skip_cfg.get("query_chunk_size", 32))
+        )
+        self.chunk_skip_oversample_factor = max(
+            1, int(skip_cfg.get("fibonacci_oversample_factor", 8))
+        )
+        self.chunk_skip_area_correction = bool(
+            skip_cfg.get("use_spherical_area_correction", True)
+        )
+        self.chunk_skip_forward_backward = bool(
+            skip_cfg.get("forward_backward", True)
+        )
+        self.chunk_skip_fb_tolerance_deg = float(
+            skip_cfg.get("fb_tolerance_deg", 1.0)
+        )
+        self.chunk_skip_min_factor_weight = float(
+            skip_cfg.get("min_factor_weight", 0.01)
+        )
+        self.chunk_skip_subpixel_refine_radius = max(
+            0, min(4, int(skip_cfg.get("subpixel_refine_radius", 1)))
+        )
+        self.chunk_cycle_sequence_objective_ratio = max(
+            1.0, float(skip_cfg.get("max_sequence_objective_ratio", 1.02))
+        )
+        self.chunk_cycle_max_cumulative_scale = max(
+            1.0, float(skip_cfg.get("max_cumulative_scale_change", 1.25))
+        )
+        self.graph_optimization_trigger = str(
+            graph_cfg.get("optimization_trigger", "periodic_and_loop")
+        ).strip().lower()
+        if self.graph_optimization_trigger not in {
+            "periodic_and_loop",
+            "loop_only",
+        }:
+            raise ValueError(
+                "global_graph.optimization_trigger must be "
+                "'periodic_and_loop' or 'loop_only'"
+            )
+        if self.chunk_first_stride_graph:
+            if self.expected_overlap_frames != 2:
+                raise ValueError(
+                    "chunk_first_stride requires expected_overlap_frames=2"
+                )
+            if self.chunk_stride_target_index != 2:
+                raise ValueError(
+                    "The supported size=4/stride=2 graph requires "
+                    "global_graph.chunk_stride.target_index=2"
+                )
+            if not 0.0 <= self.chunk_stride_min_inlier_ratio <= 1.0:
+                raise ValueError("chunk_stride.min_inlier_ratio must be in [0, 1]")
+            if self.chunk_stride_max_scale_change < 1.0:
+                raise ValueError("chunk_stride.max_scale_change must be >= 1")
         if self.two_frame_overlap_enabled:
             if not self.boundary_frame_graph:
                 raise ValueError(
@@ -833,12 +1009,20 @@ class SphericalSelfiGlobalBackend:
         self.frame_owner_window: dict[int, int] = {}
         self.frame_depth_owner_window: dict[int, int] = {}
         self.frame_windows: dict[int, set[int]] = {}
+        self.frame_pose_owner_node: dict[int, int] = {}
+        self.frame_local_pose_in_owner: dict[int, torch.Tensor] = {}
         self.window_anchor_nodes: dict[int, int] = {}
         self.window_end_nodes: dict[int, int] = {}
         self.boundary_node_order: list[int] = []
+        self._chunk_stride_holdouts: dict[
+            tuple[int, int, str], ChunkStrideHoldout
+        ] = {}
+        self._chunk_node_initial_scale: dict[int, float] = {}
         self._sequential_edges_since_optimization = 0
         self._has_run_global_ba = False
         self._geometry_updates: dict[int, FrameGeometryUpdate] = {}
+        self._geometry_revision = 0
+        self._pending_geometry_batch: FrameGeometryUpdateBatch | None = None
         self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
         self._pending_seam_owner_windows: set[int] = set()
@@ -896,6 +1080,28 @@ class SphericalSelfiGlobalBackend:
 
     def _snapshot_boundary_transaction(self) -> dict[str, Any]:
         loop_database = getattr(self.loop_detector, "_descriptor_database", None)
+        packet_variants: list[
+            tuple[
+                LocalGaussianWindowPacket,
+                torch.Tensor,
+                Any,
+                Any,
+            ]
+        ] = []
+        for candidate in (
+            list(self.packets.values())
+            + list(self._optimization_packets.values())
+            + ([self._last_full_packet] if self._last_full_packet is not None else [])
+        ):
+            if all(id(candidate) != id(item[0]) for item in packet_variants):
+                packet_variants.append(
+                    (
+                        candidate,
+                        candidate.local_poses_c2w.detach().clone(),
+                        candidate.observation,
+                        candidate.anchor_observation,
+                    )
+                )
         return {
             "graph": self._snapshot_graph_state(self.graph),
             "submap_graph": self._snapshot_graph_state(self.submap_graph),
@@ -912,14 +1118,24 @@ class SphericalSelfiGlobalBackend:
                 int(frame): set(windows)
                 for frame, windows in self.frame_windows.items()
             },
+            "frame_pose_owner_node": dict(self.frame_pose_owner_node),
+            "frame_local_pose_in_owner": {
+                int(frame): pose.clone()
+                for frame, pose in self.frame_local_pose_in_owner.items()
+            },
             "window_anchor_nodes": dict(self.window_anchor_nodes),
             "window_end_nodes": dict(self.window_end_nodes),
             "boundary_node_order": list(self.boundary_node_order),
+            "chunk_stride_holdouts": dict(self._chunk_stride_holdouts),
+            "chunk_node_initial_scale": dict(self._chunk_node_initial_scale),
             "sequential_edges": self._sequential_edges_since_optimization,
             "has_run_global_ba": self._has_run_global_ba,
             "geometry_updates": dict(self._geometry_updates),
+            "geometry_revision": int(self._geometry_revision),
+            "pending_geometry_batch": self._pending_geometry_batch,
             "pending_map_optimization": list(self._pending_map_optimization),
             "optimization_packets": dict(self._optimization_packets),
+            "packet_geometry_variants": packet_variants,
             "pending_seam_owner_windows": set(
                 self._pending_seam_owner_windows
             ),
@@ -974,14 +1190,28 @@ class SphericalSelfiGlobalBackend:
         self.frame_owner_window = state["frame_owner_window"]
         self.frame_depth_owner_window = state["frame_depth_owner_window"]
         self.frame_windows = state["frame_windows"]
+        self.frame_pose_owner_node = state["frame_pose_owner_node"]
+        self.frame_local_pose_in_owner = state[
+            "frame_local_pose_in_owner"
+        ]
         self.window_anchor_nodes = state["window_anchor_nodes"]
         self.window_end_nodes = state["window_end_nodes"]
         self.boundary_node_order = state["boundary_node_order"]
+        self._chunk_stride_holdouts = state["chunk_stride_holdouts"]
+        self._chunk_node_initial_scale = state["chunk_node_initial_scale"]
         self._sequential_edges_since_optimization = state["sequential_edges"]
         self._has_run_global_ba = state["has_run_global_ba"]
         self._geometry_updates = state["geometry_updates"]
+        self._geometry_revision = state["geometry_revision"]
+        self._pending_geometry_batch = state["pending_geometry_batch"]
         self._pending_map_optimization = state["pending_map_optimization"]
         self._optimization_packets = state["optimization_packets"]
+        for variant, local_poses, observation, anchor_observation in state.get(
+            "packet_geometry_variants", ()
+        ):
+            variant.local_poses_c2w = local_poses
+            variant.observation = observation
+            variant.anchor_observation = anchor_observation
         self._pending_seam_owner_windows = state[
             "pending_seam_owner_windows"
         ]
@@ -1078,9 +1308,19 @@ class SphericalSelfiGlobalBackend:
         selected = ordered_windows[-self.global_ba_active_nodes :]
         nodes: list[int] = []
         for window_id in selected:
+            if self.chunk_first_stride_graph:
+                packet = self.packets.get(int(window_id))
+                next_node = (
+                    None
+                    if packet is None
+                    or self.chunk_stride_target_index >= len(packet.frame_ids)
+                    else int(packet.frame_ids[self.chunk_stride_target_index])
+                )
+            else:
+                next_node = self.window_end_nodes.get(int(window_id))
             for node in (
                 self.window_anchor_nodes.get(int(window_id)),
-                self.window_end_nodes.get(int(window_id)),
+                next_node,
             ):
                 if (
                     node is not None
@@ -1090,7 +1330,91 @@ class SphericalSelfiGlobalBackend:
                     nodes.append(int(node))
         return nodes
 
-    def _overlap_seam_diagnostics(self) -> dict[str, Any]:
+    def _overlap_seam_diagnostics(
+        self,
+        *,
+        affected_window_ids: set[int] | None = None,
+    ) -> dict[str, Any]:
+        if self.chunk_first_stride_graph:
+            rotation_errors: list[float] = []
+            center_errors: list[float] = []
+            per_frame: list[dict[str, Any]] = []
+            window_transforms = self._window_anchor_transforms()
+            selected_windows = (
+                None
+                if affected_window_ids is None
+                else {int(value) for value in affected_window_ids}
+            )
+            for window_id in self.window_order[1:]:
+                if (
+                    selected_windows is not None
+                    and int(window_id) not in selected_windows
+                ):
+                    continue
+                packet = self.packets[int(window_id)]
+                owner_transform = window_transforms[int(window_id)].to(
+                    packet.local_poses_c2w
+                )
+                for index in range(
+                    min(self.chunk_stride_target_index, len(packet.frame_ids))
+                ):
+                    frame = int(packet.frame_ids[index])
+                    owner_node = self.frame_pose_owner_node.get(frame)
+                    local_pose = self.frame_local_pose_in_owner.get(frame)
+                    if (
+                        owner_node is None
+                        or local_pose is None
+                        or int(owner_node) not in self.graph.nodes
+                    ):
+                        continue
+                    canonical_pose = apply_sim3_to_c2w(
+                        self.graph.transform(int(owner_node)).to(local_pose),
+                        local_pose,
+                    )
+                    packet_pose = apply_sim3_to_c2w(
+                        owner_transform, packet.local_poses_c2w[index]
+                    )
+                    rotation_error = self._rotation_error_deg(
+                        canonical_pose[:3, :3].to(packet_pose),
+                        packet_pose[:3, :3],
+                    )
+                    center_error = float(
+                        torch.linalg.norm(
+                            canonical_pose[:3, 3].to(packet_pose)
+                            - packet_pose[:3, 3]
+                        )
+                        .detach()
+                        .cpu()
+                    )
+                    rotation_errors.append(rotation_error)
+                    center_errors.append(center_error)
+                    per_frame.append(
+                        {
+                            "window_id": int(window_id),
+                            "frame_id": frame,
+                            "rotation_error_deg": rotation_error,
+                            "center_error": center_error,
+                        }
+                    )
+            max_rotation = max(rotation_errors, default=0.0)
+            max_center = max(center_errors, default=0.0)
+            return {
+                "enabled": self.post_optimization_seam_check_enabled,
+                "mode": "chunk_overlap_acceptance_only",
+                "factor_count": 0,
+                "validation_count": len(per_frame),
+                "max_rotation_error_deg": max_rotation,
+                "max_center_error": max_center,
+                "rotation_errors_deg": rotation_errors,
+                "center_errors": center_errors,
+                "per_frame": per_frame,
+                "accepted": bool(
+                    max_rotation
+                    <= self.post_optimization_seam_max_rotation_deg
+                    and max_center
+                    <= self.post_optimization_seam_max_center_error
+                ),
+            }
         rotation_errors: list[float] = []
         center_errors: list[float] = []
         factor_count = 0
@@ -1262,6 +1586,7 @@ class SphericalSelfiGlobalBackend:
         retained: list[
             DenseSphericalFactorBlock | Sim3GraphEdge | CoincidentPanoramaFactor
         ] = []
+        internal_holdouts_to_release: list[tuple[int, int, str]] = []
         compressed = 0
         for factor in self.graph.edges:
             source = int(factor.source)
@@ -1271,7 +1596,10 @@ class SphericalSelfiGlobalBackend:
             )
             cross_frozen_boundary = (
                 isinstance(factor, DenseSphericalFactorBlock)
-                and factor.edge_type == "overlap_dense_spherical"
+                and factor.edge_type
+                in {
+                    "overlap_dense_spherical",
+                }
                 and (
                     (
                         source in frozen_predecessor_nodes
@@ -1285,9 +1613,24 @@ class SphericalSelfiGlobalBackend:
             )
             should_compress = (
                 isinstance(factor, DenseSphericalFactorBlock)
-                and factor.edge_type
-                in {"boundary_dense_spherical", "overlap_dense_spherical"}
-                and (within_record or cross_frozen_boundary)
+                and (
+                    (
+                        factor.edge_type
+                        in {
+                            "chunk_stride_dense_spherical",
+                            "chunk_skip_dense_spherical",
+                        }
+                        and within_record
+                    )
+                    or (
+                        factor.edge_type
+                        in {
+                            "boundary_dense_spherical",
+                            "overlap_dense_spherical",
+                        }
+                        and (within_record or cross_frozen_boundary)
+                    )
+                )
             )
             if not should_compress:
                 retained.append(factor)
@@ -1319,8 +1662,17 @@ class SphericalSelfiGlobalBackend:
                     },
                 )
             )
+            if within_record and factor.edge_type in {
+                "chunk_stride_dense_spherical",
+                "chunk_skip_dense_spherical",
+            }:
+                internal_holdouts_to_release.append(
+                    (source, target, str(factor.edge_type))
+                )
             compressed += 1
         self.graph.edges = retained
+        for key in internal_holdouts_to_release:
+            self._chunk_stride_holdouts.pop(key, None)
         return compressed
 
     def _apply_submap_graph_to_boundary_graph(self) -> None:
@@ -1946,6 +2298,234 @@ class SphericalSelfiGlobalBackend:
             )
         return overlap
 
+    @staticmethod
+    def _weighted_median_1d(
+        values: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a deterministic weighted median for finite one-dimensional data."""
+
+        value = values.reshape(-1)
+        weight = weights.to(value).reshape(-1).clamp_min(0.0)
+        if int(value.numel()) == 0 or int(weight.numel()) != int(value.numel()):
+            raise ValueError("Weighted median requires equally sized non-empty inputs")
+        valid = torch.isfinite(value) & torch.isfinite(weight) & (weight > 0.0)
+        if not bool(valid.any()):
+            raise ValueError("Weighted median requires positive finite support")
+        value = value[valid]
+        weight = weight[valid]
+        order = torch.argsort(value, stable=True)
+        sorted_value = value.index_select(0, order)
+        sorted_weight = weight.index_select(0, order)
+        threshold = 0.5 * sorted_weight.sum()
+        index = int(
+            torch.searchsorted(
+                sorted_weight.cumsum(dim=0),
+                threshold,
+                right=False,
+            )
+            .clamp_max(int(sorted_value.numel()) - 1)
+            .item()
+        )
+        return sorted_value[index]
+
+    def _estimate_canonical_ba_overlap_scale(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+    ) -> tuple[float | None, dict[str, Any]]:
+        """Estimate packet normalization using BA depths only, never map renders."""
+
+        overlap = self._overlap_frame_ids(previous, current)
+        if len(overlap) != 2:
+            return None, {
+                "reason": "two_ba_overlap_frames_required",
+                "overlap_frame_ids": list(overlap),
+                "accepted": False,
+            }
+        log_ratio_parts: list[torch.Tensor] = []
+        frame_ids: list[int] = []
+        frame_counts: list[int] = []
+        frame_confidence_support: list[int] = []
+        frame_confidence_rejected: list[int] = []
+        frame_index_parts: list[torch.Tensor] = []
+        seeds: list[int] = []
+        for frame_slot, frame_id in enumerate(overlap):
+            previous_index = previous.frame_index(frame_id)
+            current_index = current.frame_index(frame_id)
+            previous_depth = previous.observation.refined_depth[
+                0, previous_index
+            ].detach()
+            current_depth = current.observation.refined_depth[
+                0, current_index
+            ].detach().to(previous_depth)
+            previous_semantic_valid = (
+                previous.finite_gaussian_mask[0, previous_index]
+                & previous.static_mask[0, previous_index]
+                & previous.geometry_consistency[0, previous_index]
+                & ~previous.sky_mask[0, previous_index]
+            ).detach()
+            current_semantic_valid = (
+                current.finite_gaussian_mask[0, current_index]
+                & current.static_mask[0, current_index]
+                & current.geometry_consistency[0, current_index]
+                & ~current.sky_mask[0, current_index]
+            ).detach().to(previous_semantic_valid.device)
+            previous_confidence = previous.observation.confidence[
+                0, previous_index
+            ].detach().to(previous_depth)
+            current_confidence = current.observation.confidence[
+                0, current_index
+            ].detach().to(previous_depth)
+            previous_confident = (
+                torch.isfinite(previous_confidence)
+                & (
+                    previous_confidence
+                    >= self.rendered_alignment_min_confidence
+                )
+            )
+            current_confident = (
+                torch.isfinite(current_confidence)
+                & (
+                    current_confidence
+                    >= self.rendered_alignment_min_confidence
+                )
+            )
+            semantic_joint = (
+                previous_semantic_valid & current_semantic_valid
+            )
+            confident_joint = previous_confident & current_confident
+            previous_valid = previous_semantic_valid & previous_confident
+            current_valid = current_semantic_valid & current_confident
+            frame_confidence_support.append(
+                int((semantic_joint & confident_joint).sum().detach().cpu())
+            )
+            frame_confidence_rejected.append(
+                int((semantic_joint & ~confident_joint).sum().detach().cpu())
+            )
+            seed = (
+                self.fibonacci_seed
+                + 1_000_003 * int(previous.window_id)
+                + 10_007 * int(current.window_id)
+                + 101 * int(frame_id)
+            ) & 0x7FFFFFFF
+            samples = sample_joint_valid_fibonacci_uv(
+                current_depth,
+                previous_depth,
+                count=self.rendered_alignment_max_points_per_frame,
+                oversample_factor=self.fibonacci_oversample_factor,
+                min_depth=self.fibonacci_min_depth,
+                max_depth=self.fibonacci_max_depth,
+                source_valid=current_valid,
+                target_valid=previous_valid,
+                source_sky_probability=current.sky_prob[
+                    0, current_index
+                ].detach().to(previous_depth),
+                target_sky_probability=previous.sky_prob[
+                    0, previous_index
+                ].detach(),
+                sky_threshold=self.sky_threshold,
+                seed=seed,
+            )
+            count = int(samples.source_depth.numel())
+            if count < self.rendered_alignment_min_points_per_frame:
+                return None, {
+                    "reason": "insufficient_ba_overlap_depth_support",
+                    "failed_frame_id": int(frame_id),
+                    "valid_points": count,
+                    "accepted": False,
+                    "global_render_used_for_scale": False,
+                }
+            log_ratio_parts.append(
+                samples.target_depth.clamp_min(1.0e-8).log()
+                - samples.source_depth.clamp_min(1.0e-8).log()
+            )
+            frame_index_parts.append(
+                torch.full(
+                    (count,),
+                    frame_slot,
+                    device=samples.source_depth.device,
+                    dtype=torch.long,
+                )
+            )
+            frame_ids.append(int(frame_id))
+            frame_counts.append(count)
+            seeds.append(int(samples.seed))
+
+        log_ratio = torch.cat(log_ratio_parts, dim=0)
+        frame_index = torch.cat(frame_index_parts, dim=0)
+        base_weight = torch.zeros_like(log_ratio)
+        for frame_slot in range(2):
+            rows = frame_index == frame_slot
+            base_weight[rows] = 0.5 / float(rows.sum().item())
+        estimate = self._weighted_median_1d(log_ratio, base_weight)
+        robust_weight = base_weight
+        mad = log_ratio.new_tensor(0.0)
+        for _ in range(5):
+            residual = log_ratio - estimate
+            centered = residual - self._weighted_median_1d(
+                residual, base_weight
+            )
+            mad = self._weighted_median_1d(centered.abs(), base_weight)
+            sigma = (1.4826 * mad).clamp_min(1.0e-6)
+            delta = (1.345 * sigma).clamp_min(1.0e-4)
+            huber = torch.minimum(
+                torch.ones_like(residual),
+                delta / residual.abs().clamp_min(1.0e-8),
+            )
+            robust_weight = base_weight * huber
+            estimate = (
+                robust_weight * log_ratio
+            ).sum() / robust_weight.sum().clamp_min(1.0e-8)
+        scale = float(estimate.exp().detach().cpu())
+        relative_error = (log_ratio - estimate).exp().sub(1.0).abs()
+        inliers = relative_error <= self.rendered_alignment_max_median_relative_error
+        inlier_ratio = float(
+            (base_weight * inliers.to(base_weight)).sum().detach().cpu()
+        )
+        median_error = sum(
+            float(relative_error[frame_index == slot].median().detach().cpu())
+            for slot in range(2)
+        ) / 2.0
+        per_frame_inlier = [
+            float(inliers[frame_index == slot].float().mean().detach().cpu())
+            for slot in range(2)
+        ]
+        accepted = (
+            math.isfinite(scale)
+            and 1.0 / self.rendered_alignment_max_scale_change
+            <= scale
+            <= self.rendered_alignment_max_scale_change
+            and inlier_ratio >= self.rendered_alignment_min_inlier_ratio
+            and median_error
+            <= self.rendered_alignment_max_median_relative_error
+        )
+        diagnostics = {
+            "mode": "canonical_ba_overlap_depth_only",
+            "source_window_id": int(previous.window_id),
+            "target_window_id": int(current.window_id),
+            "overlap_frame_ids": frame_ids,
+            "per_frame_valid_points": frame_counts,
+            "min_confidence": self.rendered_alignment_min_confidence,
+            "per_frame_confidence_support_pixels": frame_confidence_support,
+            "per_frame_confidence_rejected_pixels": frame_confidence_rejected,
+            "valid_points": int(log_ratio.numel()),
+            "per_frame_inlier_ratio": per_frame_inlier,
+            "inlier_ratio": inlier_ratio,
+            "median_relative_error": median_error,
+            "log_ratio_mad": float(mad.detach().cpu()),
+            "chunk_scale_normalization": scale,
+            "c": scale,
+            "irls_iterations": 5,
+            "frame_weight": 0.5,
+            "fibonacci_seeds": seeds,
+            "global_render_used_for_scale": False,
+            "post_refiner_scale_recheck": False,
+            "accepted": bool(accepted),
+            "reason": "accepted" if accepted else "ba_overlap_scale_gate_rejected",
+        }
+        return (scale if accepted else None), diagnostics
+
     def _known_overlap_global_pose(
         self,
         previous: LocalGaussianWindowPacket,
@@ -1955,6 +2535,16 @@ class SphericalSelfiGlobalBackend:
         """Return the already-admitted global SE(3) pose of an overlap frame."""
 
         frame = int(frame_id)
+        if self.chunk_first_stride_graph and frame in self.frame_pose_owner_node:
+            owner_node = int(self.frame_pose_owner_node[frame])
+            local_pose = self.frame_local_pose_in_owner[frame]
+            if owner_node not in self.graph.nodes:
+                raise RuntimeError(
+                    f"Canonical pose owner node {owner_node} for frame {frame} is missing"
+                )
+            return apply_sim3_to_c2w(
+                self.graph.transform(owner_node).to(local_pose), local_pose
+            )
         if frame in self.graph.nodes:
             node = self.graph.transform(frame)
             _, rotation, translation = sim3_components(node)
@@ -4267,6 +4857,700 @@ class SphericalSelfiGlobalBackend:
             **{name: torch.cat(value, dim=0).detach().clone() for name, value in pieces.items()}
         )
 
+    @staticmethod
+    def _balanced_chunk_stride_weights(
+        direction: torch.Tensor,
+        selected: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Give each cached query direction exactly half of the edge weight."""
+
+        weights = torch.zeros(
+            int(direction.numel()),
+            device=direction.device,
+            dtype=dtype,
+        )
+        for value in (0, 1):
+            rows = selected & (direction == value)
+            count = int(rows.sum().item())
+            if count == 0:
+                raise RuntimeError(
+                    "Chunk-stride initialization requires both 0->2 and 2->0 matches"
+                )
+            weights[rows] = 0.5 / float(count)
+        return weights
+
+    @staticmethod
+    def _chunk_stride_holdout_mask(
+        direction: torch.Tensor,
+        *,
+        source_frame: int,
+        target_frame: int,
+        stride: int,
+    ) -> torch.Tensor:
+        """Return a deterministic 80/20-style split in each query direction."""
+
+        count = int(direction.numel())
+        rows = torch.arange(count, device=direction.device, dtype=torch.int64)
+        hashed = (
+            rows * 1_000_003
+            + int(source_frame) * 10_007
+            + int(target_frame) * 101
+            + direction.to(torch.int64) * 97
+        )
+        holdout = (hashed.remainder(int(stride))) == 0
+        for value in (0, 1):
+            members = torch.nonzero(direction == value, as_tuple=False).flatten()
+            if int(members.numel()) < 2:
+                raise RuntimeError(
+                    "Chunk-stride validation requires at least two matches per direction"
+                )
+            if not bool(holdout.index_select(0, members).any()):
+                holdout[members[-1]] = True
+            if bool(holdout.index_select(0, members).all()):
+                holdout[members[0]] = False
+        return holdout
+
+    @staticmethod
+    def _chunk_stride_alignment_errors(
+        transform_target_to_source: torch.Tensor,
+        source_bearing: torch.Tensor,
+        target_bearing: torch.Tensor,
+        source_depth: torch.Tensor,
+        target_depth: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_points = target_bearing * target_depth[:, None]
+        predicted_source = apply_sim3(
+            transform_target_to_source.to(target_points), target_points
+        )
+        predicted_depth = torch.linalg.norm(predicted_source, dim=-1).clamp_min(
+            1.0e-8
+        )
+        predicted_bearing = predicted_source / predicted_depth[:, None]
+        cosine = (predicted_bearing * source_bearing).sum(dim=-1).clamp(-1.0, 1.0)
+        angular_deg = torch.rad2deg(torch.acos(cosine))
+        relative_depth = (
+            (predicted_depth - source_depth).abs()
+            / source_depth.abs().clamp_min(1.0e-6)
+        )
+        return angular_deg, relative_depth
+
+    @staticmethod
+    def _spherical_coverage_ratio(bearing: torch.Tensor) -> float:
+        value = bearing / torch.linalg.norm(
+            bearing, dim=-1, keepdim=True
+        ).clamp_min(1.0e-8)
+        latitude = torch.asin(value[:, 1].clamp(-1.0, 1.0))
+        longitude = torch.atan2(value[:, 0], value[:, 2])
+        latitude_bin = torch.floor(
+            (latitude + 0.5 * math.pi) / math.pi * 3.0
+        ).long().clamp(0, 2)
+        longitude_bin = torch.floor(
+            (longitude + math.pi) / (2.0 * math.pi) * 8.0
+        ).long().clamp(0, 7)
+        occupied = torch.unique(latitude_bin * 8 + longitude_bin)
+        return float(occupied.numel()) / 24.0
+
+    def _chunk_stride_factor(
+        self,
+        packet: LocalGaussianWindowPacket,
+        *,
+        edge_type: str = "chunk_stride_dense_spherical",
+        expected_target_index: int | None = None,
+        validate_local_ba: bool = True,
+        reference_measurement: torch.Tensor | None = None,
+    ) -> tuple[
+        DenseSphericalFactorBlock | None,
+        torch.Tensor | None,
+        ChunkStrideHoldout | None,
+        dict[str, Any],
+    ]:
+        """Fit one independently matched chunk-anchor S²+depth factor."""
+
+        matches = packet.chunk_stride_matches
+        target_index = (
+            -1 if matches is None else int(matches.target_index)
+        )
+        ba_residual = packet.metadata.get(
+            "local_ba_final_median_residual_deg"
+        )
+        ba_trust_touched = bool(
+            packet.metadata.get("local_ba_trust_region_touched", False)
+        )
+        if validate_local_ba and (
+            packet.metadata.get("local_ba_accepted") is False
+            or ba_trust_touched
+            or ba_residual is None
+            or not math.isfinite(float(ba_residual))
+            or float(ba_residual) > 5.0
+        ):
+            return None, None, None, {
+                "reason": "local_ba_quality_gate_rejected",
+                "local_ba_accepted": packet.metadata.get("local_ba_accepted"),
+                "local_ba_final_median_residual_deg": ba_residual,
+                "local_ba_trust_region_touched": ba_trust_touched,
+            }
+        if matches is None:
+            return None, None, None, {"reason": "chunk_stride_matches_unavailable"}
+        if (
+            int(matches.source_index) != 0
+            or target_index >= len(packet.frame_ids)
+            or target_index <= 0
+            or (
+                expected_target_index is not None
+                and target_index != int(expected_target_index)
+            )
+        ):
+            return None, None, None, {
+                "reason": "unexpected_chunk_stride_match_indices",
+                "source_index": int(matches.source_index),
+                "target_index": int(matches.target_index),
+            }
+
+        source_depth = sample_erp_with_wrap(
+            packet.observation.refined_depth[0, 0], matches.source_uv
+        )[..., 0]
+        target_depth = sample_erp_with_wrap(
+            packet.observation.refined_depth[0, target_index], matches.target_uv
+        )[..., 0]
+
+        def sampled_mask(value: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+            return sample_erp_with_wrap(value.float(), uv)[..., 0] >= 0.5
+
+        source_valid = (
+            sampled_mask(packet.finite_gaussian_mask[0, 0], matches.source_uv)
+            & sampled_mask(packet.static_mask[0, 0], matches.source_uv)
+            & sampled_mask(packet.geometry_consistency[0, 0], matches.source_uv)
+        )
+        target_valid = (
+            sampled_mask(
+                packet.finite_gaussian_mask[0, target_index], matches.target_uv
+            )
+            & sampled_mask(packet.static_mask[0, target_index], matches.target_uv)
+            & sampled_mask(
+                packet.geometry_consistency[0, target_index], matches.target_uv
+            )
+        )
+        source_sky = sample_erp_with_wrap(
+            packet.sky_prob[0, 0], matches.source_uv
+        )[..., 0]
+        target_sky = sample_erp_with_wrap(
+            packet.sky_prob[0, target_index], matches.target_uv
+        )[..., 0]
+        keep = (
+            source_valid
+            & target_valid
+            & (source_sky < self.sky_threshold)
+            & (target_sky < self.sky_threshold)
+            & torch.isfinite(source_depth)
+            & torch.isfinite(target_depth)
+            & (source_depth >= self.fibonacci_min_depth)
+            & (target_depth >= self.fibonacci_min_depth)
+            & (source_depth <= self.fibonacci_max_depth)
+            & (target_depth <= self.fibonacci_max_depth)
+            & (matches.top1_cosine >= self.min_match_cosine)
+            & (matches.top2_margin >= self.min_match_margin)
+            & (matches.normalized_entropy <= self.max_match_entropy)
+        )
+        source_frame = int(packet.frame_ids[0])
+        target_frame = int(packet.frame_ids[target_index])
+        diagnostics: dict[str, Any] = {
+            "source_window_id": int(packet.window_id),
+            "target_window_id": int(packet.window_id),
+            "source_frame_id": source_frame,
+            "target_frame_id": target_frame,
+            "raw_chunk_stride_matches": int(matches.count),
+            "hard_gated_chunk_stride_matches": int(keep.sum().item()),
+            "sky_rejected": int(
+                (
+                    (source_sky >= self.sky_threshold)
+                    | (target_sky >= self.sky_threshold)
+                ).sum().item()
+            ),
+            "weight_mode": "bidirectional_half_balanced",
+            "umeyama_iterations": int(self.chunk_stride_irls_iterations),
+            "edge_type": str(edge_type),
+            "independent_correspondences": True,
+        }
+        if int(keep.sum().item()) < self.chunk_stride_min_matches:
+            diagnostics["reason"] = "insufficient_chunk_stride_matches"
+            return None, None, None, diagnostics
+
+        direction = matches.query_direction[keep].to(source_depth.device).long()
+        source_bearing = matches.source_bearing[keep].to(source_depth)
+        target_bearing = matches.target_bearing[keep].to(source_depth)
+        source_depth = source_depth[keep]
+        target_depth = target_depth[keep]
+        try:
+            holdout_mask = self._chunk_stride_holdout_mask(
+                direction,
+                source_frame=source_frame,
+                target_frame=target_frame,
+                stride=self.chunk_stride_holdout_stride,
+            )
+            train_mask = ~holdout_mask
+            base_weight = self._balanced_chunk_stride_weights(
+                direction,
+                train_mask,
+                dtype=source_depth.dtype,
+            )
+        except RuntimeError as error:
+            diagnostics.update(
+                {"reason": "missing_bidirectional_support", "detail": str(error)}
+            )
+            return None, None, None, diagnostics
+
+        source_points = source_bearing * source_depth[:, None]
+        target_points = target_bearing * target_depth[:, None]
+        train_rows = torch.nonzero(train_mask, as_tuple=False).flatten()
+        robust_weight = base_weight.clone()
+        try:
+            measurement = weighted_umeyama(
+                target_points.index_select(0, train_rows),
+                source_points.index_select(0, train_rows),
+                robust_weight.index_select(0, train_rows),
+                allow_scale=True,
+            )
+            for _ in range(self.chunk_stride_irls_iterations):
+                residual = torch.linalg.norm(
+                    apply_sim3(measurement, target_points) - source_points,
+                    dim=-1,
+                )
+                train_residual = residual.index_select(0, train_rows)
+                train_base_weight = base_weight.index_select(0, train_rows)
+                centered = train_residual - self._weighted_median_1d(
+                    train_residual,
+                    train_base_weight,
+                )
+                sigma = (
+                    1.4826
+                    * self._weighted_median_1d(
+                        centered.abs(), train_base_weight
+                    )
+                ).clamp_min(1.0e-5)
+                delta = (1.345 * sigma).clamp_min(1.0e-4)
+                huber = torch.minimum(
+                    torch.ones_like(residual),
+                    delta / residual.clamp_min(1.0e-8),
+                )
+                robust_weight = base_weight * huber
+                measurement = weighted_umeyama(
+                    target_points.index_select(0, train_rows),
+                    source_points.index_select(0, train_rows),
+                    robust_weight.index_select(0, train_rows),
+                    allow_scale=True,
+                )
+        except (RuntimeError, ValueError) as error:
+            diagnostics.update(
+                {"reason": "chunk_stride_umeyama_failed", "detail": str(error)}
+            )
+            return None, None, None, diagnostics
+
+        residual = torch.linalg.norm(
+            apply_sim3(measurement, target_points) - source_points,
+            dim=-1,
+        )
+        median_depth = float(source_depth[train_mask].median().detach().cpu())
+        inlier_threshold = max(1.0e-3, 0.10 * median_depth)
+        inliers = train_mask & (residual <= inlier_threshold)
+        inlier_ratio = float(
+            (
+                (base_weight * inliers.to(base_weight)).sum()
+                / base_weight.sum().clamp_min(1.0e-8)
+            )
+            .detach()
+            .cpu()
+        )
+        if int(inliers.sum().item()) < 3:
+            diagnostics.update(
+                {
+                    "reason": "insufficient_chunk_stride_inliers",
+                    "umeyama_inlier_ratio": inlier_ratio,
+                }
+            )
+            return None, None, None, diagnostics
+
+        try:
+            inlier_weight = self._balanced_chunk_stride_weights(
+                direction,
+                inliers,
+                dtype=source_depth.dtype,
+            )
+        except RuntimeError as error:
+            diagnostics.update(
+                {
+                    "reason": "one_sided_chunk_stride_inliers",
+                    "detail": str(error),
+                    "umeyama_inlier_ratio": inlier_ratio,
+                }
+            )
+            return None, None, None, diagnostics
+        source_singular = self._weighted_point_singular_values(
+            source_points[inliers], inlier_weight[inliers]
+        )
+        target_singular = self._weighted_point_singular_values(
+            target_points[inliers], inlier_weight[inliers]
+        )
+        source_ratio = float(
+            (source_singular[-1] / source_singular[0].clamp_min(1.0e-12))
+            .detach()
+            .cpu()
+        )
+        target_ratio = float(
+            (target_singular[-1] / target_singular[0].clamp_min(1.0e-12))
+            .detach()
+            .cpu()
+        )
+        covariance_ratio = min(source_ratio, target_ratio)
+
+        scale, rotation, translation = sim3_components(measurement)
+        local_pose = (
+            packet.local_poses_c2w[target_index].to(measurement)
+            if reference_measurement is None
+            else reference_measurement.to(measurement)
+        )
+        rotation_error = self._rotation_error_deg(
+            local_pose[:3, :3], rotation
+        )
+        translation_error = float(
+            torch.linalg.norm(translation - local_pose[:3, 3]).detach().cpu()
+        )
+        translation_limit = min(
+            self.chunk_stride_max_translation_error,
+            self.chunk_stride_max_translation_depth_ratio * median_depth,
+        )
+        holdout_angular, holdout_depth = self._chunk_stride_alignment_errors(
+            measurement,
+            source_bearing[holdout_mask],
+            target_bearing[holdout_mask],
+            source_depth[holdout_mask],
+            target_depth[holdout_mask],
+        )
+        holdout_weight = self._balanced_chunk_stride_weights(
+            direction,
+            holdout_mask,
+            dtype=source_depth.dtype,
+        )[holdout_mask]
+        holdout_angular_median = float(
+            self._weighted_median_1d(
+                holdout_angular, holdout_weight
+            ).detach().cpu()
+        )
+        holdout_depth_median = float(
+            self._weighted_median_1d(
+                holdout_depth, holdout_weight
+            ).detach().cpu()
+        )
+        source_coverage = self._spherical_coverage_ratio(
+            source_bearing[inliers]
+        )
+        target_coverage = self._spherical_coverage_ratio(
+            target_bearing[inliers]
+        )
+        coverage = 0.5 * (source_coverage + target_coverage)
+        support_score = min(
+            1.0,
+            float(inliers.sum().item())
+            / float(max(self.chunk_stride_min_matches, 1024)),
+        )
+        angular_score = math.exp(
+            -holdout_angular_median
+            / max(self.chunk_stride_max_holdout_angular_deg, 1.0e-6)
+        )
+        depth_score = math.exp(
+            -holdout_depth_median
+            / max(self.chunk_stride_max_holdout_relative_depth, 1.0e-6)
+        )
+        information_confidence = max(
+            0.05,
+            min(
+                1.0,
+                (
+                    max(support_score, 1.0e-6)
+                    * max(coverage, 1.0e-6)
+                    * angular_score
+                    * depth_score
+                )
+                ** 0.25,
+            ),
+        )
+        scale_value = float(scale.detach().cpu())
+        accepted = (
+            inlier_ratio >= self.chunk_stride_min_inlier_ratio
+            and covariance_ratio >= self.chunk_stride_covariance_min_ratio
+            and 1.0 / self.chunk_stride_max_scale_change
+            <= scale_value
+            <= self.chunk_stride_max_scale_change
+            and rotation_error <= self.chunk_stride_max_rotation_error_deg
+            and translation_error <= translation_limit
+            and holdout_angular_median
+            <= self.chunk_stride_max_holdout_angular_deg
+            and holdout_depth_median
+            <= self.chunk_stride_max_holdout_relative_depth
+        )
+        diagnostics.update(
+            {
+                "reason": "accepted" if accepted else "chunk_stride_gate_rejected",
+                "accepted": bool(accepted),
+                "train_matches": int(train_mask.sum().item()),
+                "holdout_matches": int(holdout_mask.sum().item()),
+                "umeyama_inliers": int(inliers.sum().item()),
+                "umeyama_inlier_ratio": inlier_ratio,
+                "umeyama_inlier_threshold": inlier_threshold,
+                "scale": scale_value,
+                "rotation_error_vs_local_ba_deg": rotation_error,
+                "translation_error_vs_local_ba": translation_error,
+                "translation_error_limit": translation_limit,
+                "median_scene_depth": median_depth,
+                "source_covariance_singular_values": [
+                    float(value) for value in source_singular.detach().cpu()
+                ],
+                "target_covariance_singular_values": [
+                    float(value) for value in target_singular.detach().cpu()
+                ],
+                "covariance_ratio": covariance_ratio,
+                "holdout_median_angular_error_deg": holdout_angular_median,
+                "holdout_median_relative_depth_error": holdout_depth_median,
+                "source_spherical_coverage": source_coverage,
+                "target_spherical_coverage": target_coverage,
+                "support_score": support_score,
+                "angular_score": angular_score,
+                "depth_score": depth_score,
+                "information_confidence": information_confidence,
+                "local_ba_final_median_residual_deg": (
+                    None if ba_residual is None else float(ba_residual)
+                ),
+                "local_ba_trust_region_touched": ba_trust_touched,
+            }
+        )
+        if not accepted:
+            return None, None, None, diagnostics
+
+        selected = torch.nonzero(inliers, as_tuple=False).flatten()
+        identity = torch.eye(
+            4, device=source_depth.device, dtype=source_depth.dtype
+        )
+        factor = DenseSphericalFactorBlock(
+            source=source_frame,
+            target=target_frame,
+            source_local_pose=identity,
+            target_local_pose=identity.clone(),
+            source_bearing=source_bearing.index_select(0, selected),
+            target_bearing=target_bearing.index_select(0, selected),
+            source_depth=source_depth.index_select(0, selected),
+            target_depth=target_depth.index_select(0, selected),
+            factor_weight=(
+                information_confidence
+                * inlier_weight.index_select(0, selected)
+            ),
+            depth_factor_weight=self.depth_factor_weight,
+            s2_huber_delta_deg=self.s2_huber_delta_deg,
+            use_depth=True,
+            edge_type=str(edge_type),
+            **self._dense_factor_information_options(),
+            metadata=dict(diagnostics),
+        )
+        holdout = ChunkStrideHoldout(
+            source=source_frame,
+            target=target_frame,
+            edge_type=str(edge_type),
+            source_bearing=source_bearing[holdout_mask].detach().clone(),
+            target_bearing=target_bearing[holdout_mask].detach().clone(),
+            source_depth=source_depth[holdout_mask].detach().clone(),
+            target_depth=target_depth[holdout_mask].detach().clone(),
+            initial_angular_median_deg=holdout_angular_median,
+            initial_relative_depth_median=holdout_depth_median,
+        )
+        return factor, measurement.detach(), holdout, diagnostics
+
+    def _independent_chunk_skip_factor(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+    ) -> tuple[
+        DenseSphericalFactorBlock | None,
+        ChunkStrideHoldout | None,
+        dict[str, Any],
+    ]:
+        """Match Ck to Ck+2 from scratch and build an independent cycle edge."""
+
+        if not self.chunk_skip_enabled:
+            return None, None, {"enabled": False, "reason": "disabled"}
+        target_index = int(self.chunk_stride_target_index)
+        if target_index >= len(current.frame_ids):
+            return None, None, {
+                "enabled": True,
+                "reason": "target_index_out_of_range",
+            }
+        source_frame = int(previous.frame_ids[0])
+        target_frame = int(current.frame_ids[target_index])
+        if source_frame not in self.graph.nodes or target_frame not in self.graph.nodes:
+            return None, None, {
+                "enabled": True,
+                "reason": "missing_skip_endpoint",
+                "source_frame_id": source_frame,
+                "target_frame_id": target_frame,
+            }
+
+        # Only the immediately previous full packet is used here.  Keeping the
+        # native adapter grid avoids quantizing a 2-degree holdout gate to the
+        # 32x64 loop-verification grid.
+        source = previous
+        target = current
+        if (
+            source.observation.image_size != target.observation.image_size
+            or tuple(source.verification_features.shape[-3:])
+            != tuple(target.verification_features.shape[-3:])
+        ):
+            return None, None, {
+                "enabled": True,
+                "reason": "skip_verification_shape_mismatch",
+            }
+
+        def pair_views(name: str) -> torch.Tensor:
+            left = getattr(source, name)[:, 0:1]
+            right = getattr(target, name)[:, target_index : target_index + 1]
+            return torch.cat([left, right.to(left)], dim=1)
+
+        source_observation = source.observation
+
+        def observation_views(name: str) -> torch.Tensor:
+            left = getattr(source_observation, name)[:, 0:1]
+            right = getattr(target.observation, name)[
+                :, target_index : target_index + 1
+            ]
+            return torch.cat([left, right.to(left)], dim=1)
+
+        pair_pose = torch.eye(
+            4,
+            device=source.local_poses_c2w.device,
+            dtype=source.local_poses_c2w.dtype,
+        ).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+        pair_observation = replace(
+            source_observation,
+            initial_depth=observation_views("initial_depth"),
+            depth_residual=observation_views("depth_residual"),
+            refined_depth=observation_views("refined_depth"),
+            poses_c2w=pair_pose.to(source_observation.poses_c2w),
+            local_quaternion=observation_views("local_quaternion"),
+            log_scale_multiplier=observation_views("log_scale_multiplier"),
+            rgb_sh=observation_views("rgb_sh"),
+            density_sh=observation_views("density_sh"),
+            confidence=observation_views("confidence"),
+            valid_mask=observation_views("valid_mask").bool(),
+            frame_ids=torch.tensor(
+                [[source_frame, target_frame]],
+                device=source_observation.frame_ids.device,
+                dtype=source_observation.frame_ids.dtype,
+            ),
+        )
+        pair_features = torch.cat(
+            [
+                source.verification_features[:, 0:1],
+                target.verification_features[
+                    :, target_index : target_index + 1
+                ].to(source.verification_features),
+            ],
+            dim=1,
+        )
+        pair_packet = LocalGaussianWindowPacket(
+            window_id=int(current.window_id),
+            anchor_frame_id=source_frame,
+            frame_ids=(source_frame, target_frame),
+            local_poses_c2w=pair_pose[0].float(),
+            observation=pair_observation,
+            adapter_features=pair_features,
+            retrieval_descriptors=torch.cat(
+                [
+                    source.retrieval_descriptors[0:1],
+                    target.retrieval_descriptors[
+                        target_index : target_index + 1
+                    ].to(source.retrieval_descriptors),
+                ],
+                dim=0,
+            ),
+            verification_features=pair_features,
+            valid_mask=pair_views("valid_mask").bool(),
+            finite_gaussian_mask=pair_views("finite_gaussian_mask").bool(),
+            sky_prob=pair_views("sky_prob").float(),
+            sky_mask=pair_views("sky_mask").bool(),
+            static_mask=pair_views("static_mask").bool(),
+            geometry_consistency=pair_views("geometry_consistency").bool(),
+            metadata={
+                "skip_source_window_id": int(previous.window_id),
+                "skip_target_window_id": int(current.window_id),
+            },
+        )
+        valid = (
+            pair_packet.finite_gaussian_mask
+            & pair_packet.static_mask
+            & pair_packet.geometry_consistency
+            & ~pair_packet.sky_mask
+        )
+        generator = torch.Generator(device=pair_features.device)
+        seed = (
+            self.fibonacci_seed
+            + 1_000_003 * source_frame
+            + 10_007 * target_frame
+        ) & 0x7FFFFFFF
+        generator.manual_seed(seed)
+        try:
+            cache = build_stage3_match_cache(
+                pair_features,
+                pair_observation.refined_depth,
+                num_queries=self.chunk_skip_num_queries,
+                min_depth=self.fibonacci_min_depth,
+                max_depth=self.fibonacci_max_depth,
+                temperature=self.chunk_skip_temperature,
+                query_chunk_size=self.chunk_skip_query_chunk_size,
+                fibonacci_oversample_factor=self.chunk_skip_oversample_factor,
+                use_spherical_area_correction=self.chunk_skip_area_correction,
+                forward_backward=self.chunk_skip_forward_backward,
+                fb_tolerance_deg=self.chunk_skip_fb_tolerance_deg,
+                min_factor_weight=self.chunk_skip_min_factor_weight,
+                factor_weight_mode="descriptor_confidence",
+                subpixel_refine_radius=self.chunk_skip_subpixel_refine_radius,
+                edge_topology="all_directed",
+                static_valid_mask=valid,
+                generator=generator,
+            )
+        except (RuntimeError, ValueError) as error:
+            return None, None, {
+                "enabled": True,
+                "reason": "independent_skip_matching_failed",
+                "detail": str(error),
+                "source_frame_id": source_frame,
+                "target_frame_id": target_frame,
+            }
+        pair_packet.chunk_stride_matches = chunk_stride_matches_from_cache(
+            cache,
+            pair_observation.image_size,
+            stride=1,
+        )
+        source_transform = self.graph.transform(source_frame)
+        reference = (
+            sim3_inverse(source_transform)
+            @ self.graph.transform(target_frame).to(source_transform)
+        )
+        factor, _, holdout, diagnostics = self._chunk_stride_factor(
+            pair_packet,
+            edge_type="chunk_skip_dense_spherical",
+            expected_target_index=1,
+            validate_local_ba=False,
+            reference_measurement=reference,
+        )
+        diagnostics.update(
+            {
+                "enabled": True,
+                "matching_seed": int(seed),
+                "source_window_id": int(previous.window_id),
+                "target_window_id": int(current.window_id),
+                "independent_from_sequential_and_overlap": True,
+            }
+        )
+        return factor, holdout, diagnostics
+
     def _boundary_factor(
         self,
         packet: LocalGaussianWindowPacket,
@@ -4519,7 +5803,291 @@ class SphericalSelfiGlobalBackend:
             return previous.clone()
         return previous @ edge.measurement_target_to_source.to(previous)
 
-    def _refresh_geometry_updates(self) -> None:
+    def _register_chunk_stride_segments(
+        self,
+        packet: LocalGaussianWindowPacket,
+        *,
+        source_node: int,
+        target_node: int,
+    ) -> dict[str, Any]:
+        """Register immutable two-frame pose owners for a size=4/stride=2 packet."""
+
+        target_index = int(self.chunk_stride_target_index)
+        if target_index >= len(packet.frame_ids):
+            raise RuntimeError(
+                "chunk_first_stride packet is missing its next anchor frame"
+            )
+        source_reference = packet.local_poses_c2w[0]
+        target_reference = packet.local_poses_c2w[target_index]
+        source_inverse = invert_c2w(source_reference)
+        target_inverse = invert_c2w(target_reference)
+        preserved = 0
+        registered = 0
+        max_rotation_mismatch = 0.0
+        max_translation_mismatch = 0.0
+        for index, frame_id in enumerate(packet.frame_ids):
+            frame = int(frame_id)
+            if index < target_index:
+                owner = int(source_node)
+                local_pose = source_inverse @ packet.local_poses_c2w[index]
+            else:
+                owner = int(target_node)
+                local_pose = target_inverse @ packet.local_poses_c2w[index]
+            local_pose = canonicalize_c2w(local_pose.detach())
+            existing_owner = self.frame_pose_owner_node.get(frame)
+            existing_pose = self.frame_local_pose_in_owner.get(frame)
+            if existing_owner is not None:
+                if int(existing_owner) != owner or existing_pose is None:
+                    raise RuntimeError(
+                        f"Frame {frame} already belongs to pose owner "
+                        f"{existing_owner}, not {owner}"
+                    )
+                max_rotation_mismatch = max(
+                    max_rotation_mismatch,
+                    self._rotation_error_deg(
+                        existing_pose[:3, :3].to(local_pose),
+                        local_pose[:3, :3],
+                    ),
+                )
+                max_translation_mismatch = max(
+                    max_translation_mismatch,
+                    float(
+                        torch.linalg.norm(
+                            existing_pose[:3, 3].to(local_pose)
+                            - local_pose[:3, 3]
+                        )
+                        .detach()
+                        .cpu()
+                    ),
+                )
+                preserved += 1
+                continue
+            self.frame_pose_owner_node[frame] = owner
+            self.frame_local_pose_in_owner[frame] = local_pose.clone()
+            registered += 1
+        return {
+            "registered_frames": registered,
+            "preserved_overlap_frames": preserved,
+            "max_preserved_rotation_mismatch_deg": max_rotation_mismatch,
+            "max_preserved_translation_mismatch": max_translation_mismatch,
+        }
+
+    def _chunk_stride_holdout_diagnostics(
+        self,
+        *,
+        affected_node_ids: set[int] | None = None,
+    ) -> dict[str, Any]:
+        """Validate held-out sequential/skip edges touched by a transaction."""
+
+        angular_errors: list[float] = []
+        depth_errors: list[float] = []
+        angular_ratios: list[float] = []
+        depth_ratios: list[float] = []
+        per_edge: list[dict[str, Any]] = []
+        accepted = True
+        selected_nodes = (
+            None
+            if affected_node_ids is None
+            else {int(node) for node in affected_node_ids}
+        )
+        for key in sorted(self._chunk_stride_holdouts):
+            holdout = self._chunk_stride_holdouts[key]
+            if selected_nodes is not None and {
+                int(holdout.source),
+                int(holdout.target),
+            }.isdisjoint(selected_nodes):
+                continue
+            if holdout.source not in self.graph.nodes or holdout.target not in self.graph.nodes:
+                accepted = False
+                per_edge.append(
+                    {
+                        "source": holdout.source,
+                        "target": holdout.target,
+                        "edge_type": holdout.edge_type,
+                        "reason": "missing_graph_endpoint",
+                        "accepted": False,
+                    }
+                )
+                continue
+            source_transform = self.graph.transform(holdout.source)
+            relative = (
+                sim3_inverse(source_transform)
+                @ self.graph.transform(holdout.target).to(source_transform)
+            )
+            angular, depth = self._chunk_stride_alignment_errors(
+                relative,
+                holdout.source_bearing.to(relative),
+                holdout.target_bearing.to(relative),
+                holdout.source_depth.to(relative),
+                holdout.target_depth.to(relative),
+            )
+            angular_median = float(angular.median().detach().cpu())
+            depth_median = float(depth.median().detach().cpu())
+            angular_ratio = angular_median / max(
+                holdout.initial_angular_median_deg, 1.0e-4
+            )
+            depth_ratio = depth_median / max(
+                holdout.initial_relative_depth_median, 1.0e-6
+            )
+            edge_accepted = (
+                angular_median <= self.chunk_stride_max_holdout_angular_deg
+                and depth_median <= self.chunk_stride_max_holdout_relative_depth
+                and angular_ratio <= self.chunk_stride_postopt_worse_ratio
+                and depth_ratio <= self.chunk_stride_postopt_worse_ratio
+            )
+            accepted = accepted and edge_accepted
+            angular_errors.append(angular_median)
+            depth_errors.append(depth_median)
+            angular_ratios.append(angular_ratio)
+            depth_ratios.append(depth_ratio)
+            per_edge.append(
+                {
+                    "source": holdout.source,
+                    "target": holdout.target,
+                    "edge_type": holdout.edge_type,
+                    "angular_median_deg": angular_median,
+                    "relative_depth_median": depth_median,
+                    "angular_worsening_ratio": angular_ratio,
+                    "depth_worsening_ratio": depth_ratio,
+                    "accepted": bool(edge_accepted),
+                }
+            )
+        return {
+            "enabled": bool(self.chunk_first_stride_graph),
+            "factor_count": len(per_edge),
+            "max_angular_median_deg": max(angular_errors, default=0.0),
+            "max_relative_depth_median": max(depth_errors, default=0.0),
+            "max_angular_worsening_ratio": max(angular_ratios, default=1.0),
+            "max_depth_worsening_ratio": max(depth_ratios, default=1.0),
+            "per_edge": per_edge,
+            "accepted": bool(accepted),
+        }
+
+    def _refresh_geometry_updates(
+        self,
+        *,
+        complete_snapshot: bool = True,
+        affected_node_ids: set[int] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if self.chunk_first_stride_graph:
+            updates: dict[int, FrameGeometryUpdate] = {}
+            window_transforms = self._window_anchor_transforms()
+            window_scales = {
+                int(window_id): float(
+                    sim3_components(transform)[0].detach().cpu()
+                )
+                for window_id, transform in window_transforms.items()
+            }
+            window_input_scales = {
+                int(window_id): float(
+                    self.packets[int(window_id)].metadata.get(
+                        "global_alignment_local_scale", 1.0
+                    )
+                )
+                for window_id in self.window_order
+                if int(window_id) in self.packets
+            }
+            selected_nodes = (
+                None
+                if affected_node_ids is None
+                else {int(node) for node in affected_node_ids}
+            )
+            selected_frames = [
+                int(frame)
+                for frame in sorted(self.frame_pose_owner_node)
+                if complete_snapshot
+                or selected_nodes is None
+                or int(self.frame_pose_owner_node[int(frame)]) in selected_nodes
+                or len(self.window_order) <= 1
+            ]
+            for frame in selected_frames:
+                owner_node = int(self.frame_pose_owner_node[frame])
+                local_pose = self.frame_local_pose_in_owner[frame]
+                if owner_node not in self.graph.nodes:
+                    raise RuntimeError(
+                        f"Frame {frame} references missing pose owner node {owner_node}"
+                    )
+                node_transform = self.graph.transform(owner_node).to(local_pose)
+                node_scale = float(
+                    sim3_components(node_transform)[0].detach().cpu()
+                )
+                pose = apply_sim3_to_c2w(node_transform, local_pose)
+                if not bool(torch.isfinite(pose).all()) or not math.isfinite(
+                    node_scale
+                ):
+                    raise RuntimeError(
+                        f"Frame {frame} produced non-finite canonical geometry"
+                    )
+                owner_window = int(
+                    self.frame_owner_window.get(
+                        frame,
+                        min(self.frame_windows.get(frame, {0})),
+                    )
+                )
+                depth_owner = int(
+                    self.frame_depth_owner_window.get(frame, owner_window)
+                )
+                depth_scales_by_window = {
+                    int(candidate): float(window_scales[int(candidate)])
+                    * float(window_input_scales.get(int(candidate), 1.0))
+                    for candidate in self.frame_windows.get(frame, {owner_window})
+                    if int(candidate) in window_scales
+                }
+                updates[frame] = FrameGeometryUpdate(
+                    frame_id=frame,
+                    pose_c2w=pose.detach().cpu().float(),
+                    depth_scale=(
+                        node_scale
+                        * float(window_input_scales.get(owner_window, 1.0))
+                    ),
+                    owner_window_id=owner_window,
+                    depth_owner_window_id=depth_owner,
+                    pose_owner_node_id=owner_node,
+                    depth_scales_by_window=depth_scales_by_window,
+                )
+            if complete_snapshot:
+                self._geometry_updates = dict(updates)
+            else:
+                self._geometry_updates.update(updates)
+            if not updates and not complete_snapshot:
+                return
+            self._geometry_revision += 1
+            batch_updates = dict(updates)
+            batch_complete = bool(complete_snapshot)
+            batch_affected = set(selected_nodes or ())
+            if self._pending_geometry_batch is not None:
+                previous_batch = self._pending_geometry_batch
+                batch_affected.update(previous_batch.affected_node_ids)
+                if previous_batch.complete_snapshot or batch_complete:
+                    batch_complete = True
+                    batch_updates = dict(self._geometry_updates)
+                else:
+                    batch_updates = {
+                        **previous_batch.updates,
+                        **batch_updates,
+                    }
+            self._pending_geometry_batch = FrameGeometryUpdateBatch(
+                revision=int(self._geometry_revision),
+                complete_snapshot=batch_complete,
+                updates=batch_updates,
+                affected_node_ids=tuple(
+                    sorted(
+                        batch_affected
+                        if batch_affected
+                        else self.graph.nodes
+                    )
+                ),
+                reason=(
+                    reason
+                    or (
+                        "chunk_first_stride_complete_geometry_refresh"
+                        if batch_complete
+                        else "chunk_first_stride_incremental_geometry_refresh"
+                    )
+                ),
+            )
+            return
         if self.boundary_frame_graph:
             updates: dict[int, FrameGeometryUpdate] = {}
             window_transforms = self._window_anchor_transforms()
@@ -4616,9 +6184,21 @@ class SphericalSelfiGlobalBackend:
         self._refresh_geometry_updates()
 
     def pop_frame_geometry_updates(self) -> dict[int, FrameGeometryUpdate]:
-        updates = dict(self._geometry_updates)
+        batch = self._pending_geometry_batch
+        updates = (
+            dict(batch.updates)
+            if batch is not None
+            else dict(self._geometry_updates)
+        )
         self._geometry_updates.clear()
+        self._pending_geometry_batch = None
         return updates
+
+    def pop_frame_geometry_update_batch(self) -> FrameGeometryUpdateBatch | None:
+        batch = self._pending_geometry_batch
+        self._pending_geometry_batch = None
+        self._geometry_updates.clear()
+        return batch
 
     def pop_pose_updates(self) -> dict[int, torch.Tensor]:
         """Backward-compatible pose-only view of pending geometry updates."""
@@ -4633,6 +6213,11 @@ class SphericalSelfiGlobalBackend:
             return {}
         self.mapper.optimizer = self.map.make_optimizer(
             lr=float(self.config.get("map_optimization", {}).get("lr", 2.0e-3))
+        )
+        backend_transaction = (
+            self._snapshot_boundary_transaction()
+            if self.chunk_first_stride_graph
+            else None
         )
         try:
             live_packet = self._optimization_packets.get(int(window_id))
@@ -4699,6 +6284,8 @@ class SphericalSelfiGlobalBackend:
                 try:
                     self._synchronize_joint_optimized_window(int(window_id))
                 except (RuntimeError, ValueError, KeyError) as exc:
+                    if backend_transaction is not None:
+                        self._restore_boundary_transaction(backend_transaction)
                     if self.geometry_rollback_on_failure:
                         self.mapper.rollback_spherical_selfi_window()
                     else:
@@ -4713,6 +6300,8 @@ class SphericalSelfiGlobalBackend:
                     self.mapper.commit_spherical_selfi_window()
             return metrics
         except (RuntimeError, ValueError, KeyError) as exc:
+            if backend_transaction is not None:
+                self._restore_boundary_transaction(backend_transaction)
             if self.geometry_rollback_on_failure:
                 self.mapper.rollback_spherical_selfi_window()
             else:
@@ -4983,6 +6572,9 @@ class SphericalSelfiGlobalBackend:
     def _synchronize_joint_optimized_window(self, window_id: int) -> None:
         """Transactionally rebase optimized SE(3) poses while graph scale stays authoritative."""
 
+        if self.chunk_first_stride_graph:
+            self._synchronize_chunk_stride_optimized_window(window_id)
+            return
         if self.boundary_frame_graph:
             self._synchronize_boundary_optimized_window(window_id)
             return
@@ -5076,6 +6668,219 @@ class SphericalSelfiGlobalBackend:
                 variant.local_poses_c2w = local_poses
                 variant.observation = observation
             self._refresh_factor_local_poses(affected_windows)
+            raise
+
+    def _synchronize_chunk_packet_variants(
+        self,
+        affected_windows: set[int],
+    ) -> None:
+        """Make every retained packet mirror the canonical rigid segments."""
+
+        window_transforms = self._window_anchor_transforms()
+        for window_id in sorted(int(value) for value in affected_windows):
+            if window_id not in window_transforms:
+                continue
+            owner_transform = window_transforms[window_id]
+            for variant in self._packet_variants(window_id):
+                local_poses = variant.local_poses_c2w.detach().clone()
+                changed = False
+                for index, frame_id in enumerate(variant.frame_ids):
+                    frame = int(frame_id)
+                    owner_node = self.frame_pose_owner_node.get(frame)
+                    canonical_local = self.frame_local_pose_in_owner.get(frame)
+                    if (
+                        owner_node is None
+                        or canonical_local is None
+                        or int(owner_node) not in self.graph.nodes
+                    ):
+                        continue
+                    global_pose = apply_sim3_to_c2w(
+                        self.graph.transform(int(owner_node)).to(canonical_local),
+                        canonical_local,
+                    )
+                    local_poses[index] = canonicalize_c2w(
+                        rebase_c2w_to_sim3_anchor(
+                            owner_transform.to(global_pose),
+                            global_pose,
+                        )
+                    ).to(local_poses)
+                    changed = True
+                if changed:
+                    variant.local_poses_c2w = local_poses.detach()
+                    variant.observation = variant.observation.with_geometry(
+                        poses_c2w=local_poses.unsqueeze(0).to(
+                            variant.observation.poses_c2w
+                        )
+                    )
+                    if variant.anchor_observation is not None:
+                        variant.anchor_observation = replace(
+                            variant.anchor_observation,
+                            local_poses_c2w=local_poses.unsqueeze(0).to(
+                                variant.anchor_observation.local_poses_c2w
+                            ),
+                        )
+
+    def _synchronize_chunk_stride_optimized_window_impl(
+        self,
+        window_id: int,
+    ) -> None:
+        """Validate and publish one mapper pose proposal to canonical segments."""
+
+        if self.mapper is None or int(window_id) not in self.packets:
+            return
+        packet = self.packets[int(window_id)]
+        optimized_by_frame: dict[int, torch.Tensor] = {}
+        for frame_id in packet.frame_ids:
+            pose = self.mapper.refined_pose_c2w(int(frame_id))
+            if pose is None:
+                raise RuntimeError(f"missing optimized pose for frame {frame_id}")
+            if tuple(pose.shape) != (4, 4) or not bool(torch.isfinite(pose).all()):
+                raise RuntimeError(f"invalid optimized pose for frame {frame_id}")
+            if int(frame_id) not in self.frame_pose_owner_node:
+                raise RuntimeError(
+                    f"frame {frame_id} has no canonical chunk-stride owner"
+                )
+            optimized_by_frame[int(frame_id)] = canonicalize_c2w(pose.float())
+
+        affected_nodes = {
+            int(self.frame_pose_owner_node[int(frame_id)])
+            for frame_id in optimized_by_frame
+        }
+        affected_windows = {
+            int(candidate)
+            for frame_id in optimized_by_frame
+            for candidate in self.frame_windows.get(int(frame_id), set())
+        }
+        affected_factors = tuple(
+            factor
+            for factor in self.graph.edges
+            if getattr(factor, "edge_type", "")
+            in {
+                "chunk_stride_dense_spherical",
+                "chunk_skip_dense_spherical",
+            }
+            and (
+                int(factor.source) in affected_nodes
+                or int(factor.target) in affected_nodes
+            )
+        )
+        sequential_factors = tuple(
+            factor
+            for factor in affected_factors
+            if factor.edge_type == "chunk_stride_dense_spherical"
+        )
+        skip_factors = tuple(
+            factor
+            for factor in affected_factors
+            if factor.edge_type == "chunk_skip_dense_spherical"
+        )
+        sequence_before = float(
+            self.graph.objective(factors=sequential_factors).detach().cpu()
+        )
+        skip_before = float(
+            self.graph.objective(factors=skip_factors).detach().cpu()
+        )
+        old_window_transforms = self._window_anchor_transforms()
+
+        # Node scales remain graph-owned.  The mapper proposes only global
+        # SE(3) R/t; both frames in each rigid segment are then reconstructed
+        # from the same canonical owner node.
+        for owner in sorted(affected_nodes):
+            if owner not in optimized_by_frame:
+                continue
+            current = self.graph.transform(owner)
+            scale, _, _ = sim3_components(current)
+            pose = optimized_by_frame[owner].to(current)
+            self.graph.nodes[owner] = sim3_from_components(
+                scale,
+                pose[:3, :3],
+                pose[:3, 3],
+            ).detach()
+        for frame_id, global_pose in optimized_by_frame.items():
+            owner = int(self.frame_pose_owner_node[frame_id])
+            owner_transform = self.graph.transform(owner)
+            if frame_id == owner:
+                local_pose = torch.eye(
+                    4,
+                    device=owner_transform.device,
+                    dtype=owner_transform.dtype,
+                )
+            else:
+                local_pose = rebase_c2w_to_sim3_anchor(
+                    owner_transform,
+                    global_pose.to(owner_transform),
+                )
+            self._validate_pose_round_trip(
+                owner_transform,
+                local_pose,
+                global_pose,
+                frame_id=frame_id,
+                window_id=window_id,
+            )
+            self.frame_local_pose_in_owner[frame_id] = local_pose.detach().clone()
+
+        sequence_after = float(
+            self.graph.objective(factors=sequential_factors).detach().cpu()
+        )
+        skip_after = float(
+            self.graph.objective(factors=skip_factors).detach().cpu()
+        )
+        sequence_ratio = sequence_after / max(sequence_before, 1.0e-12)
+        skip_ratio = skip_after / max(skip_before, 1.0e-12)
+        holdout = self._chunk_stride_holdout_diagnostics(
+            affected_node_ids=affected_nodes
+        )
+        seam = self._overlap_seam_diagnostics(
+            affected_window_ids=affected_windows
+        )
+        if (
+            not math.isfinite(sequence_after)
+            or not math.isfinite(skip_after)
+            or sequence_after
+            > (
+                self.chunk_cycle_sequence_objective_ratio * sequence_before
+                + self.loop_nonloop_objective_tolerance
+            )
+            or (
+                skip_factors
+                and skip_after
+                > (
+                    self.chunk_stride_postopt_worse_ratio * skip_before
+                    + self.loop_nonloop_objective_tolerance
+                )
+            )
+            or not bool(holdout["accepted"])
+            or (
+                self.post_optimization_seam_check_enabled
+                and not bool(seam["accepted"])
+            )
+        ):
+            raise RuntimeError(
+                "mapper pose proposal failed sequential/skip transaction gates: "
+                f"sequence_ratio={sequence_ratio:.6f}, "
+                f"skip_ratio={skip_ratio:.6f}, "
+                f"holdout={holdout.get('accepted')}, "
+                f"seam={seam.get('accepted')}"
+            )
+        self._synchronize_chunk_packet_variants(affected_windows)
+        self._refresh_factor_local_poses(affected_windows)
+        new_window_transforms = self._window_anchor_transforms()
+        self.fusion.apply_owner_corrections(
+            old_window_transforms,
+            new_window_transforms,
+        )
+        self._refresh_geometry_updates(
+            complete_snapshot=True,
+            affected_node_ids=affected_nodes,
+            reason="mapper_pose_transaction_commit",
+        )
+
+    def _synchronize_chunk_stride_optimized_window(self, window_id: int) -> None:
+        transaction = self._snapshot_boundary_transaction()
+        try:
+            self._synchronize_chunk_stride_optimized_window_impl(window_id)
+        except Exception:
+            self._restore_boundary_transaction(transaction)
             raise
 
     def _synchronize_boundary_optimized_window(self, window_id: int) -> None:
@@ -5682,6 +7487,13 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(f"Duplicate local Gaussian window id {window_id}")
         if len(packet.frame_ids) < 2:
             raise ValueError("Boundary-frame graph requires at least two frames per window")
+        if (
+            self.chunk_first_stride_graph
+            and len(packet.frame_ids) <= self.chunk_stride_target_index
+        ):
+            raise ValueError(
+                "chunk_first_stride requires the configured next-anchor frame"
+            )
         refined_packet = self._validate_refined_packet(packet)
         refiner_pending = bool(
             packet.metadata.get("voxel_anchor_refiner_pending", False)
@@ -5726,7 +7538,102 @@ class SphericalSelfiGlobalBackend:
             previous_packet = self._last_full_packet
             if previous_packet is None or int(previous_packet.window_id) != previous_id:
                 raise RuntimeError("The previous full-resolution window packet is unavailable")
-            if self.two_frame_known_pose_bridge_enabled:
+            if self.chunk_first_stride_graph:
+                if start_frame not in self.graph.nodes:
+                    raise RuntimeError(
+                        f"Canonical chunk-first node {start_frame} is missing"
+                    )
+                previous_transform = self._window_anchor_transforms()[
+                    previous_id
+                ].to(packet.local_poses_c2w)
+                bridge_input_packet = packet
+                local_scale, alignment_diagnostics = (
+                    self._estimate_canonical_ba_overlap_scale(
+                        previous_packet,
+                        bridge_input_packet,
+                    )
+                )
+                if local_scale is None:
+                    raise RuntimeError(
+                        f"Window {window_id} BA-overlap scale failed: "
+                        f"{alignment_diagnostics.get('reason', 'unknown')}"
+                    )
+                normalized_packet = self._rescaled_packet_copy(
+                    bridge_input_packet, local_scale
+                )
+                start_transform = self.graph.transform(start_frame).clone().to(
+                    normalized_packet.local_poses_c2w
+                )
+                overlap = self._overlap_frame_ids(
+                    previous_packet,
+                    normalized_packet,
+                )
+                known_global_poses = tuple(
+                    self._known_overlap_global_pose(
+                        previous_packet,
+                        frame_id,
+                        previous_transform,
+                    )
+                    for frame_id in overlap
+                )
+                predicted_second = apply_sim3_to_c2w(
+                    start_transform,
+                    normalized_packet.local_poses_c2w[1],
+                )
+                overlap_rotation_error = self._rotation_error_deg(
+                    known_global_poses[1][:3, :3].to(predicted_second),
+                    predicted_second[:3, :3],
+                )
+                overlap_center_error = float(
+                    torch.linalg.norm(
+                        known_global_poses[1][:3, 3].to(predicted_second)
+                        - predicted_second[:3, 3]
+                    )
+                    .detach()
+                    .cpu()
+                )
+                overlap_accepted = (
+                    overlap_rotation_error
+                    <= self.rendered_alignment_max_shared_rotation_error_deg
+                    and overlap_center_error
+                    <= self.rendered_alignment_max_shared_center_error
+                )
+                alignment_diagnostics.update(
+                    {
+                        "graph_role": "acceptance_only_no_factor",
+                        "existing_node_id": start_frame,
+                        "raw_ba_to_canonical_rotation_error_deg": (
+                            overlap_rotation_error
+                        ),
+                        "raw_ba_to_canonical_center_error": overlap_center_error,
+                        "node_sim3_scale_updated": False,
+                        "accepted": bool(overlap_accepted),
+                        "reason": (
+                            "accepted_ba_overlap_depth_normalization"
+                            if overlap_accepted
+                            else "ba_overlap_pose_gate_rejected"
+                        ),
+                    }
+                )
+                if not overlap_accepted:
+                    raise RuntimeError(
+                        f"Window {window_id} overlap acceptance failed for "
+                        f"existing node {start_frame}"
+                    )
+                packet = self._canonicalize_packet_from_two_known_poses(
+                    normalized_packet,
+                    start_transform,
+                    (known_global_poses[0], known_global_poses[1]),
+                )
+                if refined_packet:
+                    packet = self._finalize_pose_canonicalized_refiner_packet(
+                        packet
+                    )
+                packet.metadata["global_alignment_local_scale"] = float(
+                    local_scale
+                )
+                aligned = True
+            elif self.two_frame_known_pose_bridge_enabled:
                 previous_anchor = self.window_anchor_nodes[previous_id]
                 previous_transform = self._window_anchor_transforms()[
                     previous_id
@@ -5949,7 +7856,11 @@ class SphericalSelfiGlobalBackend:
                     )
                 if start_frame not in self.graph.nodes:
                     raise RuntimeError(f"Shared boundary node {start_frame} is missing")
-            if refined_packet and not self.two_frame_overlap_enabled:
+            if (
+                refined_packet
+                and not self.two_frame_overlap_enabled
+                and not self.chunk_first_stride_graph
+            ):
                 start_transform = self.graph.transform(start_frame).clone()
                 local_scale, alignment_diagnostics = (
                     self._rendered_shared_frame_alignment(
@@ -5966,7 +7877,11 @@ class SphericalSelfiGlobalBackend:
                 packet = self._rescaled_packet_copy(packet, local_scale)
                 packet.pre_depth_shift_depth = None
                 aligned = True
-            elif not refined_packet and not self.two_frame_overlap_enabled:
+            elif (
+                not refined_packet
+                and not self.two_frame_overlap_enabled
+                and not self.chunk_first_stride_graph
+            ):
                 alignment_attempts: list[dict[str, Any]] = []
                 measurement, attempt_diagnostics = self._shared_frame_alignment(
                     previous_packet, packet
@@ -6052,73 +7967,176 @@ class SphericalSelfiGlobalBackend:
         # target.  Once admitted it becomes the canonical source for the next
         # boundary and the dense backup can be released.
         packet.pre_depth_shift_depth = None
+        skip_factor_added = False
 
-        boundary_factor, boundary_diagnostics = self._boundary_factor(packet)
-        boundary_pose_fallback: Sim3GraphEdge | None = None
-        if boundary_factor is None:
-            if self.two_frame_known_pose_bridge_enabled:
-                boundary_pose_fallback = self._boundary_local_pose_fallback_edge(
-                    packet,
-                    boundary_diagnostics,
-                )
-                boundary_diagnostics = dict(boundary_pose_fallback.metadata)
-            elif not self.allow_unaligned_fallback:
+        if self.chunk_first_stride_graph:
+            (
+                stride_factor,
+                stride_measurement,
+                stride_holdout,
+                boundary_diagnostics,
+            ) = self._chunk_stride_factor(
+                packet,
+                expected_target_index=self.chunk_stride_target_index,
+            )
+            if (
+                stride_factor is None
+                or stride_measurement is None
+                or stride_holdout is None
+            ):
                 raise RuntimeError(
-                    f"Window {window_id} has no valid first/last spherical factor: "
+                    f"Window {window_id} has no valid 0->2 spherical/depth edge: "
                     f"{boundary_diagnostics.get('reason', 'unknown')}"
                 )
-
-        if (
-            self.two_frame_overlap_enabled
-            and self.window_order
-            and start_frame in self.graph.nodes
-        ):
-            raise ValueError(
-                f"Independent overlap-2 anchor node {start_frame} already exists "
-                f"before window {window_id}"
+            next_frame = int(packet.frame_ids[self.chunk_stride_target_index])
+            if not self.window_order:
+                self.graph.add_node(start_frame, start_transform)
+                self.boundary_node_order.append(start_frame)
+                self._chunk_node_initial_scale[start_frame] = float(
+                    sim3_components(start_transform)[0].detach().cpu()
+                )
+            elif start_frame not in self.graph.nodes:
+                raise RuntimeError(
+                    f"Expected existing chunk-first node {start_frame}"
+                )
+            if next_frame in self.graph.nodes:
+                raise RuntimeError(
+                    f"Next chunk-first node {next_frame} already exists before "
+                    f"window {window_id}"
+                )
+            start_node_transform = self.graph.transform(start_frame)
+            stride_ba_pose = canonicalize_c2w(
+                invert_c2w(packet.local_poses_c2w[0])
+                @ packet.local_poses_c2w[self.chunk_stride_target_index]
+            ).to(start_node_transform)
+            # Packet-to-packet overlap depth has already canonicalized the
+            # packet.  Pure-chain initialization therefore uses the
+            # canonical BA (0 -> stride) SE(3) motion and inherits the parent
+            # node scale exactly.  Umeyama s/R/t remains a correspondence
+            # quality, direction and holdout diagnostic only.
+            next_transform = (
+                start_node_transform
+                @ stride_ba_pose
             )
-        if not self.window_order:
-            self.graph.add_node(start_frame, start_transform)
-            self.boundary_node_order.append(start_frame)
-        elif start_frame not in self.graph.nodes:
-            self.graph.add_node(start_frame, start_transform)
-            self.boundary_node_order.append(start_frame)
-        self.window_anchor_nodes[window_id] = start_frame
-        if self.two_frame_overlap_enabled:
-            self.frame_owner_window[start_frame] = window_id
-            self.frame_depth_owner_window[start_frame] = window_id
-        else:
+            boundary_diagnostics["node_initialization_source"] = (
+                "canonical_ba_stride_pose"
+            )
+            boundary_diagnostics["umeyama_used_for_node_initialization"] = False
+            self.graph.add_node(next_frame, next_transform)
+            self.boundary_node_order.append(next_frame)
+            self._chunk_node_initial_scale[next_frame] = float(
+                sim3_components(next_transform)[0].detach().cpu()
+            )
+            self.graph.add_edge(stride_factor)
+            self._chunk_stride_holdouts[
+                (start_frame, next_frame, stride_holdout.edge_type)
+            ] = stride_holdout
+            skip_diagnostics: dict[str, Any] = {
+                "enabled": bool(self.chunk_skip_enabled),
+                "reason": "first_window",
+            }
+            if self.window_order and self._last_full_packet is not None:
+                skip_factor, skip_holdout, skip_diagnostics = (
+                    self._independent_chunk_skip_factor(
+                        self._last_full_packet,
+                        packet,
+                    )
+                )
+                if skip_factor is not None and skip_holdout is not None:
+                    self.graph.add_edge(skip_factor)
+                    self._chunk_stride_holdouts[
+                        (
+                            skip_holdout.source,
+                            skip_holdout.target,
+                            skip_holdout.edge_type,
+                        )
+                    ] = skip_holdout
+                    skip_factor_added = True
+            boundary_diagnostics["skip_edge"] = skip_diagnostics
+            self.window_anchor_nodes[window_id] = start_frame
             self.frame_owner_window.setdefault(start_frame, window_id)
             self.frame_depth_owner_window.setdefault(start_frame, window_id)
-
-        if end_frame in self.graph.nodes and end_frame != start_frame:
-            raise ValueError(f"Boundary frame node {end_frame} already exists before window {window_id}")
-        if end_frame not in self.graph.nodes:
-            end_transform = self._node_from_local_pose(
-                self.graph.transform(start_frame), packet.local_poses_c2w[-1]
+            self.frame_owner_window.setdefault(next_frame, window_id)
+            self.frame_depth_owner_window.setdefault(next_frame, window_id)
+            segment_diagnostics = self._register_chunk_stride_segments(
+                packet,
+                source_node=start_frame,
+                target_node=next_frame,
             )
-            self.graph.add_node(end_frame, end_transform)
-            self.boundary_node_order.append(end_frame)
-        self.window_end_nodes[window_id] = end_frame
-        self.frame_owner_window.setdefault(end_frame, window_id)
-        self.frame_depth_owner_window.setdefault(end_frame, window_id)
-        if sequential_overlap_edge is not None:
-            self.graph.add_edge(sequential_overlap_edge)
-        for factor in sequential_overlap_dense:
-            self.graph.add_edge(factor)
-        for factor in sequential_overlap_pose:
-            self.graph.add_edge(factor)
-        if boundary_factor is not None:
-            self.graph.add_edge(boundary_factor)
-        elif boundary_pose_fallback is not None:
-            self.graph.add_edge(boundary_pose_fallback)
-        if (
-            boundary_factor is not None
-            or boundary_pose_fallback is not None
-            or sequential_overlap_edge is not None
-        ):
+            boundary_diagnostics.update(segment_diagnostics)
             self._sequential_edges_since_optimization += 1
-        self._register_hierarchical_window(window_id, start_frame, end_frame)
+            self._register_hierarchical_window(
+                window_id, start_frame, next_frame
+            )
+        else:
+            boundary_factor, boundary_diagnostics = self._boundary_factor(packet)
+            boundary_pose_fallback: Sim3GraphEdge | None = None
+            if boundary_factor is None:
+                if self.two_frame_known_pose_bridge_enabled:
+                    boundary_pose_fallback = self._boundary_local_pose_fallback_edge(
+                        packet,
+                        boundary_diagnostics,
+                    )
+                    boundary_diagnostics = dict(boundary_pose_fallback.metadata)
+                elif not self.allow_unaligned_fallback:
+                    raise RuntimeError(
+                        f"Window {window_id} has no valid first/last spherical factor: "
+                        f"{boundary_diagnostics.get('reason', 'unknown')}"
+                    )
+
+            if (
+                self.two_frame_overlap_enabled
+                and self.window_order
+                and start_frame in self.graph.nodes
+            ):
+                raise ValueError(
+                    f"Independent overlap-2 anchor node {start_frame} already exists "
+                    f"before window {window_id}"
+                )
+            if not self.window_order:
+                self.graph.add_node(start_frame, start_transform)
+                self.boundary_node_order.append(start_frame)
+            elif start_frame not in self.graph.nodes:
+                self.graph.add_node(start_frame, start_transform)
+                self.boundary_node_order.append(start_frame)
+            self.window_anchor_nodes[window_id] = start_frame
+            if self.two_frame_overlap_enabled:
+                self.frame_owner_window[start_frame] = window_id
+                self.frame_depth_owner_window[start_frame] = window_id
+            else:
+                self.frame_owner_window.setdefault(start_frame, window_id)
+                self.frame_depth_owner_window.setdefault(start_frame, window_id)
+
+            if end_frame in self.graph.nodes and end_frame != start_frame:
+                raise ValueError(
+                    f"Boundary frame node {end_frame} already exists before window {window_id}"
+                )
+            if end_frame not in self.graph.nodes:
+                end_transform = self._node_from_local_pose(
+                    self.graph.transform(start_frame), packet.local_poses_c2w[-1]
+                )
+                self.graph.add_node(end_frame, end_transform)
+                self.boundary_node_order.append(end_frame)
+            self.window_end_nodes[window_id] = end_frame
+            self.frame_owner_window.setdefault(end_frame, window_id)
+            self.frame_depth_owner_window.setdefault(end_frame, window_id)
+            if sequential_overlap_edge is not None:
+                self.graph.add_edge(sequential_overlap_edge)
+            for factor in sequential_overlap_dense:
+                self.graph.add_edge(factor)
+            for factor in sequential_overlap_pose:
+                self.graph.add_edge(factor)
+            if boundary_factor is not None:
+                self.graph.add_edge(boundary_factor)
+            elif boundary_pose_fallback is not None:
+                self.graph.add_edge(boundary_pose_fallback)
+            if (
+                boundary_factor is not None
+                or boundary_pose_fallback is not None
+                or sequential_overlap_edge is not None
+            ):
+                self._sequential_edges_since_optimization += 1
+            self._register_hierarchical_window(window_id, start_frame, end_frame)
 
         # Loop retrieval operates on window packets. Verified pose and dense
         # spherical measurements are both re-keyed to boundary/submap nodes;
@@ -6192,6 +8210,21 @@ class SphericalSelfiGlobalBackend:
                 pending_loop_factors.append(merged)
 
         old_window_transforms = self._window_anchor_transforms()
+        chunk_sequence_factors = tuple(
+            factor
+            for factor in self.graph.edges
+            if getattr(factor, "edge_type", "")
+            == "chunk_stride_dense_spherical"
+        )
+        chunk_sequence_objective_before = (
+            float(
+                self.graph.objective(factors=chunk_sequence_factors)
+                .detach()
+                .cpu()
+            )
+            if self.chunk_first_stride_graph and chunk_sequence_factors
+            else 0.0
+        )
         pre_loop_nodes = {node: value.clone() for node, value in loop_graph.nodes.items()}
         pre_boundary_graph_state = self._snapshot_graph_state(self.graph)
         pre_submap_graph_state = self._snapshot_graph_state(self.submap_graph)
@@ -6204,6 +8237,8 @@ class SphericalSelfiGlobalBackend:
         recent_window_count = len(self.window_order) + 1
         should_optimize_recent = (
             self.global_graph_optimization_enabled
+            and not self.chunk_first_stride_graph
+            and self.graph_optimization_trigger == "periodic_and_loop"
             and (
                 recent_window_count >= self.global_ba_start_nodes
                 if self.two_frame_overlap_enabled
@@ -6214,15 +8249,32 @@ class SphericalSelfiGlobalBackend:
                 or self._sequential_edges_since_optimization >= self.global_ba_interval_edges
             )
         )
-        if accepted_loops:
+        if accepted_loops and not self.global_graph_optimization_enabled:
+            for loop_result in accepted_loops:
+                self.accepted_loop_pairs.add(
+                    self._canonical_loop_pair(loop_result)
+                )
+                loop_result.metadata["graph_transaction"] = {
+                    "enabled": False,
+                    "committed": False,
+                    "reason": "global_graph_optimization_disabled",
+                }
+        elif accepted_loops:
             nonloop_factors = tuple(loop_graph.edges[:loop_edge_start])
             nonloop_before = float(
                 loop_graph.objective(factors=nonloop_factors).detach().cpu()
             )
-            graph_result = loop_graph.optimize()
+            loop_scale_lock = bool(loop_graph.lock_scale_updates)
+            try:
+                if self.chunk_first_stride_graph:
+                    loop_graph.lock_scale_updates = False
+                graph_result = loop_graph.optimize()
+            finally:
+                loop_graph.lock_scale_updates = loop_scale_lock
             commit = True
             minimum_dcs_scale = 1.0
             nonloop_objective_ratio = 1.0
+            cumulative_scale_ratio = 1.0
             if self.loop_transaction_enabled:
                 nonloop_after = float(
                     loop_graph.objective(factors=nonloop_factors).detach().cpu()
@@ -6237,12 +8289,37 @@ class SphericalSelfiGlobalBackend:
                     nonloop_objective_before=nonloop_before,
                     nonloop_objective_after=nonloop_after,
                 )
+            if self.chunk_first_stride_graph and loop_graph is self.graph:
+                for node, initial_scale in self._chunk_node_initial_scale.items():
+                    if int(node) not in self.graph.nodes:
+                        commit = False
+                        break
+                    current_scale = float(
+                        sim3_components(self.graph.transform(int(node)))[0]
+                        .detach()
+                        .cpu()
+                    )
+                    ratio = max(
+                        current_scale / max(initial_scale, 1.0e-12),
+                        initial_scale / max(current_scale, 1.0e-12),
+                    )
+                    cumulative_scale_ratio = max(
+                        cumulative_scale_ratio, ratio
+                    )
+                    commit = (
+                        commit
+                        and math.isfinite(ratio)
+                        and ratio <= self.chunk_cycle_max_cumulative_scale
+                    )
             for loop_result in accepted_loops:
                 loop_result.metadata["graph_transaction"] = {
                     "enabled": self.loop_transaction_enabled,
                     "committed": bool(commit),
                     "minimum_dcs_scale": float(minimum_dcs_scale),
                     "nonloop_objective_ratio": float(nonloop_objective_ratio),
+                    "max_cumulative_scale_ratio": float(
+                        cumulative_scale_ratio
+                    ),
                     "initial_objective": float(graph_result.initial_objective),
                     "final_objective": float(graph_result.final_objective),
                 }
@@ -6279,6 +8356,101 @@ class SphericalSelfiGlobalBackend:
                     graph_result = self.graph.optimize(active, fixed_node_ids={active[0]})
                     self._has_run_global_ba = True
                     self._sequential_edges_since_optimization = 0
+        elif (
+            skip_factor_added
+            and self.chunk_first_stride_graph
+            and self.global_graph_optimization_enabled
+        ):
+            active = self._recent_boundary_window_nodes(
+                include_window_id=window_id
+            )
+            for node in (start_frame, next_frame):
+                if int(node) not in active:
+                    active.append(int(node))
+            sequence_factors = tuple(
+                factor
+                for factor in self.graph.edges
+                if getattr(factor, "edge_type", "")
+                == "chunk_stride_dense_spherical"
+            )
+            sequence_before = float(
+                self.graph.objective(factors=sequence_factors).detach().cpu()
+            )
+            scale_lock = bool(self.graph.lock_scale_updates)
+            try:
+                # A pure chain never enters this branch.  The independent skip
+                # edge creates the first observable cycle, at which point R/t
+                # and a tightly clamped log-scale may be optimized together.
+                self.graph.lock_scale_updates = False
+                graph_result = self.graph.optimize(
+                    active,
+                    fixed_node_ids={active[0]},
+                )
+            finally:
+                self.graph.lock_scale_updates = scale_lock
+            sequence_after = float(
+                self.graph.objective(factors=sequence_factors).detach().cpu()
+            )
+            sequence_ratio = sequence_after / max(sequence_before, 1.0e-12)
+            cumulative_scale_ratio = 1.0
+            cumulative_scale_ok = True
+            for node in active:
+                initial_scale = self._chunk_node_initial_scale.get(int(node))
+                if initial_scale is None:
+                    cumulative_scale_ok = False
+                    break
+                current_scale = float(
+                    sim3_components(self.graph.transform(int(node)))[0]
+                    .detach()
+                    .cpu()
+                )
+                ratio = max(
+                    current_scale / max(initial_scale, 1.0e-12),
+                    initial_scale / max(current_scale, 1.0e-12),
+                )
+                cumulative_scale_ratio = max(cumulative_scale_ratio, ratio)
+                cumulative_scale_ok = (
+                    cumulative_scale_ok
+                    and math.isfinite(ratio)
+                    and ratio <= self.chunk_cycle_max_cumulative_scale
+                )
+            cycle_commit = (
+                bool(graph_result.accepted)
+                and graph_result.final_objective
+                < graph_result.initial_objective - 1.0e-10
+                and sequence_after
+                <= (
+                    self.chunk_cycle_sequence_objective_ratio
+                    * sequence_before
+                    + self.loop_nonloop_objective_tolerance
+                )
+                and cumulative_scale_ok
+            )
+            boundary_diagnostics["cycle_optimization"] = {
+                "trigger": "independent_skip_edge",
+                "committed": bool(cycle_commit),
+                "sequence_objective_before": sequence_before,
+                "sequence_objective_after": sequence_after,
+                "sequence_objective_ratio": sequence_ratio,
+                "max_cumulative_scale_ratio": cumulative_scale_ratio,
+                "max_cumulative_scale_allowed": (
+                    self.chunk_cycle_max_cumulative_scale
+                ),
+            }
+            if cycle_commit:
+                self._has_run_global_ba = True
+                self._sequential_edges_since_optimization = 0
+            else:
+                self._restore_graph_state(
+                    self.graph, pre_boundary_graph_state
+                )
+                graph_result = replace(
+                    graph_result,
+                    accepted=False,
+                    final_objective=graph_result.initial_objective,
+                    max_update_norm=0.0,
+                    reason="chunk_cycle_transaction_rejected",
+                )
         elif should_optimize_recent:
             active = (
                 self._recent_boundary_window_nodes(
@@ -6293,6 +8465,130 @@ class SphericalSelfiGlobalBackend:
             )
             self._has_run_global_ba = True
             self._sequential_edges_since_optimization = 0
+        chunk_scale_diagnostics: dict[str, Any] = {
+            "enabled": bool(self.chunk_first_stride_graph),
+            "accepted": True,
+            "max_cumulative_scale_ratio": 1.0,
+        }
+        if graph_result is not None and self.chunk_first_stride_graph:
+            maximum_ratio = 1.0
+            scales_accepted = True
+            for node, initial_scale in self._chunk_node_initial_scale.items():
+                if int(node) not in self.graph.nodes:
+                    scales_accepted = False
+                    break
+                current_scale = float(
+                    sim3_components(self.graph.transform(int(node)))[0]
+                    .detach()
+                    .cpu()
+                )
+                ratio = max(
+                    current_scale / max(initial_scale, 1.0e-12),
+                    initial_scale / max(current_scale, 1.0e-12),
+                )
+                maximum_ratio = max(maximum_ratio, ratio)
+                scales_accepted = (
+                    scales_accepted
+                    and math.isfinite(ratio)
+                    and ratio <= self.chunk_cycle_max_cumulative_scale
+                )
+            chunk_scale_diagnostics = {
+                "enabled": True,
+                "accepted": bool(scales_accepted),
+                "max_cumulative_scale_ratio": maximum_ratio,
+                "max_cumulative_scale_allowed": (
+                    self.chunk_cycle_max_cumulative_scale
+                ),
+            }
+            if not scales_accepted:
+                self._restore_graph_state(
+                    self.graph, pre_boundary_graph_state
+                )
+                self._restore_graph_state(
+                    self.submap_graph, pre_submap_graph_state
+                )
+                if accepted_loops:
+                    del loop_graph.edges[loop_edge_start:]
+                    for loop_result in accepted_loops:
+                        self.accepted_loop_pairs.discard(
+                            self._canonical_loop_pair(loop_result)
+                        )
+                        self._reject_loop_result(
+                            loop_result,
+                            "chunk_cumulative_scale_rejected",
+                        )
+                    accepted_loops = []
+                graph_result = replace(
+                    graph_result,
+                    accepted=False,
+                    final_objective=graph_result.initial_objective,
+                    max_update_norm=0.0,
+                    reason="chunk_cumulative_scale_rejected",
+                )
+        chunk_sequence_diagnostics: dict[str, Any] = {
+            "enabled": bool(self.chunk_first_stride_graph),
+            "accepted": True,
+            "factor_count": len(chunk_sequence_factors),
+            "objective_before": chunk_sequence_objective_before,
+            "objective_after": chunk_sequence_objective_before,
+            "objective_ratio": 1.0,
+        }
+        if graph_result is not None and self.chunk_first_stride_graph:
+            sequence_after = (
+                float(
+                    self.graph.objective(factors=chunk_sequence_factors)
+                    .detach()
+                    .cpu()
+                )
+                if chunk_sequence_factors
+                else 0.0
+            )
+            sequence_ratio = sequence_after / max(
+                chunk_sequence_objective_before, 1.0e-12
+            )
+            sequence_accepted = (
+                math.isfinite(sequence_after)
+                and sequence_after
+                <= (
+                    self.chunk_cycle_sequence_objective_ratio
+                    * chunk_sequence_objective_before
+                    + self.loop_nonloop_objective_tolerance
+                )
+            )
+            chunk_sequence_diagnostics = {
+                "enabled": True,
+                "accepted": bool(sequence_accepted),
+                "factor_count": len(chunk_sequence_factors),
+                "objective_before": chunk_sequence_objective_before,
+                "objective_after": sequence_after,
+                "objective_ratio": sequence_ratio,
+                "maximum_ratio": self.chunk_cycle_sequence_objective_ratio,
+            }
+            if not sequence_accepted:
+                self._restore_graph_state(
+                    self.graph, pre_boundary_graph_state
+                )
+                self._restore_graph_state(
+                    self.submap_graph, pre_submap_graph_state
+                )
+                if accepted_loops:
+                    del loop_graph.edges[loop_edge_start:]
+                    for loop_result in accepted_loops:
+                        self.accepted_loop_pairs.discard(
+                            self._canonical_loop_pair(loop_result)
+                        )
+                        self._reject_loop_result(
+                            loop_result,
+                            "chunk_sequence_objective_rejected",
+                        )
+                    accepted_loops = []
+                graph_result = replace(
+                    graph_result,
+                    accepted=False,
+                    final_objective=graph_result.initial_objective,
+                    max_update_norm=0.0,
+                    reason="chunk_sequence_objective_rejected",
+                )
         if graph_result is not None and self.post_optimization_seam_check_enabled:
             seam_diagnostics = self._overlap_seam_diagnostics()
             if not bool(seam_diagnostics["accepted"]):
@@ -6319,6 +8615,55 @@ class SphericalSelfiGlobalBackend:
                     final_objective=graph_result.initial_objective,
                     max_update_norm=0.0,
                     reason="post_optimization_seam_check_rejected",
+                )
+        stride_holdout_diagnostics: dict[str, Any] = {
+            "enabled": bool(self.chunk_first_stride_graph),
+            "accepted": True,
+            "factor_count": 0,
+        }
+        if graph_result is not None and self.chunk_first_stride_graph:
+            affected_holdout_nodes = {
+                int(node) for node in graph_result.optimized_node_ids
+            }
+            if (
+                self.hierarchical_submaps_enabled
+                and loop_graph is self.submap_graph
+            ):
+                affected_holdout_nodes = {
+                    int(node)
+                    for submap_id in graph_result.optimized_node_ids
+                    if int(submap_id) in self.submaps
+                    for node in self.submaps[int(submap_id)].boundary_node_ids
+                }
+            stride_holdout_diagnostics = (
+                self._chunk_stride_holdout_diagnostics(
+                    affected_node_ids=affected_holdout_nodes
+                )
+            )
+            if not bool(stride_holdout_diagnostics["accepted"]):
+                self._restore_graph_state(
+                    self.graph, pre_boundary_graph_state
+                )
+                self._restore_graph_state(
+                    self.submap_graph, pre_submap_graph_state
+                )
+                if accepted_loops:
+                    del loop_graph.edges[loop_edge_start:]
+                    for loop_result in accepted_loops:
+                        self.accepted_loop_pairs.discard(
+                            self._canonical_loop_pair(loop_result)
+                        )
+                        self._reject_loop_result(
+                            loop_result,
+                            "chunk_stride_holdout_rejected",
+                        )
+                    accepted_loops = []
+                graph_result = replace(
+                    graph_result,
+                    accepted=False,
+                    final_objective=graph_result.initial_objective,
+                    max_update_norm=0.0,
+                    reason="chunk_stride_holdout_rejected",
                 )
         if self.hierarchical_submaps_enabled and self._active_submap_id is not None:
             self._update_submap_local_geometry(self._active_submap_id)
@@ -6417,17 +8762,28 @@ class SphericalSelfiGlobalBackend:
             insertion_render_seconds = 0.0
             hash_seconds = 0.0
             hash_visibility_views = 0
+            posthash_coverage_context: tuple[
+                tuple[int, ...],
+                torch.Tensor,
+                set[int],
+                tuple[int, int],
+            ] | None = None
             if self.insertion_dedup_enabled and self.map.anchor_count() > 0:
                 assert packet.anchor_observation is not None
                 if self.two_frame_overlap_enabled:
-                    previous_packet = self._last_full_packet
-                    if previous_packet is None:
-                        raise RuntimeError(
-                            "Two-frame insertion dedup requires the previous packet"
+                    if self.chunk_first_stride_graph:
+                        visibility_frame_ids = tuple(
+                            int(value) for value in packet.frame_ids
                         )
-                    overlap_ids = self._overlap_frame_ids(
-                        previous_packet, packet
-                    )
+                    else:
+                        previous_packet = self._last_full_packet
+                        if previous_packet is None:
+                            raise RuntimeError(
+                                "Two-frame insertion dedup requires the previous packet"
+                            )
+                        visibility_frame_ids = self._overlap_frame_ids(
+                            previous_packet, packet
+                        )
                     global_poses = packet.global_poses(window_transform)
                     incoming_visibility = torch.zeros(
                         packet.anchor_observation.num_anchors,
@@ -6439,7 +8795,32 @@ class SphericalSelfiGlobalBackend:
                         device=self.map.xyz.device,
                         dtype=torch.bool,
                     )
-                    for frame_id in overlap_ids:
+                    diagnostic_overlap_ids = (
+                        set(
+                            self._overlap_frame_ids(
+                                previous_packet, packet
+                            )
+                        )
+                        if self.chunk_first_stride_graph
+                        else set()
+                    )
+                    if self.insertion_dedup_log_posthash_coverage:
+                        posthash_coverage_context = (
+                            tuple(int(value) for value in visibility_frame_ids),
+                            global_poses.detach().clone(),
+                            set(diagnostic_overlap_ids),
+                            tuple(
+                                int(value)
+                                for value in packet.anchor_observation.image_size
+                            ),
+                        )
+                    diagnostic_rows: list[dict[str, torch.Tensor]] = []
+                    coverage_by_group: dict[str, list[tuple[float, ...]]] = {
+                        "overlap": [],
+                        "new_frame": [],
+                    }
+                    owner_scale = sim3_components(window_transform)[0]
+                    for frame_id in visibility_frame_ids:
                         incoming_render = self._render_refined_anchor_frame(
                             packet, frame_id
                         )
@@ -6461,7 +8842,230 @@ class SphericalSelfiGlobalBackend:
                             incoming_render.render_seconds
                             + existing_render.render_seconds
                         )
-                    hash_visibility_views = len(overlap_ids)
+                        incoming_depth_valid = (
+                            torch.isfinite(incoming_render.depth)
+                            & (incoming_render.depth > 0.0)
+                        )
+                        incoming_alpha_valid = (
+                            torch.isfinite(incoming_render.alpha)
+                            & (
+                                incoming_render.alpha
+                                >= self.rendered_alignment_alpha_threshold
+                            )
+                        )
+                        existing_depth_valid = (
+                            torch.isfinite(existing_render.depth)
+                            & (existing_render.depth > 0.0)
+                        )
+                        existing_alpha_valid = (
+                            torch.isfinite(existing_render.alpha)
+                            & (
+                                existing_render.alpha
+                                >= self.rendered_alignment_alpha_threshold
+                            )
+                        )
+                        coverage_values = (
+                            float(incoming_depth_valid.float().mean().detach().cpu()),
+                            float(incoming_alpha_valid.float().mean().detach().cpu()),
+                            float(
+                                (incoming_depth_valid & incoming_alpha_valid)
+                                .float()
+                                .mean()
+                                .detach()
+                                .cpu()
+                            ),
+                            float(existing_depth_valid.float().mean().detach().cpu()),
+                            float(existing_alpha_valid.float().mean().detach().cpu()),
+                            float(
+                                (existing_depth_valid & existing_alpha_valid)
+                                .float()
+                                .mean()
+                                .detach()
+                                .cpu()
+                            ),
+                        )
+                        coverage_group = (
+                            "overlap"
+                            if int(frame_id) in diagnostic_overlap_ids
+                            else "new_frame"
+                        )
+                        coverage_by_group[coverage_group].append(coverage_values)
+                        coverage_names = (
+                            "incoming_depth",
+                            "incoming_alpha",
+                            "incoming_valid",
+                            "existing_depth",
+                            "existing_alpha",
+                            "existing_valid",
+                        )
+                        for name, value in zip(coverage_names, coverage_values):
+                            hash_stats[
+                                f"prehash_view_{int(frame_id)}_{name}_coverage"
+                            ] = value
+                        if int(frame_id) in diagnostic_overlap_ids:
+                            frame_index = packet.frame_index(int(frame_id))
+                            previous_index = previous_packet.frame_index(
+                                int(frame_id)
+                            )
+                            local_depth = incoming_render.depth
+                            aligned_local_depth = (
+                                local_depth * owner_scale.to(local_depth)
+                            )
+                            global_depth = existing_render.depth.to(local_depth)
+                            local_alpha = incoming_render.alpha.to(local_depth)
+                            global_alpha = existing_render.alpha.to(local_depth)
+                            sky = (
+                                packet.sky_mask[0, frame_index]
+                                | previous_packet.sky_mask[
+                                    0, previous_index
+                                ].to(packet.sky_mask.device)
+                            ).to(local_depth.device)
+                            semantic_valid = (
+                                packet.finite_gaussian_mask[0, frame_index]
+                                & packet.static_mask[0, frame_index]
+                                & packet.geometry_consistency[0, frame_index]
+                                & previous_packet.finite_gaussian_mask[
+                                    0, previous_index
+                                ].to(packet.finite_gaussian_mask.device)
+                                & previous_packet.static_mask[
+                                    0, previous_index
+                                ].to(packet.static_mask.device)
+                                & previous_packet.geometry_consistency[
+                                    0, previous_index
+                                ].to(packet.geometry_consistency.device)
+                            ).to(local_depth.device)
+                            valid = (
+                                semantic_valid
+                                & ~sky
+                                & torch.isfinite(aligned_local_depth)
+                                & torch.isfinite(global_depth)
+                                & (aligned_local_depth > 0.0)
+                                & (global_depth > 0.0)
+                                & torch.isfinite(local_alpha)
+                                & torch.isfinite(global_alpha)
+                                & (
+                                    local_alpha
+                                    >= self.rendered_alignment_alpha_threshold
+                                )
+                                & (
+                                    global_alpha
+                                    >= self.rendered_alignment_alpha_threshold
+                                )
+                            )
+                            relative_error = torch.where(
+                                valid,
+                                (aligned_local_depth - global_depth).abs()
+                                / global_depth.abs().clamp_min(1.0e-6),
+                                torch.full_like(global_depth, torch.nan),
+                            )
+                            diagnostic_rows.append(
+                                {
+                                    "frame_id": torch.tensor(
+                                        int(frame_id), dtype=torch.long
+                                    ),
+                                    "local_depth": local_depth.detach(),
+                                    "aligned_local_depth": (
+                                        aligned_local_depth.detach()
+                                    ),
+                                    "global_depth": global_depth.detach(),
+                                    "relative_error": relative_error.detach(),
+                                    "local_alpha": local_alpha.detach(),
+                                    "global_alpha": global_alpha.detach(),
+                                    "sky_mask": sky.detach(),
+                                    "valid_mask": valid.detach(),
+                                    "inlier_mask": (
+                                        valid
+                                        & (
+                                            relative_error
+                                            <= self.rendered_alignment_global_map_consistency_error
+                                        )
+                                    ).detach(),
+                                }
+                            )
+                    hash_visibility_views = len(visibility_frame_ids)
+                    if diagnostic_rows:
+                        valid_errors = torch.cat(
+                            [
+                                row["relative_error"][row["valid_mask"]]
+                                for row in diagnostic_rows
+                                if bool(row["valid_mask"].any())
+                            ],
+                            dim=0,
+                        ) if any(
+                            bool(row["valid_mask"].any())
+                            for row in diagnostic_rows
+                        ) else window_transform.new_empty(0)
+                        diagnostic_inlier_ratio = (
+                            float(
+                                (
+                                    valid_errors
+                                    <= self.rendered_alignment_global_map_consistency_error
+                                )
+                                .float()
+                                .mean()
+                                .detach()
+                                .cpu()
+                            )
+                            if int(valid_errors.numel()) > 0
+                            else 0.0
+                        )
+                        diagnostic_median = (
+                            float(valid_errors.median().detach().cpu())
+                            if int(valid_errors.numel()) > 0
+                            else float("nan")
+                        )
+                        self._last_rendered_overlap_diagnostic = {
+                            name: torch.stack(
+                                [row[name].detach().cpu() for row in diagnostic_rows]
+                            )
+                            for name in (
+                                "local_depth",
+                                "aligned_local_depth",
+                                "global_depth",
+                                "relative_error",
+                                "local_alpha",
+                                "global_alpha",
+                                "sky_mask",
+                                "valid_mask",
+                                "inlier_mask",
+                            )
+                        }
+                        self._last_rendered_overlap_diagnostic["frame_ids"] = (
+                            torch.stack(
+                                [row["frame_id"] for row in diagnostic_rows]
+                            )
+                        )
+                        alignment_diagnostics.update(
+                            {
+                                "global_render_used_for_scale": False,
+                                "global_render_diagnostic_only": True,
+                                "global_render_diagnostic_valid_points": int(
+                                    valid_errors.numel()
+                                ),
+                                "global_render_diagnostic_inlier_ratio": (
+                                    diagnostic_inlier_ratio
+                                ),
+                                "global_render_diagnostic_median_relative_error": (
+                                    diagnostic_median
+                                ),
+                            }
+                        )
+                    coverage_names = (
+                        "incoming_depth",
+                        "incoming_alpha",
+                        "incoming_valid",
+                        "existing_depth",
+                        "existing_alpha",
+                        "existing_valid",
+                    )
+                    for group, rows in coverage_by_group.items():
+                        hash_stats[f"prehash_{group}_view_count"] = len(rows)
+                        if not rows:
+                            continue
+                        for index, name in enumerate(coverage_names):
+                            hash_stats[
+                                f"prehash_{group}_{name}_coverage"
+                            ] = sum(row[index] for row in rows) / len(rows)
                 else:
                     incoming_render = self._render_refined_anchor_shared_frame(
                         packet
@@ -6478,7 +9082,8 @@ class SphericalSelfiGlobalBackend:
                     )
                     hash_visibility_views = 1
                 hash_start = time.perf_counter()
-                prepared, hash_stats, evidence_update = (
+                prehash_diagnostics = dict(hash_stats)
+                prepared, filtered_hash_stats, evidence_update = (
                     self.fusion.filter_against_visible_map(
                         prepared,
                         incoming_anchor_visibility=incoming_visibility,
@@ -6489,8 +9094,25 @@ class SphericalSelfiGlobalBackend:
                         ),
                     )
                 )
+                hash_stats = {
+                    **prehash_diagnostics,
+                    **filtered_hash_stats,
+                }
                 hash_stats["hash_visibility_views"] = hash_visibility_views
                 hash_seconds = float(time.perf_counter() - hash_start)
+            prepared, incoming_budget_stats = (
+                self.fusion.limit_prepared_incoming_by_coverage(
+                    prepared,
+                    max_new_gaussians=(
+                        self.insertion_dedup_max_new_gaussians_per_chunk
+                    ),
+                    coarse_cell_size=(
+                        self.insertion_dedup_coverage_coarse_cell_size
+                    ),
+                )
+            )
+            hash_stats.update(incoming_budget_stats)
+            anchors_before_commit = self.map.anchor_count()
             commit_start = time.perf_counter()
             fusion_stats = self.fusion.commit_prepared_packet(
                 packet,
@@ -6510,6 +9132,93 @@ class SphericalSelfiGlobalBackend:
             fusion_stats["fusion_commit_seconds"] = float(
                 time.perf_counter() - commit_start
             )
+            fusion_stats["chunk_anchor_delta"] = (
+                self.map.anchor_count() - anchors_before_commit
+            )
+            if posthash_coverage_context is not None:
+                (
+                    coverage_frame_ids,
+                    coverage_global_poses,
+                    coverage_overlap_ids,
+                    coverage_image_size,
+                ) = posthash_coverage_context
+                posthash_render_start = time.perf_counter()
+                posthash_by_group: dict[str, list[tuple[float, float, float]]] = {
+                    "overlap": [],
+                    "new_frame": [],
+                }
+                for frame_id in coverage_frame_ids:
+                    frame_index = packet.frame_index(frame_id)
+                    rendered = self._render_global_pose_frame(
+                        coverage_global_poses[frame_index],
+                        image_size=coverage_image_size,
+                    )
+                    depth_valid = torch.isfinite(rendered.depth) & (
+                        rendered.depth > 0.0
+                    )
+                    alpha_valid = torch.isfinite(rendered.alpha) & (
+                        rendered.alpha
+                        >= self.rendered_alignment_alpha_threshold
+                    )
+                    coverage_values = (
+                        float(depth_valid.float().mean().detach().cpu()),
+                        float(alpha_valid.float().mean().detach().cpu()),
+                        float(
+                            (depth_valid & alpha_valid)
+                            .float()
+                            .mean()
+                            .detach()
+                            .cpu()
+                        ),
+                    )
+                    group = (
+                        "overlap"
+                        if frame_id in coverage_overlap_ids
+                        else "new_frame"
+                    )
+                    posthash_by_group[group].append(coverage_values)
+                    for name, value in zip(
+                        ("global_depth", "global_alpha", "global_valid"),
+                        coverage_values,
+                    ):
+                        fusion_stats[
+                            f"posthash_view_{frame_id}_{name}_coverage"
+                        ] = value
+                    prehash_valid = fusion_stats.get(
+                        f"prehash_view_{frame_id}_existing_valid_coverage"
+                    )
+                    if prehash_valid is not None:
+                        fusion_stats[
+                            f"posthash_view_{frame_id}_valid_coverage_delta"
+                        ] = coverage_values[2] - float(prehash_valid)
+                for group, rows in posthash_by_group.items():
+                    fusion_stats[f"posthash_{group}_view_count"] = len(rows)
+                    if not rows:
+                        continue
+                    for index, name in enumerate(
+                        ("global_depth", "global_alpha", "global_valid")
+                    ):
+                        fusion_stats[
+                            f"posthash_{group}_{name}_coverage"
+                        ] = sum(row[index] for row in rows) / len(rows)
+                    prehash_group_valid = fusion_stats.get(
+                        f"prehash_{group}_existing_valid_coverage"
+                    )
+                    if prehash_group_valid is not None:
+                        fusion_stats[
+                            f"posthash_{group}_valid_coverage_delta"
+                        ] = (
+                            fusion_stats[
+                                f"posthash_{group}_global_valid_coverage"
+                            ]
+                            - float(prehash_group_valid)
+                        )
+                fusion_stats["posthash_coverage_views"] = len(
+                    coverage_frame_ids
+                )
+                fusion_stats["posthash_coverage_render_seconds"] = float(
+                    time.perf_counter() - posthash_render_start
+                )
         else:
             fusion_stats = self.fusion.fuse_packet(
                 packet,
@@ -6535,7 +9244,29 @@ class SphericalSelfiGlobalBackend:
                 max_render_error=self.lifecycle_max_render_error,
             )
         self.loop_detector.add(compact_packet)
-        self._refresh_geometry_updates()
+        if self.chunk_first_stride_graph:
+            graph_changed_history = bool(
+                graph_result is not None and graph_result.accepted
+            )
+            self._refresh_geometry_updates(
+                complete_snapshot=graph_changed_history,
+                affected_node_ids=(
+                    set(self.graph.nodes)
+                    if graph_changed_history
+                    else (
+                        {int(start_frame), int(next_frame)}
+                        if len(self.window_order) == 1
+                        else {int(next_frame)}
+                    )
+                ),
+                reason=(
+                    "chunk_graph_optimization_commit"
+                    if graph_changed_history
+                    else "chunk_pure_chain_append"
+                ),
+            )
+        else:
+            self._refresh_geometry_updates()
 
         if self.loop_neighborhood_refinement_enabled and accepted_loops:
             self._enqueue_map_optimization(
@@ -6582,7 +9313,7 @@ class SphericalSelfiGlobalBackend:
                 "alignment": alignment_diagnostics,
                 "boundary_factor": boundary_diagnostics,
                 "loops": [self._loop_summary(value) for value in loop_results],
-                "graph_node_mode": "boundary_frame",
+                "graph_node_mode": self.node_mode,
                 "global_graph_optimization_enabled": (
                     self.global_graph_optimization_enabled
                 ),
@@ -6598,6 +9329,11 @@ class SphericalSelfiGlobalBackend:
                     else 0
                 ),
                 "post_optimization_seam_check": seam_diagnostics,
+                "chunk_stride_holdout_check": stride_holdout_diagnostics,
+                "chunk_scale_check": chunk_scale_diagnostics,
+                "chunk_sequence_objective_check": (
+                    chunk_sequence_diagnostics
+                ),
             },
         )
         self.results.append(result)
@@ -6610,6 +9346,7 @@ class SphericalSelfiGlobalBackend:
         if (
             not self._packet_uses_voxel_refiner(packet)
             and not self.two_frame_overlap_enabled
+            and not self.chunk_first_stride_graph
         ):
             return self._process_boundary_packet_impl(packet)
         transaction = self._snapshot_boundary_transaction()
@@ -6902,7 +9639,25 @@ class SphericalSelfiGlobalBackend:
         if self.boundary_frame_graph:
             pending_metrics = self.run_pending_map_optimization()
             old_transforms = self._window_anchor_transforms()
-            if self.hierarchical_submaps_enabled:
+            if self.chunk_first_stride_graph:
+                # Every admitted skip/loop cycle has already passed the
+                # sequential-objective and holdout transaction at insertion
+                # time.  Re-running an unconditional legacy final LM here
+                # would bypass those gates and can move the complete history
+                # after the last observable cycle.  Publish the accepted graph
+                # as-is instead.
+                objective = float(self.graph.objective().detach().cpu())
+                graph_result = Sim3GraphOptimizeResult(
+                    accepted=False,
+                    iterations=0,
+                    initial_objective=objective,
+                    final_objective=objective,
+                    max_update_norm=0.0,
+                    optimized_node_ids=(),
+                    reason="chunk_first_stride_no_unvalidated_finalize_lm",
+                    final_damping=float(self.graph.damping),
+                )
+            elif self.hierarchical_submaps_enabled:
                 assert self.submap_graph is not None
                 if self._active_submap_id is not None:
                     self._update_submap_local_geometry(self._active_submap_id)
@@ -6936,7 +9691,7 @@ class SphericalSelfiGlobalBackend:
                 "global_graph_optimization_enabled": (
                     self.global_graph_optimization_enabled
                 ),
-                "graph_node_mode": "boundary_frame",
+                "graph_node_mode": self.node_mode,
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,
                 "local_camera_model": self.local_camera_model,
                 "submap_nodes": (

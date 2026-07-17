@@ -3362,6 +3362,149 @@ class PanoGaussianMapper:
                         keyframe.target_depth = observation.target_depth.detach().cpu().float()
         return applied
 
+    def apply_frontend_geometry_snapshot(self, updates: dict[int, object]) -> int:
+        """Atomically replace every registered pose/depth represented by a snapshot."""
+
+        if not updates:
+            return 0
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        staged_poses: dict[int, PoseDelta] = {}
+        staged_observations: dict[
+            int, tuple[float, int | None, torch.Tensor | None]
+        ] = {}
+        staged_keyframe_depths: dict[int, torch.Tensor | None] = {}
+        for frame_id, update in updates.items():
+            fid = int(frame_id)
+            pose = torch.as_tensor(getattr(update, "pose_c2w")).detach().to(
+                device=device, dtype=dtype
+            )
+            if tuple(pose.shape) != (4, 4) or not bool(
+                torch.isfinite(pose).all()
+            ):
+                raise ValueError(
+                    f"Invalid complete-snapshot pose for frame {fid}"
+                )
+            if fid in self.observations or fid in self.pose_deltas:
+                staged_poses[fid] = PoseDelta(pose).to(device=device)
+
+            observation = self.observations.get(fid)
+            if observation is None:
+                continue
+            depth_owner = int(
+                observation.owner_window_id
+                if observation.owner_window_id is not None
+                else getattr(
+                    update,
+                    "depth_owner_window_id",
+                    getattr(update, "owner_window_id"),
+                )
+            )
+            scales_by_window = dict(
+                getattr(update, "depth_scales_by_window", {}) or {}
+            )
+            scale = float(
+                scales_by_window.get(depth_owner, getattr(update, "depth_scale"))
+            )
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"Invalid complete-snapshot depth scale for frame {fid}: {scale}"
+                )
+            local_depth = observation.target_depth_local
+            if local_depth is None and observation.target_depth is not None:
+                previous_scale = max(
+                    float(observation.target_depth_scale), 1.0e-8
+                )
+                local_depth = (
+                    observation.target_depth.detach().cpu().float()
+                    / previous_scale
+                )
+            target_depth = (
+                None
+                if local_depth is None
+                else local_depth.detach().cpu().float() * scale
+            )
+            staged_observations[fid] = (
+                scale,
+                (
+                    depth_owner
+                    if observation.owner_window_id is None
+                    else observation.owner_window_id
+                ),
+                target_depth,
+            )
+            staged_keyframe_depths[fid] = target_depth
+
+        new_optimizer = None
+        if staged_poses:
+            learning_rate = (
+                float(self.optimizer.param_groups[0]["lr"])
+                if self.optimizer is not None
+                else float(self.optim_cfg.get("lr", 2.0e-3))
+            )
+            new_optimizer = self.map.make_optimizer(lr=learning_rate)
+
+        for fid, pose_delta in staged_poses.items():
+            self.pose_deltas[fid] = pose_delta
+        for fid, (scale, owner, target_depth) in staged_observations.items():
+            observation = self.observations[fid]
+            if observation.target_depth_local is None and target_depth is not None:
+                observation.target_depth_local = target_depth / scale
+            observation.target_depth_scale = scale
+            observation.owner_window_id = owner
+            observation.target_depth = target_depth
+        for keyframe in self.keyframes:
+            fid = int(keyframe.frame_id)
+            if fid in staged_keyframe_depths:
+                keyframe.target_depth = staged_keyframe_depths[fid]
+        if new_optimizer is not None:
+            self.optimizer = new_optimizer
+        return len(staged_poses)
+
+    def snapshot_frontend_geometry_state(self) -> dict[str, object]:
+        """Capture mapper-owned trajectory/depth state for a cross-layer transaction."""
+
+        return {
+            "pose_deltas": dict(self.pose_deltas),
+            "observation_geometry": {
+                int(frame_id): (
+                    observation.target_depth_local,
+                    float(observation.target_depth_scale),
+                    observation.owner_window_id,
+                    observation.target_depth,
+                )
+                for frame_id, observation in self.observations.items()
+            },
+            "keyframe_depths": [
+                keyframe.target_depth for keyframe in self.keyframes
+            ],
+            "optimizer": self.optimizer,
+        }
+
+    def restore_frontend_geometry_state(self, state: dict[str, object]) -> None:
+        """Restore a state returned by :meth:`snapshot_frontend_geometry_state`."""
+
+        self.pose_deltas = dict(state["pose_deltas"])
+        observation_geometry = dict(state["observation_geometry"])
+        for frame_id, values in observation_geometry.items():
+            observation = self.observations.get(int(frame_id))
+            if observation is None:
+                continue
+            (
+                observation.target_depth_local,
+                observation.target_depth_scale,
+                observation.owner_window_id,
+                observation.target_depth,
+            ) = values
+        keyframe_depths = list(state["keyframe_depths"])
+        if len(keyframe_depths) != len(self.keyframes):
+            raise RuntimeError(
+                "Cannot restore mapper geometry after keyframe topology changed"
+            )
+        for keyframe, target_depth in zip(self.keyframes, keyframe_depths):
+            keyframe.target_depth = target_depth
+        self.optimizer = state["optimizer"]
+
     def render_view(
         self,
         *,
