@@ -32,6 +32,34 @@ def sim3_from_components(
     return out
 
 
+def project_rotation_to_so3(rotation: torch.Tensor) -> torch.Tensor:
+    """Return the closest proper rotation in Frobenius norm.
+
+    Sim(3) nodes are stored in float32 and can acquire a small shear after
+    repeated graph/map synchronization.  The shear must not be interpreted as
+    either camera rotation or scale because the rest of this module relies on
+    ``R.T == R.inverse()``.
+    """
+
+    if rotation.shape[-2:] != (3, 3):
+        raise ValueError(
+            f"rotation must end in 3x3, got {tuple(rotation.shape)}"
+        )
+    u, _, vh = torch.linalg.svd(rotation)
+    correction = torch.ones(
+        *rotation.shape[:-2],
+        3,
+        device=rotation.device,
+        dtype=rotation.dtype,
+    )
+    correction[..., -1] = torch.where(
+        torch.linalg.det(u @ vh) < 0.0,
+        rotation.new_tensor(-1.0),
+        rotation.new_tensor(1.0),
+    )
+    return (u * correction.unsqueeze(-2)) @ vh
+
+
 def sim3_components(transform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if transform.shape[-2:] != (4, 4):
         raise ValueError(f"Sim(3) transform must end in 4x4, got {tuple(transform.shape)}")
@@ -40,6 +68,31 @@ def sim3_components(transform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     scale = determinant.abs().clamp_min(torch.finfo(linear.dtype).eps).pow(1.0 / 3.0)
     rotation = linear / scale[..., None, None]
     return scale, rotation, transform[..., :3, 3]
+
+
+def canonicalize_sim3(transform: torch.Tensor) -> torch.Tensor:
+    """Retract a finite approximate Sim(3) matrix onto the Sim(3) manifold."""
+
+    scale, rotation, translation = sim3_components(transform)
+    return sim3_from_components(
+        scale,
+        project_rotation_to_so3(rotation),
+        translation,
+    )
+
+
+def canonicalize_c2w(pose_c2w: torch.Tensor) -> torch.Tensor:
+    """Retract a finite homogeneous camera pose onto SE(3)."""
+
+    if pose_c2w.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"pose_c2w must end in 4x4, got {tuple(pose_c2w.shape)}"
+        )
+    output = pose_c2w.clone()
+    output[..., :3, :3] = project_rotation_to_so3(pose_c2w[..., :3, :3])
+    output[..., 3, :] = 0.0
+    output[..., 3, 3] = 1.0
+    return output
 
 
 def sim3_inverse(transform: torch.Tensor) -> torch.Tensor:

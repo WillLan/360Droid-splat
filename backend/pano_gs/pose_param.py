@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from frontend.pano_droid.spherical_ba import se3_exp
+from geometry.sim3 import canonicalize_c2w
 
 
 def ensure_homogeneous(T: torch.Tensor) -> torch.Tensor:
@@ -32,7 +33,9 @@ class PoseDelta(nn.Module):
 
     def __init__(self, base_c2w: torch.Tensor, init_delta: torch.Tensor | None = None) -> None:
         super().__init__()
-        base = ensure_homogeneous(base_c2w.detach().clone().float())
+        base = canonicalize_c2w(
+            ensure_homogeneous(base_c2w.detach().clone().float())
+        )
         self.register_buffer("base_c2w", base)
         if init_delta is None:
             init_delta = torch.zeros(6, dtype=base.dtype)
@@ -57,4 +60,3 @@ def make_pose_optimizer(
     weight_decay: float = 0.0,
 ) -> torch.optim.Optimizer:
     return torch.optim.AdamW([pose_delta.delta], lr=float(lr), weight_decay=float(weight_decay))
-

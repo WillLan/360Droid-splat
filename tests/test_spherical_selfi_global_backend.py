@@ -2839,6 +2839,56 @@ def test_boundary_pose_sync_updates_nodes_and_rebases_shared_window_coordinates(
     torch.testing.assert_close(geometry[2].pose_c2w[:3, 3], node2_translation)
 
 
+def test_boundary_pose_sync_retracts_graph_mapper_feedback_to_sim3() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, 0, 3] = 1.0
+    packet = _packet(0, poses, (0, 1))
+    optimized = {0: torch.eye(4), 1: torch.eye(4)}
+    optimized[0][:3, :3] = torch.tensor(
+        [[1.0, 0.03, 0.0], [0.0, 1.0, -0.02], [0.01, 0.0, 1.0]]
+    )
+    optimized[1][:3, :3] = torch.tensor(
+        [[1.0, -0.04, 0.01], [0.02, 1.0, 0.0], [0.0, 0.03, 1.0]]
+    )
+    optimized[1][0, 3] = 2.0
+
+    class _Mapper:
+        def refined_pose_c2w(self, frame_id: int):
+            return optimized.get(int(frame_id))
+
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    backend = _boundary_backend(gaussian_map, mapper=_Mapper())
+    backend.graph.add_node(0, sim3_identity())
+    backend.graph.add_node(
+        1, sim3_from_components(2.0, torch.eye(3), torch.tensor([2.0, 0.0, 0.0]))
+    )
+    # Reproduce the numerical shear that used to accumulate across repeated
+    # graph -> mapper -> graph synchronization cycles.
+    sheared = backend.graph.transform(0).clone()
+    sheared[:3, :3] = torch.tensor(
+        [[1.0, 0.02, 0.0], [0.0, 1.0, 0.01], [-0.01, 0.0, 1.0]]
+    )
+    backend.graph.nodes[0] = sheared
+    backend.window_anchor_nodes = {0: 0}
+    backend.boundary_node_order = [0, 1]
+    backend.packets = {0: packet}
+    backend.window_order = [0]
+    backend.frame_windows = {0: {0}, 1: {0}}
+    backend.frame_owner_window = {0: 0, 1: 0}
+    backend.frame_depth_owner_window = {0: 0, 1: 0}
+
+    backend._synchronize_joint_optimized_window(0)
+
+    eye = torch.eye(3)
+    for transform in backend.graph.nodes.values():
+        _, rotation, _ = sim3_components(transform)
+        torch.testing.assert_close(rotation.T @ rotation, eye, atol=1.0e-6, rtol=1.0e-6)
+        torch.testing.assert_close(torch.linalg.det(rotation), torch.tensor(1.0), atol=1.0e-6, rtol=1.0e-6)
+    for pose in packet.local_poses_c2w:
+        rotation = pose[:3, :3]
+        torch.testing.assert_close(rotation.T @ rotation, eye, atol=1.0e-6, rtol=1.0e-6)
+
+
 def test_mapper_geometry_updates_materialize_depth_from_immutable_local_value() -> None:
     gaussian_map = PanoGaussianMap(config={}, device="cpu")
     mapper = PanoGaussianMapper(gaussian_map)

@@ -24,6 +24,8 @@ from geometry.spherical_erp import sample_erp_with_wrap
 from geometry.sim3 import (
     apply_sim3,
     apply_sim3_to_c2w,
+    canonicalize_c2w,
+    canonicalize_sim3,
     rebase_c2w_to_sim3_anchor,
     sim3_components,
     sim3_from_components,
@@ -4977,7 +4979,7 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError(f"missing optimized pose for frame {frame_id}")
             if tuple(pose.shape) != (4, 4) or not bool(torch.isfinite(pose).all()):
                 raise RuntimeError(f"invalid optimized pose for frame {frame_id}")
-            optimized_by_frame[int(frame_id)] = pose.float()
+            optimized_by_frame[int(frame_id)] = canonicalize_c2w(pose.float())
 
         old_nodes = {node: value.clone() for node, value in self.graph.nodes.items()}
         geometry_snapshot = dict(self._geometry_updates)
@@ -4997,6 +4999,10 @@ class SphericalSelfiGlobalBackend:
         }
 
         try:
+            self.graph.nodes = {
+                int(node): canonicalize_sim3(transform)
+                for node, transform in self.graph.nodes.items()
+            }
             current_sim3 = self.graph.transform(int(window_id))
             scale, _, _ = sim3_components(current_sim3)
             anchor_pose = optimized_by_frame[int(packet.frame_ids[0])].to(current_sim3)
@@ -5068,7 +5074,7 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError(f"missing optimized pose for frame {frame_id}")
             if tuple(pose.shape) != (4, 4) or not bool(torch.isfinite(pose).all()):
                 raise RuntimeError(f"invalid optimized pose for frame {frame_id}")
-            optimized_by_frame[int(frame_id)] = pose.float()
+            optimized_by_frame[int(frame_id)] = canonicalize_c2w(pose.float())
 
         affected_windows = {
             int(owner)
@@ -5093,6 +5099,13 @@ class SphericalSelfiGlobalBackend:
         }
 
         try:
+            # The graph/map feedback loop crosses a float32 matrix boundary.
+            # Retract every node before using R.T as R^-1 so numerical shear
+            # cannot accumulate from one window to the next.
+            self.graph.nodes = {
+                int(node): canonicalize_sim3(transform)
+                for node, transform in self.graph.nodes.items()
+            }
             # Boundary-node scale remains the Sim(3) gauge authority; render BA
             # contributes only the optimized global SE(3) rotation/translation.
             for frame_id, global_pose in optimized_by_frame.items():

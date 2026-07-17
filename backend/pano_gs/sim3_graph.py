@@ -10,6 +10,7 @@ import torch
 
 from geometry.sim3 import (
     apply_sim3,
+    canonicalize_sim3,
     sim3_components,
     sim3_exp,
     sim3_identity,
@@ -258,7 +259,7 @@ class GlobalSim3FactorGraph:
         scale, rotation, _ = sim3_components(value)
         if float(scale) <= 0.0 or float(torch.linalg.det(rotation)) <= 0.0:
             raise ValueError("Sim(3) graph node must have positive scale and proper rotation")
-        self.nodes[node] = value
+        self.nodes[node] = canonicalize_sim3(value)
         if self.fixed_node_id is None:
             self.fixed_node_id = node
 
@@ -972,7 +973,10 @@ class GlobalSim3FactorGraph:
                     and trial_gain >= self.lm_acceptance_eta
                 ):
                     self.nodes.update(
-                        {node_id: value.detach() for node_id, value in proposal.items()}
+                        {
+                            node_id: canonicalize_sim3(value.detach())
+                            for node_id, value in proposal.items()
+                        }
                     )
                     last = objective
                     gain_ratio = float(trial_gain)
