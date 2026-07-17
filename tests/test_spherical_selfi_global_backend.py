@@ -337,8 +337,8 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert local_ba["lm_max_trials"] == 8
     assert local_ba["lm_acceptance_eta"] == 1.0e-6
     assert local_ba["residual_worse_tolerance"] == 1.05
-    assert local_ba["max_pose_update_deg"] == 10.0
-    assert local_ba["max_translation_update"] == 0.10
+    assert local_ba["max_pose_update_deg"] == 30.0
+    assert local_ba["max_translation_update"] == 1.0
     assert local_ba["max_logdepth_update"] == 0.70
     assert local_ba["min_factors"] == 128
     assert local_ba["pose_safe_two_stage"] is False

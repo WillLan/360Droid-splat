@@ -130,8 +130,8 @@ SphericalSelfiRuntime:
     huber_delta_deg: 0.5
     pose_prior_weight: 1.0e-3
     depth_prior_weight: 1.0e-2
-    max_pose_update_deg: 10.0
-    max_translation_update: 0.10
+    max_pose_update_deg: 30.0
+    max_translation_update: 1.0
     max_logdepth_update: 0.70
     factor_chunk_size: 2048
     min_factors: 128
