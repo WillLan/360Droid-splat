@@ -9,6 +9,7 @@ SphericalSelfiGlobalBackend:
   rendered_overlap_alignment:
     mode: two_frame_bridge_depth_scale
     max_median_relative_error: 0.20
+    post_refiner_scale_recheck: false
 
 WeightsAndBiases:
   group: ob3d-sponza-known-pose-bridge-refiner-ba8-100
