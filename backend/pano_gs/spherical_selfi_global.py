@@ -2118,15 +2118,6 @@ class SphericalSelfiGlobalBackend:
             if support_count == 0
             else float(consistency.sum().float().item() / support_count)
         )
-        if (
-            consistency_ratio
-            < self.rendered_alignment_global_map_min_consistency_ratio
-        ):
-            raise RuntimeError(
-                f"Frame {frame_id} global/previous map consistency ratio "
-                f"{consistency_ratio:.3f} is below "
-                f"{self.rendered_alignment_global_map_min_consistency_ratio:.3f}"
-            )
         global_valid = global_valid_base & consistency
         seed = (
             self.fibonacci_seed
@@ -2211,7 +2202,7 @@ class SphericalSelfiGlobalBackend:
         overlap = self._overlap_frame_ids(previous, current)
         if len(overlap) != 2:
             raise RuntimeError("Known-pose bridge requires exactly two overlap frames")
-        return [
+        frames = [
             self._collect_known_pose_bridge_frame(
                 previous,
                 current,
@@ -2221,6 +2212,22 @@ class SphericalSelfiGlobalBackend:
             )
             for frame_id in overlap
         ]
+        ratios = [
+            float(frame.global_previous_consistency_ratio) for frame in frames
+        ]
+        balanced_ratio = sum(ratios) / float(len(ratios))
+        if (
+            balanced_ratio
+            < self.rendered_alignment_global_map_min_consistency_ratio
+        ):
+            formatted = ", ".join(f"{value:.3f}" for value in ratios)
+            raise RuntimeError(
+                "Two-frame balanced global/previous map consistency ratio "
+                f"{balanced_ratio:.3f} is below "
+                f"{self.rendered_alignment_global_map_min_consistency_ratio:.3f} "
+                f"(per-frame: [{formatted}])"
+            )
+        return frames
 
     @staticmethod
     def _bridge_balanced_weights(
@@ -2289,6 +2296,11 @@ class SphericalSelfiGlobalBackend:
             "bridge_global_previous_consistency_ratio": [
                 frame.global_previous_consistency_ratio for frame in frames
             ],
+            "bridge_global_previous_consistency_balanced_ratio": sum(
+                float(frame.global_previous_consistency_ratio)
+                for frame in frames
+            )
+            / float(len(frames)),
         }
         if mode == "depth":
             log_ratio = torch.cat(

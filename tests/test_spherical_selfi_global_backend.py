@@ -1303,6 +1303,41 @@ def _known_pose_bridge_geometry(
     return frames
 
 
+def test_known_pose_bridge_uses_balanced_two_frame_map_consistency_gate() -> None:
+    backend = object.__new__(SphericalSelfiGlobalBackend)
+    backend.rendered_alignment_global_map_min_consistency_ratio = 0.35
+    backend._overlap_frame_ids = lambda previous, current: (10, 11)  # type: ignore[method-assign]
+    ratios = {10: 0.34, 11: 0.36}
+
+    def collect(previous, current, frame_id, **kwargs):
+        del previous, current, kwargs
+        return SimpleNamespace(
+            frame_id=int(frame_id),
+            global_previous_consistency_ratio=ratios[int(frame_id)],
+        )
+
+    backend._collect_known_pose_bridge_frame = collect  # type: ignore[method-assign]
+    frames = backend._collect_known_pose_bridge_frames(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        torch.eye(4),
+        exclude_current_target_only=True,
+    )
+    assert [frame.global_previous_consistency_ratio for frame in frames] == [
+        0.34,
+        0.36,
+    ]
+
+    ratios.update({10: 0.348, 11: 0.349})
+    with pytest.raises(RuntimeError, match="Two-frame balanced"):
+        backend._collect_known_pose_bridge_frames(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            torch.eye(4),
+            exclude_current_target_only=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("mode", "config_mode"),
     [
