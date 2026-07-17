@@ -2481,7 +2481,7 @@ class SphericalSelfiGlobalBackend:
             if self.two_frame_bridge_depth_scale_enabled
             else "pose_baseline"
         )
-        scale, _, diagnostics = self._estimate_known_pose_bridge_scale(
+        scale, inlier_masks, diagnostics = self._estimate_known_pose_bridge_scale(
             frames,
             previous_owner_transform,
             mode=mode,
@@ -2490,6 +2490,32 @@ class SphericalSelfiGlobalBackend:
             diagnostics["alignment_seconds"] = float(
                 time.perf_counter() - started
             )
+            diagnostics.update(
+                {
+                    "mode": self.rendered_overlap_alignment_mode,
+                    "alignment_method": f"known_pose_bridge_{mode}",
+                    "source_window_id": int(previous.window_id),
+                    "target_window_id": int(current.window_id),
+                    "overlap_frame_ids": [frame.frame_id for frame in frames],
+                    "per_frame_valid_points": [
+                        int(frame.current_depth.numel()) for frame in frames
+                    ],
+                    "valid_points": sum(
+                        int(frame.current_depth.numel()) for frame in frames
+                    ),
+                    "accepted": False,
+                }
+            )
+            candidate_scale = diagnostics.get("absolute_scale")
+            if isinstance(candidate_scale, (int, float)) and math.isfinite(
+                float(candidate_scale)
+            ):
+                self._set_known_pose_bridge_diagnostic(
+                    frames,
+                    float(candidate_scale),
+                    inlier_masks,
+                )
+            self._last_overlap_alignment_failure = copy.deepcopy(diagnostics)
             raise RuntimeError(
                 "Known-pose bridge scale failed: "
                 f"{diagnostics.get('reason', 'unknown')}"
