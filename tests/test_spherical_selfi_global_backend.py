@@ -367,7 +367,8 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert graph["optimization_trigger"] == "periodic_and_loop"
     assert graph["chunk_stride"]["target_index"] == 2
     assert graph["chunk_stride"]["min_matches"] == 256
-    assert graph["chunk_stride"]["max_holdout_angular_deg"] == 2.0
+    assert graph["chunk_stride"]["max_translation_depth_ratio"] == 0.06
+    assert graph["chunk_stride"]["max_holdout_angular_deg"] == 3.0
     assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
     assert "min_match_margin" not in graph
     assert graph["skip_edge"]["enabled"] is False
