@@ -646,9 +646,6 @@ class SphericalSelfiGlobalBackend:
         self.chunk_stride_max_translation_error = float(
             stride_cfg.get("max_translation_error", 1.0)
         )
-        self.chunk_stride_max_translation_depth_ratio = float(
-            stride_cfg.get("max_translation_depth_ratio", 0.05)
-        )
         self.chunk_stride_max_holdout_angular_deg = float(
             stride_cfg.get("max_holdout_angular_deg", 2.0)
         )
@@ -5214,10 +5211,7 @@ class SphericalSelfiGlobalBackend:
         translation_error = float(
             torch.linalg.norm(translation - local_pose[:3, 3]).detach().cpu()
         )
-        translation_limit = min(
-            self.chunk_stride_max_translation_error,
-            self.chunk_stride_max_translation_depth_ratio * median_depth,
-        )
+        translation_limit = self.chunk_stride_max_translation_error
         holdout_angular, holdout_depth = self._chunk_stride_alignment_errors(
             measurement,
             source_bearing[holdout_mask],

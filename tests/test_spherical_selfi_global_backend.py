@@ -162,7 +162,6 @@ def _chunk_stride_backend(
                     "max_scale_change": 2.5,
                     "max_rotation_error_deg": 5.0,
                     "max_translation_error": 1.0,
-                    "max_translation_depth_ratio": 0.05,
                     "max_holdout_angular_deg": 2.0,
                     "max_holdout_relative_depth": 0.10,
                     "postopt_worse_ratio": 1.05,
@@ -367,7 +366,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert graph["optimization_trigger"] == "periodic_and_loop"
     assert graph["chunk_stride"]["target_index"] == 2
     assert graph["chunk_stride"]["min_matches"] == 256
-    assert graph["chunk_stride"]["max_translation_depth_ratio"] == 0.06
+    assert "max_translation_depth_ratio" not in graph["chunk_stride"]
     assert graph["chunk_stride"]["max_holdout_angular_deg"] == 3.0
     assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
     assert "min_match_margin" not in graph
@@ -502,6 +501,7 @@ def test_chunk_stride_factor_uses_holdout_and_rejects_ba_trust_boundary() -> Non
     assert diagnostics["accepted"] is True
     assert diagnostics["train_matches"] > diagnostics["holdout_matches"] > 0
     assert diagnostics["information_confidence"] > 0.0
+    assert diagnostics["translation_error_limit"] == pytest.approx(1.0)
     torch.testing.assert_close(measurement, sim3_identity(), atol=1.0e-4, rtol=1.0e-4)
 
     packet.metadata["local_ba_trust_region_touched"] = True

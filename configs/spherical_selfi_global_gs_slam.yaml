@@ -283,7 +283,6 @@ SphericalSelfiGlobalBackend:
       max_scale_change: 2.5
       max_rotation_error_deg: 5.0
       max_translation_error: 1.0
-      max_translation_depth_ratio: 0.06
       max_holdout_angular_deg: 3.0
       max_holdout_relative_depth: 0.10
       postopt_worse_ratio: 1.05
