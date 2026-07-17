@@ -742,6 +742,295 @@ class Stage2GlobalMapFusion:
             depth_selected=depth_selected,
         )
 
+    @staticmethod
+    def _spatial_hash_keys(grid: torch.Tensor) -> torch.Tensor:
+        """Hash integer xyz cells; exact cell equality resolves rare collisions."""
+
+        value = grid.to(dtype=torch.int64)
+        return (
+            (value[..., 0] * 73_856_093)
+            ^ (value[..., 1] * 19_349_663)
+            ^ (value[..., 2] * 83_492_791)
+        )
+
+    @classmethod
+    def _match_visible_level_vectorized(
+        cls,
+        *,
+        incoming_xyz: torch.Tensor,
+        incoming_voxel: torch.Tensor,
+        incoming_rows: torch.Tensor,
+        existing_xyz: torch.Tensor,
+        existing_voxel: torch.Tensor,
+        existing_quality: torch.Tensor,
+        existing_rows: torch.Tensor,
+        radius_scale: float,
+        radius_cells: int,
+        query_chunk_size: int = 16_384,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return exact incoming-to-existing matches without per-anchor Python work."""
+
+        if int(incoming_rows.numel()) == 0 or int(existing_rows.numel()) == 0:
+            return incoming_rows.new_empty(0), existing_rows.new_empty(0)
+        device = incoming_xyz.device
+        cell_size = torch.maximum(
+            incoming_voxel.max(), existing_voxel.max()
+        ).clamp_min(1.0e-8)
+        old_grid = torch.floor(existing_xyz / cell_size).to(torch.int64)
+        old_keys, old_order = torch.sort(cls._spatial_hash_keys(old_grid))
+        axis = torch.arange(
+            -int(radius_cells),
+            int(radius_cells) + 1,
+            device=device,
+            dtype=torch.int64,
+        )
+        offsets = torch.cartesian_prod(axis, axis, axis).reshape(-1, 3)
+        offset_count = int(offsets.shape[0])
+        matched_new_parts: list[torch.Tensor] = []
+        matched_old_parts: list[torch.Tensor] = []
+
+        for start in range(0, int(incoming_rows.numel()), int(query_chunk_size)):
+            end = min(int(incoming_rows.numel()), start + int(query_chunk_size))
+            chunk_xyz = incoming_xyz[start:end]
+            chunk_voxel = incoming_voxel[start:end]
+            new_grid = torch.floor(chunk_xyz / cell_size).to(torch.int64)
+            query_grid = new_grid[:, None, :] + offsets[None, :, :]
+            flat_query_grid = query_grid.reshape(-1, 3)
+            query_keys = cls._spatial_hash_keys(flat_query_grid).contiguous()
+            left = torch.searchsorted(old_keys, query_keys, right=False)
+            right = torch.searchsorted(old_keys, query_keys, right=True)
+            counts = right - left
+            active_queries = torch.nonzero(counts > 0, as_tuple=False).flatten()
+            if int(active_queries.numel()) == 0:
+                continue
+            active_counts = counts.index_select(0, active_queries)
+            total_candidates = int(active_counts.sum().item())
+            if total_candidates == 0:
+                continue
+            query_ids = torch.repeat_interleave(active_queries, active_counts)
+            active_left = left.index_select(0, active_queries)
+            output_starts = torch.cumsum(active_counts, dim=0) - active_counts
+            candidate_offsets = torch.arange(
+                total_candidates, device=device, dtype=torch.long
+            ) - torch.repeat_interleave(output_starts, active_counts)
+            sorted_positions = (
+                torch.repeat_interleave(active_left, active_counts)
+                + candidate_offsets
+            )
+            old_local = old_order.index_select(0, sorted_positions)
+            new_local = torch.div(
+                query_ids, offset_count, rounding_mode="floor"
+            )
+
+            same_cell = (
+                old_grid.index_select(0, old_local)
+                == flat_query_grid.index_select(0, query_ids)
+            ).all(dim=-1)
+            candidate_xyz = existing_xyz.index_select(0, old_local)
+            candidate_new_xyz = chunk_xyz.index_select(0, new_local)
+            distances = torch.linalg.norm(candidate_xyz - candidate_new_xyz, dim=-1)
+            radii = float(radius_scale) * 0.5 * (
+                chunk_voxel.index_select(0, new_local)
+                + existing_voxel.index_select(0, old_local)
+            )
+            eligible = same_cell & (distances <= radii + 1.0e-8)
+            if not bool(eligible.any()):
+                continue
+
+            chunk_count = end - start
+            minimum_distance = distances.new_full((chunk_count,), torch.inf)
+            minimum_distance.scatter_reduce_(
+                0,
+                new_local,
+                torch.where(eligible, distances, torch.inf),
+                reduce="amin",
+                include_self=True,
+            )
+            nearest = eligible & (
+                distances <= minimum_distance.index_select(0, new_local) + 1.0e-8
+            )
+            candidate_quality = existing_quality.index_select(0, old_local)
+            best_quality = candidate_quality.new_full((chunk_count,), -torch.inf)
+            best_quality.scatter_reduce_(
+                0,
+                new_local,
+                torch.where(nearest, candidate_quality, -torch.inf),
+                reduce="amax",
+                include_self=True,
+            )
+            quality_winner = nearest & (
+                candidate_quality
+                >= best_quality.index_select(0, new_local) - 1.0e-12
+            )
+            sentinel = torch.iinfo(torch.long).max
+            candidate_global_rows = existing_rows.index_select(0, old_local)
+            best_existing = torch.full(
+                (chunk_count,), sentinel, device=device, dtype=torch.long
+            )
+            best_existing.scatter_reduce_(
+                0,
+                new_local,
+                torch.where(
+                    quality_winner,
+                    candidate_global_rows,
+                    torch.full_like(candidate_global_rows, sentinel),
+                ),
+                reduce="amin",
+                include_self=True,
+            )
+            matched = best_existing != sentinel
+            if bool(matched.any()):
+                matched_local = torch.nonzero(
+                    matched, as_tuple=False
+                ).flatten()
+                matched_new_parts.append(
+                    incoming_rows[start:end].index_select(0, matched_local)
+                )
+                matched_old_parts.append(
+                    best_existing.index_select(0, matched_local)
+                )
+
+        if not matched_new_parts:
+            return incoming_rows.new_empty(0), existing_rows.new_empty(0)
+        return torch.cat(matched_new_parts), torch.cat(matched_old_parts)
+
+    def _filter_against_visible_map_vectorized(
+        self,
+        prepared: PreparedPacketFusion,
+        *,
+        incoming_visible: torch.Tensor,
+        existing_visibility: torch.Tensor,
+        radius_scale: float,
+        radius_cells: int,
+        update_existing_statistics: bool,
+        stats: dict[str, int | float],
+    ) -> tuple[
+        PreparedPacketFusion,
+        dict[str, int | float],
+        ExistingAnchorEvidenceUpdate | None,
+    ]:
+        """Visible-only exact spatial hash that stays on the map device."""
+
+        device = prepared.batch.xyz.device
+        incoming_rows = torch.nonzero(
+            incoming_visible.to(device=device), as_tuple=False
+        ).flatten()
+        existing_rows = torch.nonzero(
+            existing_visibility.to(device=self.map.xyz.device), as_tuple=False
+        ).flatten()
+        stats["hash_vectorized"] = 1
+        stats["hash_materialized_existing"] = int(existing_rows.numel())
+        if int(incoming_rows.numel()) == 0 or int(existing_rows.numel()) == 0:
+            return prepared, stats, None
+
+        existing_rows_cpu = existing_rows.detach().cpu().long()
+        existing_xyz, existing_voxel = self.map.materialized_anchor_geometry_rows(
+            existing_rows
+        )
+        existing_level = self.map._anchor_level.index_select(
+            0, existing_rows_cpu
+        ).to(device=device, dtype=torch.long)
+        existing_quality = self.map._anchor_quality.index_select(
+            0, existing_rows_cpu
+        ).to(device=device, dtype=prepared.batch.quality.dtype)
+        incoming_level = prepared.batch.level.index_select(0, incoming_rows)
+        matched_new_parts: list[torch.Tensor] = []
+        matched_old_parts: list[torch.Tensor] = []
+
+        for level in range(len(self.voxel_sizes)):
+            new_selection = torch.nonzero(
+                incoming_level == level, as_tuple=False
+            ).flatten()
+            old_selection = torch.nonzero(
+                existing_level == level, as_tuple=False
+            ).flatten()
+            stats[f"hash_level_{level}_visible"] = int(new_selection.numel())
+            if (
+                int(new_selection.numel()) == 0
+                or int(old_selection.numel()) == 0
+                or radius_scale <= 0.0
+            ):
+                continue
+            level_new_rows = incoming_rows.index_select(0, new_selection)
+            level_old_rows = existing_rows.index_select(0, old_selection)
+            matched_new, matched_old = self._match_visible_level_vectorized(
+                incoming_xyz=prepared.batch.xyz.detach().index_select(
+                    0, level_new_rows
+                ),
+                incoming_voxel=prepared.batch.voxel_size[
+                    level_new_rows, 0
+                ].detach().to(device=device),
+                incoming_rows=level_new_rows,
+                existing_xyz=existing_xyz.index_select(0, old_selection),
+                existing_voxel=existing_voxel.index_select(0, old_selection),
+                existing_quality=existing_quality.index_select(0, old_selection),
+                existing_rows=level_old_rows,
+                radius_scale=radius_scale,
+                radius_cells=radius_cells,
+            )
+            level_hits = int(matched_new.numel())
+            stats[f"hash_level_{level}_hits"] = level_hits
+            stats[f"hash_level_{level}_kept"] = (
+                int(stats[f"hash_level_{level}_incoming"]) - level_hits
+            )
+            if level_hits > 0:
+                matched_new_parts.append(matched_new)
+                matched_old_parts.append(matched_old)
+
+        keep = torch.ones(len(prepared.batch), device=device, dtype=torch.bool)
+        if matched_new_parts:
+            matched_new = torch.cat(matched_new_parts)
+            matched_old = torch.cat(matched_old_parts)
+            keep[matched_new] = False
+        else:
+            matched_new = incoming_rows.new_empty(0)
+            matched_old = existing_rows.new_empty(0)
+        kept = torch.nonzero(keep, as_tuple=False).flatten()
+        filtered = prepared.index(kept)
+        stats["hash_hits"] = int(matched_new.numel())
+        stats["hash_kept"] = len(filtered.batch)
+        if not update_existing_statistics or int(matched_new.numel()) == 0:
+            return filtered, stats, None
+
+        evidence_rows, inverse = torch.unique(
+            matched_old, sorted=True, return_inverse=True
+        )
+        observation_delta = torch.zeros(
+            int(evidence_rows.numel()), device=device, dtype=torch.long
+        )
+        observation_delta.index_add_(
+            0,
+            inverse,
+            prepared.batch.observation_count.index_select(0, matched_new).long(),
+        )
+        confidence_delta = torch.zeros(
+            int(evidence_rows.numel()),
+            device=device,
+            dtype=prepared.batch.confidence_accum.dtype,
+        )
+        confidence_delta.index_add_(
+            0,
+            inverse,
+            prepared.batch.confidence_accum.index_select(0, matched_new),
+        )
+        last_seen = torch.zeros(
+            int(evidence_rows.numel()), device=device, dtype=torch.long
+        )
+        last_seen.scatter_reduce_(
+            0,
+            inverse,
+            prepared.batch.last_seen_frame.index_select(0, matched_new).long(),
+            reduce="amax",
+            include_self=True,
+        )
+        evidence_update = ExistingAnchorEvidenceUpdate(
+            indices=evidence_rows.detach().cpu(),
+            observation_count_delta=observation_delta.detach().cpu(),
+            confidence_accum_delta=confidence_delta.detach().cpu(),
+            last_seen_frame=last_seen.detach().cpu(),
+        )
+        return filtered, stats, evidence_update
+
     def filter_against_visible_map(
         self,
         prepared: PreparedPacketFusion,
@@ -777,10 +1066,11 @@ class Stage2GlobalMapFusion:
             "hash_hits": 0,
             "hash_kept": len(prepared.batch),
             "hash_radius_voxels": float(radius_voxels),
+            "hash_vectorized": 0,
+            "hash_materialized_existing": 0,
         }
-        incoming_level_all = prepared.batch.level.detach().cpu().long()
         for level in range(len(self.voxel_sizes)):
-            level_incoming = int((incoming_level_all == level).sum().item())
+            level_incoming = int((prepared.batch.level == level).sum().item())
             stats[f"hash_level_{level}_incoming"] = level_incoming
             stats[f"hash_level_{level}_visible"] = 0
             stats[f"hash_level_{level}_hits"] = 0
@@ -793,6 +1083,23 @@ class Stage2GlobalMapFusion:
             source_indices.to(incoming_visibility.device),
         )
         stats["hash_visible_incoming"] = int(incoming_visible.sum().item())
+        radius_scale = max(0.0, float(radius_voxels))
+        radius_cells = max(0, int(math.ceil(radius_scale)))
+        if (
+            prepared.batch.xyz.is_cuda
+            and self.map.xyz.is_cuda
+            and prepared.batch.xyz.device == self.map.xyz.device
+        ):
+            return self._filter_against_visible_map_vectorized(
+                prepared,
+                incoming_visible=incoming_visible,
+                existing_visibility=existing_visibility,
+                radius_scale=radius_scale,
+                radius_cells=radius_cells,
+                update_existing_statistics=update_existing_statistics,
+                stats=stats,
+            )
+        stats["hash_materialized_existing"] = self.map.anchor_count()
         keep = torch.ones(len(prepared.batch), dtype=torch.bool)
         incoming_xyz = prepared.batch.xyz.detach().cpu().float()
         incoming_level = prepared.batch.level.detach().cpu().long()
@@ -813,8 +1120,6 @@ class Stage2GlobalMapFusion:
             .reshape(-1)
         )
         existing_visible_cpu = existing_visibility.detach().cpu().bool()
-        radius_scale = max(0.0, float(radius_voxels))
-        radius_cells = max(0, int(math.ceil(radius_scale)))
         evidence: dict[int, tuple[int, float, int]] = {}
 
         for level in range(len(self.voxel_sizes)):

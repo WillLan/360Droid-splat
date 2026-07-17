@@ -361,6 +361,61 @@ class PanoGaussianMap(nn.Module):
             output[mask] *= scale
         return output
 
+    def materialized_anchor_geometry_rows(
+        self,
+        indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize world xyz and voxel size for selected anchor rows only."""
+
+        rows_cpu = indices.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        if int(rows_cpu.numel()) == 0:
+            return (
+                self.xyz.new_zeros((0, 3)),
+                self.xyz.new_zeros((0,)),
+            )
+        count = self.anchor_count()
+        if int(rows_cpu.min()) < 0 or int(rows_cpu.max()) >= count:
+            raise IndexError("Materialized anchor rows are outside the current map")
+
+        rows = rows_cpu.to(device=self.xyz.device)
+        xyz = self.xyz.detach().index_select(0, rows).clone()
+        voxel_size = (
+            self._anchor_voxel_size.detach()
+            .index_select(0, rows_cpu)
+            .to(
+                device=self.xyz.device,
+                dtype=self.xyz.dtype,
+            )
+        )
+        if (
+            not self._lazy_owner_transforms_enabled
+            or int(self._anchor_owner_window_id.numel()) != count
+        ):
+            return xyz, voxel_size
+
+        owners = self._anchor_owner_window_id.index_select(0, rows_cpu).to(
+            device=self.xyz.device,
+            dtype=torch.long,
+        )
+        for owner in torch.unique(owners).detach().cpu().tolist():
+            owner_id = int(owner)
+            if (
+                owner_id < 0
+                or owner_id not in self._lazy_owner_reference_transforms
+                or owner_id not in self._lazy_owner_current_transforms
+            ):
+                continue
+            mask = owners == owner_id
+            delta = self._lazy_owner_delta(
+                owner_id,
+                device=self.xyz.device,
+                dtype=self.xyz.dtype,
+            )
+            scale, _, _ = sim3_components(delta)
+            xyz[mask] = apply_sim3(delta, xyz[mask])
+            voxel_size[mask] *= scale
+        return xyz, voxel_size
+
     def _lazy_owner_masks(
         self,
         *,

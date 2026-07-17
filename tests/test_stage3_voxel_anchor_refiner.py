@@ -489,6 +489,11 @@ def test_world_voxel_size_tracks_packet_and_lazy_owner_sim3_scale() -> None:
         gaussian_map.materialized_anchor_voxel_size(),
         torch.tensor([0.12]),
     )
+    selected_xyz, selected_voxel = gaussian_map.materialized_anchor_geometry_rows(
+        torch.tensor([0])
+    )
+    torch.testing.assert_close(selected_xyz, gaussian_map.get_xyz[[0]])
+    torch.testing.assert_close(selected_voxel, torch.tensor([0.12]))
 
 
 def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> None:
@@ -572,6 +577,20 @@ def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> No
         radius_voxels=1.0,
         update_existing_statistics=True,
     )
+    incoming_visible = torch.tensor(
+        [True, False, True, True, True, True]
+    ).index_select(0, prepared.source_anchor_indices)
+    vectorized, vectorized_stats, vectorized_evidence = (
+        fusion._filter_against_visible_map_vectorized(
+            prepared,
+            incoming_visible=incoming_visible,
+            existing_visibility=torch.tensor([True]),
+            radius_scale=1.0,
+            radius_cells=1,
+            update_existing_statistics=True,
+            stats=dict(stats),
+        )
+    )
 
     assert stats["hash_hits"] == 1
     assert stats["hash_kept"] == 5
@@ -581,6 +600,27 @@ def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> No
     # The two adjacent incoming voxels survive because this hash never compares
     # anchors against other anchors in the same incoming batch.
     assert {4, 5}.issubset(set(filtered.source_anchor_indices.tolist()))
+    assert vectorized_stats["hash_vectorized"] == 1
+    assert vectorized_stats["hash_materialized_existing"] == 1
+    assert vectorized_stats["hash_hits"] == stats["hash_hits"]
+    assert vectorized_stats["hash_kept"] == stats["hash_kept"]
+    assert vectorized.source_anchor_indices.tolist() == (
+        filtered.source_anchor_indices.tolist()
+    )
+    assert vectorized_evidence is not None
+    torch.testing.assert_close(vectorized_evidence.indices, evidence.indices)
+    torch.testing.assert_close(
+        vectorized_evidence.observation_count_delta,
+        evidence.observation_count_delta,
+    )
+    torch.testing.assert_close(
+        vectorized_evidence.confidence_accum_delta,
+        evidence.confidence_accum_delta,
+    )
+    torch.testing.assert_close(
+        vectorized_evidence.last_seen_frame,
+        evidence.last_seen_frame,
+    )
 
     fusion.commit_prepared_packet(
         incoming_packet,
@@ -592,6 +632,114 @@ def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> No
     assert gaussian_map.anchor_count() == 6
     assert int(gaussian_map._anchor_obs_count[0]) > original_observation_count
     assert float(gaussian_map._anchor_conf_accum[0]) > original_confidence
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_vectorized_visible_hash_preserves_distance_quality_and_row_ties(
+    device: str,
+) -> None:
+    incoming_xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.04, 0.0, 0.0], [0.02, 0.0, 0.0]],
+        device=device,
+    )
+    existing_xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.04, 0.0, 0.0]],
+        device=device,
+    )
+    matched_new, matched_old = Stage2GlobalMapFusion._match_visible_level_vectorized(
+        incoming_xyz=incoming_xyz,
+        incoming_voxel=torch.full((3,), 0.04, device=device),
+        incoming_rows=torch.tensor([11, 12, 13], device=device),
+        existing_xyz=existing_xyz,
+        existing_voxel=torch.full((3,), 0.04, device=device),
+        existing_quality=torch.tensor([0.9, 0.9, 0.5], device=device),
+        existing_rows=torch.tensor([7, 3, 5], device=device),
+        radius_scale=1.0,
+        radius_cells=1,
+        query_chunk_size=2,
+    )
+
+    assert matched_new.cpu().tolist() == [11, 12, 13]
+    assert matched_old.cpu().tolist() == [3, 5, 3]
+
+
+def test_vectorized_visible_hash_matches_brute_force_random_scene() -> None:
+    generator = torch.Generator().manual_seed(20260717)
+    incoming_xyz = torch.randn(64, 3, generator=generator) * 0.25
+    existing_xyz = torch.cat(
+        (
+            incoming_xyz[:32]
+            + torch.randn(32, 3, generator=generator) * 0.015,
+            torch.randn(48, 3, generator=generator) * 0.25,
+        ),
+        dim=0,
+    )
+    incoming_voxel = 0.04 + torch.rand(64, generator=generator) * 0.08
+    existing_voxel = 0.04 + torch.rand(80, generator=generator) * 0.08
+    existing_quality = torch.rand(80, generator=generator)
+    incoming_rows = torch.randperm(64, generator=generator) + 100
+    existing_rows = torch.randperm(80, generator=generator) + 500
+    radius_scale = 1.4
+
+    expected_new: list[int] = []
+    expected_old: list[int] = []
+    for local_new in range(int(incoming_xyz.shape[0])):
+        distances = torch.linalg.norm(existing_xyz - incoming_xyz[local_new], dim=-1)
+        radii = radius_scale * 0.5 * (
+            incoming_voxel[local_new] + existing_voxel
+        )
+        eligible = torch.nonzero(
+            distances <= radii + 1.0e-8, as_tuple=False
+        ).flatten()
+        if int(eligible.numel()) == 0:
+            continue
+        eligible_distances = distances.index_select(0, eligible)
+        nearest = eligible.index_select(
+            0,
+            torch.nonzero(
+                eligible_distances <= eligible_distances.min() + 1.0e-8,
+                as_tuple=False,
+            ).flatten(),
+        )
+        nearest_quality = existing_quality.index_select(0, nearest)
+        quality_winners = nearest.index_select(
+            0,
+            torch.nonzero(
+                nearest_quality >= nearest_quality.max() - 1.0e-12,
+                as_tuple=False,
+            ).flatten(),
+        )
+        expected_new.append(int(incoming_rows[local_new]))
+        expected_old.append(
+            int(existing_rows.index_select(0, quality_winners).min())
+        )
+
+    matched_new, matched_old = Stage2GlobalMapFusion._match_visible_level_vectorized(
+        incoming_xyz=incoming_xyz,
+        incoming_voxel=incoming_voxel,
+        incoming_rows=incoming_rows,
+        existing_xyz=existing_xyz,
+        existing_voxel=existing_voxel,
+        existing_quality=existing_quality,
+        existing_rows=existing_rows,
+        radius_scale=radius_scale,
+        radius_cells=2,
+        query_chunk_size=7,
+    )
+
+    assert matched_new.tolist() == expected_new
+    assert matched_old.tolist() == expected_old
 
 
 def test_formal_runtime_config_enables_post_bridge_refiner_mainline() -> None:
