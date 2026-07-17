@@ -736,7 +736,6 @@ class SphericalSelfiGlobalBackend:
         self.depth_factor_weight = float(graph_cfg.get("depth_factor_weight", 0.1))
         self.s2_huber_delta_deg = float(graph_cfg.get("s2_huber_delta_deg", 1.0))
         self.min_match_cosine = float(graph_cfg.get("min_match_cosine", 0.45))
-        self.min_match_margin = float(graph_cfg.get("min_match_margin", 0.01))
         self.max_match_entropy = float(graph_cfg.get("max_match_entropy", 0.95))
         self.min_dense_factors = max(3, int(graph_cfg.get("min_dense_factors", 32)))
         self.normalize_dense_information_by_count = bool(
@@ -955,7 +954,6 @@ class SphericalSelfiGlobalBackend:
             min_depth=self.fibonacci_min_depth,
             max_depth=self.fibonacci_max_depth,
             sky_threshold=self.sky_threshold,
-            min_match_margin=float(graph_cfg.get("min_match_margin", 0.01)),
             max_match_entropy=float(graph_cfg.get("max_match_entropy", 0.95)),
             forward_backward=bool(graph_cfg.get("forward_backward", True)),
             fb_tolerance_deg=float(graph_cfg.get("fb_tolerance_deg", 1.0)),
@@ -5051,7 +5049,6 @@ class SphericalSelfiGlobalBackend:
             & (source_depth <= self.fibonacci_max_depth)
             & (target_depth <= self.fibonacci_max_depth)
             & (matches.top1_cosine >= self.min_match_cosine)
-            & (matches.top2_margin >= self.min_match_margin)
             & (matches.normalized_entropy <= self.max_match_entropy)
         )
         source_frame = int(packet.frame_ids[0])
@@ -5590,7 +5587,6 @@ class SphericalSelfiGlobalBackend:
             & (source_depth <= self.fibonacci_max_depth)
             & (target_depth <= self.fibonacci_max_depth)
             & (matches.top1_cosine >= self.min_match_cosine)
-            & (matches.top2_margin >= self.min_match_margin)
             & (matches.normalized_entropy <= self.max_match_entropy)
         )
         count = int(keep.sum())

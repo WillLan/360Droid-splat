@@ -310,7 +310,6 @@ SphericalSelfiGlobalBackend:
     max_depth: 20.0
     sky_threshold: 0.5
     min_match_cosine: 0.45
-    min_match_margin: 0.01
     max_match_entropy: 0.95
     min_factor_weight: 0.01
     forward_backward: true

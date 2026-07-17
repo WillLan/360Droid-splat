@@ -201,7 +201,6 @@ class PanoramaLoopDetector:
         min_depth: float = 0.05,
         max_depth: float = 20.0,
         sky_threshold: float = 0.5,
-        min_match_margin: float = 0.01,
         max_match_entropy: float = 0.95,
         forward_backward: bool = True,
         fb_tolerance_deg: float = 1.0,
@@ -238,7 +237,6 @@ class PanoramaLoopDetector:
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
         self.sky_threshold = float(sky_threshold)
-        self.min_match_margin = float(min_match_margin)
         self.max_match_entropy = float(max_match_entropy)
         self.forward_backward = bool(forward_backward)
         self.fb_tolerance = math.radians(float(fb_tolerance_deg))
@@ -591,7 +589,6 @@ class PanoramaLoopDetector:
             & (target_depth <= self.max_depth)
             & (target_sky < self.sky_threshold)
             & (cosine >= self.min_match_cosine)
-            & (margin >= self.min_match_margin)
             & (entropy <= self.max_match_entropy)
         )
         selected = torch.nonzero(valid, as_tuple=False).flatten()

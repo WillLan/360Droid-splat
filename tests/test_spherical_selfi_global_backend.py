@@ -151,7 +151,6 @@ def _chunk_stride_backend(
                 "min_depth": 0.05,
                 "max_depth": 20.0,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "chunk_stride": {
                     "target_index": 2,
@@ -370,6 +369,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert graph["chunk_stride"]["min_matches"] == 256
     assert graph["chunk_stride"]["max_holdout_angular_deg"] == 2.0
     assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
+    assert "min_match_margin" not in graph
     assert graph["skip_edge"]["enabled"] is False
     assert graph["skip_edge"]["max_sequence_objective_ratio"] == 1.02
     assert graph["max_log_scale_update"] == pytest.approx(math.log(1.05))
@@ -510,6 +510,33 @@ def test_chunk_stride_factor_uses_holdout_and_rejects_ba_trust_boundary() -> Non
     )
     assert rejected is None
     assert rejected_diagnostics["reason"] == "local_ba_quality_gate_rejected"
+
+
+def test_chunk_stride_factor_does_not_gate_on_top2_margin() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    _attach_identity_stride_matches(packet)
+    assert packet.chunk_stride_matches is not None
+    packet.chunk_stride_matches = replace(
+        packet.chunk_stride_matches,
+        top2_margin=torch.full_like(
+            packet.chunk_stride_matches.top2_margin,
+            -1.0,
+        ),
+    )
+    backend = _chunk_stride_backend(min_matches=64)
+
+    factor, measurement, holdout, diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+
+    assert factor is not None, diagnostics
+    assert measurement is not None
+    assert holdout is not None
+    assert diagnostics["hard_gated_chunk_stride_matches"] == (
+        packet.chunk_stride_matches.count
+    )
 
 
 def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
@@ -1145,7 +1172,6 @@ def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None
                 "min_depth": 0.05,
                 "max_depth": 20.0,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "chunk_stride": {
                     "target_index": 2,
@@ -1880,6 +1906,34 @@ def test_spherical_rotation_ransac_recovers_rotation_with_outliers() -> None:
     assert residual < math.radians(0.05)
 
 
+def test_loop_dense_matching_does_not_gate_on_top2_margin() -> None:
+    source = _packet(0, torch.eye(4).view(1, 4, 4), (0,))
+    target = _packet(10, torch.eye(4).view(1, 4, 4), (10,))
+    source.verification_features = torch.ones_like(source.verification_features)
+    target.verification_features = torch.ones_like(target.verification_features)
+    detector = PanoramaLoopDetector(
+        factor_queries_per_direction=32,
+        min_match_cosine=0.2,
+        max_match_entropy=1.01,
+        forward_backward=False,
+        target_area_correction=False,
+    )
+
+    matches = detector._fibonacci_matches(
+        source,
+        target,
+        source_frame_index=0,
+        target_frame_index=0,
+        direction=0,
+    )
+
+    assert int(matches["count"]) > 0
+    torch.testing.assert_close(
+        matches["top2_margin"],
+        torch.zeros_like(matches["top2_margin"]),
+    )
+
+
 def test_so3_loop_verification_filters_rotation_outliers_before_sim3() -> None:
     torch.manual_seed(29)
     count = 128
@@ -2109,7 +2163,6 @@ def _boundary_backend(
                 "max_overlap_points": 128,
                 "min_dense_factors": 8,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "forward_backward": False,
                 "allow_boundary_matching_fallback": True,
@@ -2147,7 +2200,6 @@ def _refined_boundary_backend(
                 "max_overlap_points": 128,
                 "min_dense_factors": 8,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "forward_backward": False,
                 "allow_boundary_matching_fallback": True,
@@ -2214,7 +2266,6 @@ def _two_frame_boundary_backend(
                 "min_overlap_inlier_ratio": 0.35,
                 "min_dense_factors": 8,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "forward_backward": False,
                 "allow_boundary_matching_fallback": True,
@@ -3339,7 +3390,6 @@ def test_boundary_loop_transaction_rolls_back_dcs_rejected_factor() -> None:
                 "max_overlap_points": 128,
                 "min_dense_factors": 8,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "forward_backward": False,
                 "allow_boundary_matching_fallback": True,
@@ -3433,7 +3483,6 @@ def test_hierarchical_backend_freezes_five_window_submaps_and_keeps_six_node_loc
                 "max_overlap_points": 128,
                 "min_dense_factors": 8,
                 "min_match_cosine": 0.2,
-                "min_match_margin": 0.0,
                 "max_match_entropy": 1.0,
                 "forward_backward": False,
                 "allow_boundary_matching_fallback": True,
