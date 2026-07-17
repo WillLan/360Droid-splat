@@ -325,9 +325,18 @@ class VoxelAnchorObservation:
         cameras: Iterable[PanoRenderCamera],
         *,
         batch_index: int,
+        anchor_indices: torch.Tensor | None = None,
     ) -> ExplicitVoxelAnchorSet:
         camera_list = list(cameras)
-        indices = self.indices_for_batch(batch_index)
+        indices = (
+            self.indices_for_batch(batch_index)
+            if anchor_indices is None
+            else anchor_indices.to(device=self.xyz.device, dtype=torch.long)
+        )
+        if int(indices.numel()) > 0 and not bool(
+            (self.batch_index.index_select(0, indices) == int(batch_index)).all()
+        ):
+            raise ValueError("anchor_indices must belong to the requested batch")
         xyz = self.xyz.index_select(0, indices)
         scaling = self.scaling.index_select(0, indices)
         rotation = self.rotation.index_select(0, indices)

@@ -1,0 +1,37 @@
+base_config: spherical_selfi_global_gs_slam_ob3d_sponza_nonegocentric.yaml
+
+Dataset:
+  begin: 0
+  end: 100
+  frame_stride: 1
+
+SphericalSelfiGlobalBackend:
+  rendered_overlap_alignment:
+    mode: two_frame_bridge_pose_scale
+
+WeightsAndBiases:
+  group: ob3d-sponza-known-pose-bridge-refiner-ba8-100
+  run_name: ob3d100_bridge_posebaseline_refiner_ba8
+  tags:
+    - spherical-selfi
+    - adapter-ba
+    - localba8-single-stage
+    - refiner-post-bridge
+    - overlap2
+    - known-pose-bridge
+    - pose-baseline-scale-only
+    - formal100
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  post_opt_all_frames: true
+  post_opt_log_depth: false
+
+Results:
+  save_dir: outputs/ob3d100_bridge_posebaseline_refiner_ba8
+  render_final_all_frames: true
+  kf_render_format: png

@@ -18,7 +18,9 @@ from backend.pano_gs.sim3_graph import (
     s2_log_tangent_coordinates,
 )
 from backend.pano_gs.spherical_selfi_global import (
+    KnownPoseBridgeFrame,
     OverlapFrameGeometry,
+    RenderedSharedFrame,
     SphericalSelfiGlobalBackend,
 )
 from backend.pano_gs.stage2_global_fusion import (
@@ -214,7 +216,7 @@ class _TwoViewUnionRenderer(_SyntheticSharedDepthRenderer):
         return package
 
 
-def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rates() -> None:
+def test_spherical_selfi_global_config_uses_ba8_post_bridge_refiner_mainline() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     local_ba = config["SphericalSelfiRuntime"]["local_ba"]
@@ -224,7 +226,7 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     global_backend = config["SphericalSelfiGlobalBackend"]
     window = config["SphericalSelfiRuntime"]["window"]
 
-    assert local_ba["iterations"] == 5
+    assert local_ba["iterations"] == 8
     assert local_ba["lm_max_trials"] == 8
     assert local_ba["lm_acceptance_eta"] == 1.0e-6
     assert local_ba["residual_worse_tolerance"] == 1.05
@@ -232,10 +234,11 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert local_ba["max_translation_update"] == 0.10
     assert local_ba["max_logdepth_update"] == 0.70
     assert local_ba["min_factors"] == 128
-    assert local_ba["pose_safe_two_stage"] is True
-    assert local_ba["defer_dense_depth_affine"] is True
-    assert local_ba["dense_depth_mode"] == "shift"
+    assert local_ba["pose_safe_two_stage"] is False
+    assert local_ba["defer_dense_depth_affine"] is False
+    assert local_ba["dense_depth_mode"] == "affine"
     assert local_ba["dense_depth_output_floor"] == 0.01
+    assert outlier["enabled"] is False
     assert outlier["second_stage_iterations"] == 10
     assert outlier["angular_max_deg"] == 5.0
     assert outlier["sim3_max_relative_depth"] == 0.05
@@ -245,7 +248,8 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert outlier["validation_min_inliers"] == 32
     assert outlier["validation_residual_worse_tolerance"] == 1.0
     assert outlier["validation_sim3_worse_tolerance"] == 1.05
-    assert local_ba["matching"]["factor_weight_mode"] == "fibonacci_equal"
+    assert local_ba["matching"]["num_queries"] == 1024
+    assert local_ba["matching"]["factor_weight_mode"] == "descriptor_confidence"
     assert window["size"] == 4
     assert window["stride"] == 2
     assert window["expected_overlap_frames"] == 2
@@ -265,7 +269,7 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
     assert global_backend["keyframe_selection"]["enabled"] is True
     assert global_backend["rendered_overlap_alignment"] == {
         "enabled": True,
-        "mode": "two_frame_full_sim3",
+        "mode": "two_frame_bridge_depth_scale",
         "min_points": 256,
         "max_points": 4096,
         "min_points_per_frame": 256,
@@ -279,9 +283,15 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
         "covariance_min_ratio": 1.0e-4,
         "max_rotation_correction_deg": 10.0,
         "max_translation_correction": 1.0,
-        "max_shared_rotation_error_deg": 2.0,
+        "max_shared_rotation_error_deg": 5.0,
         "max_shared_center_error": 0.15,
-        "failure_policy": "scale_pose_then_error",
+        "global_map_consistency_max_relative_error": 0.15,
+        "global_map_min_consistency_ratio": 0.35,
+        "pose_baseline_min": 0.001,
+        "post_refiner_scale_recheck": True,
+        "post_refiner_scale_rerun_threshold": 0.02,
+        "post_refiner_scale_max_relative_change": 0.10,
+        "failure_policy": "error",
     }
     assert global_backend["loop_closure"]["exclude_recent_windows"] == 5
     assert global_backend["insertion_dedup"] == {
@@ -292,7 +302,14 @@ def test_spherical_selfi_global_config_uses_confirmed_two_stage_and_backend_rate
         "compare_existing_only": True,
         "permanent_drop": True,
         "update_existing_statistics": True,
+        "require_new_frame_support": True,
     }
+    assert global_backend["post_optimization_seam_check"] == {
+        "enabled": True,
+        "max_rotation_error_deg": 2.0,
+        "max_center_error": 0.15,
+    }
+    assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
     assert map_optimization["loop_neighborhood_refinement"] is True
     assert map_optimization["loop_seam_deduplication"] is True
@@ -1224,6 +1241,141 @@ def _known_two_frame_geometry(
             )
         )
     return frames
+
+
+def _known_pose_bridge_geometry(
+    *,
+    absolute_scale: float = 1.2,
+    local_baseline: float = 1.0,
+) -> list[KnownPoseBridgeFrame]:
+    frames: list[KnownPoseBridgeFrame] = []
+    count = 80
+    dummy_depth = torch.ones(1, 8, 16)
+    dummy_render = RenderedSharedFrame(
+        depth=dummy_depth,
+        alpha=torch.ones_like(dummy_depth),
+        anchor_visibility=torch.ones(4, dtype=torch.bool),
+        render_seconds=0.0,
+    )
+    for index in range(2):
+        current_pose = torch.eye(4)
+        current_pose[0, 3] = float(index) * local_baseline
+        global_pose = torch.eye(4)
+        global_pose[0, 3] = float(index) * local_baseline * absolute_scale
+        current_depth = torch.linspace(1.0, 3.0, count)
+        global_depth = current_depth * absolute_scale
+        holdout = torch.arange(count) % 5 == 0
+        frames.append(
+            KnownPoseBridgeFrame(
+                frame_id=2 + index,
+                previous_index=2 + index,
+                current_index=index,
+                bearing=torch.nn.functional.normalize(
+                    torch.randn(count, 3), dim=-1
+                ),
+                uv=torch.stack(
+                    [
+                        torch.arange(count, dtype=torch.float32) % 16,
+                        torch.arange(count, dtype=torch.float32) % 8,
+                    ],
+                    dim=-1,
+                ),
+                global_depth=global_depth,
+                current_depth=current_depth,
+                source_depth_previous_owner=global_depth / 0.75,
+                previous_local_pose=global_pose,
+                current_local_pose=current_pose,
+                known_global_pose=global_pose,
+                holdout_mask=holdout,
+                inlier_mask=torch.ones(count, dtype=torch.bool),
+                global_render=dummy_render,
+                previous_render=dummy_render,
+                current_render=dummy_render,
+                global_valid_image=torch.ones_like(dummy_depth, dtype=torch.bool),
+                current_valid_image=torch.ones_like(dummy_depth, dtype=torch.bool),
+                global_previous_consistency_image=torch.ones_like(
+                    dummy_depth, dtype=torch.bool
+                ),
+                sky_union_image=torch.zeros_like(dummy_depth, dtype=torch.bool),
+                global_previous_consistency_ratio=1.0,
+            )
+        )
+    return frames
+
+
+@pytest.mark.parametrize(
+    ("mode", "config_mode"),
+    [
+        ("depth", "two_frame_bridge_depth_scale"),
+        ("pose_baseline", "two_frame_bridge_pose_scale"),
+    ],
+)
+def test_known_pose_bridge_recovers_scale_from_only_requested_source(
+    mode: str,
+    config_mode: str,
+) -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        mode=config_mode,
+    )
+    previous_owner = sim3_from_components(
+        0.75, torch.eye(3), torch.zeros(3)
+    )
+    scale, inliers, diagnostics = backend._estimate_known_pose_bridge_scale(
+        _known_pose_bridge_geometry(),
+        previous_owner,
+        mode=mode,
+    )
+
+    assert scale == pytest.approx(1.2, rel=1.0e-5)
+    assert diagnostics["measurement_scale"] == pytest.approx(1.6, rel=1.0e-5)
+    assert diagnostics["accepted"] is True
+    assert all(float(mask.float().mean()) > 0.99 for mask in inliers)
+
+
+def test_known_pose_bridge_canonicalization_pins_overlap_and_preserves_tail() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    poses[:, 0, 3] = torch.tensor([0.0, 0.7, 1.1, 1.6])
+    packet = _packet(1, poses, (2, 3, 4, 5))
+    angle = torch.deg2rad(torch.tensor(5.0))
+    rotation = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle), 0.0],
+            [torch.sin(angle), torch.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    owner = sim3_from_components(
+        1.3, rotation, torch.tensor([0.2, -0.1, 0.05])
+    )
+    desired_second = packet.local_poses_c2w[1].clone()
+    desired_second[:3, :3] = rotation.transpose(0, 1)
+    desired_second[0, 3] = 0.9
+    known = (
+        apply_sim3_to_c2w(owner, torch.eye(4)),
+        apply_sim3_to_c2w(owner, desired_second),
+    )
+    original_tail_from_second = (
+        torch.linalg.inv(packet.local_poses_c2w[1])
+        @ packet.local_poses_c2w[3]
+    )
+
+    corrected = SphericalSelfiGlobalBackend._canonicalize_packet_from_two_known_poses(
+        packet,
+        owner,
+        known,
+    )
+    global_poses = corrected.global_poses(owner)
+
+    torch.testing.assert_close(global_poses[0], known[0], atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(global_poses[1], known[1], atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(
+        torch.linalg.inv(corrected.local_poses_c2w[1])
+        @ corrected.local_poses_c2w[3],
+        original_tail_from_second,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
 
 
 def test_two_frame_full_sim3_recovers_known_transform_with_training_outliers() -> None:

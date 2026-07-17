@@ -467,6 +467,10 @@ class LocalGaussianWindowPacket:
             return resize_channels(value.float(), 1).clamp(0.0, 1.0)
 
         verification = self.verification_features.detach().cpu().float()
+        compact_metadata = dict(self.metadata)
+        # This per-anchor sidecar is consumed by insertion filtering and has
+        # no loop-closure use after the anchors have been fused.
+        compact_metadata.pop("voxel_anchor_source_view_mask", None)
         return LocalGaussianWindowPacket(
             window_id=int(self.window_id),
             anchor_frame_id=int(self.anchor_frame_id),
@@ -493,7 +497,7 @@ class LocalGaussianWindowPacket:
                 else self.boundary_matches.detached_clone(device="cpu")
             ),
             match_quality={key: value.detach().cpu() for key, value in self.match_quality.items()},
-            metadata=dict(self.metadata),
+            metadata=compact_metadata,
         )
 
 

@@ -46,12 +46,12 @@ adapter_checkpoint:
 stage2_checkpoint:
   path: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage2_selfi_joint_gpu03_20260712_20k_r1/stage2_selfi_omniscene_joint_fullres_s4_ddp2_effbs4_20k_gpu03_20260712_r1/checkpoints/best_val_psnr.pt
 
-# Optional simplified Stage-3 path.  Disabled keeps the existing dense
-# per-pixel packet and scale-selected backend behavior byte-for-byte.
+# Mainline Stage-3 path.  The frontend sends provisional whole-chunk anchors;
+# learned refinement is deferred until the overlap bridge fixes local poses.
 VoxelAnchorRefiner:
-  enabled: false
-  checkpoint: null
-  sha256: null
+  enabled: true
+  checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/outputs/stage3_spherical_voxel_anchor_refiner_omni360_fullres_20k_resume_83cea9d_gpu05_20260715_1510/checkpoints/best_val_psnr.pt
+  sha256: 63d4b02565f5278eafd278b3d305620df97b551c9b85c05361d25d0416077b97
   iterations: 3
   hidden_dim: 32
   adapter_dim: 24
@@ -105,8 +105,8 @@ SphericalSelfiRuntime:
     max_depth: 20.0
   local_ba:
     enabled: true
-    pose_safe_two_stage: true
-    iterations: 5
+    pose_safe_two_stage: false
+    iterations: 8
     damping: 1.0e-4
     solver_mode: standard_lm
     lm_max_trials: 8
@@ -121,8 +121,8 @@ SphericalSelfiRuntime:
     pose_update_side: right
     pose_dof_mode: se3
     gauge_mode: initial_baseline
-    dense_depth_mode: shift
-    defer_dense_depth_affine: true
+    dense_depth_mode: affine
+    defer_dense_depth_affine: false
     dense_depth_output_floor: 0.01
     max_depth_shift_ratio: 0.25
     max_depth_shift_step_ratio: 0.05
@@ -143,7 +143,7 @@ SphericalSelfiRuntime:
     relative_objective_tolerance: 1.0e-6
     affine_min_relative_improvement: 1.0e-3
     outlier_refinement:
-      enabled: true
+      enabled: false
       second_stage_iterations: 10
       angular_mad_scale: 3.0
       angular_min_deg: 1.0
@@ -161,7 +161,7 @@ SphericalSelfiRuntime:
       validation_sim3_worse_tolerance: 1.05
     matching:
       type: adapter
-      num_queries: 2048
+      num_queries: 1024
       min_depth: 0.05
       max_depth: 20.0
       temperature: 0.07
@@ -171,16 +171,16 @@ SphericalSelfiRuntime:
       forward_backward: true
       fb_tolerance_deg: 1.0
       min_factor_weight: 0.01
-      factor_weight_mode: fibonacci_equal
+      factor_weight_mode: descriptor_confidence
 
 SphericalSelfiGlobalBackend:
   enabled: true
   rgb_sh_degree: 2
   rendered_overlap_alignment:
     enabled: true
-    # Ablation: use two_frame_scale_pose to keep the same overlap-2 graph and
-    # estimate only scale from depth while deriving R/t from shared-frame poses.
-    mode: two_frame_full_sim3
+    # Mainline: both shared global R/t poses are treated as known.  Only scale
+    # is estimated, then the local trajectory is canonicalized before Refiner.
+    mode: two_frame_bridge_depth_scale
     min_points: 256
     max_points: 4096
     min_points_per_frame: 256
@@ -194,9 +194,15 @@ SphericalSelfiGlobalBackend:
     covariance_min_ratio: 1.0e-4
     max_rotation_correction_deg: 10.0
     max_translation_correction: 1.0
-    max_shared_rotation_error_deg: 2.0
+    max_shared_rotation_error_deg: 5.0
     max_shared_center_error: 0.15
-    failure_policy: scale_pose_then_error
+    global_map_consistency_max_relative_error: 0.15
+    global_map_min_consistency_ratio: 0.35
+    pose_baseline_min: 0.001
+    post_refiner_scale_recheck: true
+    post_refiner_scale_rerun_threshold: 0.02
+    post_refiner_scale_max_relative_change: 0.10
+    failure_policy: error
   insertion_dedup:
     enabled: true
     visible_only: true
@@ -205,6 +211,11 @@ SphericalSelfiGlobalBackend:
     compare_existing_only: true
     permanent_drop: true
     update_existing_statistics: true
+    require_new_frame_support: true
+  post_optimization_seam_check:
+    enabled: true
+    max_rotation_error_deg: 2.0
+    max_center_error: 0.15
   geometry_validation:
     enabled: true
     tolerance: 1.0e-5
@@ -273,7 +284,7 @@ SphericalSelfiGlobalBackend:
     max_overlap_points: 4096
     max_overlap_residual: 0.35
     min_overlap_inlier_ratio: 0.35
-    umeyama_irls_iterations: 3
+    umeyama_irls_iterations: 5
     umeyama_huber_delta: null
     max_scale_change: 2.5
     max_translation_update: 1.0
@@ -331,6 +342,8 @@ SphericalSelfiGlobalBackend:
     min_confidence: 0.05
     min_opacity: 0.02
     max_total_gaussians: 2000000
+    coverage_aware_budget: true
+    coverage_coarse_cell_size: 0.64
     lifecycle_prune_interval_windows: 8
     max_stale_frames: 0
     max_render_error: null

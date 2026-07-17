@@ -118,6 +118,8 @@ class Stage2GlobalMapFusion:
         min_confidence: float = 0.05,
         min_opacity: float = 0.02,
         max_total_gaussians: int = 0,
+        coverage_aware_budget: bool = False,
+        coverage_coarse_cell_size: float = 0.64,
         lazy_owner_transforms: bool = False,
     ) -> None:
         self.map = gaussian_map
@@ -128,6 +130,13 @@ class Stage2GlobalMapFusion:
         self.min_confidence = float(min_confidence)
         self.min_opacity = float(min_opacity)
         self.max_total_gaussians = max(0, int(max_total_gaussians))
+        self.coverage_aware_budget = bool(coverage_aware_budget)
+        self.coverage_coarse_cell_size = float(coverage_coarse_cell_size)
+        if self.coverage_aware_budget and (
+            not math.isfinite(self.coverage_coarse_cell_size)
+            or self.coverage_coarse_cell_size <= 0.0
+        ):
+            raise ValueError("coverage_coarse_cell_size must be positive")
         self.lazy_owner_transforms = bool(lazy_owner_transforms)
         self.map.configure_lazy_owner_transforms(self.lazy_owner_transforms)
         self.last_pre_cap_count = 0
@@ -137,6 +146,71 @@ class Stage2GlobalMapFusion:
         self._depth_selected_mode = bool(
             getattr(self.map, "_anchor_depth_selected_levels", False)
         )
+
+    def _cap_to_budget(
+        self,
+        batch: GlobalExplicitGaussianBatch,
+    ) -> GlobalExplicitGaussianBatch:
+        if self.max_total_gaussians <= 0 or len(batch) <= self.max_total_gaussians:
+            return batch
+        if not self.coverage_aware_budget:
+            selected = torch.topk(
+                batch.quality,
+                k=self.max_total_gaussians,
+                largest=True,
+            ).indices
+            return batch.index(selected)
+
+        coarse = torch.floor(
+            batch.xyz / float(self.coverage_coarse_cell_size)
+        ).to(torch.int64)
+        key = torch.cat([batch.level.long()[:, None], coarse], dim=-1)
+        unique, inverse = torch.unique(key, dim=0, return_inverse=True, sorted=True)
+        max_quality = batch.quality.new_full((int(unique.shape[0]),), -torch.inf)
+        max_quality.scatter_reduce_(
+            0, inverse, batch.quality, reduce="amax", include_self=True
+        )
+        rows = torch.arange(len(batch), device=batch.xyz.device, dtype=torch.long)
+        candidates = torch.where(
+            batch.quality >= max_quality[inverse] - 1.0e-12,
+            rows,
+            torch.full_like(rows, len(batch)),
+        )
+        coverage = torch.full(
+            (int(unique.shape[0]),),
+            len(batch),
+            device=batch.xyz.device,
+            dtype=torch.long,
+        )
+        coverage.scatter_reduce_(
+            0, inverse, candidates, reduce="amin", include_self=True
+        )
+        coverage = coverage[coverage < len(batch)]
+        if int(coverage.numel()) >= self.max_total_gaussians:
+            chosen = coverage.index_select(
+                0,
+                torch.topk(
+                    batch.quality.index_select(0, coverage),
+                    k=self.max_total_gaussians,
+                    largest=True,
+                ).indices,
+            )
+            return batch.index(chosen)
+        selected_mask = torch.zeros(
+            len(batch), device=batch.xyz.device, dtype=torch.bool
+        )
+        selected_mask[coverage] = True
+        remaining = torch.nonzero(~selected_mask, as_tuple=False).flatten()
+        fill_count = self.max_total_gaussians - int(coverage.numel())
+        fill = remaining.index_select(
+            0,
+            torch.topk(
+                batch.quality.index_select(0, remaining),
+                k=fill_count,
+                largest=True,
+            ).indices,
+        )
+        return batch.index(torch.cat([coverage, fill], dim=0))
 
     def _levels_and_grid(self, xyz: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sizes = xyz.new_tensor(self.voxel_sizes)
@@ -369,10 +443,7 @@ class Stage2GlobalMapFusion:
         result = batch.index(winner)
         self.last_pre_cap_count = len(result)
         self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
-        if self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians:
-            selected = torch.topk(result.quality, k=self.max_total_gaussians, largest=True).indices
-            result = result.index(selected)
-        return result
+        return self._cap_to_budget(result)
 
     def _winner_take_owner_voxel(
         self,
@@ -412,10 +483,7 @@ class Stage2GlobalMapFusion:
         result = batch.index(winner[winner < len(batch)])
         self.last_pre_cap_count = len(result)
         self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
-        if self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians:
-            selected = torch.topk(result.quality, k=self.max_total_gaussians, largest=True).indices
-            result = result.index(selected)
-        return result
+        return self._cap_to_budget(result)
 
     @staticmethod
     def _distribution(prefix: str, value: torch.Tensor) -> dict[str, float]:
@@ -737,6 +805,13 @@ class Stage2GlobalMapFusion:
         existing_xyz = self.map.get_xyz.detach().cpu().float()
         existing_level = self.map._anchor_level.detach().cpu().long()
         existing_quality = self.map._anchor_quality.detach().cpu().float()
+        existing_voxel = (
+            self.map.materialized_anchor_voxel_size()
+            .detach()
+            .cpu()
+            .float()
+            .reshape(-1)
+        )
         existing_visible_cpu = existing_visibility.detach().cpu().bool()
         radius_scale = max(0.0, float(radius_voxels))
         radius_cells = max(0, int(math.ceil(radius_scale)))
@@ -755,7 +830,10 @@ class Stage2GlobalMapFusion:
             stats[f"hash_level_{level}_visible"] = int(level_new.numel())
             if int(level_new.numel()) > 0 and int(level_old.numel()) > 0 and radius_scale > 0.0:
                 cell_size = float(
-                    incoming_voxel.index_select(0, level_new).max().clamp_min(1.0e-8)
+                    torch.maximum(
+                        incoming_voxel.index_select(0, level_new).max(),
+                        existing_voxel.index_select(0, level_old).max(),
+                    ).clamp_min(1.0e-8)
                 )
                 old_grid = torch.floor(
                     existing_xyz.index_select(0, level_old) / cell_size
@@ -791,9 +869,17 @@ class Stage2GlobalMapFusion:
                         existing_xyz.index_select(0, candidate_rows) - candidate_xyz,
                         dim=-1,
                     )
-                    radius = radius_scale * float(incoming_voxel[int(new_row)])
+                    # Owner Sim(3) corrections can make nominally equal-level
+                    # anchors carry different world voxel sizes.  A symmetric
+                    # radius avoids order-dependent suppression.
+                    candidate_voxel = existing_voxel.index_select(
+                        0, candidate_rows
+                    )
+                    radii = radius_scale * 0.5 * (
+                        float(incoming_voxel[int(new_row)]) + candidate_voxel
+                    )
                     within = torch.nonzero(
-                        distances <= radius + 1.0e-8,
+                        distances <= radii + 1.0e-8,
                         as_tuple=False,
                     ).flatten()
                     if int(within.numel()) == 0:

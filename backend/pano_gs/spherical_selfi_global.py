@@ -6,13 +6,14 @@ import copy
 from dataclasses import dataclass, field, replace
 import math
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 from frontend.pano_vggt.alignment import SubmapAligner
 from frontend.spherical_selfi.panorama_loop import PanoramaLoopDetector
 from frontend.spherical_selfi.window_packet import BoundaryMatchBlock, LocalGaussianWindowPacket
+from geometry.pose import invert_c2w
 from geometry.panorama_loop_contracts import (
     DenseSphericalLoopMeasurement,
     LoopPoseMeasurement,
@@ -115,6 +116,41 @@ class OverlapFrameGeometry:
     sky_union_image: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class KnownPoseBridgeFrame:
+    """One overlap frame linking a local whole-chunk map to the global map."""
+
+    frame_id: int
+    previous_index: int
+    current_index: int
+    bearing: torch.Tensor
+    uv: torch.Tensor
+    global_depth: torch.Tensor
+    current_depth: torch.Tensor
+    source_depth_previous_owner: torch.Tensor
+    previous_local_pose: torch.Tensor
+    current_local_pose: torch.Tensor
+    known_global_pose: torch.Tensor
+    holdout_mask: torch.Tensor
+    inlier_mask: torch.Tensor
+    global_render: RenderedSharedFrame
+    previous_render: RenderedSharedFrame
+    current_render: RenderedSharedFrame
+    global_valid_image: torch.Tensor
+    current_valid_image: torch.Tensor
+    global_previous_consistency_image: torch.Tensor
+    sky_union_image: torch.Tensor
+    global_previous_consistency_ratio: float
+
+
+@dataclass(frozen=True)
+class KnownPoseBridgeSolution:
+    packet: LocalGaussianWindowPacket
+    owner_transform: torch.Tensor
+    relative_measurement: torch.Tensor
+    diagnostics: dict[str, Any]
+
+
 class SphericalSelfiGlobalBackend:
     _MAP_TRANSACTION_METADATA = (
         "_anchor_level",
@@ -143,11 +179,20 @@ class SphericalSelfiGlobalBackend:
         *,
         mapper: PanoGaussianMapper | None = None,
         renderer: PFGS360Renderer | None = None,
+        pose_canonicalized_packet_refiner: (
+            Callable[[LocalGaussianWindowPacket], LocalGaussianWindowPacket]
+            | None
+        ) = None,
+        packet_refiner_release: Callable[[int], None] | None = None,
         config: dict[str, Any] | None = None,
     ) -> None:
         self.map = gaussian_map
         self.mapper = mapper
         self.renderer = renderer if renderer is not None else getattr(mapper, "renderer", None)
+        self.pose_canonicalized_packet_refiner = (
+            pose_canonicalized_packet_refiner
+        )
+        self.packet_refiner_release = packet_refiner_release
         self.config = dict(config or {})
         graph_cfg = dict(self.config.get("global_graph", {}) or {})
         loop_cfg = dict(self.config.get("loop_closure", {}) or {})
@@ -160,6 +205,9 @@ class SphericalSelfiGlobalBackend:
         optimize_cfg = dict(self.config.get("map_optimization", {}) or {})
         lazy_map_cfg = dict(optimize_cfg.get("lazy_submap_transforms", {}) or {})
         validation_cfg = dict(self.config.get("geometry_validation", {}) or {})
+        seam_check_cfg = dict(
+            self.config.get("post_optimization_seam_check", {}) or {}
+        )
         rendered_alignment_cfg = dict(
             self.config.get("rendered_overlap_alignment", {}) or {}
         )
@@ -181,17 +229,41 @@ class SphericalSelfiGlobalBackend:
                 "shared_frame_scale_only",
                 "two_frame_scale_pose",
                 "two_frame_full_sim3",
+                "two_frame_bridge_depth_scale",
+                "two_frame_bridge_pose_scale",
             }
         ):
             raise ValueError(
                 "rendered_overlap_alignment.mode must be "
                 "'shared_frame_scale_only', 'two_frame_scale_pose', "
-                "or 'two_frame_full_sim3'"
+                "'two_frame_full_sim3', 'two_frame_bridge_depth_scale', "
+                "or 'two_frame_bridge_pose_scale'"
             )
+        self.two_frame_known_pose_bridge_enabled = (
+            self.rendered_overlap_alignment_enabled
+            and self.rendered_overlap_alignment_mode
+            in {
+                "two_frame_bridge_depth_scale",
+                "two_frame_bridge_pose_scale",
+            }
+        )
+        self.two_frame_bridge_depth_scale_enabled = (
+            self.rendered_overlap_alignment_mode
+            == "two_frame_bridge_depth_scale"
+        )
+        self.two_frame_bridge_pose_scale_enabled = (
+            self.rendered_overlap_alignment_mode
+            == "two_frame_bridge_pose_scale"
+        )
         self.two_frame_overlap_enabled = (
             self.rendered_overlap_alignment_enabled
             and self.rendered_overlap_alignment_mode
-            in {"two_frame_scale_pose", "two_frame_full_sim3"}
+            in {
+                "two_frame_scale_pose",
+                "two_frame_full_sim3",
+                "two_frame_bridge_depth_scale",
+                "two_frame_bridge_pose_scale",
+            }
         )
         self.two_frame_full_sim3_enabled = (
             self.two_frame_overlap_enabled
@@ -258,6 +330,26 @@ class SphericalSelfiGlobalBackend:
         )
         self.rendered_alignment_max_shared_center_error = float(
             rendered_alignment_cfg.get("max_shared_center_error", 0.15)
+        )
+        self.rendered_alignment_global_map_consistency_error = float(
+            rendered_alignment_cfg.get(
+                "global_map_consistency_max_relative_error", 0.15
+            )
+        )
+        self.rendered_alignment_global_map_min_consistency_ratio = float(
+            rendered_alignment_cfg.get("global_map_min_consistency_ratio", 0.35)
+        )
+        self.rendered_alignment_pose_baseline_min = float(
+            rendered_alignment_cfg.get("pose_baseline_min", 1.0e-3)
+        )
+        self.post_refiner_scale_recheck_enabled = bool(
+            rendered_alignment_cfg.get("post_refiner_scale_recheck", True)
+        )
+        self.post_refiner_scale_rerun_threshold = float(
+            rendered_alignment_cfg.get("post_refiner_scale_rerun_threshold", 0.02)
+        )
+        self.post_refiner_scale_max_relative_change = float(
+            rendered_alignment_cfg.get("post_refiner_scale_max_relative_change", 0.10)
         )
         if not 0.0 <= self.rendered_alignment_alpha_threshold <= 1.0:
             raise ValueError(
@@ -328,6 +420,34 @@ class SphericalSelfiGlobalBackend:
                 "rendered_overlap_alignment.max_shared_center_error "
                 "must be non-negative"
             )
+        if not (
+            math.isfinite(self.rendered_alignment_global_map_consistency_error)
+            and self.rendered_alignment_global_map_consistency_error >= 0.0
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment."
+                "global_map_consistency_max_relative_error must be non-negative"
+            )
+        if not 0.0 <= self.rendered_alignment_global_map_min_consistency_ratio <= 1.0:
+            raise ValueError(
+                "rendered_overlap_alignment.global_map_min_consistency_ratio "
+                "must be in [0, 1]"
+            )
+        if not (
+            math.isfinite(self.rendered_alignment_pose_baseline_min)
+            and self.rendered_alignment_pose_baseline_min > 0.0
+        ):
+            raise ValueError(
+                "rendered_overlap_alignment.pose_baseline_min must be positive"
+            )
+        if not (
+            0.0 <= self.post_refiner_scale_rerun_threshold
+            <= self.post_refiner_scale_max_relative_change
+        ):
+            raise ValueError(
+                "post-refiner scale thresholds must satisfy "
+                "0 <= rerun_threshold <= max_relative_change"
+            )
         self.rendered_alignment_failure_policy = str(
             rendered_alignment_cfg.get("failure_policy", "error")
         ).strip().lower()
@@ -369,6 +489,9 @@ class SphericalSelfiGlobalBackend:
         )
         self.insertion_dedup_update_existing_statistics = bool(
             insertion_dedup_cfg.get("update_existing_statistics", True)
+        )
+        self.insertion_dedup_require_new_frame_support = bool(
+            insertion_dedup_cfg.get("require_new_frame_support", False)
         )
         if self.insertion_dedup_enabled and not all(
             (
@@ -500,6 +623,15 @@ class SphericalSelfiGlobalBackend:
         self.geometry_validation_enabled = bool(validation_cfg.get("enabled", True))
         self.geometry_tolerance = float(validation_cfg.get("tolerance", 1.0e-5))
         self.geometry_rollback_on_failure = bool(validation_cfg.get("rollback_on_failure", True))
+        self.post_optimization_seam_check_enabled = bool(
+            seam_check_cfg.get("enabled", False)
+        )
+        self.post_optimization_seam_max_rotation_deg = float(
+            seam_check_cfg.get("max_rotation_error_deg", 2.0)
+        )
+        self.post_optimization_seam_max_center_error = float(
+            seam_check_cfg.get("max_center_error", 0.15)
+        )
         self.robust_loop_mode = str(robust_loop_cfg.get("mode", "off")).lower()
         if self.robust_loop_mode not in {"off", "dcs"}:
             raise ValueError("robust_loop.mode must be 'off' or 'dcs'")
@@ -676,6 +808,12 @@ class SphericalSelfiGlobalBackend:
             min_confidence=float(fusion_cfg.get("min_confidence", 0.05)),
             min_opacity=float(fusion_cfg.get("min_opacity", 0.02)),
             max_total_gaussians=int(fusion_cfg.get("max_total_gaussians", 0)),
+            coverage_aware_budget=bool(
+                fusion_cfg.get("coverage_aware_budget", False)
+            ),
+            coverage_coarse_cell_size=float(
+                fusion_cfg.get("coverage_coarse_cell_size", 0.64)
+            ),
             lazy_owner_transforms=self.lazy_submap_transforms_enabled,
         )
         self.packets: dict[int, LocalGaussianWindowPacket] = {}
@@ -945,6 +1083,59 @@ class SphericalSelfiGlobalBackend:
                     nodes.append(int(node))
         return nodes
 
+    def _overlap_seam_diagnostics(self) -> dict[str, Any]:
+        rotation_errors: list[float] = []
+        center_errors: list[float] = []
+        factor_count = 0
+        for factor in self.graph.edges:
+            if not isinstance(factor, CoincidentPanoramaFactor):
+                continue
+            if factor.edge_type not in {
+                "overlap_shared_pose_consistency",
+                "overlap_known_pose_bridge_pose_consistency",
+            }:
+                continue
+            if factor.source not in self.graph.nodes or factor.target not in self.graph.nodes:
+                continue
+            source_pose = apply_sim3_to_c2w(
+                self.graph.transform(factor.source).to(factor.source_local_pose),
+                factor.source_local_pose,
+            )
+            target_pose = apply_sim3_to_c2w(
+                self.graph.transform(factor.target).to(factor.target_local_pose),
+                factor.target_local_pose,
+            )
+            rotation_errors.append(
+                self._rotation_error_deg(
+                    source_pose[:3, :3], target_pose[:3, :3]
+                )
+            )
+            center_errors.append(
+                float(
+                    torch.linalg.norm(
+                        source_pose[:3, 3] - target_pose[:3, 3]
+                    )
+                    .detach()
+                    .cpu()
+                )
+            )
+            factor_count += 1
+        max_rotation = max(rotation_errors, default=0.0)
+        max_center = max(center_errors, default=0.0)
+        accepted = (
+            max_rotation <= self.post_optimization_seam_max_rotation_deg
+            and max_center <= self.post_optimization_seam_max_center_error
+        )
+        return {
+            "enabled": self.post_optimization_seam_check_enabled,
+            "factor_count": factor_count,
+            "max_rotation_error_deg": max_rotation,
+            "max_center_error": max_center,
+            "rotation_errors_deg": rotation_errors,
+            "center_errors": center_errors,
+            "accepted": bool(accepted),
+        }
+
     @staticmethod
     def _owner_transforms_changed(
         old: dict[int, torch.Tensor],
@@ -1210,7 +1401,10 @@ class SphericalSelfiGlobalBackend:
 
     @staticmethod
     def _packet_uses_voxel_refiner(packet: LocalGaussianWindowPacket) -> bool:
-        return bool(packet.metadata.get("voxel_anchor_refiner_enabled", False))
+        return bool(
+            packet.metadata.get("voxel_anchor_refiner_requested", False)
+            or packet.metadata.get("voxel_anchor_refiner_enabled", False)
+        )
 
     def _validate_refined_packet(self, packet: LocalGaussianWindowPacket) -> bool:
         refined = self._packet_uses_voxel_refiner(packet)
@@ -1222,7 +1416,18 @@ class SphericalSelfiGlobalBackend:
             return False
         if packet.anchor_observation is None:
             raise RuntimeError(
-                "A refined frontend packet must contain anchor_observation"
+                "A Refiner-routed packet must contain provisional or final anchors"
+            )
+        pending = bool(packet.metadata.get("voxel_anchor_refiner_pending", False))
+        if pending and self.pose_canonicalized_packet_refiner is None:
+            raise RuntimeError(
+                "A deferred Refiner packet requires a pose-canonicalized "
+                "packet refiner callback"
+            )
+        if pending and not self.two_frame_known_pose_bridge_enabled:
+            raise RuntimeError(
+                "Deferred post-bridge Refiner packets require a "
+                "two_frame_bridge_* alignment mode"
             )
         if not self.rendered_overlap_alignment_enabled:
             raise RuntimeError(
@@ -1235,6 +1440,30 @@ class SphericalSelfiGlobalBackend:
         if self.renderer is None:
             raise RuntimeError("Rendered refined-anchor alignment requires a renderer")
         return True
+
+    def _finalize_pose_canonicalized_refiner_packet(
+        self,
+        packet: LocalGaussianWindowPacket,
+    ) -> LocalGaussianWindowPacket:
+        if not bool(packet.metadata.get("voxel_anchor_refiner_pending", False)):
+            if not bool(packet.metadata.get("voxel_anchor_refiner_enabled", False)):
+                raise RuntimeError(
+                    "Refiner-routed packet is neither pending nor finalized"
+                )
+            return packet
+        callback = self.pose_canonicalized_packet_refiner
+        if callback is None:
+            raise RuntimeError("Deferred Refiner callback is unavailable")
+        refined = callback(packet)
+        if refined.anchor_observation is None or not bool(
+            refined.metadata.get("voxel_anchor_refiner_enabled", False)
+        ):
+            raise RuntimeError(
+                "Pose-canonicalized Refiner callback did not return final anchors"
+            )
+        if bool(refined.metadata.get("voxel_anchor_refiner_pending", False)):
+            raise RuntimeError("Pose-canonicalized Refiner packet is still pending")
+        return refined
 
     @staticmethod
     def _single_camera_render_tensor(
@@ -1293,6 +1522,8 @@ class SphericalSelfiGlobalBackend:
         self,
         packet: LocalGaussianWindowPacket,
         frame_id: int,
+        *,
+        exclude_target_only_anchors: bool = False,
     ) -> RenderedSharedFrame:
         if self.renderer is None or packet.anchor_observation is None:
             raise RuntimeError("Refined-anchor rendering requires anchors and a renderer")
@@ -1304,7 +1535,37 @@ class SphericalSelfiGlobalBackend:
             dtype=anchor.xyz.dtype,
         )
         camera = PanoRenderCamera(height, width, camera_pose)
-        explicit = anchor.materialize_batch([camera], batch_index=0)
+        selected_indices = None
+        if exclude_target_only_anchors:
+            membership = anchor.membership
+            if int(membership.anchor_index.numel()) == 0:
+                raise RuntimeError(
+                    "Non-self overlap rendering requires provisional anchor membership"
+                )
+            supported_elsewhere = torch.zeros(
+                anchor.num_anchors,
+                device=anchor.xyz.device,
+                dtype=torch.bool,
+            )
+            other = membership.source_view_index != int(frame_index)
+            if bool(other.any()):
+                supported_elsewhere[
+                    membership.anchor_index[other].to(supported_elsewhere.device)
+                ] = True
+            selected_indices = torch.nonzero(
+                supported_elsewhere
+                & (anchor.batch_index == 0),
+                as_tuple=False,
+            ).flatten()
+            if int(selected_indices.numel()) == 0:
+                raise RuntimeError(
+                    f"Frame {frame_id} has no non-self-supported provisional anchors"
+                )
+        explicit = anchor.materialize_batch(
+            [camera],
+            batch_index=0,
+            anchor_indices=selected_indices,
+        )
         if anchor.xyz.device.type == "cuda":
             torch.cuda.synchronize(anchor.xyz.device)
         start = time.perf_counter()
@@ -1677,6 +1938,845 @@ class SphericalSelfiGlobalBackend:
                 f"for windows {previous.window_id}->{current.window_id}"
             )
         return overlap
+
+    def _known_overlap_global_pose(
+        self,
+        previous: LocalGaussianWindowPacket,
+        frame_id: int,
+        previous_owner_transform: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the already-admitted global SE(3) pose of an overlap frame."""
+
+        frame = int(frame_id)
+        if frame in self.graph.nodes:
+            node = self.graph.transform(frame)
+            _, rotation, translation = sim3_components(node)
+            pose = torch.eye(4, device=node.device, dtype=node.dtype)
+            pose[:3, :3] = rotation
+            pose[:3, 3] = translation
+            return pose
+        index = previous.frame_index(frame)
+        return apply_sim3_to_c2w(
+            previous_owner_transform.to(previous.local_poses_c2w),
+            previous.local_poses_c2w[index],
+        )
+
+    @staticmethod
+    def _bridge_owner_from_first_pose(
+        scale: float,
+        local_first_pose: torch.Tensor,
+        known_global_first_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        value = float(scale)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("Known-pose bridge scale must be positive and finite")
+        local = local_first_pose.to(known_global_first_pose)
+        rotation = (
+            known_global_first_pose[:3, :3]
+            @ local[:3, :3].transpose(0, 1)
+        )
+        translation = (
+            known_global_first_pose[:3, 3]
+            - value * (rotation @ local[:3, 3])
+        )
+        return sim3_from_components(value, rotation, translation)
+
+    @staticmethod
+    def _canonicalize_packet_from_two_known_poses(
+        packet: LocalGaussianWindowPacket,
+        owner_transform: torch.Tensor,
+        known_global_poses: tuple[torch.Tensor, torch.Tensor],
+    ) -> LocalGaussianWindowPacket:
+        """Pin both overlap poses and preserve the second-to-tail local motion."""
+
+        if len(packet.frame_ids) < 2:
+            raise ValueError("Known-pose bridge requires at least two packet frames")
+        original = packet.local_poses_c2w.detach().clone()
+        corrected = original.clone()
+        corrected[0] = rebase_c2w_to_sim3_anchor(
+            owner_transform.to(known_global_poses[0]),
+            known_global_poses[0],
+        ).to(corrected)
+        corrected[0] = torch.eye(
+            4, device=corrected.device, dtype=corrected.dtype
+        )
+        corrected[1] = rebase_c2w_to_sim3_anchor(
+            owner_transform.to(known_global_poses[1]),
+            known_global_poses[1],
+        ).to(corrected)
+        tail_from_second = invert_c2w(original[1])
+        for index in range(2, len(packet.frame_ids)):
+            corrected[index] = corrected[1] @ tail_from_second @ original[index]
+        observation = packet.observation.with_geometry(
+            poses_c2w=corrected.unsqueeze(0).to(packet.observation.poses_c2w)
+        )
+        metadata = dict(packet.metadata)
+        metadata["known_pose_bridge_canonicalized"] = True
+        metadata["known_pose_bridge_tail_reference_index"] = 1
+        # Provisional anchors use the pre-canonical trajectory and are never
+        # allowed to reach fusion.  The deferred callback re-voxelizes from
+        # ``observation`` before running the learned Refiner.
+        return replace(
+            packet,
+            local_poses_c2w=corrected,
+            observation=observation,
+            anchor_observation=None,
+            metadata=metadata,
+        )
+
+    def _collect_known_pose_bridge_frame(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        frame_id: int,
+        *,
+        previous_owner_transform: torch.Tensor,
+        exclude_current_target_only: bool,
+    ) -> KnownPoseBridgeFrame:
+        if previous.anchor_observation is None or current.anchor_observation is None:
+            raise RuntimeError(
+                "Known-pose bridge requires previous final and current whole-chunk anchors"
+            )
+        previous_index = previous.frame_index(frame_id)
+        current_index = current.frame_index(frame_id)
+        known_global_pose = self._known_overlap_global_pose(
+            previous,
+            frame_id,
+            previous_owner_transform,
+        )
+        global_render = self._render_global_pose_frame(
+            known_global_pose,
+            image_size=current.anchor_observation.image_size,
+        )
+        previous_render = self._render_refined_anchor_frame(previous, frame_id)
+        current_render = self._render_refined_anchor_frame(
+            current,
+            frame_id,
+            exclude_target_only_anchors=exclude_current_target_only,
+        )
+        device_depth = current_render.depth
+        global_depth = global_render.depth.to(device_depth)
+        previous_depth = previous_render.depth.to(device_depth)
+        current_depth = current_render.depth
+        global_alpha = global_render.alpha.to(device_depth)
+        previous_alpha = previous_render.alpha.to(device_depth)
+        current_alpha = current_render.alpha
+        previous_semantic = (
+            previous.finite_gaussian_mask[0, previous_index]
+            & previous.static_mask[0, previous_index]
+            & previous.geometry_consistency[0, previous_index]
+            & ~previous.sky_mask[0, previous_index]
+        ).to(device_depth.device)
+        current_semantic = (
+            current.finite_gaussian_mask[0, current_index]
+            & current.static_mask[0, current_index]
+            & current.geometry_consistency[0, current_index]
+            & ~current.sky_mask[0, current_index]
+        ).to(device_depth.device)
+
+        def render_valid(
+            depth: torch.Tensor,
+            alpha: torch.Tensor,
+            semantic: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                semantic
+                & torch.isfinite(depth)
+                & (depth > 0.0)
+                & torch.isfinite(alpha)
+                & (alpha >= self.rendered_alignment_alpha_threshold)
+            )
+
+        global_valid_base = render_valid(
+            global_depth, global_alpha, previous_semantic
+        )
+        previous_valid = render_valid(
+            previous_depth, previous_alpha, previous_semantic
+        )
+        current_valid = render_valid(
+            current_depth, current_alpha, current_semantic
+        )
+        previous_scale, _, _ = sim3_components(previous_owner_transform)
+        previous_world_depth = previous_depth * previous_scale.to(previous_depth)
+        consistency_error = (
+            (previous_world_depth - global_depth).abs()
+            / global_depth.abs().clamp_min(1.0e-6)
+        )
+        consistency_support = global_valid_base & previous_valid
+        consistency = (
+            consistency_support
+            & (
+                consistency_error
+                <= self.rendered_alignment_global_map_consistency_error
+            )
+        )
+        support_count = int(consistency_support.sum().item())
+        consistency_ratio = (
+            0.0
+            if support_count == 0
+            else float(consistency.sum().float().item() / support_count)
+        )
+        if (
+            consistency_ratio
+            < self.rendered_alignment_global_map_min_consistency_ratio
+        ):
+            raise RuntimeError(
+                f"Frame {frame_id} global/previous map consistency ratio "
+                f"{consistency_ratio:.3f} is below "
+                f"{self.rendered_alignment_global_map_min_consistency_ratio:.3f}"
+            )
+        global_valid = global_valid_base & consistency
+        seed = (
+            self.fibonacci_seed
+            + 1_000_003 * int(previous.window_id)
+            + 10_007 * int(current.window_id)
+            + 101 * int(frame_id)
+        ) & 0x7FFFFFFF
+        samples = sample_joint_valid_fibonacci_uv(
+            global_depth,
+            current_depth,
+            count=self.rendered_alignment_max_points_per_frame,
+            oversample_factor=self.fibonacci_oversample_factor,
+            min_depth=self.fibonacci_min_depth,
+            max_depth=self.fibonacci_max_depth,
+            source_valid=global_valid,
+            target_valid=current_valid,
+            source_sky_probability=previous.sky_prob[
+                0, previous_index
+            ].detach().to(device_depth),
+            target_sky_probability=current.sky_prob[
+                0, current_index
+            ].detach().to(device_depth),
+            sky_threshold=self.sky_threshold,
+            seed=seed,
+        )
+        count = int(samples.source_depth.numel())
+        if count < self.rendered_alignment_min_points_per_frame:
+            raise RuntimeError(
+                f"Frame {frame_id} has only {count} valid known-pose bridge points; "
+                f"{self.rendered_alignment_min_points_per_frame} required"
+            )
+        row = torch.arange(count, device=samples.bearing.device, dtype=torch.long)
+        hashed = (row * 1_103_515_245 + int(seed) * 12_345) & 0x7FFFFFFF
+        holdout = (hashed % self.rendered_alignment_holdout_stride) == 0
+        if not bool(holdout.any()):
+            holdout[-1] = True
+        if bool(holdout.all()):
+            holdout[0] = False
+        previous_local_pose = rebase_c2w_to_sim3_anchor(
+            previous_owner_transform.to(known_global_pose),
+            known_global_pose,
+        ).to(samples.bearing)
+        return KnownPoseBridgeFrame(
+            frame_id=int(frame_id),
+            previous_index=previous_index,
+            current_index=current_index,
+            bearing=samples.bearing.detach(),
+            uv=samples.uv.detach(),
+            global_depth=samples.source_depth.detach(),
+            current_depth=samples.target_depth.detach(),
+            source_depth_previous_owner=(
+                samples.source_depth / previous_scale.to(samples.source_depth)
+            ).detach(),
+            previous_local_pose=previous_local_pose.detach(),
+            current_local_pose=current.local_poses_c2w[current_index]
+            .to(samples.bearing)
+            .detach(),
+            known_global_pose=known_global_pose.to(samples.bearing).detach(),
+            holdout_mask=holdout,
+            inlier_mask=torch.ones(count, device=samples.bearing.device, dtype=torch.bool),
+            global_render=global_render,
+            previous_render=previous_render,
+            current_render=current_render,
+            global_valid_image=global_valid.detach(),
+            current_valid_image=current_valid.detach(),
+            global_previous_consistency_image=consistency.detach(),
+            sky_union_image=(
+                previous.sky_mask[0, previous_index]
+                | current.sky_mask[0, current_index].to(previous.sky_mask.device)
+            ).detach().to(device_depth.device),
+            global_previous_consistency_ratio=consistency_ratio,
+        )
+
+    def _collect_known_pose_bridge_frames(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        previous_owner_transform: torch.Tensor,
+        *,
+        exclude_current_target_only: bool,
+    ) -> list[KnownPoseBridgeFrame]:
+        overlap = self._overlap_frame_ids(previous, current)
+        if len(overlap) != 2:
+            raise RuntimeError("Known-pose bridge requires exactly two overlap frames")
+        return [
+            self._collect_known_pose_bridge_frame(
+                previous,
+                current,
+                frame_id,
+                previous_owner_transform=previous_owner_transform,
+                exclude_current_target_only=exclude_current_target_only,
+            )
+            for frame_id in overlap
+        ]
+
+    @staticmethod
+    def _bridge_balanced_weights(
+        frames: list[KnownPoseBridgeFrame],
+        masks: list[torch.Tensor],
+        robust_parts: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if len(frames) != len(masks) or not frames:
+            raise ValueError("Bridge weights require one mask per frame")
+        pieces: list[torch.Tensor] = []
+        frame_weight = 1.0 / float(len(frames))
+        for index, (frame, mask) in enumerate(zip(frames, masks)):
+            count = int(mask.sum().item())
+            if count <= 0:
+                raise ValueError(
+                    f"Bridge frame {frame.frame_id} has no selected samples"
+                )
+            values = (
+                torch.ones(
+                    count,
+                    device=frame.current_depth.device,
+                    dtype=frame.current_depth.dtype,
+                )
+                if robust_parts is None
+                else robust_parts[index].to(frame.current_depth)[mask]
+            ).clamp_min(0.0)
+            if not bool((values > 0.0).any()):
+                raise ValueError(
+                    f"Bridge frame {frame.frame_id} has no positive weights"
+                )
+            pieces.append(
+                frame_weight * values / values.sum().clamp_min(1.0e-8)
+            )
+        return torch.cat(pieces, dim=0)
+
+    def _estimate_known_pose_bridge_scale(
+        self,
+        frames: list[KnownPoseBridgeFrame],
+        previous_owner_transform: torch.Tensor,
+        *,
+        mode: str,
+    ) -> tuple[float | None, list[torch.Tensor], dict[str, Any]]:
+        if len(frames) != 2:
+            raise ValueError("Known-pose bridge scale requires two frames")
+        train_masks = [~frame.holdout_mask for frame in frames]
+        previous_scale = float(
+            sim3_components(previous_owner_transform)[0].detach().cpu()
+        )
+        per_frame_depth_scales = [
+            float(
+                (
+                    frame.global_depth[mask].clamp_min(1.0e-8).log()
+                    - frame.current_depth[mask].clamp_min(1.0e-8).log()
+                )
+                .median()
+                .exp()
+                .detach()
+                .cpu()
+            )
+            for frame, mask in zip(frames, train_masks)
+        ]
+        diagnostics: dict[str, Any] = {
+            "bridge_scale_mode": str(mode),
+            "bridge_previous_owner_scale": previous_scale,
+            "bridge_per_frame_depth_scale": per_frame_depth_scales,
+            "bridge_global_previous_consistency_ratio": [
+                frame.global_previous_consistency_ratio for frame in frames
+            ],
+        }
+        if mode == "depth":
+            log_ratio = torch.cat(
+                [
+                    frame.global_depth[mask].clamp_min(1.0e-8).log()
+                    - frame.current_depth[mask].clamp_min(1.0e-8).log()
+                    for frame, mask in zip(frames, train_masks)
+                ],
+                dim=0,
+            )
+            weights = self._bridge_balanced_weights(frames, train_masks)
+            estimate = (weights * log_ratio).sum() / weights.sum().clamp_min(
+                1.0e-8
+            )
+            for _ in range(self.rendered_alignment_irls_iterations):
+                residual = log_ratio - estimate
+                centered = residual - residual.median()
+                mad = centered.abs().median()
+                delta = (1.345 * 1.4826 * mad).clamp_min(1.0e-4)
+                huber = torch.minimum(
+                    torch.ones_like(residual),
+                    delta / residual.abs().clamp_min(1.0e-8),
+                )
+                robust_parts: list[torch.Tensor] = []
+                offset = 0
+                for frame, mask in zip(frames, train_masks):
+                    count = int(mask.sum().item())
+                    full = torch.zeros_like(frame.current_depth)
+                    full[mask] = huber[offset : offset + count]
+                    robust_parts.append(full)
+                    offset += count
+                weights = self._bridge_balanced_weights(
+                    frames, train_masks, robust_parts
+                )
+                estimate = (
+                    weights * log_ratio
+                ).sum() / weights.sum().clamp_min(1.0e-8)
+            absolute_scale = float(estimate.exp().detach().cpu())
+            frame_scale_disagreement = (
+                max(per_frame_depth_scales) / max(min(per_frame_depth_scales), 1.0e-8)
+                - 1.0
+            )
+            diagnostics["bridge_frame_scale_disagreement"] = float(
+                frame_scale_disagreement
+            )
+        elif mode == "pose_baseline":
+            global_baseline = float(
+                torch.linalg.norm(
+                    frames[1].known_global_pose[:3, 3]
+                    - frames[0].known_global_pose[:3, 3]
+                )
+                .detach()
+                .cpu()
+            )
+            local_baseline = float(
+                torch.linalg.norm(
+                    frames[1].current_local_pose[:3, 3]
+                    - frames[0].current_local_pose[:3, 3]
+                )
+                .detach()
+                .cpu()
+            )
+            diagnostics.update(
+                {
+                    "bridge_global_pose_baseline": global_baseline,
+                    "bridge_local_pose_baseline": local_baseline,
+                }
+            )
+            if (
+                global_baseline < self.rendered_alignment_pose_baseline_min
+                or local_baseline < self.rendered_alignment_pose_baseline_min
+            ):
+                diagnostics.update(
+                    {
+                        "accepted": False,
+                        "reason": "pose_baseline_degenerate",
+                    }
+                )
+                return None, [
+                    torch.zeros_like(frame.current_depth, dtype=torch.bool)
+                    for frame in frames
+                ], diagnostics
+            absolute_scale = global_baseline / local_baseline
+        else:
+            raise ValueError(f"Unsupported known-pose bridge scale mode {mode!r}")
+
+        relative_owner_scale = absolute_scale / max(previous_scale, 1.0e-8)
+        inlier_masks: list[torch.Tensor] = []
+        train_errors: list[torch.Tensor] = []
+        holdout_errors: list[torch.Tensor] = []
+        per_frame_ratios: list[float] = []
+        per_frame_medians: list[float] = []
+        for frame in frames:
+            error = (
+                (absolute_scale * frame.current_depth - frame.global_depth).abs()
+                / frame.global_depth.abs().clamp_min(1.0e-6)
+            )
+            inliers = (
+                error <= self.rendered_alignment_max_median_relative_error
+            )
+            inlier_masks.append(inliers)
+            train_errors.append(error[~frame.holdout_mask])
+            holdout_errors.append(error[frame.holdout_mask])
+            per_frame_ratios.append(float(inliers.float().mean().detach().cpu()))
+            per_frame_medians.append(float(error.median().detach().cpu()))
+        train_ratio = sum(
+            float(
+                (error <= self.rendered_alignment_max_median_relative_error)
+                .float()
+                .mean()
+                .detach()
+                .cpu()
+            )
+            for error in train_errors
+        ) / float(len(train_errors))
+        holdout_ratio = sum(
+            float(
+                (error <= self.rendered_alignment_max_median_relative_error)
+                .float()
+                .mean()
+                .detach()
+                .cpu()
+            )
+            for error in holdout_errors
+        ) / float(len(holdout_errors))
+        train_median = sum(
+            float(error.median().detach().cpu()) for error in train_errors
+        ) / float(len(train_errors))
+        holdout_median = sum(
+            float(error.median().detach().cpu()) for error in holdout_errors
+        ) / float(len(holdout_errors))
+        scale_ok = (
+            math.isfinite(absolute_scale)
+            and 1.0 / self.rendered_alignment_max_scale_change
+            <= relative_owner_scale
+            <= self.rendered_alignment_max_scale_change
+        )
+        depth_gate = (
+            train_ratio >= self.rendered_alignment_min_inlier_ratio
+            and holdout_ratio >= self.rendered_alignment_min_inlier_ratio
+            and train_median
+            <= self.rendered_alignment_max_median_relative_error
+            and holdout_median
+            <= self.rendered_alignment_max_median_relative_error
+        )
+        # Pose-baseline is an intentional ablation: rendered depth remains a
+        # diagnostic/factor selector but cannot change or veto its scale.
+        accepted = scale_ok and (depth_gate if mode == "depth" else True)
+        reason = (
+            "accepted"
+            if accepted
+            else ("scale_gate_rejected" if not scale_ok else "depth_gate_rejected")
+        )
+        diagnostics.update(
+            {
+                "absolute_scale": absolute_scale,
+                "s_absolute": absolute_scale,
+                "measurement_scale": relative_owner_scale,
+                "bridge_relative_owner_scale": relative_owner_scale,
+                "bridge_train_inlier_ratio": train_ratio,
+                "bridge_holdout_inlier_ratio": holdout_ratio,
+                "bridge_train_median_relative_error": train_median,
+                "bridge_holdout_median_relative_error": holdout_median,
+                "bridge_per_frame_inlier_ratio": per_frame_ratios,
+                "bridge_per_frame_median_relative_error": per_frame_medians,
+                "bridge_depth_gate_passed": bool(depth_gate),
+                "accepted": bool(accepted),
+                "reason": reason,
+            }
+        )
+        return (
+            absolute_scale if accepted else None,
+            inlier_masks,
+            diagnostics,
+        )
+
+    def _solve_known_pose_bridge(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        previous_owner_transform: torch.Tensor,
+    ) -> KnownPoseBridgeSolution:
+        started = time.perf_counter()
+        frames = self._collect_known_pose_bridge_frames(
+            previous,
+            current,
+            previous_owner_transform,
+            exclude_current_target_only=True,
+        )
+        mode = (
+            "depth"
+            if self.two_frame_bridge_depth_scale_enabled
+            else "pose_baseline"
+        )
+        scale, _, diagnostics = self._estimate_known_pose_bridge_scale(
+            frames,
+            previous_owner_transform,
+            mode=mode,
+        )
+        if scale is None:
+            diagnostics["alignment_seconds"] = float(
+                time.perf_counter() - started
+            )
+            raise RuntimeError(
+                "Known-pose bridge scale failed: "
+                f"{diagnostics.get('reason', 'unknown')}"
+            )
+        known_global_poses = (
+            frames[0].known_global_pose,
+            frames[1].known_global_pose,
+        )
+        owner = self._bridge_owner_from_first_pose(
+            scale,
+            current.local_poses_c2w[0],
+            known_global_poses[0],
+        )
+        corrected = self._canonicalize_packet_from_two_known_poses(
+            current,
+            owner,
+            known_global_poses,
+        )
+        relative_measurement = (
+            sim3_inverse(previous_owner_transform.to(owner)) @ owner
+        )
+        predicted = corrected.global_poses(owner.to(corrected.local_poses_c2w))
+        rotation_errors = [
+            self._rotation_error_deg(expected[:3, :3], actual[:3, :3])
+            for expected, actual in zip(known_global_poses, predicted[:2])
+        ]
+        center_errors = [
+            float(
+                torch.linalg.norm(expected[:3, 3] - actual[:3, 3])
+                .detach()
+                .cpu()
+            )
+            for expected, actual in zip(known_global_poses, predicted[:2])
+        ]
+        diagnostics.update(
+            {
+                "mode": self.rendered_overlap_alignment_mode,
+                "alignment_method": f"known_pose_bridge_{mode}",
+                "source_window_id": int(previous.window_id),
+                "target_window_id": int(current.window_id),
+                "overlap_frame_ids": [frame.frame_id for frame in frames],
+                "per_frame_valid_points": [
+                    int(frame.current_depth.numel()) for frame in frames
+                ],
+                "valid_points": sum(
+                    int(frame.current_depth.numel()) for frame in frames
+                ),
+                "bridge_shared_rotation_errors_deg": rotation_errors,
+                "bridge_shared_center_errors": center_errors,
+                "chunk_scale_normalization": 1.0,
+                "canonical_rotation_mismatch_deg": max(rotation_errors),
+                "canonical_translation_mismatch": max(center_errors),
+                "accepted": True,
+                "reason": "accepted",
+                "alignment_seconds": float(time.perf_counter() - started),
+                "render_seconds": sum(
+                    frame.global_render.render_seconds
+                    + frame.previous_render.render_seconds
+                    + frame.current_render.render_seconds
+                    for frame in frames
+                ),
+            }
+        )
+        return KnownPoseBridgeSolution(
+            packet=corrected,
+            owner_transform=owner.detach(),
+            relative_measurement=relative_measurement.detach(),
+            diagnostics=diagnostics,
+        )
+
+    def _set_known_pose_bridge_diagnostic(
+        self,
+        frames: list[KnownPoseBridgeFrame],
+        absolute_scale: float,
+        inlier_masks: list[torch.Tensor],
+    ) -> None:
+        panels: dict[str, list[torch.Tensor]] = {
+            "local_depth": [],
+            "aligned_local_depth": [],
+            "global_depth": [],
+            "relative_error": [],
+            "local_alpha": [],
+            "global_alpha": [],
+            "sky_mask": [],
+            "valid_mask": [],
+            "inlier_mask": [],
+        }
+        frame_ids: list[int] = []
+        for frame, inliers in zip(frames, inlier_masks):
+            local = frame.current_render.depth
+            global_depth = frame.global_render.depth.to(local)
+            aligned = local * float(absolute_scale)
+            relative_error = (
+                (aligned - global_depth).abs()
+                / global_depth.abs().clamp_min(1.0e-6)
+            )
+            inlier_image = torch.zeros_like(local, dtype=torch.bool)
+            if int(frame.uv.numel()) > 0 and bool(inliers.any()):
+                uv = frame.uv[inliers]
+                columns = torch.floor(uv[:, 0]).long().clamp(
+                    0, int(local.shape[-1]) - 1
+                )
+                rows = torch.floor(uv[:, 1]).long().clamp(
+                    0, int(local.shape[-2]) - 1
+                )
+                inlier_image[0, rows, columns] = True
+            panels["local_depth"].append(local.detach().cpu().float())
+            panels["aligned_local_depth"].append(
+                aligned.detach().cpu().float()
+            )
+            panels["global_depth"].append(
+                global_depth.detach().cpu().float()
+            )
+            panels["relative_error"].append(
+                relative_error.detach().cpu().float()
+            )
+            panels["local_alpha"].append(
+                frame.current_render.alpha.detach().cpu().float()
+            )
+            panels["global_alpha"].append(
+                frame.global_render.alpha.detach().cpu().float()
+            )
+            panels["sky_mask"].append(frame.sky_union_image.detach().cpu())
+            panels["valid_mask"].append(
+                (
+                    frame.global_valid_image
+                    & frame.current_valid_image
+                )
+                .detach()
+                .cpu()
+            )
+            panels["inlier_mask"].append(inlier_image.detach().cpu())
+            frame_ids.append(frame.frame_id)
+        self._last_rendered_overlap_diagnostic = {
+            name: torch.stack(values, dim=0)
+            for name, values in panels.items()
+        }
+        self._last_rendered_overlap_diagnostic["frame_ids"] = torch.tensor(
+            frame_ids, dtype=torch.long
+        )
+
+    def _known_pose_bridge_constraints(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        *,
+        previous_anchor_node: int,
+        current_anchor_node: int,
+        previous_owner_transform: torch.Tensor,
+        current_owner_transform: torch.Tensor,
+        alignment_diagnostics: dict[str, Any],
+    ) -> tuple[
+        Sim3GraphEdge,
+        tuple[DenseSphericalFactorBlock, ...],
+        tuple[CoincidentPanoramaFactor, ...],
+        dict[str, Any],
+    ]:
+        frames = self._collect_known_pose_bridge_frames(
+            previous,
+            current,
+            previous_owner_transform,
+            exclude_current_target_only=False,
+        )
+        absolute_scale = float(
+            sim3_components(current_owner_transform)[0].detach().cpu()
+        )
+        inlier_masks: list[torch.Tensor] = []
+        per_frame_ratio: list[float] = []
+        per_frame_median: list[float] = []
+        for frame in frames:
+            error = (
+                (absolute_scale * frame.current_depth - frame.global_depth).abs()
+                / frame.global_depth.abs().clamp_min(1.0e-6)
+            )
+            mask = error <= self.rendered_alignment_max_median_relative_error
+            inlier_masks.append(mask)
+            per_frame_ratio.append(float(mask.float().mean().detach().cpu()))
+            per_frame_median.append(float(error.median().detach().cpu()))
+        self._set_known_pose_bridge_diagnostic(
+            frames, absolute_scale, inlier_masks
+        )
+        measurement = (
+            sim3_inverse(previous_owner_transform.to(current_owner_transform))
+            @ current_owner_transform
+        )
+        total_inliers = sum(int(mask.sum().item()) for mask in inlier_masks)
+        confidence = min(
+            8.0,
+            max(1.0, math.sqrt(float(max(1, total_inliers)) / 64.0)),
+        )
+        information = measurement.new_tensor(
+            [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.75]
+        ) * confidence
+        diagnostics = dict(alignment_diagnostics)
+        diagnostics.update(
+            {
+                "post_refiner_per_frame_inlier_ratio": per_frame_ratio,
+                "post_refiner_per_frame_median_relative_error": per_frame_median,
+                "post_refiner_valid_points": sum(
+                    int(frame.current_depth.numel()) for frame in frames
+                ),
+                "post_refiner_depth_gate_passed": bool(
+                    min(per_frame_ratio, default=0.0)
+                    >= self.rendered_alignment_min_inlier_ratio
+                    and max(per_frame_median, default=float("inf"))
+                    <= self.rendered_alignment_max_median_relative_error
+                ),
+            }
+        )
+        edge = Sim3GraphEdge(
+            source=int(previous_anchor_node),
+            target=int(current_anchor_node),
+            measurement_target_to_source=measurement.detach(),
+            information_diag=information.detach(),
+            edge_type="overlap_known_pose_bridge_sim3",
+            metadata=dict(diagnostics),
+        )
+        dense_factors: list[DenseSphericalFactorBlock] = []
+        pose_factors: list[CoincidentPanoramaFactor] = []
+        for frame, strict_inliers in zip(frames, inlier_masks):
+            keep = strict_inliers
+            relaxed = False
+            if int(keep.sum().item()) < self.min_dense_factors:
+                if self.two_frame_bridge_depth_scale_enabled:
+                    raise RuntimeError(
+                        f"Frame {frame.frame_id} has insufficient post-Refiner "
+                        "depth inliers for bridge factors"
+                    )
+                # Pose-baseline is deliberately independent of rendered depth;
+                # keep all geometrically valid samples and let the graph's
+                # robust depth residual downweight disagreement.
+                keep = torch.ones_like(strict_inliers)
+                relaxed = True
+            frame_diagnostics = {
+                "source_window_id": int(previous.window_id),
+                "target_window_id": int(current.window_id),
+                "source_frame_id": int(frame.frame_id),
+                "target_frame_id": int(frame.frame_id),
+                "overlap_frame_id": int(frame.frame_id),
+                "num_matches": int(keep.sum().item()),
+                "alignment_method": diagnostics.get("alignment_method"),
+                "weight_mode": "equal_solid_angle_per_frame",
+                "pose_baseline_relaxed_depth_selection": relaxed,
+            }
+            dense_factors.append(
+                DenseSphericalFactorBlock(
+                    source=int(previous_anchor_node),
+                    target=int(current_anchor_node),
+                    source_local_pose=frame.previous_local_pose.detach(),
+                    target_local_pose=frame.current_local_pose.detach(),
+                    source_bearing=frame.bearing[keep].detach(),
+                    target_bearing=frame.bearing[keep].detach(),
+                    source_depth=frame.source_depth_previous_owner[keep].detach(),
+                    target_depth=frame.current_depth[keep].detach(),
+                    factor_weight=torch.ones(
+                        int(keep.sum().item()),
+                        device=frame.bearing.device,
+                        dtype=frame.bearing.dtype,
+                    ),
+                    depth_factor_weight=self.depth_factor_weight,
+                    s2_huber_delta_deg=self.s2_huber_delta_deg,
+                    use_depth=True,
+                    edge_type="overlap_known_pose_bridge_dense",
+                    **self._dense_factor_information_options(),
+                    metadata=frame_diagnostics,
+                )
+            )
+            pose_factors.append(
+                CoincidentPanoramaFactor(
+                    source=int(previous_anchor_node),
+                    target=int(current_anchor_node),
+                    source_local_pose=frame.previous_local_pose.detach(),
+                    target_local_pose=frame.current_local_pose.detach(),
+                    measured_source_to_target_rotation=torch.eye(
+                        3,
+                        device=frame.bearing.device,
+                        dtype=frame.bearing.dtype,
+                    ),
+                    center_weight=confidence,
+                    rotation_weight=confidence,
+                    edge_type="overlap_known_pose_bridge_pose_consistency",
+                    metadata=frame_diagnostics,
+                )
+            )
+        if len(dense_factors) != 2 or len(pose_factors) != 2:
+            raise RuntimeError("Known-pose bridge must create two overlap factors")
+        return edge, tuple(dense_factors), tuple(pose_factors), diagnostics
 
     def _collect_overlap_frame_geometry(
         self,
@@ -4413,6 +5513,9 @@ class SphericalSelfiGlobalBackend:
         if len(packet.frame_ids) < 2:
             raise ValueError("Boundary-frame graph requires at least two frames per window")
         refined_packet = self._validate_refined_packet(packet)
+        refiner_pending = bool(
+            packet.metadata.get("voxel_anchor_refiner_pending", False)
+        )
         if refined_packet:
             # Keep the frontend-owned packet immutable even for the first
             # chunk or for failures after alignment has succeeded.
@@ -4446,12 +5549,170 @@ class SphericalSelfiGlobalBackend:
                 "c": 1.0,
                 "accepted": True,
             }
+            if refiner_pending:
+                packet = self._finalize_pose_canonicalized_refiner_packet(packet)
         else:
             previous_id = int(self.window_order[-1])
             previous_packet = self._last_full_packet
             if previous_packet is None or int(previous_packet.window_id) != previous_id:
                 raise RuntimeError("The previous full-resolution window packet is unavailable")
-            if self.two_frame_overlap_enabled:
+            if self.two_frame_known_pose_bridge_enabled:
+                previous_anchor = self.window_anchor_nodes[previous_id]
+                previous_transform = self._window_anchor_transforms()[
+                    previous_id
+                ].to(packet.local_poses_c2w)
+                bridge_input_packet = packet
+                bridge = self._solve_known_pose_bridge(
+                    previous_packet,
+                    bridge_input_packet,
+                    previous_transform,
+                )
+                packet = self._finalize_pose_canonicalized_refiner_packet(
+                    bridge.packet
+                )
+                start_transform = bridge.owner_transform.to(
+                    packet.local_poses_c2w
+                )
+                alignment_diagnostics = dict(bridge.diagnostics)
+                if (
+                    self.two_frame_bridge_depth_scale_enabled
+                    and self.post_refiner_scale_recheck_enabled
+                ):
+                    post_frames = self._collect_known_pose_bridge_frames(
+                        previous_packet,
+                        packet,
+                        previous_transform,
+                        exclude_current_target_only=False,
+                    )
+                    post_scale, _, post_diagnostics = (
+                        self._estimate_known_pose_bridge_scale(
+                            post_frames,
+                            previous_transform,
+                            mode="depth",
+                        )
+                    )
+                    if post_scale is None:
+                        raise RuntimeError(
+                            "Post-Refiner bridge scale validation failed: "
+                            f"{post_diagnostics.get('reason', 'unknown')}"
+                        )
+                    pre_scale = float(
+                        sim3_components(start_transform)[0].detach().cpu()
+                    )
+                    relative_change = abs(post_scale / pre_scale - 1.0)
+                    alignment_diagnostics.update(
+                        {
+                            "post_refiner_scale": float(post_scale),
+                            "post_refiner_scale_relative_change": float(
+                                relative_change
+                            ),
+                            "post_refiner_scale_rerun": False,
+                            **{
+                                f"post_refiner_{key}": value
+                                for key, value in post_diagnostics.items()
+                                if key not in {"accepted", "reason"}
+                            },
+                        }
+                    )
+                    if (
+                        relative_change
+                        > self.post_refiner_scale_max_relative_change
+                    ):
+                        raise RuntimeError(
+                            "Post-Refiner scale changed by "
+                            f"{relative_change:.3f}, exceeding "
+                            f"{self.post_refiner_scale_max_relative_change:.3f}"
+                        )
+                    if (
+                        relative_change
+                        > self.post_refiner_scale_rerun_threshold
+                    ):
+                        known_global = (
+                            post_frames[0].known_global_pose,
+                            post_frames[1].known_global_pose,
+                        )
+                        start_transform = self._bridge_owner_from_first_pose(
+                            post_scale,
+                            bridge_input_packet.local_poses_c2w[0],
+                            known_global[0],
+                        ).to(packet.local_poses_c2w)
+                        rerun_packet = (
+                            self._canonicalize_packet_from_two_known_poses(
+                                bridge_input_packet,
+                                start_transform,
+                                known_global,
+                            )
+                        )
+                        packet = self._finalize_pose_canonicalized_refiner_packet(
+                            rerun_packet
+                        )
+                        alignment_diagnostics[
+                            "post_refiner_scale_rerun"
+                        ] = True
+                        alignment_diagnostics["absolute_scale"] = float(
+                            post_scale
+                        )
+                        alignment_diagnostics["s_absolute"] = float(post_scale)
+                        previous_scale = float(
+                            sim3_components(previous_transform)[0]
+                            .detach()
+                            .cpu()
+                        )
+                        alignment_diagnostics["measurement_scale"] = float(
+                            post_scale / previous_scale
+                        )
+                        final_frames = self._collect_known_pose_bridge_frames(
+                            previous_packet,
+                            packet,
+                            previous_transform,
+                            exclude_current_target_only=False,
+                        )
+                        final_scale, _, final_scale_diagnostics = (
+                            self._estimate_known_pose_bridge_scale(
+                                final_frames,
+                                previous_transform,
+                                mode="depth",
+                            )
+                        )
+                        if final_scale is None:
+                            raise RuntimeError(
+                                "Final post-Refiner scale validation failed: "
+                                f"{final_scale_diagnostics.get('reason', 'unknown')}"
+                            )
+                        final_relative_change = abs(
+                            final_scale / float(post_scale) - 1.0
+                        )
+                        alignment_diagnostics[
+                            "post_refiner_final_scale"
+                        ] = float(final_scale)
+                        alignment_diagnostics[
+                            "post_refiner_final_scale_relative_change"
+                        ] = float(final_relative_change)
+                        if (
+                            final_relative_change
+                            > self.post_refiner_scale_max_relative_change
+                        ):
+                            raise RuntimeError(
+                                "Final post-Refiner scale remained unstable: "
+                                f"{final_relative_change:.3f}"
+                            )
+                (
+                    sequential_overlap_edge,
+                    sequential_overlap_dense,
+                    sequential_overlap_pose,
+                    alignment_diagnostics,
+                ) = self._known_pose_bridge_constraints(
+                    previous_packet,
+                    packet,
+                    previous_anchor_node=previous_anchor,
+                    current_anchor_node=start_frame,
+                    previous_owner_transform=previous_transform,
+                    current_owner_transform=start_transform,
+                    alignment_diagnostics=alignment_diagnostics,
+                )
+                packet.metadata["global_alignment_local_scale"] = 1.0
+                aligned = True
+            elif self.two_frame_overlap_enabled:
                 previous_anchor = self.window_anchor_nodes[previous_id]
                 (
                     sequential_overlap_edge,
@@ -4720,7 +5981,14 @@ class SphericalSelfiGlobalBackend:
 
         old_window_transforms = self._window_anchor_transforms()
         pre_loop_nodes = {node: value.clone() for node, value in loop_graph.nodes.items()}
+        pre_boundary_graph_state = self._snapshot_graph_state(self.graph)
+        pre_submap_graph_state = self._snapshot_graph_state(self.submap_graph)
         graph_result: Sim3GraphOptimizeResult | None = None
+        seam_diagnostics: dict[str, Any] = {
+            "enabled": self.post_optimization_seam_check_enabled,
+            "accepted": True,
+            "factor_count": 0,
+        }
         recent_window_count = len(self.window_order) + 1
         should_optimize_recent = (
             (
@@ -4812,6 +6080,33 @@ class SphericalSelfiGlobalBackend:
             )
             self._has_run_global_ba = True
             self._sequential_edges_since_optimization = 0
+        if graph_result is not None and self.post_optimization_seam_check_enabled:
+            seam_diagnostics = self._overlap_seam_diagnostics()
+            if not bool(seam_diagnostics["accepted"]):
+                self._restore_graph_state(
+                    self.graph, pre_boundary_graph_state
+                )
+                self._restore_graph_state(
+                    self.submap_graph, pre_submap_graph_state
+                )
+                if accepted_loops:
+                    del loop_graph.edges[loop_edge_start:]
+                    for loop_result in accepted_loops:
+                        self.accepted_loop_pairs.discard(
+                            self._canonical_loop_pair(loop_result)
+                        )
+                        self._reject_loop_result(
+                            loop_result,
+                            "post_optimization_seam_check_rejected",
+                        )
+                    accepted_loops = []
+                graph_result = replace(
+                    graph_result,
+                    accepted=False,
+                    final_objective=graph_result.initial_objective,
+                    max_update_norm=0.0,
+                    reason="post_optimization_seam_check_rejected",
+                )
         if self.hierarchical_submaps_enabled and self._active_submap_id is not None:
             self._update_submap_local_geometry(self._active_submap_id)
         submap_frozen = self._freeze_active_submap_if_ready()
@@ -4833,6 +6128,55 @@ class SphericalSelfiGlobalBackend:
             prepare_start = time.perf_counter()
             prepared = self.fusion.prepare_packet_batch(packet, window_transform)
             prepare_seconds = float(time.perf_counter() - prepare_start)
+            support_requested = len(prepared.batch)
+            support_kept = support_requested
+            if (
+                self.insertion_dedup_require_new_frame_support
+                and self.window_order
+            ):
+                source_view_mask = packet.metadata.get(
+                    "voxel_anchor_source_view_mask"
+                )
+                if not torch.is_tensor(source_view_mask):
+                    raise RuntimeError(
+                        "New-frame-supported fusion requires the Refiner "
+                        "source-view support mask"
+                    )
+                if prepared.source_anchor_indices is None:
+                    raise RuntimeError(
+                        "New-frame-supported fusion requires source anchor indices"
+                    )
+                previous_packet = self._last_full_packet
+                if previous_packet is None:
+                    raise RuntimeError(
+                        "New-frame-supported fusion requires the previous packet"
+                    )
+                overlap_ids = set(
+                    self._overlap_frame_ids(previous_packet, packet)
+                )
+                new_indices = [
+                    index
+                    for index, frame_id in enumerate(packet.frame_ids)
+                    if int(frame_id) not in overlap_ids
+                ]
+                if not new_indices:
+                    raise RuntimeError(
+                        "The incoming packet has no non-overlap frame support"
+                    )
+                new_bits = sum(1 << int(index) for index in new_indices)
+                support = source_view_mask.to(
+                    device=prepared.source_anchor_indices.device,
+                    dtype=torch.long,
+                )
+                source_rows = prepared.source_anchor_indices.to(support.device)
+                keep_support = (
+                    support.index_select(0, source_rows) & int(new_bits)
+                ) != 0
+                selected = torch.nonzero(
+                    keep_support, as_tuple=False
+                ).flatten().to(prepared.batch.xyz.device)
+                prepared = prepared.index(selected)
+                support_kept = len(prepared.batch)
             hash_stats: dict[str, int | float] = {
                 "hash_requested": int(prepared.requested),
                 "hash_candidates": len(prepared.batch),
@@ -4842,6 +6186,11 @@ class SphericalSelfiGlobalBackend:
                 "hash_kept": len(prepared.batch),
                 "hash_radius_voxels": self.insertion_dedup_radius_voxels,
                 "hash_visibility_views": 0,
+                "new_frame_support_requested": support_requested,
+                "new_frame_support_kept": support_kept,
+                "new_frame_support_dropped": (
+                    support_requested - support_kept
+                ),
             }
             for level in range(len(self.fusion.voxel_sizes)):
                 level_incoming = int(
@@ -5032,6 +6381,7 @@ class SphericalSelfiGlobalBackend:
                     if window_id in self.window_to_submap
                     else 0
                 ),
+                "post_optimization_seam_check": seam_diagnostics,
             },
         )
         self.results.append(result)
@@ -5049,13 +6399,30 @@ class SphericalSelfiGlobalBackend:
         transaction = self._snapshot_boundary_transaction()
         try:
             return self._process_boundary_packet_impl(packet)
-        except Exception:
+        except Exception as exc:
             failure_diagnostic = self._last_rendered_overlap_diagnostic
             failure_alignment = self._last_overlap_alignment_failure
+            if (
+                failure_alignment is None
+                and self.two_frame_known_pose_bridge_enabled
+            ):
+                failure_alignment = {
+                    "mode": self.rendered_overlap_alignment_mode,
+                    "window_id": int(packet.window_id),
+                    "accepted": False,
+                    "reason": "known_pose_bridge_exception",
+                    "error": repr(exc),
+                }
             self._restore_boundary_transaction(transaction)
             self._last_rendered_overlap_diagnostic = failure_diagnostic
             self._last_overlap_alignment_failure = failure_alignment
             raise
+        finally:
+            if (
+                self._packet_uses_voxel_refiner(packet)
+                and self.packet_refiner_release is not None
+            ):
+                self.packet_refiner_release(int(packet.window_id))
 
     def process_packet(self, packet: LocalGaussianWindowPacket) -> GlobalWindowBackendResult:
         if self.boundary_frame_graph:

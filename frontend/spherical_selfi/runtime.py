@@ -297,6 +297,13 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.voxel_anchor_renderer: PFGS360Renderer | None = None
         self.voxel_anchor_config: VoxelAnchorConfig | None = None
         self.voxel_anchor_last_seconds = 0.0
+        # Full-resolution RGB/adapter tensors are kept only until the matching
+        # backend window has been pose-canonicalized.  The Refiner must see
+        # those canonical poses, so its learned iterations are deliberately
+        # deferred across the private frontend/backend packet boundary.
+        self._voxel_anchor_refiner_sidecars: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = {}
         if self.voxel_anchor_enabled:
             checkpoint = voxel_cfg.get("checkpoint")
             if not checkpoint:
@@ -531,6 +538,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.sky_mask_by_frame.clear()
         self._local_ba_diagnostics.clear()
         self._local_gaussian_windows.clear()
+        self._voxel_anchor_refiner_sidecars.clear()
         self.last_processed_frame_id = None
         self.last_window_frame_ids = None
         self._keyframe_decisions.clear()
@@ -1092,22 +1100,14 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         )
         return updated, published_cache, result, matching_sec, ba_sec
 
-    def _run_voxel_anchor_refiner(
+    def _prepare_voxel_anchor_inputs(
         self,
         observation,
         adapter_features: torch.Tensor,
         images: torch.Tensor,
         sky_prob: torch.Tensor | None,
-    ) -> VoxelAnchorObservation | None:
-        if not self.voxel_anchor_enabled:
-            return None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.voxel_anchor_config is not None
-        assert self.voxel_anchor_model is not None
-        assert self.voxel_anchor_renderer is not None
-        if self.head_device.type == "cuda":
-            torch.cuda.synchronize(self.head_device)
-        refiner_start = time.perf_counter()
-
         target_images = images.to(self.head_device)
         if tuple(target_images.shape[-2:]) != tuple(observation.image_size):
             batch, views = int(target_images.shape[0]), int(target_images.shape[1])
@@ -1125,6 +1125,79 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                     observation.image_size,
                 ).reshape(batch, views, 1, *observation.image_size)
             target_valid = target_valid & (resized_sky < self.sky_threshold)
+        return target_images, target_valid
+
+    @staticmethod
+    def _anchor_source_view_mask(
+        observation: VoxelAnchorObservation,
+    ) -> torch.Tensor:
+        """Return one compact bit mask describing each anchor's source views."""
+
+        result = torch.zeros(
+            observation.num_anchors,
+            device=observation.xyz.device,
+            dtype=torch.long,
+        )
+        membership = observation.membership
+        if int(membership.anchor_index.numel()) == 0:
+            return result
+        for view_index in range(observation.num_views):
+            selected = membership.anchor_index[
+                membership.source_view_index == int(view_index)
+            ]
+            if int(selected.numel()) > 0:
+                result[selected.unique()] |= 1 << int(view_index)
+        return result
+
+    def _voxelize_provisional_anchors(
+        self,
+        observation,
+        adapter_features: torch.Tensor,
+        images: torch.Tensor,
+        sky_prob: torch.Tensor | None,
+    ) -> VoxelAnchorObservation | None:
+        """Build the whole-chunk map used by the known-pose bridge only."""
+
+        if not self.voxel_anchor_enabled:
+            return None
+        assert self.voxel_anchor_config is not None
+        target_images, target_valid = self._prepare_voxel_anchor_inputs(
+            observation,
+            adapter_features,
+            images,
+            sky_prob,
+        )
+        with torch.inference_mode():
+            return voxelize_per_pixel_gaussians(
+                observation,
+                adapter_features.to(self.head_device),
+                target_images,
+                self.voxel_anchor_config,
+                valid_mask=target_valid,
+            ).detach_parameters()
+
+    def _run_voxel_anchor_refiner(
+        self,
+        observation,
+        adapter_features: torch.Tensor,
+        images: torch.Tensor,
+        sky_prob: torch.Tensor | None,
+    ) -> tuple[VoxelAnchorObservation | None, torch.Tensor | None]:
+        if not self.voxel_anchor_enabled:
+            return None, None
+        assert self.voxel_anchor_config is not None
+        assert self.voxel_anchor_model is not None
+        assert self.voxel_anchor_renderer is not None
+        if self.head_device.type == "cuda":
+            torch.cuda.synchronize(self.head_device)
+        refiner_start = time.perf_counter()
+
+        target_images, target_valid = self._prepare_voxel_anchor_inputs(
+            observation,
+            adapter_features,
+            images,
+            sky_prob,
+        )
 
         with torch.inference_mode():
             current = voxelize_per_pixel_gaussians(
@@ -1150,11 +1223,51 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 if iteration < self.voxel_anchor_config.iterations - 1:
                     current = current.detach_parameters()
                     hidden = hidden.detach()
+        source_view_mask = self._anchor_source_view_mask(current).detach()
         result = current.detach_for_backend()
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         self.voxel_anchor_last_seconds = float(time.perf_counter() - refiner_start)
-        return result
+        return result, source_view_mask
+
+    def refine_pose_canonicalized_packet(
+        self,
+        packet: LocalGaussianWindowPacket,
+    ) -> LocalGaussianWindowPacket:
+        """Run the learned Refiner only after backend bridge canonicalization."""
+
+        if not self.voxel_anchor_enabled:
+            return packet
+        sidecar = self._voxel_anchor_refiner_sidecars.get(int(packet.window_id))
+        if sidecar is None:
+            raise RuntimeError(
+                f"Missing deferred Refiner inputs for window {packet.window_id}"
+            )
+        adapter_features, images, sky_prob = sidecar
+        anchors, source_view_mask = self._run_voxel_anchor_refiner(
+            packet.observation,
+            adapter_features,
+            images,
+            sky_prob,
+        )
+        if anchors is None or source_view_mask is None:
+            raise RuntimeError("Deferred VoxelAnchorRefiner returned no anchors")
+        metadata = dict(packet.metadata)
+        metadata.update(
+            {
+                "voxel_anchor_refiner_requested": True,
+                "voxel_anchor_refiner_pending": False,
+                "voxel_anchor_refiner_enabled": True,
+                "voxel_anchor_refiner_stage": "post_bridge_final",
+                "voxel_anchor_count": anchors.num_anchors,
+                "voxel_anchor_refiner_seconds": self.voxel_anchor_last_seconds,
+                "voxel_anchor_source_view_mask": source_view_mask,
+            }
+        )
+        return replace(packet, anchor_observation=anchors, metadata=metadata)
+
+    def release_pose_canonicalized_refiner_inputs(self, window_id: int) -> None:
+        self._voxel_anchor_refiner_sidecars.pop(int(window_id), None)
 
     def _spherical_keyframe_decision(
         self,
@@ -1332,12 +1445,20 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             images,
             static_valid_mask=ba_valid,
         )
-        anchor_observation = self._run_voxel_anchor_refiner(
+        # Only voxelize here.  The learned Refiner runs after the backend has
+        # used the two overlap poses to canonicalize this packet's trajectory.
+        anchor_observation = self._voxelize_provisional_anchors(
             observation,
             dense,
             images,
             sky_prob,
         )
+        if self.voxel_anchor_enabled:
+            self._voxel_anchor_refiner_sidecars[int(self.window_index)] = (
+                dense.detach(),
+                images.detach(),
+                None if sky_prob is None else sky_prob.detach(),
+            )
         depth_shift_applied = bool(
             ba_result is not None
             and getattr(ba_result, "depth_affine_accepted", None) is not None
@@ -1431,7 +1552,12 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "dense_depth_shift_deferred": self.local_ba_defer_dense_affine,
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
                 "fibonacci": dict(self.fibonacci_config),
-                "voxel_anchor_refiner_enabled": self.voxel_anchor_enabled,
+                "voxel_anchor_refiner_requested": self.voxel_anchor_enabled,
+                "voxel_anchor_refiner_pending": self.voxel_anchor_enabled,
+                "voxel_anchor_refiner_enabled": False,
+                "voxel_anchor_refiner_stage": (
+                    "post_ba_provisional" if self.voxel_anchor_enabled else "disabled"
+                ),
                 "voxel_anchor_count": (
                     0 if anchor_observation is None else anchor_observation.num_anchors
                 ),

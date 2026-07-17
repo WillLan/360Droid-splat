@@ -1954,6 +1954,16 @@ class PanoDroidGSSlamSystem:
                 self.map,
                 mapper=self.mapper,
                 renderer=self.renderer,
+                pose_canonicalized_packet_refiner=getattr(
+                    self.frontend,
+                    "refine_pose_canonicalized_packet",
+                    None,
+                ),
+                packet_refiner_release=getattr(
+                    self.frontend,
+                    "release_pose_canonicalized_refiner_inputs",
+                    None,
+                ),
                 config=spherical_global_cfg,
             )
 
@@ -3079,6 +3089,30 @@ class PanoDroidGSSlamSystem:
                             "fallback_holdout_inlier_ratio",
                             "fallback_holdout_inlier_ratio",
                         ),
+                        ("bridge_previous_owner_scale", "bridge_previous_owner_scale"),
+                        ("bridge_relative_owner_scale", "bridge_relative_owner_scale"),
+                        ("bridge_train_inlier_ratio", "bridge_train_inlier_ratio"),
+                        ("bridge_holdout_inlier_ratio", "bridge_holdout_inlier_ratio"),
+                        (
+                            "bridge_train_median_relative_error",
+                            "bridge_train_median_relative_error",
+                        ),
+                        (
+                            "bridge_holdout_median_relative_error",
+                            "bridge_holdout_median_relative_error",
+                        ),
+                        ("bridge_global_pose_baseline", "bridge_global_pose_baseline"),
+                        ("bridge_local_pose_baseline", "bridge_local_pose_baseline"),
+                        ("post_refiner_scale", "post_refiner_scale"),
+                        (
+                            "post_refiner_scale_relative_change",
+                            "post_refiner_scale_relative_change",
+                        ),
+                        ("post_refiner_final_scale", "post_refiner_final_scale"),
+                        (
+                            "post_refiner_final_scale_relative_change",
+                            "post_refiner_final_scale_relative_change",
+                        ),
                     ):
                         value = alignment_diag.get(source_name)
                         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -3109,6 +3143,14 @@ class PanoDroidGSSlamSystem:
                         "fallback_per_frame_inlier_ratio",
                         "fallback_shared_rotation_errors_deg",
                         "fallback_shared_center_errors",
+                        "bridge_per_frame_depth_scale",
+                        "bridge_global_previous_consistency_ratio",
+                        "bridge_per_frame_inlier_ratio",
+                        "bridge_per_frame_median_relative_error",
+                        "bridge_shared_rotation_errors_deg",
+                        "bridge_shared_center_errors",
+                        "post_refiner_per_frame_inlier_ratio",
+                        "post_refiner_per_frame_median_relative_error",
                         "pose_frame_scale",
                         "pose_frame_rotation_deg",
                         "pose_frame_translation_norm",
@@ -3153,6 +3195,28 @@ class PanoDroidGSSlamSystem:
                             f"backend/selfi_{key}": float(value)
                             for key, value in result.fusion.items()
                             if isinstance(value, (int, float)) and not isinstance(value, bool)
+                        }
+                    )
+                    seam_diag = dict(
+                        result.diagnostics.get(
+                            "post_optimization_seam_check", {}
+                        )
+                        or {}
+                    )
+                    wandb_payload.update(
+                        {
+                            "backend/selfi_seam_check_accepted": int(
+                                bool(seam_diag.get("accepted", True))
+                            ),
+                            "backend/selfi_seam_check_factor_count": int(
+                                seam_diag.get("factor_count", 0)
+                            ),
+                            "backend/selfi_seam_check_max_rotation_deg": float(
+                                seam_diag.get("max_rotation_error_deg", 0.0)
+                            ),
+                            "backend/selfi_seam_check_max_center_error": float(
+                                seam_diag.get("max_center_error", 0.0)
+                            ),
                         }
                     )
                     logger._log_wandb_payload(

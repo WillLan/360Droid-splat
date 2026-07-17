@@ -594,12 +594,13 @@ def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> No
     assert float(gaussian_map._anchor_conf_accum[0]) > original_confidence
 
 
-def test_formal_runtime_config_keeps_new_path_disabled_by_default() -> None:
+def test_formal_runtime_config_enables_post_bridge_refiner_mainline() -> None:
     path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     voxel = config["VoxelAnchorRefiner"]
-    assert voxel["enabled"] is False
-    assert voxel["sha256"] is None
+    assert voxel["enabled"] is True
+    assert voxel["checkpoint"].endswith("/checkpoints/best_val_psnr.pt")
+    assert len(voxel["sha256"]) == 64
     assert voxel["adapter_dim"] == 24
     assert voxel["depth_boundaries"] == [5.0, 20.0, 40.0]
     assert voxel["voxel_sizes"] == [0.04, 0.08, 0.16, 0.32]
