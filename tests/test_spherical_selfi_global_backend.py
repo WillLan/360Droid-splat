@@ -1333,6 +1333,42 @@ def test_known_pose_bridge_recovers_scale_from_only_requested_source(
     assert all(float(mask.float().mean()) > 0.99 for mask in inliers)
 
 
+def test_known_pose_depth_bridge_accepts_consistent_two_frame_scale_with_surface_noise() -> None:
+    backend = _two_frame_boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"),
+        mode="two_frame_bridge_depth_scale",
+    )
+    noisy_frames: list[KnownPoseBridgeFrame] = []
+    for frame in _known_pose_bridge_geometry(absolute_scale=1.0):
+        row = torch.arange(frame.current_depth.numel())
+        multiplier = torch.where(
+            row.remainder(2) == 0,
+            torch.full_like(frame.current_depth, 0.85),
+            torch.full_like(frame.current_depth, 1.15),
+        )
+        global_depth = frame.current_depth * multiplier
+        noisy_frames.append(
+            replace(
+                frame,
+                global_depth=global_depth,
+                source_depth_previous_owner=global_depth,
+            )
+        )
+
+    scale, inliers, diagnostics = backend._estimate_known_pose_bridge_scale(
+        noisy_frames,
+        sim3_identity(),
+        mode="depth",
+    )
+
+    assert scale is not None
+    assert diagnostics["bridge_depth_gate_passed"] is False
+    assert diagnostics["bridge_depth_consensus_gate_passed"] is True
+    assert diagnostics["bridge_depth_consensus_fallback_used"] is True
+    assert diagnostics["bridge_frame_scale_disagreement"] < 1.0e-6
+    assert all(float(mask.float().mean()) > 0.99 for mask in inliers)
+
+
 def test_known_pose_bridge_canonicalization_pins_overlap_and_preserves_tail() -> None:
     poses = torch.eye(4).repeat(4, 1, 1)
     poses[:, 0, 3] = torch.tensor([0.0, 0.7, 1.1, 1.6])

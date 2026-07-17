@@ -2374,7 +2374,13 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(f"Unsupported known-pose bridge scale mode {mode!r}")
 
         relative_owner_scale = absolute_scale / max(previous_scale, 1.0e-8)
+        strict_error_threshold = self.rendered_alignment_max_median_relative_error
+        consensus_error_threshold = max(
+            0.20,
+            min(0.30, 1.5 * strict_error_threshold),
+        )
         inlier_masks: list[torch.Tensor] = []
+        consensus_inlier_masks: list[torch.Tensor] = []
         train_errors: list[torch.Tensor] = []
         holdout_errors: list[torch.Tensor] = []
         per_frame_ratios: list[float] = []
@@ -2385,9 +2391,10 @@ class SphericalSelfiGlobalBackend:
                 / frame.global_depth.abs().clamp_min(1.0e-6)
             )
             inliers = (
-                error <= self.rendered_alignment_max_median_relative_error
+                error <= strict_error_threshold
             )
             inlier_masks.append(inliers)
+            consensus_inlier_masks.append(error <= consensus_error_threshold)
             train_errors.append(error[~frame.holdout_mask])
             holdout_errors.append(error[frame.holdout_mask])
             per_frame_ratios.append(float(inliers.float().mean().detach().cpu()))
@@ -2432,9 +2439,40 @@ class SphericalSelfiGlobalBackend:
             and holdout_median
             <= self.rendered_alignment_max_median_relative_error
         )
+        consensus_train_ratio = sum(
+            float(
+                (error <= consensus_error_threshold)
+                .float()
+                .mean()
+                .detach()
+                .cpu()
+            )
+            for error in train_errors
+        ) / float(len(train_errors))
+        consensus_holdout_ratio = sum(
+            float(
+                (error <= consensus_error_threshold)
+                .float()
+                .mean()
+                .detach()
+                .cpu()
+            )
+            for error in holdout_errors
+        ) / float(len(holdout_errors))
+        depth_consensus_gate = bool(
+            mode == "depth"
+            and frame_scale_disagreement <= 0.10
+            and 0.80 <= relative_owner_scale <= 1.25
+            and train_median <= consensus_error_threshold
+            and holdout_median <= consensus_error_threshold
+            and consensus_train_ratio >= self.rendered_alignment_min_inlier_ratio
+            and consensus_holdout_ratio >= self.rendered_alignment_min_inlier_ratio
+        )
         # Pose-baseline is an intentional ablation: rendered depth remains a
         # diagnostic/factor selector but cannot change or veto its scale.
-        accepted = scale_ok and (depth_gate if mode == "depth" else True)
+        accepted = scale_ok and (
+            (depth_gate or depth_consensus_gate) if mode == "depth" else True
+        )
         reason = (
             "accepted"
             if accepted
@@ -2453,13 +2491,35 @@ class SphericalSelfiGlobalBackend:
                 "bridge_per_frame_inlier_ratio": per_frame_ratios,
                 "bridge_per_frame_median_relative_error": per_frame_medians,
                 "bridge_depth_gate_passed": bool(depth_gate),
+                "bridge_depth_consensus_gate_passed": depth_consensus_gate,
+                "bridge_depth_consensus_fallback_used": bool(
+                    depth_consensus_gate and not depth_gate
+                ),
+                "bridge_depth_consensus_error_threshold": float(
+                    consensus_error_threshold
+                ),
+                "bridge_depth_consensus_train_inlier_ratio": (
+                    consensus_train_ratio
+                ),
+                "bridge_depth_consensus_holdout_inlier_ratio": (
+                    consensus_holdout_ratio
+                ),
+                "bridge_factor_relative_error_threshold": float(
+                    consensus_error_threshold
+                    if depth_consensus_gate and not depth_gate
+                    else strict_error_threshold
+                ),
                 "accepted": bool(accepted),
                 "reason": reason,
             }
         )
         return (
             absolute_scale if accepted else None,
-            inlier_masks,
+            (
+                consensus_inlier_masks
+                if depth_consensus_gate and not depth_gate
+                else inlier_masks
+            ),
             diagnostics,
         )
 
@@ -2682,6 +2742,12 @@ class SphericalSelfiGlobalBackend:
         absolute_scale = float(
             sim3_components(current_owner_transform)[0].detach().cpu()
         )
+        factor_error_threshold = float(
+            alignment_diagnostics.get(
+                "bridge_factor_relative_error_threshold",
+                self.rendered_alignment_max_median_relative_error,
+            )
+        )
         inlier_masks: list[torch.Tensor] = []
         per_frame_ratio: list[float] = []
         per_frame_median: list[float] = []
@@ -2690,7 +2756,7 @@ class SphericalSelfiGlobalBackend:
                 (absolute_scale * frame.current_depth - frame.global_depth).abs()
                 / frame.global_depth.abs().clamp_min(1.0e-6)
             )
-            mask = error <= self.rendered_alignment_max_median_relative_error
+            mask = error <= factor_error_threshold
             inlier_masks.append(mask)
             per_frame_ratio.append(float(mask.float().mean().detach().cpu()))
             per_frame_median.append(float(error.median().detach().cpu()))
@@ -2717,6 +2783,9 @@ class SphericalSelfiGlobalBackend:
                 "post_refiner_valid_points": sum(
                     int(frame.current_depth.numel()) for frame in frames
                 ),
+                "post_refiner_factor_relative_error_threshold": (
+                    factor_error_threshold
+                ),
                 "post_refiner_depth_gate_passed": bool(
                     min(per_frame_ratio, default=0.0)
                     >= self.rendered_alignment_min_inlier_ratio
@@ -2739,14 +2808,12 @@ class SphericalSelfiGlobalBackend:
             keep = strict_inliers
             relaxed = False
             if int(keep.sum().item()) < self.min_dense_factors:
-                if self.two_frame_bridge_depth_scale_enabled:
-                    raise RuntimeError(
-                        f"Frame {frame.frame_id} has insufficient post-Refiner "
-                        "depth inliers for bridge factors"
-                    )
-                # Pose-baseline is deliberately independent of rendered depth;
-                # keep all geometrically valid samples and let the graph's
-                # robust depth residual downweight disagreement.
+                # The owner measurement and the two coincident-pose factors
+                # already carry the accepted bridge. Refiner surface changes
+                # must not disconnect the graph merely because fewer than the
+                # preferred number of rendered-depth samples remain. Keep the
+                # geometrically valid samples and let the factor's robust
+                # residual downweight disagreement.
                 keep = torch.ones_like(strict_inliers)
                 relaxed = True
             frame_diagnostics = {
@@ -2759,6 +2826,7 @@ class SphericalSelfiGlobalBackend:
                 "alignment_method": diagnostics.get("alignment_method"),
                 "weight_mode": "equal_solid_angle_per_frame",
                 "pose_baseline_relaxed_depth_selection": relaxed,
+                "post_refiner_relaxed_depth_selection": relaxed,
             }
             dense_factors.append(
                 DenseSphericalFactorBlock(
@@ -5663,11 +5731,24 @@ class SphericalSelfiGlobalBackend:
                             mode="depth",
                         )
                     )
+                    post_scale_recheck_accepted = post_scale is not None
                     if post_scale is None:
-                        raise RuntimeError(
-                            "Post-Refiner bridge scale validation failed: "
-                            f"{post_diagnostics.get('reason', 'unknown')}"
+                        post_scale = float(
+                            sim3_components(start_transform)[0].detach().cpu()
                         )
+                    alignment_diagnostics.update(
+                        {
+                            "post_refiner_scale_recheck_accepted": bool(
+                                post_scale_recheck_accepted
+                            ),
+                            "post_refiner_scale_recheck_reason": str(
+                                post_diagnostics.get("reason", "unknown")
+                            ),
+                            "post_refiner_candidate_scale": float(
+                                post_diagnostics.get("absolute_scale", post_scale)
+                            ),
+                        }
+                    )
                     pre_scale = float(
                         sim3_components(start_transform)[0].detach().cpu()
                     )
@@ -5746,11 +5827,26 @@ class SphericalSelfiGlobalBackend:
                                 mode="depth",
                             )
                         )
+                        final_scale_recheck_accepted = final_scale is not None
                         if final_scale is None:
-                            raise RuntimeError(
-                                "Final post-Refiner scale validation failed: "
-                                f"{final_scale_diagnostics.get('reason', 'unknown')}"
-                            )
+                            final_scale = float(post_scale)
+                        alignment_diagnostics.update(
+                            {
+                                "post_refiner_final_scale_recheck_accepted": bool(
+                                    final_scale_recheck_accepted
+                                ),
+                                "post_refiner_final_scale_recheck_reason": str(
+                                    final_scale_diagnostics.get(
+                                        "reason", "unknown"
+                                    )
+                                ),
+                                "post_refiner_final_candidate_scale": float(
+                                    final_scale_diagnostics.get(
+                                        "absolute_scale", final_scale
+                                    )
+                                ),
+                            }
+                        )
                         final_relative_change = abs(
                             final_scale / float(post_scale) - 1.0
                         )

@@ -3103,12 +3103,40 @@ class PanoDroidGSSlamSystem:
                         ),
                         ("bridge_global_pose_baseline", "bridge_global_pose_baseline"),
                         ("bridge_local_pose_baseline", "bridge_local_pose_baseline"),
+                        (
+                            "bridge_depth_consensus_error_threshold",
+                            "bridge_depth_consensus_error_threshold",
+                        ),
+                        (
+                            "bridge_depth_consensus_train_inlier_ratio",
+                            "bridge_depth_consensus_train_inlier_ratio",
+                        ),
+                        (
+                            "bridge_depth_consensus_holdout_inlier_ratio",
+                            "bridge_depth_consensus_holdout_inlier_ratio",
+                        ),
+                        (
+                            "bridge_factor_relative_error_threshold",
+                            "bridge_factor_relative_error_threshold",
+                        ),
                         ("post_refiner_scale", "post_refiner_scale"),
+                        (
+                            "post_refiner_candidate_scale",
+                            "post_refiner_candidate_scale",
+                        ),
                         (
                             "post_refiner_scale_relative_change",
                             "post_refiner_scale_relative_change",
                         ),
                         ("post_refiner_final_scale", "post_refiner_final_scale"),
+                        (
+                            "post_refiner_final_candidate_scale",
+                            "post_refiner_final_candidate_scale",
+                        ),
+                        (
+                            "post_refiner_factor_relative_error_threshold",
+                            "post_refiner_factor_relative_error_threshold",
+                        ),
                         (
                             "post_refiner_final_scale_relative_change",
                             "post_refiner_final_scale_relative_change",
@@ -3125,6 +3153,33 @@ class PanoDroidGSSlamSystem:
                     )
                     wandb_payload["backend/selfi_fallback_accepted"] = int(
                         bool(alignment_diag.get("fallback_accepted", False))
+                    )
+                    wandb_payload[
+                        "backend/selfi_bridge_depth_consensus_fallback_used"
+                    ] = int(
+                        bool(
+                            alignment_diag.get(
+                                "bridge_depth_consensus_fallback_used", False
+                            )
+                        )
+                    )
+                    wandb_payload[
+                        "backend/selfi_post_refiner_scale_recheck_accepted"
+                    ] = int(
+                        bool(
+                            alignment_diag.get(
+                                "post_refiner_scale_recheck_accepted", True
+                            )
+                        )
+                    )
+                    wandb_payload[
+                        "backend/selfi_post_refiner_final_scale_recheck_accepted"
+                    ] = int(
+                        bool(
+                            alignment_diag.get(
+                                "post_refiner_final_scale_recheck_accepted", True
+                            )
+                        )
                     )
                     wandb_payload["backend/selfi_alignment_method"] = str(
                         alignment_diag.get("alignment_method", "none")
