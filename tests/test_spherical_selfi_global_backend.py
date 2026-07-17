@@ -15,6 +15,7 @@ from backend.pano_gs.sim3_graph import (
     DenseSphericalFactorBlock,
     GlobalSim3FactorGraph,
     Sim3GraphEdge,
+    Sim3GraphOptimizeResult,
     s2_log_tangent_coordinates,
 )
 from backend.pano_gs.spherical_selfi_global import (
@@ -128,7 +129,12 @@ def _packet(
     )
 
 
-def _chunk_stride_backend(*, min_matches: int = 256, skip: bool = False):
+def _chunk_stride_backend(
+    *,
+    min_matches: int = 256,
+    skip: bool = False,
+    periodic: bool = False,
+):
     return SphericalSelfiGlobalBackend(
         PanoGaussianMap(config={}, device="cpu"),
         config={
@@ -136,7 +142,12 @@ def _chunk_stride_backend(*, min_matches: int = 256, skip: bool = False):
             "global_graph": {
                 "node_mode": "chunk_first_stride",
                 "expected_overlap_frames": 2,
-                "optimization_trigger": "loop_only",
+                "optimization_trigger": (
+                    "periodic_and_loop" if periodic else "loop_only"
+                ),
+                "optimization_start_nodes": 6,
+                "optimization_interval_edges": 3,
+                "active_nodes": 6,
                 "min_depth": 0.05,
                 "max_depth": 20.0,
                 "min_match_cosine": 0.2,
@@ -350,16 +361,16 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert window["stride"] == 2
     assert window["expected_overlap_frames"] == 2
     assert graph["optimization_start_nodes"] == 6
-    assert graph["optimization_interval_edges"] == 8
+    assert graph["optimization_interval_edges"] == 3
     assert graph["optimization_enabled"] is True
     assert graph["expected_overlap_frames"] == 2
     assert graph["node_mode"] == "chunk_first_stride"
-    assert graph["optimization_trigger"] == "loop_only"
+    assert graph["optimization_trigger"] == "periodic_and_loop"
     assert graph["chunk_stride"]["target_index"] == 2
     assert graph["chunk_stride"]["min_matches"] == 256
     assert graph["chunk_stride"]["max_holdout_angular_deg"] == 2.0
     assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
-    assert graph["skip_edge"]["enabled"] is True
+    assert graph["skip_edge"]["enabled"] is False
     assert graph["skip_edge"]["max_sequence_objective_ratio"] == 1.02
     assert graph["max_log_scale_update"] == pytest.approx(math.log(1.05))
     assert graph["normalize_dense_information_by_count"] is True
@@ -405,7 +416,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "enabled": True,
         "visible_only": True,
         "same_level_only": True,
-        "radius_voxels": 1.0,
+        "radius_voxels": 1.5,
         "compare_existing_only": True,
         "permanent_drop": True,
         "update_existing_statistics": True,
@@ -559,6 +570,88 @@ def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
     assert len(stride_edges) == 1
     assert stride_edges[0].use_depth is True
     assert stride_edges[0].depth_factor_weight > 0.0
+
+
+def test_chunk_first_periodic_ba_starts_at_six_nodes_then_runs_every_three_chunks(
+    monkeypatch,
+) -> None:
+    packets = [
+        _packet(
+            window_id,
+            torch.eye(4).repeat(4, 1, 1),
+            (
+                2 * window_id,
+                2 * window_id + 1,
+                2 * window_id + 2,
+                2 * window_id + 3,
+            ),
+            height=32,
+            width=64,
+        )
+        for window_id in range(8)
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        periodic=True,
+    )
+    monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
+    calls: list[dict[str, object]] = []
+
+    def record_periodic_optimize(active_node_ids=None, *, fixed_node_ids=None):
+        calls.append(
+            {
+                "active": tuple(int(node) for node in active_node_ids),
+                "fixed": tuple(sorted(int(node) for node in fixed_node_ids)),
+                "scale_locked": bool(backend.graph.lock_scale_updates),
+            }
+        )
+        return Sim3GraphOptimizeResult(
+            accepted=False,
+            iterations=0,
+            initial_objective=0.0,
+            final_objective=0.0,
+            max_update_norm=0.0,
+            optimized_node_ids=(),
+            reason="synthetic_no_update",
+            final_damping=float(backend.graph.damping),
+        )
+
+    monkeypatch.setattr(backend.graph, "optimize", record_periodic_optimize)
+    results = [backend.process_packet(packet) for packet in packets]
+
+    assert [index for index, result in enumerate(results) if result.graph] == [4, 7]
+    assert calls == [
+        {
+            "active": (0, 2, 4, 6, 8, 10),
+            "fixed": (0,),
+            "scale_locked": True,
+        },
+        {
+            "active": (6, 8, 10, 12, 14, 16),
+            "fixed": (6,),
+            "scale_locked": True,
+        },
+    ]
+    for result in (results[4], results[7]):
+        periodic = result.diagnostics["boundary_factor"][
+            "periodic_optimization"
+        ]
+        assert periodic["attempted"] is True
+        assert periodic["accepted"] is False
+        assert periodic["scale_locked"] is True
+        assert periodic["reason"] == "synthetic_no_update"
+    edge_types = [edge.edge_type for edge in backend.graph.edges]
+    assert edge_types.count("chunk_stride_dense_spherical") == 8
+    assert "chunk_skip_dense_spherical" not in edge_types
+    scales = [
+        float(sim3_components(backend.graph.transform(node))[0])
+        for node in sorted(backend.graph.nodes)
+    ]
+    assert scales == pytest.approx([scales[0]] * len(scales))
 
 
 def test_chunk_stride_holdout_validation_only_checks_affected_edges(

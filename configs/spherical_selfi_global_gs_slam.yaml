@@ -208,9 +208,9 @@ SphericalSelfiGlobalBackend:
     enabled: true
     visible_only: true
     same_level_only: true
-    # Ablation values: 1.0 / 1.25 / 1.5.  Keep 1.0 until the 20-frame
-    # coverage/map-growth sweep provides evidence for a larger radius.
-    radius_voxels: 1.0
+    # The four-view visible Hash uses the confirmed relaxed same-level radius.
+    # The 1.0 / 1.25 / 1.5 short-run configs remain available for ablations.
+    radius_voxels: 1.5
     compare_existing_only: true
     permanent_drop: true
     update_existing_statistics: true
@@ -249,7 +249,7 @@ SphericalSelfiGlobalBackend:
   global_graph:
     optimization_enabled: true
     node_mode: chunk_first_stride
-    optimization_trigger: loop_only
+    optimization_trigger: periodic_and_loop
     factor_mode: dense_spherical
     sampling: fibonacci_depth_filtered
     iterations: 8
@@ -268,7 +268,7 @@ SphericalSelfiGlobalBackend:
     dense_information_reference_count: 64
     recent_windows: 32
     optimization_start_nodes: 6
-    optimization_interval_edges: 8
+    optimization_interval_edges: 3
     active_nodes: 6
     allow_boundary_matching_fallback: false
     expected_overlap_frames: 2
@@ -288,7 +288,7 @@ SphericalSelfiGlobalBackend:
       max_holdout_relative_depth: 0.10
       postopt_worse_ratio: 1.05
     skip_edge:
-      enabled: true
+      enabled: false
       num_queries: 2048
       temperature: 0.07
       query_chunk_size: 32

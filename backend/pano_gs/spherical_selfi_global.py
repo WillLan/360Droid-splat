@@ -1297,7 +1297,17 @@ class SphericalSelfiGlobalBackend:
         *,
         include_window_id: int | None = None,
     ) -> list[int]:
-        """Return start/end graph nodes for the most recent configured windows."""
+        """Return the configured recent graph nodes for local optimization."""
+
+        if self.chunk_first_stride_graph:
+            # In chunk-first mode every boundary entry is already one canonical
+            # chunk node.  Selecting by windows would include the target node of
+            # the newest window as an extra seventh node when active_nodes=6.
+            return [
+                int(node)
+                for node in self.boundary_node_order
+                if int(node) in self.graph.nodes
+            ][-self.global_ba_active_nodes :]
 
         ordered_windows = list(self.window_order)
         if (
@@ -1308,16 +1318,7 @@ class SphericalSelfiGlobalBackend:
         selected = ordered_windows[-self.global_ba_active_nodes :]
         nodes: list[int] = []
         for window_id in selected:
-            if self.chunk_first_stride_graph:
-                packet = self.packets.get(int(window_id))
-                next_node = (
-                    None
-                    if packet is None
-                    or self.chunk_stride_target_index >= len(packet.frame_ids)
-                    else int(packet.frame_ids[self.chunk_stride_target_index])
-                )
-            else:
-                next_node = self.window_end_nodes.get(int(window_id))
+            next_node = self.window_end_nodes.get(int(window_id))
             for node in (
                 self.window_anchor_nodes.get(int(window_id)),
                 next_node,
@@ -8235,20 +8236,61 @@ class SphericalSelfiGlobalBackend:
             "factor_count": 0,
         }
         recent_window_count = len(self.window_order) + 1
-        should_optimize_recent = (
-            self.global_graph_optimization_enabled
-            and not self.chunk_first_stride_graph
-            and self.graph_optimization_trigger == "periodic_and_loop"
-            and (
+        periodic_start_ready = (
+            len(self.boundary_node_order) >= self.global_ba_start_nodes
+            if self.chunk_first_stride_graph
+            else (
                 recent_window_count >= self.global_ba_start_nodes
                 if self.two_frame_overlap_enabled
                 else len(self.boundary_node_order) >= self.global_ba_start_nodes
             )
+        )
+        should_optimize_recent = (
+            self.global_graph_optimization_enabled
+            and self.graph_optimization_trigger == "periodic_and_loop"
+            and periodic_start_ready
             and (
                 not self._has_run_global_ba
                 or self._sequential_edges_since_optimization >= self.global_ba_interval_edges
             )
         )
+
+        def optimize_recent_periodic_graph() -> Sim3GraphOptimizeResult:
+            active = (
+                self._recent_boundary_window_nodes(
+                    include_window_id=window_id
+                )
+                if self.two_frame_overlap_enabled
+                or self.chunk_first_stride_graph
+                else self.boundary_node_order[-self.global_ba_active_nodes :]
+            )
+            periodic_scale_lock = bool(self.graph.lock_scale_updates)
+            try:
+                if self.chunk_first_stride_graph:
+                    # Adjacent stride edges do not make per-node scale
+                    # independently observable.  Periodic local BA therefore
+                    # refines only R/t; accepted loop transactions retain their
+                    # separate bounded log-scale path.
+                    self.graph.lock_scale_updates = True
+                result = self.graph.optimize(
+                    active,
+                    fixed_node_ids={active[0]},
+                )
+            finally:
+                self.graph.lock_scale_updates = periodic_scale_lock
+            boundary_diagnostics["periodic_optimization"] = {
+                "trigger": "recent_chunk_cadence",
+                "active_node_ids": [int(node) for node in active],
+                "fixed_node_id": int(active[0]),
+                "scale_locked": bool(self.chunk_first_stride_graph),
+                "attempted": True,
+                "accepted": bool(result.accepted),
+                "reason": str(result.reason),
+            }
+            self._has_run_global_ba = True
+            self._sequential_edges_since_optimization = 0
+            return result
+
         if accepted_loops and not self.global_graph_optimization_enabled:
             for loop_result in accepted_loops:
                 self.accepted_loop_pairs.add(
@@ -8344,18 +8386,7 @@ class SphericalSelfiGlobalBackend:
                     reason="loop_transaction_rejected",
                 )
                 if should_optimize_recent:
-                    active = (
-                        self._recent_boundary_window_nodes(
-                            include_window_id=window_id
-                        )
-                        if self.two_frame_overlap_enabled
-                        else self.boundary_node_order[
-                            -self.global_ba_active_nodes :
-                        ]
-                    )
-                    graph_result = self.graph.optimize(active, fixed_node_ids={active[0]})
-                    self._has_run_global_ba = True
-                    self._sequential_edges_since_optimization = 0
+                    graph_result = optimize_recent_periodic_graph()
         elif (
             skip_factor_added
             and self.chunk_first_stride_graph
@@ -8452,19 +8483,7 @@ class SphericalSelfiGlobalBackend:
                     reason="chunk_cycle_transaction_rejected",
                 )
         elif should_optimize_recent:
-            active = (
-                self._recent_boundary_window_nodes(
-                    include_window_id=window_id
-                )
-                if self.two_frame_overlap_enabled
-                else self.boundary_node_order[-self.global_ba_active_nodes :]
-            )
-            graph_result = self.graph.optimize(
-                active,
-                fixed_node_ids={active[0]},
-            )
-            self._has_run_global_ba = True
-            self._sequential_edges_since_optimization = 0
+            graph_result = optimize_recent_periodic_graph()
         chunk_scale_diagnostics: dict[str, Any] = {
             "enabled": bool(self.chunk_first_stride_graph),
             "accepted": True,
