@@ -212,9 +212,6 @@ class GlobalSim3FactorGraph:
         max_iterations: int = 8,
         pcg_iterations: int = 64,
         pcg_tolerance: float = 1.0e-6,
-        max_translation_update: float = 1.0,
-        max_rotation_update_deg: float = 10.0,
-        max_log_scale_update: float = 0.25,
         lm_max_trials: int = 6,
         lm_acceptance_eta: float = 1.0e-4,
         lm_damping_min: float = 1.0e-8,
@@ -232,9 +229,6 @@ class GlobalSim3FactorGraph:
         self.max_iterations = max(1, int(max_iterations))
         self.pcg_iterations = max(1, int(pcg_iterations))
         self.pcg_tolerance = float(pcg_tolerance)
-        self.max_translation_update = float(max_translation_update)
-        self.max_rotation_update = math.radians(float(max_rotation_update_deg))
-        self.max_log_scale_update = float(max_log_scale_update)
         self.lm_max_trials = max(1, int(lm_max_trials))
         self.lm_acceptance_eta = float(lm_acceptance_eta)
         self.lm_damping_min = float(lm_damping_min)
@@ -948,17 +942,6 @@ class GlobalSim3FactorGraph:
                 )
                 if not bool(torch.isfinite(update).all()):
                     return failure("non_finite_step")
-                translation_norm = update[:, :3].norm(dim=-1).clamp_min(1.0e-8)
-                rotation_norm = update[:, 3:6].norm(dim=-1).clamp_min(1.0e-8)
-                update[:, :3] *= torch.minimum(
-                    torch.ones_like(translation_norm),
-                    translation_norm.new_tensor(self.max_translation_update) / translation_norm,
-                )[:, None]
-                update[:, 3:6] *= torch.minimum(
-                    torch.ones_like(rotation_norm),
-                    rotation_norm.new_tensor(self.max_rotation_update) / rotation_norm,
-                )[:, None]
-                update[:, 6].clamp_(-self.max_log_scale_update, self.max_log_scale_update)
                 update_norm = float(update.norm())
                 if update_norm < 1.0e-9:
                     termination_reason = "converged_step"

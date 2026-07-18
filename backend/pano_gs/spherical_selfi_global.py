@@ -298,9 +298,6 @@ class SphericalSelfiGlobalBackend:
         self.global_graph_optimization_enabled = bool(
             graph_cfg.get("optimization_enabled", True)
         )
-        self.enforce_post_optimization_validation = bool(
-            graph_cfg.get("enforce_post_optimization_validation", False)
-        )
         loop_cfg = dict(self.config.get("loop_closure", {}) or {})
         descriptor_cfg = dict(loop_cfg.get("descriptor", {}) or {})
         retrieval_cfg = dict(loop_cfg.get("retrieval", {}) or {})
@@ -692,40 +689,16 @@ class SphericalSelfiGlobalBackend:
         self.chunk_stride_target_index = max(
             1, int(stride_cfg.get("target_index", 2))
         )
-        self.chunk_stride_min_matches = max(
-            3, int(stride_cfg.get("min_matches", 256))
-        )
         self.chunk_stride_holdout_stride = max(
             2, int(stride_cfg.get("holdout_stride", 5))
         )
         self.chunk_stride_irls_iterations = max(
             1, int(stride_cfg.get("irls_iterations", 5))
         )
-        self.chunk_stride_min_inlier_ratio = float(
-            stride_cfg.get("min_inlier_ratio", 0.35)
-        )
-        self.chunk_stride_covariance_min_ratio = float(
-            stride_cfg.get("covariance_min_ratio", 1.0e-4)
-        )
-        self.chunk_stride_max_scale_change = float(
-            stride_cfg.get("max_scale_change", 2.5)
-        )
-        self.chunk_stride_max_rotation_error_deg = float(
-            stride_cfg.get("max_rotation_error_deg", 5.0)
-        )
-        self.chunk_stride_max_translation_error = float(
-            stride_cfg.get("max_translation_error", 1.0)
-        )
-        self.chunk_stride_max_holdout_relative_depth = float(
-            stride_cfg.get("max_holdout_relative_depth", 0.10)
-        )
-        self.chunk_stride_postopt_worse_ratio = max(
-            1.0, float(stride_cfg.get("postopt_worse_ratio", 1.05))
-        )
         skip_cfg = dict(graph_cfg.get("skip_edge", {}) or {})
         self.chunk_skip_enabled = bool(skip_cfg.get("enabled", False))
         self.chunk_skip_num_queries = max(
-            self.chunk_stride_min_matches,
+            3,
             int(skip_cfg.get("num_queries", 2048)),
         )
         self.chunk_skip_temperature = float(skip_cfg.get("temperature", 0.07))
@@ -750,12 +723,6 @@ class SphericalSelfiGlobalBackend:
         self.chunk_skip_subpixel_refine_radius = max(
             0, min(4, int(skip_cfg.get("subpixel_refine_radius", 1)))
         )
-        self.chunk_cycle_sequence_objective_ratio = max(
-            1.0, float(skip_cfg.get("max_sequence_objective_ratio", 1.02))
-        )
-        self.chunk_cycle_max_cumulative_scale = max(
-            1.0, float(skip_cfg.get("max_cumulative_scale_change", 1.25))
-        )
         self.graph_optimization_trigger = str(
             graph_cfg.get("optimization_trigger", "periodic_and_loop")
         ).strip().lower()
@@ -777,10 +744,6 @@ class SphericalSelfiGlobalBackend:
                     "The supported size=4/stride=2 graph requires "
                     "global_graph.chunk_stride.target_index=2"
                 )
-            if not 0.0 <= self.chunk_stride_min_inlier_ratio <= 1.0:
-                raise ValueError("chunk_stride.min_inlier_ratio must be in [0, 1]")
-            if self.chunk_stride_max_scale_change < 1.0:
-                raise ValueError("chunk_stride.max_scale_change must be >= 1")
         if self.two_frame_overlap_enabled:
             if not self.boundary_frame_graph:
                 raise ValueError(
@@ -870,12 +833,6 @@ class SphericalSelfiGlobalBackend:
         self.post_optimization_seam_check_enabled = bool(
             seam_check_cfg.get("enabled", False)
         )
-        self.post_optimization_seam_max_rotation_deg = float(
-            seam_check_cfg.get("max_rotation_error_deg", 2.0)
-        )
-        self.post_optimization_seam_max_center_error = float(
-            seam_check_cfg.get("max_center_error", 0.15)
-        )
         self.robust_loop_mode = str(robust_loop_cfg.get("mode", "off")).lower()
         if self.robust_loop_mode not in {"off", "dcs"}:
             raise ValueError("robust_loop.mode must be 'off' or 'dcs'")
@@ -919,9 +876,6 @@ class SphericalSelfiGlobalBackend:
             max_iterations=int(graph_cfg.get("iterations", 8)),
             pcg_iterations=int(graph_cfg.get("pcg_iterations", 64)),
             pcg_tolerance=float(graph_cfg.get("pcg_tolerance", 1.0e-6)),
-            max_translation_update=float(graph_cfg.get("max_translation_update", 1.0)),
-            max_rotation_update_deg=float(graph_cfg.get("max_rotation_update_deg", 10.0)),
-            max_log_scale_update=float(graph_cfg.get("max_log_scale_update", 0.25)),
             lm_max_trials=int(graph_cfg.get("lm_max_trials", 6)),
             lm_acceptance_eta=float(graph_cfg.get("lm_acceptance_eta", 1.0e-4)),
             lm_damping_min=float(graph_cfg.get("lm_damping_min", 1.0e-8)),
@@ -954,9 +908,6 @@ class SphericalSelfiGlobalBackend:
                 pcg_tolerance=float(
                     hierarchical_cfg.get("pcg_tolerance", graph_cfg.get("pcg_tolerance", 1.0e-6))
                 ),
-                max_translation_update=float(graph_cfg.get("max_translation_update", 1.0)),
-                max_rotation_update_deg=float(graph_cfg.get("max_rotation_update_deg", 10.0)),
-                max_log_scale_update=float(graph_cfg.get("max_log_scale_update", 0.25)),
                 lm_max_trials=int(graph_cfg.get("lm_max_trials", 6)),
                 lm_acceptance_eta=float(graph_cfg.get("lm_acceptance_eta", 1.0e-4)),
                 lm_damping_min=float(graph_cfg.get("lm_damping_min", 1.0e-8)),
@@ -1516,18 +1467,15 @@ class SphericalSelfiGlobalBackend:
             factor_count += 1
         max_rotation = max(rotation_errors, default=0.0)
         max_center = max(center_errors, default=0.0)
-        accepted = (
-            max_rotation <= self.post_optimization_seam_max_rotation_deg
-            and max_center <= self.post_optimization_seam_max_center_error
-        )
         return {
             "enabled": self.post_optimization_seam_check_enabled,
+            "quality_gating_enabled": False,
             "factor_count": factor_count,
             "max_rotation_error_deg": max_rotation,
             "max_center_error": max_center,
             "rotation_errors_deg": rotation_errors,
             "center_errors": center_errors,
-            "accepted": bool(accepted),
+            "accepted": True,
         }
 
     @staticmethod
@@ -4951,21 +4899,25 @@ class SphericalSelfiGlobalBackend:
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Give each cached query direction exactly half of the edge weight."""
+        """Balance available query directions without requiring both sides."""
 
         weights = torch.zeros(
             int(direction.numel()),
             device=direction.device,
             dtype=dtype,
         )
-        for value in (0, 1):
+        present = [
+            value
+            for value in (0, 1)
+            if bool((selected & (direction == value)).any())
+        ]
+        if not present:
+            raise RuntimeError("Chunk-stride weights require at least one row")
+        direction_weight = 1.0 / float(len(present))
+        for value in present:
             rows = selected & (direction == value)
             count = int(rows.sum().item())
-            if count == 0:
-                raise RuntimeError(
-                    "Chunk-stride initialization requires both 0->2 and 2->0 matches"
-                )
-            weights[rows] = 0.5 / float(count)
+            weights[rows] = direction_weight / float(count)
         return weights
 
     @staticmethod
@@ -4976,7 +4928,7 @@ class SphericalSelfiGlobalBackend:
         target_frame: int,
         stride: int,
     ) -> torch.Tensor:
-        """Return a deterministic 80/20-style split in each query direction."""
+        """Return a deterministic split for every available query direction."""
 
         count = int(direction.numel())
         rows = torch.arange(count, device=direction.device, dtype=torch.int64)
@@ -4987,16 +4939,20 @@ class SphericalSelfiGlobalBackend:
             + direction.to(torch.int64) * 97
         )
         holdout = (hashed.remainder(int(stride))) == 0
-        for value in (0, 1):
+        for value in torch.unique(direction).tolist():
             members = torch.nonzero(direction == value, as_tuple=False).flatten()
             if int(members.numel()) < 2:
-                raise RuntimeError(
-                    "Chunk-stride validation requires at least two matches per direction"
-                )
+                holdout[members] = False
+                continue
             if not bool(holdout.index_select(0, members).any()):
                 holdout[members[-1]] = True
             if bool(holdout.index_select(0, members).all()):
                 holdout[members[0]] = False
+        # Umeyama needs at least three optimization rows. With very sparse
+        # support, prefer using every finite correspondence over manufacturing
+        # a holdout that would make the dense edge impossible to construct.
+        if int((~holdout).sum().item()) < 3:
+            holdout.zero_()
         return holdout
 
     @staticmethod
@@ -5039,6 +4995,69 @@ class SphericalSelfiGlobalBackend:
         occupied = torch.unique(latitude_bin * 8 + longitude_bin)
         return float(occupied.numel()) / 24.0
 
+    def _chunk_stride_pose_fallback(
+        self,
+        packet: LocalGaussianWindowPacket,
+        *,
+        target_index: int,
+        edge_type: str,
+        diagnostics: dict[str, Any],
+    ) -> tuple[Sim3GraphEdge, torch.Tensor, None, dict[str, Any]]:
+        """Keep the chunk graph connected with canonical BA odometry.
+
+        The fallback is used only when a finite dense S2+depth factor cannot be
+        formed. It deliberately carries no scale information: packet overlap
+        depth has already canonicalized the local unit and pure-chain node
+        scale remains graph-owned.
+        """
+
+        if not 0 < int(target_index) < len(packet.frame_ids):
+            raise RuntimeError(
+                "Chunk-stride BA fallback target index is outside the packet"
+            )
+        source_pose = packet.local_poses_c2w[0]
+        target_pose = packet.local_poses_c2w[int(target_index)]
+        relative_pose = canonicalize_c2w(
+            invert_c2w(source_pose) @ target_pose
+        )
+        if tuple(relative_pose.shape) != (4, 4) or not bool(
+            torch.isfinite(relative_pose).all()
+        ):
+            raise RuntimeError(
+                "Chunk-stride BA fallback requires a finite canonical pose"
+            )
+        measurement = sim3_from_components(
+            1.0,
+            relative_pose[:3, :3],
+            relative_pose[:3, 3],
+        )
+        metadata = dict(diagnostics)
+        metadata.update(
+            {
+                "accepted": True,
+                "quality_gating_enabled": False,
+                "fallback_used": True,
+                "fallback_reason": str(
+                    diagnostics.get("reason", "dense_factor_unavailable")
+                ),
+                "reason": "canonical_ba_pose_fallback",
+                "factor_representation": "sim3_pose_fallback",
+                "source_frame_id": int(packet.frame_ids[0]),
+                "target_frame_id": int(packet.frame_ids[int(target_index)]),
+            }
+        )
+        factor = Sim3GraphEdge(
+            source=int(packet.frame_ids[0]),
+            target=int(packet.frame_ids[int(target_index)]),
+            measurement_target_to_source=measurement.detach(),
+            information_diag=measurement.new_tensor(
+                [0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 0.0]
+            ),
+            edge_type=str(edge_type),
+            metadata=metadata,
+        )
+        return factor, measurement.detach(), None, metadata
+
     def _chunk_stride_factor(
         self,
         packet: LocalGaussianWindowPacket,
@@ -5047,8 +5066,9 @@ class SphericalSelfiGlobalBackend:
         expected_target_index: int | None = None,
         validate_local_ba: bool = True,
         reference_measurement: torch.Tensor | None = None,
+        allow_pose_fallback: bool = True,
     ) -> tuple[
-        DenseSphericalFactorBlock | None,
+        DenseSphericalFactorBlock | Sim3GraphEdge | None,
         torch.Tensor | None,
         ChunkStrideHoldout | None,
         dict[str, Any],
@@ -5056,8 +5076,15 @@ class SphericalSelfiGlobalBackend:
         """Fit one independently matched chunk-anchor S²+depth factor."""
 
         matches = packet.chunk_stride_matches
+        fallback_target_index = int(
+            self.chunk_stride_target_index
+            if expected_target_index is None
+            else expected_target_index
+        )
         target_index = (
-            -1 if matches is None else int(matches.target_index)
+            fallback_target_index
+            if matches is None
+            else int(matches.target_index)
         )
         ba_residual = packet.metadata.get(
             "local_ba_final_median_residual_deg"
@@ -5065,21 +5092,29 @@ class SphericalSelfiGlobalBackend:
         ba_trust_touched = bool(
             packet.metadata.get("local_ba_trust_region_touched", False)
         )
-        if validate_local_ba and (
-            packet.metadata.get("local_ba_accepted") is False
-            or ba_trust_touched
-            or ba_residual is None
-            or not math.isfinite(float(ba_residual))
-            or float(ba_residual) > 5.0
-        ):
-            return None, None, None, {
-                "reason": "local_ba_quality_gate_rejected",
-                "local_ba_accepted": packet.metadata.get("local_ba_accepted"),
-                "local_ba_final_median_residual_deg": ba_residual,
-                "local_ba_trust_region_touched": ba_trust_touched,
-            }
+        ba_quality_diagnostic = {
+            "local_ba_validation_requested": bool(validate_local_ba),
+            "local_ba_accepted": packet.metadata.get("local_ba_accepted"),
+            "local_ba_final_median_residual_deg": ba_residual,
+            "local_ba_trust_region_touched": ba_trust_touched,
+            "quality_gating_enabled": False,
+        }
         if matches is None:
-            return None, None, None, {"reason": "chunk_stride_matches_unavailable"}
+            diagnostics = {
+                **ba_quality_diagnostic,
+                "reason": "chunk_stride_matches_unavailable",
+                "raw_chunk_stride_matches": 0,
+                "hard_gated_chunk_stride_matches": 0,
+                "edge_type": str(edge_type),
+            }
+            if allow_pose_fallback:
+                return self._chunk_stride_pose_fallback(
+                    packet,
+                    target_index=fallback_target_index,
+                    edge_type=edge_type,
+                    diagnostics=diagnostics,
+                )
+            return None, None, None, diagnostics
         if (
             int(matches.source_index) != 0
             or target_index >= len(packet.frame_ids)
@@ -5089,11 +5124,20 @@ class SphericalSelfiGlobalBackend:
                 and target_index != int(expected_target_index)
             )
         ):
-            return None, None, None, {
+            diagnostics = {
+                **ba_quality_diagnostic,
                 "reason": "unexpected_chunk_stride_match_indices",
                 "source_index": int(matches.source_index),
                 "target_index": int(matches.target_index),
             }
+            if allow_pose_fallback:
+                return self._chunk_stride_pose_fallback(
+                    packet,
+                    target_index=fallback_target_index,
+                    edge_type=edge_type,
+                    diagnostics=diagnostics,
+                )
+            return None, None, None, diagnostics
 
         source_depth = sample_erp_with_wrap(
             packet.observation.refined_depth[0, 0], matches.source_uv
@@ -5142,6 +5186,7 @@ class SphericalSelfiGlobalBackend:
         source_frame = int(packet.frame_ids[0])
         target_frame = int(packet.frame_ids[target_index])
         diagnostics: dict[str, Any] = {
+            **ba_quality_diagnostic,
             "source_window_id": int(packet.window_id),
             "target_window_id": int(packet.window_id),
             "source_frame_id": source_frame,
@@ -5159,8 +5204,15 @@ class SphericalSelfiGlobalBackend:
             "edge_type": str(edge_type),
             "independent_correspondences": True,
         }
-        if int(keep.sum().item()) < self.chunk_stride_min_matches:
-            diagnostics["reason"] = "insufficient_chunk_stride_matches"
+        if int(keep.sum().item()) < 3:
+            diagnostics["reason"] = "insufficient_finite_chunk_stride_matches"
+            if allow_pose_fallback:
+                return self._chunk_stride_pose_fallback(
+                    packet,
+                    target_index=fallback_target_index,
+                    edge_type=edge_type,
+                    diagnostics=diagnostics,
+                )
             return None, None, None, diagnostics
 
         direction = matches.query_direction[keep].to(source_depth.device).long()
@@ -5183,8 +5235,15 @@ class SphericalSelfiGlobalBackend:
             )
         except RuntimeError as error:
             diagnostics.update(
-                {"reason": "missing_bidirectional_support", "detail": str(error)}
+                {"reason": "chunk_stride_weighting_failed", "detail": str(error)}
             )
+            if allow_pose_fallback:
+                return self._chunk_stride_pose_fallback(
+                    packet,
+                    target_index=fallback_target_index,
+                    edge_type=edge_type,
+                    diagnostics=diagnostics,
+                )
             return None, None, None, diagnostics
 
         source_points = source_bearing * source_depth[:, None]
@@ -5231,6 +5290,13 @@ class SphericalSelfiGlobalBackend:
             diagnostics.update(
                 {"reason": "chunk_stride_umeyama_failed", "detail": str(error)}
             )
+            if allow_pose_fallback:
+                return self._chunk_stride_pose_fallback(
+                    packet,
+                    target_index=fallback_target_index,
+                    edge_type=edge_type,
+                    diagnostics=diagnostics,
+                )
             return None, None, None, diagnostics
 
         residual = torch.linalg.norm(
@@ -5248,35 +5314,19 @@ class SphericalSelfiGlobalBackend:
             .detach()
             .cpu()
         )
-        if int(inliers.sum().item()) < 3:
-            diagnostics.update(
-                {
-                    "reason": "insufficient_chunk_stride_inliers",
-                    "umeyama_inlier_ratio": inlier_ratio,
-                }
-            )
-            return None, None, None, diagnostics
-
-        try:
-            inlier_weight = self._balanced_chunk_stride_weights(
-                direction,
-                inliers,
-                dtype=source_depth.dtype,
-            )
-        except RuntimeError as error:
-            diagnostics.update(
-                {
-                    "reason": "one_sided_chunk_stride_inliers",
-                    "detail": str(error),
-                    "umeyama_inlier_ratio": inlier_ratio,
-                }
-            )
-            return None, None, None, diagnostics
+        diagnostic_mask = (
+            inliers if int(inliers.sum().item()) >= 3 else train_mask
+        )
+        inlier_weight = self._balanced_chunk_stride_weights(
+            direction,
+            diagnostic_mask,
+            dtype=source_depth.dtype,
+        )
         source_singular = self._weighted_point_singular_values(
-            source_points[inliers], inlier_weight[inliers]
+            source_points[diagnostic_mask], inlier_weight[diagnostic_mask]
         )
         target_singular = self._weighted_point_singular_values(
-            target_points[inliers], inlier_weight[inliers]
+            target_points[diagnostic_mask], inlier_weight[diagnostic_mask]
         )
         source_ratio = float(
             (source_singular[-1] / source_singular[0].clamp_min(1.0e-12))
@@ -5302,45 +5352,46 @@ class SphericalSelfiGlobalBackend:
         translation_error = float(
             torch.linalg.norm(translation - local_pose[:3, 3]).detach().cpu()
         )
-        translation_limit = self.chunk_stride_max_translation_error
-        holdout_angular, holdout_depth = self._chunk_stride_alignment_errors(
-            measurement,
-            source_bearing[holdout_mask],
-            target_bearing[holdout_mask],
-            source_depth[holdout_mask],
-            target_depth[holdout_mask],
-        )
-        holdout_weight = self._balanced_chunk_stride_weights(
-            direction,
-            holdout_mask,
-            dtype=source_depth.dtype,
-        )[holdout_mask]
-        holdout_angular_median = float(
-            self._weighted_median_1d(
-                holdout_angular, holdout_weight
-            ).detach().cpu()
-        )
-        holdout_depth_median = float(
-            self._weighted_median_1d(
-                holdout_depth, holdout_weight
-            ).detach().cpu()
-        )
+        holdout_available = bool(holdout_mask.any())
+        if holdout_available:
+            holdout_angular, holdout_depth = self._chunk_stride_alignment_errors(
+                measurement,
+                source_bearing[holdout_mask],
+                target_bearing[holdout_mask],
+                source_depth[holdout_mask],
+                target_depth[holdout_mask],
+            )
+            holdout_weight = self._balanced_chunk_stride_weights(
+                direction,
+                holdout_mask,
+                dtype=source_depth.dtype,
+            )[holdout_mask]
+            holdout_angular_median = float(
+                self._weighted_median_1d(
+                    holdout_angular, holdout_weight
+                ).detach().cpu()
+            )
+            holdout_depth_median = float(
+                self._weighted_median_1d(
+                    holdout_depth, holdout_weight
+                ).detach().cpu()
+            )
+        else:
+            holdout_angular_median = 0.0
+            holdout_depth_median = 0.0
         source_coverage = self._spherical_coverage_ratio(
-            source_bearing[inliers]
+            source_bearing[diagnostic_mask]
         )
         target_coverage = self._spherical_coverage_ratio(
-            target_bearing[inliers]
+            target_bearing[diagnostic_mask]
         )
         coverage = 0.5 * (source_coverage + target_coverage)
         support_score = min(
             1.0,
-            float(inliers.sum().item())
-            / float(max(self.chunk_stride_min_matches, 1024)),
+            float(train_mask.sum().item())
+            / float(max(self.dense_information_reference_count, 1.0)),
         )
-        depth_score = math.exp(
-            -holdout_depth_median
-            / max(self.chunk_stride_max_holdout_relative_depth, 1.0e-6)
-        )
+        depth_score = 1.0 / (1.0 + max(0.0, holdout_depth_median))
         information_confidence = max(
             0.05,
             min(
@@ -5354,30 +5405,22 @@ class SphericalSelfiGlobalBackend:
             ),
         )
         scale_value = float(scale.detach().cpu())
-        accepted = (
-            inlier_ratio >= self.chunk_stride_min_inlier_ratio
-            and covariance_ratio >= self.chunk_stride_covariance_min_ratio
-            and 1.0 / self.chunk_stride_max_scale_change
-            <= scale_value
-            <= self.chunk_stride_max_scale_change
-            and rotation_error <= self.chunk_stride_max_rotation_error_deg
-            and translation_error <= translation_limit
-            and holdout_depth_median
-            <= self.chunk_stride_max_holdout_relative_depth
-        )
         diagnostics.update(
             {
-                "reason": "accepted" if accepted else "chunk_stride_gate_rejected",
-                "accepted": bool(accepted),
+                "reason": "accepted_without_geometric_quality_gate",
+                "accepted": True,
+                "quality_gating_enabled": False,
+                "fallback_used": False,
+                "factor_representation": "dense_spherical_depth",
                 "train_matches": int(train_mask.sum().item()),
                 "holdout_matches": int(holdout_mask.sum().item()),
+                "holdout_available": holdout_available,
                 "umeyama_inliers": int(inliers.sum().item()),
                 "umeyama_inlier_ratio": inlier_ratio,
                 "umeyama_inlier_threshold": inlier_threshold,
                 "scale": scale_value,
                 "rotation_error_vs_local_ba_deg": rotation_error,
                 "translation_error_vs_local_ba": translation_error,
-                "translation_error_limit": translation_limit,
                 "median_scene_depth": median_depth,
                 "source_covariance_singular_values": [
                     float(value) for value in source_singular.detach().cpu()
@@ -5399,10 +5442,7 @@ class SphericalSelfiGlobalBackend:
                 "local_ba_trust_region_touched": ba_trust_touched,
             }
         )
-        if not accepted:
-            return None, None, None, diagnostics
-
-        selected = torch.nonzero(inliers, as_tuple=False).flatten()
+        selected = torch.nonzero(train_mask, as_tuple=False).flatten()
         identity = torch.eye(
             4, device=source_depth.device, dtype=source_depth.dtype
         )
@@ -5417,7 +5457,7 @@ class SphericalSelfiGlobalBackend:
             target_depth=target_depth.index_select(0, selected),
             factor_weight=(
                 information_confidence
-                * inlier_weight.index_select(0, selected)
+                * robust_weight.index_select(0, selected)
             ),
             depth_factor_weight=self.depth_factor_weight,
             s2_huber_delta_deg=self.s2_huber_delta_deg,
@@ -5426,16 +5466,20 @@ class SphericalSelfiGlobalBackend:
             **self._dense_factor_information_options(),
             metadata=dict(diagnostics),
         )
-        holdout = ChunkStrideHoldout(
-            source=source_frame,
-            target=target_frame,
-            edge_type=str(edge_type),
-            source_bearing=source_bearing[holdout_mask].detach().clone(),
-            target_bearing=target_bearing[holdout_mask].detach().clone(),
-            source_depth=source_depth[holdout_mask].detach().clone(),
-            target_depth=target_depth[holdout_mask].detach().clone(),
-            initial_angular_median_deg=holdout_angular_median,
-            initial_relative_depth_median=holdout_depth_median,
+        holdout = (
+            ChunkStrideHoldout(
+                source=source_frame,
+                target=target_frame,
+                edge_type=str(edge_type),
+                source_bearing=source_bearing[holdout_mask].detach().clone(),
+                target_bearing=target_bearing[holdout_mask].detach().clone(),
+                source_depth=source_depth[holdout_mask].detach().clone(),
+                target_depth=target_depth[holdout_mask].detach().clone(),
+                initial_angular_median_deg=holdout_angular_median,
+                initial_relative_depth_median=holdout_depth_median,
+            )
+            if holdout_available
+            else None
         )
         return factor, measurement.detach(), holdout, diagnostics
 
@@ -5614,6 +5658,7 @@ class SphericalSelfiGlobalBackend:
             expected_target_index=1,
             validate_local_ba=False,
             reference_measurement=reference,
+            allow_pose_fallback=False,
         )
         diagnostics.update(
             {
@@ -5958,7 +6003,6 @@ class SphericalSelfiGlobalBackend:
         angular_ratios: list[float] = []
         depth_ratios: list[float] = []
         per_edge: list[dict[str, Any]] = []
-        accepted = True
         selected_nodes = (
             None
             if affected_node_ids is None
@@ -5972,14 +6016,14 @@ class SphericalSelfiGlobalBackend:
             }.isdisjoint(selected_nodes):
                 continue
             if holdout.source not in self.graph.nodes or holdout.target not in self.graph.nodes:
-                accepted = False
                 per_edge.append(
                     {
                         "source": holdout.source,
                         "target": holdout.target,
                         "edge_type": holdout.edge_type,
                         "reason": "missing_graph_endpoint",
-                        "accepted": False,
+                        "accepted": True,
+                        "quality_gating_enabled": False,
                     }
                 )
                 continue
@@ -6003,11 +6047,6 @@ class SphericalSelfiGlobalBackend:
             depth_ratio = depth_median / max(
                 holdout.initial_relative_depth_median, 1.0e-6
             )
-            edge_accepted = (
-                depth_median <= self.chunk_stride_max_holdout_relative_depth
-                and depth_ratio <= self.chunk_stride_postopt_worse_ratio
-            )
-            accepted = accepted and edge_accepted
             angular_errors.append(angular_median)
             depth_errors.append(depth_median)
             angular_ratios.append(angular_ratio)
@@ -6021,7 +6060,8 @@ class SphericalSelfiGlobalBackend:
                     "relative_depth_median": depth_median,
                     "angular_worsening_ratio": angular_ratio,
                     "depth_worsening_ratio": depth_ratio,
-                    "accepted": bool(edge_accepted),
+                    "accepted": True,
+                    "quality_gating_enabled": False,
                 }
             )
         return {
@@ -6032,7 +6072,8 @@ class SphericalSelfiGlobalBackend:
             "max_angular_worsening_ratio": max(angular_ratios, default=1.0),
             "max_depth_worsening_ratio": max(depth_ratios, default=1.0),
             "per_edge": per_edge,
-            "accepted": bool(accepted),
+            "accepted": True,
+            "quality_gating_enabled": False,
         }
 
     def _refresh_geometry_updates(
@@ -7407,26 +7448,11 @@ class SphericalSelfiGlobalBackend:
         if (
             not math.isfinite(sequence_after)
             or not math.isfinite(skip_after)
-            or sequence_after
-            > (
-                self.chunk_cycle_sequence_objective_ratio * sequence_before
-                + self.loop_nonloop_objective_tolerance
-            )
-            or (
-                skip_factors
-                and skip_after
-                > (
-                    self.chunk_stride_postopt_worse_ratio * skip_before
-                    + self.loop_nonloop_objective_tolerance
-                )
-            )
-            or not bool(holdout["accepted"])
         ):
             raise RuntimeError(
-                "mapper pose proposal failed sequential/skip transaction gates: "
+                "mapper pose proposal produced a non-finite graph objective: "
                 f"sequence_ratio={sequence_ratio:.6f}, "
-                f"skip_ratio={skip_ratio:.6f}, "
-                f"holdout={holdout.get('accepted')}"
+                f"skip_ratio={skip_ratio:.6f}"
             )
         candidate, report, _ = self._materialize_pose_state_candidate(
             affected_node_ids=affected_nodes,
@@ -7442,6 +7468,18 @@ class SphericalSelfiGlobalBackend:
         self._last_mapper_committed_state_diagnostic[
             "pose_state_consistency"
         ] = report.as_diagnostics()
+        self._last_mapper_committed_state_diagnostic[
+            "geometric_quality_diagnostics"
+        ] = {
+            "quality_gating_enabled": False,
+            "sequence_objective_before": sequence_before,
+            "sequence_objective_after": sequence_after,
+            "sequence_objective_ratio": sequence_ratio,
+            "skip_objective_before": skip_before,
+            "skip_objective_after": skip_after,
+            "skip_objective_ratio": skip_ratio,
+            "holdout": holdout,
+        }
         self._refresh_geometry_updates(
             complete_snapshot=True,
             affected_node_ids=affected_nodes,
@@ -8555,10 +8593,9 @@ class SphericalSelfiGlobalBackend:
             if (
                 stride_factor is None
                 or stride_measurement is None
-                or stride_holdout is None
             ):
                 raise RuntimeError(
-                    f"Window {window_id} has no valid 0->2 spherical/depth edge: "
+                    f"Window {window_id} cannot construct a finite stride edge: "
                     f"{boundary_diagnostics.get('reason', 'unknown')}"
                 )
             next_frame = int(packet.frame_ids[self.chunk_stride_target_index])
@@ -8601,9 +8638,10 @@ class SphericalSelfiGlobalBackend:
                 sim3_components(next_transform)[0].detach().cpu()
             )
             self.graph.add_edge(stride_factor)
-            self._chunk_stride_holdouts[
-                (start_frame, next_frame, stride_holdout.edge_type)
-            ] = stride_holdout
+            if stride_holdout is not None:
+                self._chunk_stride_holdouts[
+                    (start_frame, next_frame, stride_holdout.edge_type)
+                ] = stride_holdout
             skip_diagnostics: dict[str, Any] = {
                 "enabled": bool(self.chunk_skip_enabled),
                 "reason": "first_window",
@@ -8812,10 +8850,8 @@ class SphericalSelfiGlobalBackend:
                 if self.chunk_first_stride_graph
                 else "legacy_overlap_seam"
             ),
-            "enforced": bool(
-                self.chunk_first_stride_graph
-                or self.enforce_post_optimization_validation
-            ),
+            "enforced": bool(self.chunk_first_stride_graph),
+            "quality_gating_enabled": False,
             "accepted": True,
             "factor_count": 0,
             "candidate_revision": int(self._pose_state_revision),
@@ -8856,7 +8892,7 @@ class SphericalSelfiGlobalBackend:
                     # Adjacent stride edges do not make per-node scale
                     # independently observable.  Periodic local BA therefore
                     # refines only R/t; accepted loop transactions retain their
-                    # separate bounded log-scale path.
+                    # separate log-scale path.
                     self.graph.lock_scale_updates = True
                 result = self.graph.optimize(
                     active,
@@ -8920,8 +8956,7 @@ class SphericalSelfiGlobalBackend:
             if self.chunk_first_stride_graph and loop_graph is self.graph:
                 for node, initial_scale in self._chunk_node_initial_scale.items():
                     if int(node) not in self.graph.nodes:
-                        commit = False
-                        break
+                        continue
                     current_scale = float(
                         sim3_components(self.graph.transform(int(node)))[0]
                         .detach()
@@ -8934,11 +8969,6 @@ class SphericalSelfiGlobalBackend:
                     cumulative_scale_ratio = max(
                         cumulative_scale_ratio, ratio
                     )
-                    commit = (
-                        commit
-                        and math.isfinite(ratio)
-                        and ratio <= self.chunk_cycle_max_cumulative_scale
-                    )
             for loop_result in accepted_loops:
                 loop_result.metadata["graph_transaction"] = {
                     "enabled": self.loop_transaction_enabled,
@@ -8948,6 +8978,7 @@ class SphericalSelfiGlobalBackend:
                     "max_cumulative_scale_ratio": float(
                         cumulative_scale_ratio
                     ),
+                    "cumulative_scale_gating_enabled": False,
                     "initial_objective": float(graph_result.initial_objective),
                     "final_objective": float(graph_result.final_objective),
                 }
@@ -8995,9 +9026,9 @@ class SphericalSelfiGlobalBackend:
             )
             scale_lock = bool(self.graph.lock_scale_updates)
             try:
-                # A pure chain never enters this branch.  The independent skip
+                # A pure chain never enters this branch. The independent skip
                 # edge creates the first observable cycle, at which point R/t
-                # and a tightly clamped log-scale may be optimized together.
+                # and unconstrained log-scale steps may be optimized together.
                 self.graph.lock_scale_updates = False
                 graph_result = self.graph.optimize(
                     active,
@@ -9010,12 +9041,10 @@ class SphericalSelfiGlobalBackend:
             )
             sequence_ratio = sequence_after / max(sequence_before, 1.0e-12)
             cumulative_scale_ratio = 1.0
-            cumulative_scale_ok = True
             for node in active:
                 initial_scale = self._chunk_node_initial_scale.get(int(node))
                 if initial_scale is None:
-                    cumulative_scale_ok = False
-                    break
+                    continue
                 current_scale = float(
                     sim3_components(self.graph.transform(int(node)))[0]
                     .detach()
@@ -9026,33 +9055,15 @@ class SphericalSelfiGlobalBackend:
                     initial_scale / max(current_scale, 1.0e-12),
                 )
                 cumulative_scale_ratio = max(cumulative_scale_ratio, ratio)
-                cumulative_scale_ok = (
-                    cumulative_scale_ok
-                    and math.isfinite(ratio)
-                    and ratio <= self.chunk_cycle_max_cumulative_scale
-                )
-            cycle_commit = (
-                bool(graph_result.accepted)
-                and graph_result.final_objective
-                < graph_result.initial_objective - 1.0e-10
-                and sequence_after
-                <= (
-                    self.chunk_cycle_sequence_objective_ratio
-                    * sequence_before
-                    + self.loop_nonloop_objective_tolerance
-                )
-                and cumulative_scale_ok
-            )
+            cycle_commit = bool(graph_result.accepted)
             boundary_diagnostics["cycle_optimization"] = {
                 "trigger": "independent_skip_edge",
                 "committed": bool(cycle_commit),
+                "quality_gating_enabled": False,
                 "sequence_objective_before": sequence_before,
                 "sequence_objective_after": sequence_after,
                 "sequence_objective_ratio": sequence_ratio,
                 "max_cumulative_scale_ratio": cumulative_scale_ratio,
-                "max_cumulative_scale_allowed": (
-                    self.chunk_cycle_max_cumulative_scale
-                ),
             }
             if cycle_commit:
                 self._has_run_global_ba = True
@@ -9077,11 +9088,9 @@ class SphericalSelfiGlobalBackend:
         }
         if graph_result is not None and self.chunk_first_stride_graph:
             maximum_ratio = 1.0
-            scales_accepted = True
             for node, initial_scale in self._chunk_node_initial_scale.items():
                 if int(node) not in self.graph.nodes:
-                    scales_accepted = False
-                    break
+                    continue
                 current_scale = float(
                     sim3_components(self.graph.transform(int(node)))[0]
                     .detach()
@@ -9092,47 +9101,16 @@ class SphericalSelfiGlobalBackend:
                     initial_scale / max(current_scale, 1.0e-12),
                 )
                 maximum_ratio = max(maximum_ratio, ratio)
-                scales_accepted = (
-                    scales_accepted
-                    and math.isfinite(ratio)
-                    and ratio <= self.chunk_cycle_max_cumulative_scale
-                )
             chunk_scale_diagnostics = {
                 "enabled": True,
-                "accepted": bool(scales_accepted),
+                "accepted": True,
+                "quality_gating_enabled": False,
                 "max_cumulative_scale_ratio": maximum_ratio,
-                "max_cumulative_scale_allowed": (
-                    self.chunk_cycle_max_cumulative_scale
-                ),
             }
-            if not scales_accepted:
-                self._restore_graph_state(
-                    self.graph, pre_boundary_graph_state
-                )
-                self._restore_graph_state(
-                    self.submap_graph, pre_submap_graph_state
-                )
-                if accepted_loops:
-                    del loop_graph.edges[loop_edge_start:]
-                    for loop_result in accepted_loops:
-                        self.accepted_loop_pairs.discard(
-                            self._canonical_loop_pair(loop_result)
-                        )
-                        self._reject_loop_result(
-                            loop_result,
-                            "chunk_cumulative_scale_rejected",
-                        )
-                    accepted_loops = []
-                graph_result = replace(
-                    graph_result,
-                    accepted=False,
-                    final_objective=graph_result.initial_objective,
-                    max_update_norm=0.0,
-                    reason="chunk_cumulative_scale_rejected",
-                )
         chunk_sequence_diagnostics: dict[str, Any] = {
             "enabled": bool(self.chunk_first_stride_graph),
-            "enforced": self.enforce_post_optimization_validation,
+            "enforced": False,
+            "quality_gating_enabled": False,
             "accepted": True,
             "factor_count": len(chunk_sequence_factors),
             "objective_before": chunk_sequence_objective_before,
@@ -9152,93 +9130,28 @@ class SphericalSelfiGlobalBackend:
             sequence_ratio = sequence_after / max(
                 chunk_sequence_objective_before, 1.0e-12
             )
-            sequence_accepted = (
-                math.isfinite(sequence_after)
-                and sequence_after
-                <= (
-                    self.chunk_cycle_sequence_objective_ratio
-                    * chunk_sequence_objective_before
-                    + self.loop_nonloop_objective_tolerance
-                )
-            )
             chunk_sequence_diagnostics = {
                 "enabled": True,
-                "enforced": self.enforce_post_optimization_validation,
-                "accepted": bool(sequence_accepted),
+                "enforced": False,
+                "quality_gating_enabled": False,
+                "accepted": True,
                 "factor_count": len(chunk_sequence_factors),
                 "objective_before": chunk_sequence_objective_before,
                 "objective_after": sequence_after,
                 "objective_ratio": sequence_ratio,
-                "maximum_ratio": self.chunk_cycle_sequence_objective_ratio,
+                "objective_finite": math.isfinite(sequence_after),
             }
-            if (
-                self.enforce_post_optimization_validation
-                and not sequence_accepted
-            ):
-                self._restore_graph_state(
-                    self.graph, pre_boundary_graph_state
-                )
-                self._restore_graph_state(
-                    self.submap_graph, pre_submap_graph_state
-                )
-                if accepted_loops:
-                    del loop_graph.edges[loop_edge_start:]
-                    for loop_result in accepted_loops:
-                        self.accepted_loop_pairs.discard(
-                            self._canonical_loop_pair(loop_result)
-                        )
-                        self._reject_loop_result(
-                            loop_result,
-                            "chunk_sequence_objective_rejected",
-                        )
-                    accepted_loops = []
-                graph_result = replace(
-                    graph_result,
-                    accepted=False,
-                    final_objective=graph_result.initial_objective,
-                    max_update_norm=0.0,
-                    reason="chunk_sequence_objective_rejected",
-                )
         if (
             graph_result is not None
             and not self.chunk_first_stride_graph
             and self.post_optimization_seam_check_enabled
         ):
             seam_diagnostics = self._overlap_seam_diagnostics()
-            seam_diagnostics["enforced"] = (
-                self.enforce_post_optimization_validation
-            )
-            if (
-                self.enforce_post_optimization_validation
-                and not bool(seam_diagnostics["accepted"])
-            ):
-                self._restore_graph_state(
-                    self.graph, pre_boundary_graph_state
-                )
-                self._restore_graph_state(
-                    self.submap_graph, pre_submap_graph_state
-                )
-                if accepted_loops:
-                    del loop_graph.edges[loop_edge_start:]
-                    for loop_result in accepted_loops:
-                        self.accepted_loop_pairs.discard(
-                            self._canonical_loop_pair(loop_result)
-                        )
-                        self._reject_loop_result(
-                            loop_result,
-                            "post_optimization_seam_check_rejected",
-                        )
-                    accepted_loops = []
-                graph_result = replace(
-                    graph_result,
-                    accepted=False,
-                    final_objective=graph_result.initial_objective,
-                    max_update_norm=0.0,
-                    reason="post_optimization_seam_check_rejected",
-                )
+            seam_diagnostics["enforced"] = False
         stride_holdout_diagnostics: dict[str, Any] = {
             "enabled": bool(self.chunk_first_stride_graph),
-            "enforced": self.enforce_post_optimization_validation,
+            "enforced": False,
+            "quality_gating_enabled": False,
             "accepted": True,
             "factor_count": 0,
         }
@@ -9261,37 +9174,7 @@ class SphericalSelfiGlobalBackend:
                     affected_node_ids=affected_holdout_nodes
                 )
             )
-            stride_holdout_diagnostics["enforced"] = (
-                self.enforce_post_optimization_validation
-            )
-            if (
-                self.enforce_post_optimization_validation
-                and not bool(stride_holdout_diagnostics["accepted"])
-            ):
-                self._restore_graph_state(
-                    self.graph, pre_boundary_graph_state
-                )
-                self._restore_graph_state(
-                    self.submap_graph, pre_submap_graph_state
-                )
-                if accepted_loops:
-                    del loop_graph.edges[loop_edge_start:]
-                    for loop_result in accepted_loops:
-                        self.accepted_loop_pairs.discard(
-                            self._canonical_loop_pair(loop_result)
-                        )
-                        self._reject_loop_result(
-                            loop_result,
-                            "chunk_stride_holdout_rejected",
-                        )
-                    accepted_loops = []
-                graph_result = replace(
-                    graph_result,
-                    accepted=False,
-                    final_objective=graph_result.initial_objective,
-                    max_update_norm=0.0,
-                    reason="chunk_stride_holdout_rejected",
-                )
+            stride_holdout_diagnostics["enforced"] = False
         correction: dict[str, int] = {"moved": 0, "deduplicated": 0}
         if (
             graph_result is not None
@@ -10072,7 +9955,7 @@ class SphericalSelfiGlobalBackend:
                     self.global_graph_optimization_enabled
                 ),
                 "post_optimization_validation_enforced": (
-                    self.enforce_post_optimization_validation
+                    False
                 ),
                 "global_ba_scheduled": graph_result is not None,
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,

@@ -157,16 +157,8 @@ def _chunk_stride_backend(
                 "max_match_entropy": 1.0,
                 "chunk_stride": {
                     "target_index": 2,
-                    "min_matches": int(min_matches),
                     "holdout_stride": 5,
                     "irls_iterations": 5,
-                    "min_inlier_ratio": 0.35,
-                    "covariance_min_ratio": 1.0e-4,
-                    "max_scale_change": 2.5,
-                    "max_rotation_error_deg": 5.0,
-                    "max_translation_error": 1.0,
-                    "max_holdout_relative_depth": 0.10,
-                    "postopt_worse_ratio": 1.05,
                 },
                 "skip_edge": {
                     "enabled": bool(skip),
@@ -381,19 +373,23 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 3
     assert graph["optimization_enabled"] is True
-    assert graph["enforce_post_optimization_validation"] is False
+    assert "enforce_post_optimization_validation" not in graph
     assert graph["expected_overlap_frames"] == 2
     assert graph["node_mode"] == "chunk_first_stride"
     assert graph["optimization_trigger"] == "periodic_and_loop"
     assert graph["chunk_stride"]["target_index"] == 2
-    assert graph["chunk_stride"]["min_matches"] == 256
-    assert "max_translation_depth_ratio" not in graph["chunk_stride"]
-    assert "max_holdout_angular_deg" not in graph["chunk_stride"]
-    assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
+    assert graph["chunk_stride"] == {
+        "target_index": 2,
+        "holdout_stride": 5,
+        "irls_iterations": 5,
+    }
     assert "min_match_margin" not in graph
     assert graph["skip_edge"]["enabled"] is False
-    assert graph["skip_edge"]["max_sequence_objective_ratio"] == 1.02
-    assert graph["max_log_scale_update"] == pytest.approx(math.log(1.05))
+    assert "max_sequence_objective_ratio" not in graph["skip_edge"]
+    assert "max_cumulative_scale_change" not in graph["skip_edge"]
+    assert "max_translation_update" not in graph
+    assert "max_rotation_update_deg" not in graph
+    assert "max_log_scale_update" not in graph
     assert graph["normalize_dense_information_by_count"] is True
     assert graph["analytic_dense_linearization"] is True
     assert graph["restrict_objective_to_active_factors"] is True
@@ -446,11 +442,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "coverage_coarse_cell_size": 0.64,
         "log_posthash_coverage": False,
     }
-    assert global_backend["post_optimization_seam_check"] == {
-        "enabled": True,
-        "max_rotation_error_deg": 5.0,
-        "max_center_error": 0.15,
-    }
+    assert global_backend["post_optimization_seam_check"] == {"enabled": True}
     assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
     assert global_backend["voxel_fusion"]["max_total_gaussians"] == 3_000_000
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
@@ -503,7 +495,7 @@ def test_hash_radius20_configs_only_sweep_the_radius_algorithmically() -> None:
         }
 
 
-def test_chunk_stride_factor_uses_holdout_and_rejects_ba_trust_boundary() -> None:
+def test_chunk_stride_factor_uses_holdout_without_ba_quality_rejection() -> None:
     poses = torch.eye(4).repeat(4, 1, 1)
     packet = _packet(0, poses, (0, 1, 2, 3))
     _attach_identity_stride_matches(packet)
@@ -520,18 +512,77 @@ def test_chunk_stride_factor_uses_holdout_and_rejects_ba_trust_boundary() -> Non
     assert factor.edge_type == "chunk_stride_dense_spherical"
     assert holdout.edge_type == factor.edge_type
     assert diagnostics["accepted"] is True
+    assert diagnostics["quality_gating_enabled"] is False
     assert diagnostics["train_matches"] > diagnostics["holdout_matches"] > 0
     assert diagnostics["information_confidence"] > 0.0
-    assert diagnostics["translation_error_limit"] == pytest.approx(1.0)
     torch.testing.assert_close(measurement, sim3_identity(), atol=1.0e-4, rtol=1.0e-4)
 
     packet.metadata["local_ba_trust_region_touched"] = True
-    rejected, _, _, rejected_diagnostics = backend._chunk_stride_factor(
+    admitted, _, _, admitted_diagnostics = backend._chunk_stride_factor(
         packet,
         expected_target_index=2,
     )
-    assert rejected is None
-    assert rejected_diagnostics["reason"] == "local_ba_quality_gate_rejected"
+    assert admitted is not None
+    assert admitted_diagnostics["accepted"] is True
+    assert admitted_diagnostics["local_ba_trust_region_touched"] is True
+
+
+def test_chunk_stride_missing_matches_uses_canonical_ba_pose_fallback() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    poses[2, :3, :3] = se3_exp(
+        torch.tensor([0.0, 0.0, 0.0, 0.2, -0.1, 0.05])
+    )[:3, :3]
+    poses[2, :3, 3] = torch.tensor([1.5, -0.4, 0.2])
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    backend = _chunk_stride_backend(min_matches=64)
+
+    factor, measurement, holdout, diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+
+    assert isinstance(factor, Sim3GraphEdge)
+    assert measurement is not None
+    assert holdout is None
+    assert diagnostics["accepted"] is True
+    assert diagnostics["fallback_used"] is True
+    assert diagnostics["reason"] == "canonical_ba_pose_fallback"
+    torch.testing.assert_close(measurement, poses[2], atol=1.0e-6, rtol=1.0e-6)
+    assert float(factor.information_diag[-1]) == 0.0
+
+    result = backend.process_packet(packet)
+    assert result.diagnostics["boundary_factor"]["fallback_used"] is True
+    assert set(backend.graph.nodes) == {0, 2}
+    assert any(
+        isinstance(edge, Sim3GraphEdge)
+        and edge.edge_type == "chunk_stride_dense_spherical"
+        and edge.metadata.get("fallback_used") is True
+        for edge in backend.graph.edges
+    )
+
+
+def test_chunk_stride_single_direction_dense_matches_are_admitted() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    _attach_identity_stride_matches(packet)
+    assert packet.chunk_stride_matches is not None
+    packet.chunk_stride_matches = replace(
+        packet.chunk_stride_matches,
+        query_direction=torch.zeros_like(
+            packet.chunk_stride_matches.query_direction
+        ),
+    )
+    backend = _chunk_stride_backend(min_matches=64)
+
+    factor, measurement, _, diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+
+    assert isinstance(factor, DenseSphericalFactorBlock), diagnostics
+    assert measurement is not None
+    assert diagnostics["accepted"] is True
+    assert diagnostics["fallback_used"] is False
 
 
 def test_chunk_stride_factor_does_not_gate_on_top2_margin() -> None:
@@ -762,7 +813,6 @@ def test_periodic_graph_geometry_failures_are_diagnostic_but_state_is_hard(
         skip=False,
         periodic=True,
     )
-    assert backend.enforce_post_optimization_validation is False
     backend.post_optimization_seam_check_enabled = True
     monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
     moved: dict[str, object] = {}
@@ -862,7 +912,37 @@ def test_periodic_graph_geometry_failures_are_diagnostic_but_state_is_hard(
     assert holdout["enforced"] is False
 
 
-def test_periodic_graph_independent_holdout_can_restore_pre_lm_state(
+def test_legacy_overlap_seam_magnitude_is_diagnostic_only() -> None:
+    backend = _boundary_backend(PanoGaussianMap(config={}, device="cpu"))
+    backend.post_optimization_seam_check_enabled = True
+    backend.graph.add_node(0, sim3_identity())
+    rotation = se3_exp(
+        torch.tensor([0.0, 0.0, 0.0, 0.0, math.radians(60.0), 0.0])
+    )[:3, :3]
+    backend.graph.add_node(
+        1,
+        sim3_from_components(1.0, rotation, torch.tensor([3.0, 0.0, 0.0])),
+    )
+    backend.graph.add_edge(
+        CoincidentPanoramaFactor(
+            source=0,
+            target=1,
+            source_local_pose=torch.eye(4),
+            target_local_pose=torch.eye(4),
+            measured_source_to_target_rotation=torch.eye(3),
+            edge_type="overlap_shared_pose_consistency",
+        )
+    )
+
+    diagnostics = backend._overlap_seam_diagnostics()
+
+    assert diagnostics["max_rotation_error_deg"] > 5.0
+    assert diagnostics["max_center_error"] > 0.15
+    assert diagnostics["quality_gating_enabled"] is False
+    assert diagnostics["accepted"] is True
+
+
+def test_periodic_graph_holdout_cannot_restore_an_accepted_lm_state(
     monkeypatch,
 ) -> None:
     packets = [
@@ -888,8 +968,6 @@ def test_periodic_graph_independent_holdout_can_restore_pre_lm_state(
         skip=False,
         periodic=True,
     )
-    backend.enforce_post_optimization_validation = True
-    backend.chunk_cycle_sequence_objective_ratio = float("inf")
     backend.post_optimization_seam_check_enabled = True
     monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
     state: dict[str, object] = {}
@@ -917,19 +995,30 @@ def test_periodic_graph_independent_holdout_can_restore_pre_lm_state(
         )
 
     monkeypatch.setattr(backend.graph, "optimize", accepted_optimize)
+    monkeypatch.setattr(
+        backend,
+        "_chunk_stride_holdout_diagnostics",
+        lambda *, affected_node_ids=None: {
+            "enabled": True,
+            "accepted": False,
+            "quality_gating_enabled": False,
+            "factor_count": 1,
+            "reason": "synthetic_holdout_degradation",
+        },
+    )
     results = [backend.process_packet(packet) for packet in packets]
     result = results[-1]
 
     assert result.graph is not None
-    assert result.graph.accepted is False
-    assert result.graph.reason == "chunk_stride_holdout_rejected"
-    torch.testing.assert_close(
+    assert result.graph.accepted is True
+    assert result.graph.reason == "synthetic_accepted"
+    assert not torch.allclose(
         backend.graph.transform(int(state["node"])),
         state["before"],
     )
     holdout = result.diagnostics["chunk_stride_holdout_check"]
     assert holdout["accepted"] is False
-    assert holdout["enforced"] is True
+    assert holdout["enforced"] is False
 
 
 def test_post_candidate_fusion_failure_restores_pose_state_transaction(
@@ -1086,9 +1175,12 @@ def test_chunk_stride_holdout_validation_only_checks_affected_edges(
 
     assert affected["factor_count"] == 1
     assert affected["accepted"] is True
+    assert affected["quality_gating_enabled"] is False
     assert affected["per_edge"][0]["source"] == 4
     assert all_edges["factor_count"] == 2
-    assert all_edges["accepted"] is False
+    assert all_edges["accepted"] is True
+    assert all_edges["quality_gating_enabled"] is False
+    assert all_edges["max_relative_depth_median"] == pytest.approx(0.5)
 
 
 def test_overlap_scale_uses_only_canonical_and_raw_ba_depths() -> None:
@@ -1225,7 +1317,9 @@ def test_chunk_first_nodes_rigidly_publish_both_frames_in_each_segment() -> None
         )
 
 
-def test_mapper_internal_frame_motion_is_not_rejected_by_stale_packet_seam() -> None:
+def test_mapper_internal_frame_motion_ignores_geometry_quality_gates(
+    monkeypatch,
+) -> None:
     packets = [
         _packet(
             0,
@@ -1246,8 +1340,6 @@ def test_mapper_internal_frame_motion_is_not_rejected_by_stale_packet_seam() -> 
         _attach_identity_stride_matches(packet)
     backend = _chunk_stride_backend(min_matches=64, skip=False)
     backend.post_optimization_seam_check_enabled = True
-    backend.post_optimization_seam_max_rotation_deg = 5.0
-    backend.post_optimization_seam_max_center_error = 0.15
     backend.process_packet(packets[0])
     backend.process_packet(packets[1])
     backend.pop_frame_geometry_update_batch()
@@ -1290,6 +1382,23 @@ def test_mapper_internal_frame_motion_is_not_rejected_by_stale_packet_seam() -> 
 
     backend.mapper = MapperProposal()
     revision_before = backend._geometry_revision
+    objective_values = iter((1.0, 1.0, 100.0, 100.0))
+    monkeypatch.setattr(
+        backend.graph,
+        "objective",
+        lambda *, factors=None: torch.tensor(next(objective_values)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_chunk_stride_holdout_diagnostics",
+        lambda *, affected_node_ids=None: {
+            "enabled": True,
+            "accepted": False,
+            "quality_gating_enabled": False,
+            "factor_count": 1,
+            "reason": "synthetic_geometry_degradation",
+        },
+    )
 
     backend._synchronize_chunk_stride_optimized_window(1)
 
@@ -1300,6 +1409,13 @@ def test_mapper_internal_frame_motion_is_not_rejected_by_stale_packet_seam() -> 
     assert state["accepted"] is True
     assert state["max_matrix_error"] <= 1.0e-5
     assert state["max_center_error"] <= 1.0e-5
+    committed = backend._last_mapper_committed_state_diagnostic
+    assert committed is not None
+    quality = committed["geometric_quality_diagnostics"]
+    assert quality["quality_gating_enabled"] is False
+    assert quality["sequence_objective_ratio"] == pytest.approx(100.0)
+    assert quality["skip_objective_ratio"] == pytest.approx(100.0)
+    assert quality["holdout"]["accepted"] is False
     for window_id in (0, 1):
         packet = backend.packets[window_id]
         frame_index = packet.frame_index(3)
@@ -1344,8 +1460,6 @@ def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch
         _attach_identity_stride_matches(packet)
     backend = _chunk_stride_backend(min_matches=64, skip=False)
     backend.post_optimization_seam_check_enabled = True
-    backend.post_optimization_seam_max_rotation_deg = 5.0
-    backend.post_optimization_seam_max_center_error = 0.15
     backend.process_packet(packets[0])
     backend.process_packet(packets[1])
     backend.pop_frame_geometry_update_batch()
@@ -2247,6 +2361,37 @@ def test_sim3_exp_log_round_trip_and_graph_scale_recovery() -> None:
     assert result.accepted
     assert result.final_objective < result.initial_objective
     torch.testing.assert_close(graph.transform(1), truth, atol=2e-4, rtol=2e-4)
+
+
+def test_sim3_graph_lm_does_not_clamp_translation_rotation_or_scale_steps() -> None:
+    tangent = torch.tensor(
+        [2.5, -1.5, 0.8, 0.6, -0.35, 0.2, math.log(1.8)]
+    )
+    truth = sim3_exp(tangent)
+    graph = GlobalSim3FactorGraph(
+        max_iterations=1,
+        pcg_iterations=64,
+        damping=1.0e-6,
+    )
+    graph.add_node(0, sim3_identity())
+    graph.add_node(1, sim3_identity())
+    graph.add_edge(
+        Sim3GraphEdge(
+            source=0,
+            target=1,
+            measurement_target_to_source=truth,
+            information_diag=torch.ones(7),
+        )
+    )
+
+    result = graph.optimize()
+    optimized = sim3_log(graph.transform(1))
+
+    assert result.accepted
+    assert result.max_update_norm > 1.0
+    assert float(optimized[:3].norm()) > 1.0
+    assert math.degrees(float(optimized[3:6].norm())) > 10.0
+    assert math.exp(abs(float(optimized[6]))) > 1.25
 
 
 def test_sim3_graph_optimization_can_be_disabled_without_mutating_nodes() -> None:

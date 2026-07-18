@@ -224,8 +224,6 @@ SphericalSelfiGlobalBackend:
     log_posthash_coverage: false
   post_optimization_seam_check:
     enabled: true
-    max_rotation_error_deg: 5.0
-    max_center_error: 0.15
   geometry_validation:
     enabled: true
     tolerance: 1.0e-5
@@ -248,9 +246,6 @@ SphericalSelfiGlobalBackend:
     compress_frozen_dense_factors: true
   global_graph:
     optimization_enabled: true
-    # Keep post-LM sequence/seam/holdout checks as diagnostics, but do not
-    # veto an LM result that passed the solver's own finite/objective checks.
-    enforce_post_optimization_validation: false
     node_mode: chunk_first_stride
     optimization_trigger: periodic_and_loop
     factor_mode: dense_spherical
@@ -278,16 +273,8 @@ SphericalSelfiGlobalBackend:
     enforce_exact_overlap: true
     chunk_stride:
       target_index: 2
-      min_matches: 256
       holdout_stride: 5
       irls_iterations: 5
-      min_inlier_ratio: 0.35
-      covariance_min_ratio: 1.0e-4
-      max_scale_change: 2.5
-      max_rotation_error_deg: 5.0
-      max_translation_error: 1.0
-      max_holdout_relative_depth: 0.10
-      postopt_worse_ratio: 1.05
     skip_edge:
       enabled: false
       num_queries: 2048
@@ -299,8 +286,6 @@ SphericalSelfiGlobalBackend:
       fb_tolerance_deg: 1.0
       min_factor_weight: 0.01
       subpixel_refine_radius: 1
-      max_sequence_objective_ratio: 1.02
-      max_cumulative_scale_change: 1.25
     overlap_num_queries: 4096
     factor_queries_per_direction: 2048
     max_dense_factors_per_edge: 4096
@@ -326,10 +311,6 @@ SphericalSelfiGlobalBackend:
     umeyama_irls_iterations: 5
     umeyama_huber_delta: null
     max_scale_change: 2.5
-    max_translation_update: 1.0
-    max_rotation_update_deg: 10.0
-    # One accepted LM retraction changes scale by at most 5%.
-    max_log_scale_update: 0.04879016417
     allow_unaligned_fallback: false
   loop_closure:
     # Explicit opt-in to the arbitrary-orientation loop path. Code defaults
