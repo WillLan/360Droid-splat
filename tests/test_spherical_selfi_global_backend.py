@@ -162,7 +162,6 @@ def _chunk_stride_backend(
                     "max_scale_change": 2.5,
                     "max_rotation_error_deg": 5.0,
                     "max_translation_error": 1.0,
-                    "max_holdout_angular_deg": 2.0,
                     "max_holdout_relative_depth": 0.10,
                     "postopt_worse_ratio": 1.05,
                 },
@@ -321,6 +320,19 @@ class _TwoViewUnionRenderer(_SyntheticSharedDepthRenderer):
         return package
 
 
+class _FirstTwoLocalAnchorsVisibleRenderer(_SyntheticSharedDepthRenderer):
+    """Mark only the first two refined anchors visible in every local view."""
+
+    def render_cameras(self, cameras, gaussians):
+        package = super().render_cameras(cameras, gaussians)
+        if hasattr(gaussians, "anchor_indices"):
+            visibility = package["visibility_filter"]
+            visibility.zero_()
+            visibility[..., : min(2, int(visibility.shape[-1]))] = True
+            package["accum_visible"] = visibility.clone()
+        return package
+
+
 def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -361,13 +373,14 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert graph["optimization_start_nodes"] == 6
     assert graph["optimization_interval_edges"] == 3
     assert graph["optimization_enabled"] is True
+    assert graph["enforce_post_optimization_validation"] is False
     assert graph["expected_overlap_frames"] == 2
     assert graph["node_mode"] == "chunk_first_stride"
     assert graph["optimization_trigger"] == "periodic_and_loop"
     assert graph["chunk_stride"]["target_index"] == 2
     assert graph["chunk_stride"]["min_matches"] == 256
     assert "max_translation_depth_ratio" not in graph["chunk_stride"]
-    assert graph["chunk_stride"]["max_holdout_angular_deg"] == 3.0
+    assert "max_holdout_angular_deg" not in graph["chunk_stride"]
     assert graph["chunk_stride"]["max_holdout_relative_depth"] == 0.10
     assert "min_match_margin" not in graph
     assert graph["skip_edge"]["enabled"] is False
@@ -431,7 +444,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "max_center_error": 0.15,
     }
     assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
-    assert global_backend["voxel_fusion"]["max_total_gaussians"] == 2_000_000
+    assert global_backend["voxel_fusion"]["max_total_gaussians"] == 3_000_000
     assert map_optimization["lazy_submap_transforms"]["enabled"] is True
     assert map_optimization["loop_neighborhood_refinement"] is True
     assert map_optimization["loop_seam_deduplication"] is True
@@ -538,6 +551,39 @@ def test_chunk_stride_factor_does_not_gate_on_top2_margin() -> None:
     assert diagnostics["hard_gated_chunk_stride_matches"] == (
         packet.chunk_stride_matches.count
     )
+
+
+def test_chunk_stride_factor_does_not_gate_on_holdout_angular_error() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _packet(0, poses, (0, 1, 2, 3))
+    _attach_identity_stride_matches(packet)
+    assert packet.chunk_stride_matches is not None
+    matches = packet.chunk_stride_matches
+    holdout_rows = SphericalSelfiGlobalBackend._chunk_stride_holdout_mask(
+        matches.query_direction,
+        source_frame=0,
+        target_frame=2,
+        stride=5,
+    )
+    corrupted_target = matches.target_bearing.clone()
+    corrupted_target[holdout_rows] *= -1.0
+    packet.chunk_stride_matches = replace(
+        matches,
+        target_bearing=corrupted_target,
+    )
+    backend = _chunk_stride_backend(min_matches=64)
+
+    factor, measurement, holdout, diagnostics = backend._chunk_stride_factor(
+        packet,
+        expected_target_index=2,
+    )
+
+    assert factor is not None, diagnostics
+    assert measurement is not None
+    assert holdout is not None
+    assert diagnostics["accepted"] is True
+    assert diagnostics["holdout_median_angular_error_deg"] > 90.0
+    assert "angular_score" not in diagnostics
 
 
 def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
@@ -680,6 +726,182 @@ def test_chunk_first_periodic_ba_starts_at_six_nodes_then_runs_every_three_chunk
         for node in sorted(backend.graph.nodes)
     ]
     assert scales == pytest.approx([scales[0]] * len(scales))
+
+
+def test_periodic_graph_post_lm_geometry_failures_are_diagnostic_by_default(
+    monkeypatch,
+) -> None:
+    packets = [
+        _packet(
+            window_id,
+            torch.eye(4).repeat(4, 1, 1),
+            (
+                2 * window_id,
+                2 * window_id + 1,
+                2 * window_id + 2,
+                2 * window_id + 3,
+            ),
+            height=32,
+            width=64,
+        )
+        for window_id in range(5)
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        periodic=True,
+    )
+    assert backend.enforce_post_optimization_validation is False
+    backend.post_optimization_seam_check_enabled = True
+    monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
+    moved: dict[str, object] = {}
+
+    def accepted_optimize(active_node_ids=None, *, fixed_node_ids=None):
+        node = int(active_node_ids[-1])
+        transform = backend.graph.transform(node)
+        scale, rotation, translation = sim3_components(transform)
+        updated = sim3_from_components(
+            scale,
+            rotation,
+            translation + translation.new_tensor([0.25, 0.0, 0.0]),
+        )
+        backend.graph.nodes[node] = updated
+        moved["node"] = node
+        moved["transform"] = updated.clone()
+        return Sim3GraphOptimizeResult(
+            accepted=True,
+            iterations=1,
+            initial_objective=1.0,
+            final_objective=0.5,
+            max_update_norm=0.25,
+            optimized_node_ids=tuple(int(value) for value in active_node_ids),
+            reason="synthetic_accepted",
+            final_damping=float(backend.graph.damping),
+        )
+
+    monkeypatch.setattr(backend.graph, "optimize", accepted_optimize)
+    monkeypatch.setattr(
+        backend,
+        "_overlap_seam_diagnostics",
+        lambda: {
+            "enabled": True,
+            "accepted": False,
+            "factor_count": 1,
+            "reason": "synthetic_seam_failure",
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_chunk_stride_holdout_diagnostics",
+        lambda *, affected_node_ids=None: {
+            "enabled": True,
+            "accepted": False,
+            "factor_count": 1,
+            "reason": "synthetic_holdout_failure",
+        },
+    )
+
+    results = [backend.process_packet(packet) for packet in packets]
+    result = results[-1]
+
+    assert result.graph is not None
+    assert result.graph.accepted is True
+    assert result.graph.reason == "synthetic_accepted"
+    assert moved
+    torch.testing.assert_close(
+        backend.graph.transform(int(moved["node"])),
+        moved["transform"],
+    )
+    seam = result.diagnostics["post_optimization_seam_check"]
+    holdout = result.diagnostics["chunk_stride_holdout_check"]
+    assert seam["accepted"] is False
+    assert seam["enforced"] is False
+    assert holdout["accepted"] is False
+    assert holdout["enforced"] is False
+
+
+def test_periodic_graph_post_lm_validation_can_restore_pre_lm_state(
+    monkeypatch,
+) -> None:
+    packets = [
+        _packet(
+            window_id,
+            torch.eye(4).repeat(4, 1, 1),
+            (
+                2 * window_id,
+                2 * window_id + 1,
+                2 * window_id + 2,
+                2 * window_id + 3,
+            ),
+            height=32,
+            width=64,
+        )
+        for window_id in range(5)
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        periodic=True,
+    )
+    backend.enforce_post_optimization_validation = True
+    backend.chunk_cycle_sequence_objective_ratio = float("inf")
+    backend.post_optimization_seam_check_enabled = True
+    monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
+    state: dict[str, object] = {}
+
+    def accepted_optimize(active_node_ids=None, *, fixed_node_ids=None):
+        node = int(active_node_ids[-1])
+        before = backend.graph.transform(node).clone()
+        scale, rotation, translation = sim3_components(before)
+        backend.graph.nodes[node] = sim3_from_components(
+            scale,
+            rotation,
+            translation + translation.new_tensor([0.25, 0.0, 0.0]),
+        )
+        state["node"] = node
+        state["before"] = before
+        return Sim3GraphOptimizeResult(
+            accepted=True,
+            iterations=1,
+            initial_objective=1.0,
+            final_objective=0.5,
+            max_update_norm=0.25,
+            optimized_node_ids=tuple(int(value) for value in active_node_ids),
+            reason="synthetic_accepted",
+            final_damping=float(backend.graph.damping),
+        )
+
+    monkeypatch.setattr(backend.graph, "optimize", accepted_optimize)
+    monkeypatch.setattr(
+        backend,
+        "_overlap_seam_diagnostics",
+        lambda: {
+            "enabled": True,
+            "accepted": False,
+            "factor_count": 1,
+            "reason": "synthetic_seam_failure",
+        },
+    )
+
+    results = [backend.process_packet(packet) for packet in packets]
+    result = results[-1]
+
+    assert result.graph is not None
+    assert result.graph.accepted is False
+    assert result.graph.reason == "post_optimization_seam_check_rejected"
+    torch.testing.assert_close(
+        backend.graph.transform(int(state["node"])),
+        state["before"],
+    )
+    seam = result.diagnostics["post_optimization_seam_check"]
+    assert seam["accepted"] is False
+    assert seam["enforced"] is True
 
 
 def test_chunk_stride_holdout_validation_only_checks_affected_edges(
@@ -1093,6 +1315,119 @@ def test_post_hash_incoming_budget_is_coverage_first_and_level_separated() -> No
     assert set(limited.batch.level.tolist()) == {0, 1}
     assert stats["incoming_budget_dropped"] == 4
     assert stats["incoming_budget_same_level_only"] == 1
+
+
+def test_new_frame_support_and_four_view_visibility_jointly_gate_first_fusion() -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    packet.metadata["voxel_anchor_refiner_requested"] = True
+    packet.metadata["voxel_anchor_refiner_pending"] = True
+
+    def finalize_refiner(value: LocalGaussianWindowPacket):
+        images = torch.zeros(
+            1,
+            len(value.frame_ids),
+            3,
+            *value.observation.image_size,
+        )
+        anchors = voxelize_per_pixel_gaussians(
+            value.observation,
+            value.adapter_features,
+            images,
+            VoxelAnchorConfig(
+                use_resnet_error=False,
+                pretrained_resnet=False,
+            ),
+            valid_mask=value.finite_gaussian_mask,
+        ).detach_for_backend()
+        assert anchors.num_anchors >= 3
+        source_view_mask = torch.zeros(anchors.num_anchors, dtype=torch.long)
+        # Anchor 1 is supported and visible; anchor 2 is supported but not
+        # visible. Anchor 0 is visible but lacks new-frame support.
+        source_view_mask[1:3] = 1
+        metadata = dict(value.metadata)
+        metadata.update(
+            {
+                "voxel_anchor_refiner_pending": False,
+                "voxel_anchor_refiner_enabled": True,
+                "voxel_anchor_source_view_mask": source_view_mask,
+            }
+        )
+        return replace(
+            value,
+            anchor_observation=anchors,
+            metadata=metadata,
+        )
+
+    _attach_identity_stride_matches(packet)
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        renderer=_FirstTwoLocalAnchorsVisibleRenderer(
+            local_depth=2.0,
+            global_depth=2.0,
+        ),
+        pose_canonicalized_packet_refiner=finalize_refiner,
+        config={
+            "enabled": True,
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "two_frame_bridge_depth_scale",
+                "min_points": 32,
+                "max_points": 128,
+                "min_points_per_frame": 32,
+                "max_points_per_frame": 64,
+                "post_refiner_scale_recheck": False,
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "radius_voxels": 1.5,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "update_existing_statistics": True,
+                "require_new_frame_support": True,
+                "log_posthash_coverage": False,
+            },
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "optimization_trigger": "loop_only",
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+                "min_match_cosine": 0.2,
+                "max_match_entropy": 1.0,
+                "chunk_stride": {
+                    "target_index": 2,
+                    "min_matches": 64,
+                    "holdout_stride": 5,
+                },
+                "skip_edge": {"enabled": False},
+            },
+            "loop_closure": {"exclude_recent_windows": 100},
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+    result = backend.process_packet(packet)
+
+    assert result.fusion["new_frame_support_requested"] >= 3
+    assert result.fusion["new_frame_support_kept"] == 2
+    assert result.fusion["incoming_visibility_admission_requested"] == 2
+    assert result.fusion["incoming_visibility_admission_kept"] == 1
+    assert result.fusion["incoming_visibility_admission_dropped"] == 1
+    assert result.fusion["incoming_visibility_admission_views"] == 4
+    assert result.fusion["hash_visibility_views"] == 4
+    assert result.fusion["chunk_anchor_delta"] == 1
+    assert backend.map.anchor_count() == 1
 
 
 def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None:

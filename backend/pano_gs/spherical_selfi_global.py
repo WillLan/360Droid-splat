@@ -231,6 +231,9 @@ class SphericalSelfiGlobalBackend:
         self.global_graph_optimization_enabled = bool(
             graph_cfg.get("optimization_enabled", True)
         )
+        self.enforce_post_optimization_validation = bool(
+            graph_cfg.get("enforce_post_optimization_validation", False)
+        )
         loop_cfg = dict(self.config.get("loop_closure", {}) or {})
         descriptor_cfg = dict(loop_cfg.get("descriptor", {}) or {})
         retrieval_cfg = dict(loop_cfg.get("retrieval", {}) or {})
@@ -645,9 +648,6 @@ class SphericalSelfiGlobalBackend:
         )
         self.chunk_stride_max_translation_error = float(
             stride_cfg.get("max_translation_error", 1.0)
-        )
-        self.chunk_stride_max_holdout_angular_deg = float(
-            stride_cfg.get("max_holdout_angular_deg", 2.0)
         )
         self.chunk_stride_max_holdout_relative_depth = float(
             stride_cfg.get("max_holdout_relative_depth", 0.10)
@@ -5246,10 +5246,6 @@ class SphericalSelfiGlobalBackend:
             float(inliers.sum().item())
             / float(max(self.chunk_stride_min_matches, 1024)),
         )
-        angular_score = math.exp(
-            -holdout_angular_median
-            / max(self.chunk_stride_max_holdout_angular_deg, 1.0e-6)
-        )
         depth_score = math.exp(
             -holdout_depth_median
             / max(self.chunk_stride_max_holdout_relative_depth, 1.0e-6)
@@ -5261,10 +5257,9 @@ class SphericalSelfiGlobalBackend:
                 (
                     max(support_score, 1.0e-6)
                     * max(coverage, 1.0e-6)
-                    * angular_score
                     * depth_score
                 )
-                ** 0.25,
+                ** (1.0 / 3.0),
             ),
         )
         scale_value = float(scale.detach().cpu())
@@ -5276,8 +5271,6 @@ class SphericalSelfiGlobalBackend:
             <= self.chunk_stride_max_scale_change
             and rotation_error <= self.chunk_stride_max_rotation_error_deg
             and translation_error <= translation_limit
-            and holdout_angular_median
-            <= self.chunk_stride_max_holdout_angular_deg
             and holdout_depth_median
             <= self.chunk_stride_max_holdout_relative_depth
         )
@@ -5307,7 +5300,6 @@ class SphericalSelfiGlobalBackend:
                 "source_spherical_coverage": source_coverage,
                 "target_spherical_coverage": target_coverage,
                 "support_score": support_score,
-                "angular_score": angular_score,
                 "depth_score": depth_score,
                 "information_confidence": information_confidence,
                 "local_ba_final_median_residual_deg": (
@@ -5921,9 +5913,7 @@ class SphericalSelfiGlobalBackend:
                 holdout.initial_relative_depth_median, 1.0e-6
             )
             edge_accepted = (
-                angular_median <= self.chunk_stride_max_holdout_angular_deg
-                and depth_median <= self.chunk_stride_max_holdout_relative_depth
-                and angular_ratio <= self.chunk_stride_postopt_worse_ratio
+                depth_median <= self.chunk_stride_max_holdout_relative_depth
                 and depth_ratio <= self.chunk_stride_postopt_worse_ratio
             )
             accepted = accepted and edge_accepted
@@ -8222,6 +8212,7 @@ class SphericalSelfiGlobalBackend:
         graph_result: Sim3GraphOptimizeResult | None = None
         seam_diagnostics: dict[str, Any] = {
             "enabled": self.post_optimization_seam_check_enabled,
+            "enforced": self.enforce_post_optimization_validation,
             "accepted": True,
             "factor_count": 0,
         }
@@ -8536,6 +8527,7 @@ class SphericalSelfiGlobalBackend:
                 )
         chunk_sequence_diagnostics: dict[str, Any] = {
             "enabled": bool(self.chunk_first_stride_graph),
+            "enforced": self.enforce_post_optimization_validation,
             "accepted": True,
             "factor_count": len(chunk_sequence_factors),
             "objective_before": chunk_sequence_objective_before,
@@ -8566,6 +8558,7 @@ class SphericalSelfiGlobalBackend:
             )
             chunk_sequence_diagnostics = {
                 "enabled": True,
+                "enforced": self.enforce_post_optimization_validation,
                 "accepted": bool(sequence_accepted),
                 "factor_count": len(chunk_sequence_factors),
                 "objective_before": chunk_sequence_objective_before,
@@ -8573,7 +8566,10 @@ class SphericalSelfiGlobalBackend:
                 "objective_ratio": sequence_ratio,
                 "maximum_ratio": self.chunk_cycle_sequence_objective_ratio,
             }
-            if not sequence_accepted:
+            if (
+                self.enforce_post_optimization_validation
+                and not sequence_accepted
+            ):
                 self._restore_graph_state(
                     self.graph, pre_boundary_graph_state
                 )
@@ -8600,7 +8596,13 @@ class SphericalSelfiGlobalBackend:
                 )
         if graph_result is not None and self.post_optimization_seam_check_enabled:
             seam_diagnostics = self._overlap_seam_diagnostics()
-            if not bool(seam_diagnostics["accepted"]):
+            seam_diagnostics["enforced"] = (
+                self.enforce_post_optimization_validation
+            )
+            if (
+                self.enforce_post_optimization_validation
+                and not bool(seam_diagnostics["accepted"])
+            ):
                 self._restore_graph_state(
                     self.graph, pre_boundary_graph_state
                 )
@@ -8627,6 +8629,7 @@ class SphericalSelfiGlobalBackend:
                 )
         stride_holdout_diagnostics: dict[str, Any] = {
             "enabled": bool(self.chunk_first_stride_graph),
+            "enforced": self.enforce_post_optimization_validation,
             "accepted": True,
             "factor_count": 0,
         }
@@ -8649,7 +8652,13 @@ class SphericalSelfiGlobalBackend:
                     affected_node_ids=affected_holdout_nodes
                 )
             )
-            if not bool(stride_holdout_diagnostics["accepted"]):
+            stride_holdout_diagnostics["enforced"] = (
+                self.enforce_post_optimization_validation
+            )
+            if (
+                self.enforce_post_optimization_validation
+                and not bool(stride_holdout_diagnostics["accepted"])
+            ):
                 self._restore_graph_state(
                     self.graph, pre_boundary_graph_state
                 )
@@ -8699,7 +8708,6 @@ class SphericalSelfiGlobalBackend:
             support_kept = support_requested
             if (
                 self.insertion_dedup_require_new_frame_support
-                and self.window_order
             ):
                 source_view_mask = packet.metadata.get(
                     "voxel_anchor_source_view_mask"
@@ -8714,12 +8722,10 @@ class SphericalSelfiGlobalBackend:
                         "New-frame-supported fusion requires source anchor indices"
                     )
                 previous_packet = self._last_full_packet
-                if previous_packet is None:
-                    raise RuntimeError(
-                        "New-frame-supported fusion requires the previous packet"
-                    )
-                overlap_ids = set(
-                    self._overlap_frame_ids(previous_packet, packet)
+                overlap_ids = (
+                    set()
+                    if previous_packet is None
+                    else set(self._overlap_frame_ids(previous_packet, packet))
                 )
                 new_indices = [
                     index
@@ -8777,10 +8783,23 @@ class SphericalSelfiGlobalBackend:
                 set[int],
                 tuple[int, int],
             ] | None = None
-            if self.insertion_dedup_enabled and self.map.anchor_count() > 0:
+            has_existing_map = self.map.anchor_count() > 0
+            require_four_view_admission = bool(
+                self.insertion_dedup_require_new_frame_support
+                and len(packet.frame_ids) == 4
+            )
+            render_insertion_visibility = bool(
+                require_four_view_admission
+                or (self.insertion_dedup_enabled and has_existing_map)
+            )
+            if render_insertion_visibility:
                 assert packet.anchor_observation is not None
-                if self.two_frame_overlap_enabled:
-                    if self.chunk_first_stride_graph:
+                use_all_packet_views = bool(
+                    require_four_view_admission
+                    or self.chunk_first_stride_graph
+                )
+                if require_four_view_admission or self.two_frame_overlap_enabled:
+                    if use_all_packet_views:
                         visibility_frame_ids = tuple(
                             int(value) for value in packet.frame_ids
                         )
@@ -8811,9 +8830,13 @@ class SphericalSelfiGlobalBackend:
                             )
                         )
                         if self.chunk_first_stride_graph
+                        and previous_packet is not None
                         else set()
                     )
-                    if self.insertion_dedup_log_posthash_coverage:
+                    if (
+                        self.insertion_dedup_log_posthash_coverage
+                        and has_existing_map
+                    ):
                         posthash_coverage_context = (
                             tuple(int(value) for value in visibility_frame_ids),
                             global_poses.detach().clone(),
@@ -8833,24 +8856,28 @@ class SphericalSelfiGlobalBackend:
                         incoming_render = self._render_refined_anchor_frame(
                             packet, frame_id
                         )
-                        existing_render = self._render_global_pose_frame(
-                            global_poses[packet.frame_index(frame_id)],
-                            image_size=packet.anchor_observation.image_size,
+                        existing_render = (
+                            self._render_global_pose_frame(
+                                global_poses[packet.frame_index(frame_id)],
+                                image_size=packet.anchor_observation.image_size,
+                            )
+                            if has_existing_map
+                            else None
                         )
                         incoming_visibility |= (
                             incoming_render.anchor_visibility.to(
                                 incoming_visibility.device
                             )
                         )
-                        existing_visibility |= (
-                            existing_render.anchor_visibility.to(
-                                existing_visibility.device
+                        if existing_render is not None:
+                            existing_visibility |= (
+                                existing_render.anchor_visibility.to(
+                                    existing_visibility.device
+                                )
                             )
-                        )
-                        insertion_render_seconds += (
-                            incoming_render.render_seconds
-                            + existing_render.render_seconds
-                        )
+                        insertion_render_seconds += incoming_render.render_seconds
+                        if existing_render is not None:
+                            insertion_render_seconds += existing_render.render_seconds
                         incoming_depth_valid = (
                             torch.isfinite(incoming_render.depth)
                             & (incoming_render.depth > 0.0)
@@ -8865,6 +8892,8 @@ class SphericalSelfiGlobalBackend:
                         existing_depth_valid = (
                             torch.isfinite(existing_render.depth)
                             & (existing_render.depth > 0.0)
+                            if existing_render is not None
+                            else torch.zeros_like(incoming_depth_valid)
                         )
                         existing_alpha_valid = (
                             torch.isfinite(existing_render.alpha)
@@ -8872,6 +8901,8 @@ class SphericalSelfiGlobalBackend:
                                 existing_render.alpha
                                 >= self.rendered_alignment_alpha_threshold
                             )
+                            if existing_render is not None
+                            else torch.zeros_like(incoming_alpha_valid)
                         )
                         coverage_values = (
                             float(incoming_depth_valid.float().mean().detach().cpu()),
@@ -8911,7 +8942,11 @@ class SphericalSelfiGlobalBackend:
                             hash_stats[
                                 f"prehash_view_{int(frame_id)}_{name}_coverage"
                             ] = value
-                        if int(frame_id) in diagnostic_overlap_ids:
+                        if (
+                            int(frame_id) in diagnostic_overlap_ids
+                            and existing_render is not None
+                            and previous_packet is not None
+                        ):
                             frame_index = packet.frame_index(int(frame_id))
                             previous_index = previous_packet.frame_index(
                                 int(frame_id)
@@ -9075,6 +9110,58 @@ class SphericalSelfiGlobalBackend:
                             hash_stats[
                                 f"prehash_{group}_{name}_coverage"
                             ] = sum(row[index] for row in rows) / len(rows)
+                    if require_four_view_admission:
+                        if prepared.source_anchor_indices is None:
+                            raise RuntimeError(
+                                "Four-view incoming admission requires source anchor indices"
+                            )
+                        admission_requested = len(prepared.batch)
+                        source_rows = prepared.source_anchor_indices.to(
+                            incoming_visibility.device
+                        )
+                        admitted = incoming_visibility.index_select(
+                            0, source_rows
+                        )
+                        selected = torch.nonzero(
+                            admitted, as_tuple=False
+                        ).flatten().to(prepared.batch.xyz.device)
+                        prepared = prepared.index(selected)
+                        admission_kept = len(prepared.batch)
+                        hash_stats.update(
+                            {
+                                "incoming_visibility_admission_requested": (
+                                    admission_requested
+                                ),
+                                "incoming_visibility_admission_kept": (
+                                    admission_kept
+                                ),
+                                "incoming_visibility_admission_dropped": (
+                                    admission_requested - admission_kept
+                                ),
+                                "incoming_visibility_admission_views": (
+                                    len(visibility_frame_ids)
+                                ),
+                                "hash_candidates": admission_kept,
+                                "hash_visible_incoming": admission_kept,
+                                "hash_kept": admission_kept,
+                            }
+                        )
+                        for level in range(len(self.fusion.voxel_sizes)):
+                            level_incoming = int(
+                                (prepared.batch.level == level)
+                                .sum()
+                                .detach()
+                                .cpu()
+                            )
+                            hash_stats[f"hash_level_{level}_incoming"] = (
+                                level_incoming
+                            )
+                            hash_stats[f"hash_level_{level}_visible"] = (
+                                level_incoming
+                            )
+                            hash_stats[f"hash_level_{level}_kept"] = (
+                                level_incoming
+                            )
                 else:
                     incoming_render = self._render_refined_anchor_shared_frame(
                         packet
@@ -9090,25 +9177,27 @@ class SphericalSelfiGlobalBackend:
                         + existing_render.render_seconds
                     )
                     hash_visibility_views = 1
-                hash_start = time.perf_counter()
-                prehash_diagnostics = dict(hash_stats)
-                prepared, filtered_hash_stats, evidence_update = (
-                    self.fusion.filter_against_visible_map(
-                        prepared,
-                        incoming_anchor_visibility=incoming_visibility,
-                        existing_anchor_visibility=existing_visibility,
-                        radius_voxels=self.insertion_dedup_radius_voxels,
-                        update_existing_statistics=(
-                            self.insertion_dedup_update_existing_statistics
-                        ),
-                    )
-                )
-                hash_stats = {
-                    **prehash_diagnostics,
-                    **filtered_hash_stats,
-                }
                 hash_stats["hash_visibility_views"] = hash_visibility_views
-                hash_seconds = float(time.perf_counter() - hash_start)
+                if self.insertion_dedup_enabled and has_existing_map:
+                    hash_start = time.perf_counter()
+                    prehash_diagnostics = dict(hash_stats)
+                    prepared, filtered_hash_stats, evidence_update = (
+                        self.fusion.filter_against_visible_map(
+                            prepared,
+                            incoming_anchor_visibility=incoming_visibility,
+                            existing_anchor_visibility=existing_visibility,
+                            radius_voxels=self.insertion_dedup_radius_voxels,
+                            update_existing_statistics=(
+                                self.insertion_dedup_update_existing_statistics
+                            ),
+                        )
+                    )
+                    hash_stats = {
+                        **prehash_diagnostics,
+                        **filtered_hash_stats,
+                    }
+                    hash_stats["hash_visibility_views"] = hash_visibility_views
+                    hash_seconds = float(time.perf_counter() - hash_start)
             prepared, incoming_budget_stats = (
                 self.fusion.limit_prepared_incoming_by_coverage(
                     prepared,
@@ -9325,6 +9414,9 @@ class SphericalSelfiGlobalBackend:
                 "graph_node_mode": self.node_mode,
                 "global_graph_optimization_enabled": (
                     self.global_graph_optimization_enabled
+                ),
+                "post_optimization_validation_enforced": (
+                    self.enforce_post_optimization_validation
                 ),
                 "global_ba_scheduled": graph_result is not None,
                 "hierarchical_submaps_enabled": self.hierarchical_submaps_enabled,

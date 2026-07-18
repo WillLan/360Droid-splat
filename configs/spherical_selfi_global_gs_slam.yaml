@@ -248,6 +248,9 @@ SphericalSelfiGlobalBackend:
     compress_frozen_dense_factors: true
   global_graph:
     optimization_enabled: true
+    # Keep post-LM sequence/seam/holdout checks as diagnostics, but do not
+    # veto an LM result that passed the solver's own finite/objective checks.
+    enforce_post_optimization_validation: false
     node_mode: chunk_first_stride
     optimization_trigger: periodic_and_loop
     factor_mode: dense_spherical
@@ -283,7 +286,6 @@ SphericalSelfiGlobalBackend:
       max_scale_change: 2.5
       max_rotation_error_deg: 5.0
       max_translation_error: 1.0
-      max_holdout_angular_deg: 3.0
       max_holdout_relative_depth: 0.10
       postopt_worse_ratio: 1.05
     skip_edge:
@@ -381,8 +383,8 @@ SphericalSelfiGlobalBackend:
     min_opacity: 0.02
     # Retain the global long-sequence safety cap.  A no-cap run is allowed
     # only as an explicit short-sequence ablation override.
-    max_total_gaussians: 2000000
-    # This switch controls selection at the global 2M cap; it is independent
+    max_total_gaussians: 3000000
+    # This switch controls selection at the global 3M cap; it is independent
     # of insertion_dedup.max_new_gaussians_per_chunk.
     coverage_aware_budget: true
     coverage_coarse_cell_size: 0.64
