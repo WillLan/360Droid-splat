@@ -6286,11 +6286,11 @@ class SphericalSelfiGlobalBackend:
         self.mapper.optimizer = self.map.make_optimizer(
             lr=float(self.config.get("map_optimization", {}).get("lr", 2.0e-3))
         )
-        backend_transaction = (
-            self._snapshot_boundary_transaction()
-            if self.chunk_first_stride_graph
-            else None
-        )
+        # Mapper keyframes are registered by prepare_spherical_selfi_window().
+        # They are durable input state, not part of the pose proposal.  Capture
+        # the rollback boundary only after registration so rejecting a proposal
+        # never tries to restore a pre-registration keyframe topology.
+        backend_transaction = None
         if self.chunk_first_stride_graph:
             self._last_mapper_committed_state_diagnostic = None
         try:
@@ -6319,6 +6319,8 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError(
                     f"window {window_id} has {prepared}/{len(frame_ids)} registered RGB observations"
                 )
+            if self.chunk_first_stride_graph:
+                backend_transaction = self._snapshot_boundary_transaction()
             fixed_frame_ids: list[int] = []
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),

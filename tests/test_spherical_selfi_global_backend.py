@@ -135,9 +135,11 @@ def _chunk_stride_backend(
     skip: bool = False,
     periodic: bool = False,
     hierarchical: bool = False,
+    mapper=None,
 ):
     return SphericalSelfiGlobalBackend(
         PanoGaussianMap(config={}, device="cpu"),
+        mapper=mapper,
         config={
             "enabled": True,
             "global_graph": {
@@ -4554,6 +4556,69 @@ def test_boundary_map_optimization_refines_all_poses_and_passes_group_lrs() -> N
     assert mapper.settings["fixed_pose_frame_ids"] == []
     assert callable(mapper.extra_loss_fn)
     assert mapper.commits == 1
+
+
+def test_mapper_rejection_snapshots_after_durable_keyframe_registration() -> None:
+    packet = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.keyframe_ids: list[int] = []
+            self.restore_count = 0
+            self.rollback_count = 0
+
+        def set_spherical_selfi_observation_geometry(self, *args, **kwargs) -> None:
+            return None
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            for frame_id in frame_ids:
+                if int(frame_id) not in self.keyframe_ids:
+                    self.keyframe_ids.append(int(frame_id))
+            return len(frame_ids)
+
+        def snapshot_frontend_geometry_state(self):
+            return {"keyframe_ids": tuple(self.keyframe_ids)}
+
+        def restore_frontend_geometry_state(self, state) -> None:
+            # This models the real Mapper's strict topology invariant.  A
+            # proposal rollback may restore geometry, but must not attempt to
+            # erase keyframes durably registered by prepare().
+            assert tuple(self.keyframe_ids) == state["keyframe_ids"]
+            self.restore_count += 1
+
+        def optimize_spherical_selfi_window(self, **kwargs):
+            return {"steps": 1.0, "window_rollback": 0.0}
+
+        def rollback_spherical_selfi_window(self) -> None:
+            self.rollback_count += 1
+
+        def commit_spherical_selfi_window(self) -> None:
+            raise AssertionError("A rejected mapper proposal must not commit")
+
+    mapper = _Mapper()
+    backend = _chunk_stride_backend(min_matches=8, mapper=mapper)
+    backend.graph.add_node(0, sim3_identity())
+    backend.window_order = [0]
+    backend.window_anchor_nodes[0] = 0
+    backend.packets[0] = packet.compact_for_memory()
+    backend._optimization_packets[0] = packet
+
+    def reject_sync(window_id: int) -> None:
+        raise RuntimeError(f"synthetic proposal rejection for {window_id}")
+
+    backend._synchronize_joint_optimized_window = reject_sync
+    metrics = backend._run_map_optimization(0, packet.frame_ids, 1)
+
+    assert metrics["window_rollback"] == 1.0
+    assert mapper.keyframe_ids == [0, 1, 2, 3]
+    assert mapper.restore_count == 1
+    assert mapper.rollback_count == 1
 
 
 def test_separate_gaussian_groups_and_true_adam_update_scaling() -> None:
