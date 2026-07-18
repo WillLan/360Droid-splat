@@ -117,6 +117,7 @@ class MapperObservation:
     target_depth_local: torch.Tensor | None = None
     target_depth_scale: float = 1.0
     owner_window_id: int | None = None
+    pose_revision: int = 0
 
 
 @dataclass
@@ -3293,10 +3294,59 @@ class PanoGaussianMapper:
             if tuple(pose_t.shape) != (4, 4) or not torch.isfinite(pose_t).all():
                 continue
             self.pose_deltas[fid] = PoseDelta(pose_t).to(device=device)
+            observation = self.observations.get(fid)
+            if observation is not None:
+                observation.pose_c2w = pose_t.detach().cpu().float()
             applied += 1
         if applied > 0:
             self.optimizer = self.map.make_optimizer(lr=self.optimizer.param_groups[0]["lr"])
         return applied
+
+    def apply_canonical_pose_state(
+        self,
+        poses_c2w: dict[int, torch.Tensor],
+        *,
+        revision: int,
+    ) -> int:
+        """Atomically mirror one committed backend pose revision."""
+
+        if not poses_c2w:
+            return 0
+        device = self.map.get_xyz.device
+        dtype = self.map.get_xyz.dtype
+        staged: dict[int, PoseDelta] = {}
+        staged_observations: dict[int, torch.Tensor] = {}
+        for frame_id, pose in poses_c2w.items():
+            fid = int(frame_id)
+            value = pose.detach().to(device=device, dtype=dtype)
+            if tuple(value.shape) != (4, 4) or not bool(
+                torch.isfinite(value).all()
+            ):
+                raise ValueError(
+                    f"Invalid canonical pose for mapper frame {fid}"
+                )
+            if fid in self.pose_deltas or fid in self.observations:
+                staged[fid] = PoseDelta(value).to(device=device)
+            if fid in self.observations:
+                staged_observations[fid] = value.detach().cpu().float()
+
+        new_optimizer = None
+        if staged:
+            learning_rate = (
+                float(self.optimizer.param_groups[0]["lr"])
+                if self.optimizer is not None
+                else float(self.optim_cfg.get("lr", 2.0e-3))
+            )
+            new_optimizer = self.map.make_optimizer(lr=learning_rate)
+        for fid, pose_delta in staged.items():
+            self.pose_deltas[fid] = pose_delta
+        for fid, pose in staged_observations.items():
+            observation = self.observations[fid]
+            observation.pose_c2w = pose
+            observation.pose_revision = int(revision)
+        if new_optimizer is not None:
+            self.optimizer = new_optimizer
+        return len(staged)
 
     def set_spherical_selfi_observation_geometry(
         self,
@@ -3327,7 +3377,12 @@ class PanoGaussianMapper:
             observation.sky_mask = sky_mask.detach().cpu().bool()
         return True
 
-    def apply_frontend_geometry_updates(self, updates: dict[int, object]) -> int:
+    def apply_frontend_geometry_updates(
+        self,
+        updates: dict[int, object],
+        *,
+        revision: int | None = None,
+    ) -> int:
         """Apply global c2w and graph depth scale without rescaling depth twice."""
 
         if not updates:
@@ -3341,6 +3396,8 @@ class PanoGaussianMapper:
             observation = self.observations.get(int(frame_id))
             if observation is None:
                 continue
+            if revision is not None:
+                observation.pose_revision = int(revision)
             depth_owner = int(
                 observation.owner_window_id
                 if observation.owner_window_id is not None
@@ -3362,7 +3419,12 @@ class PanoGaussianMapper:
                         keyframe.target_depth = observation.target_depth.detach().cpu().float()
         return applied
 
-    def apply_frontend_geometry_snapshot(self, updates: dict[int, object]) -> int:
+    def apply_frontend_geometry_snapshot(
+        self,
+        updates: dict[int, object],
+        *,
+        revision: int | None = None,
+    ) -> int:
         """Atomically replace every registered pose/depth represented by a snapshot."""
 
         if not updates:
@@ -3373,6 +3435,7 @@ class PanoGaussianMapper:
         staged_observations: dict[
             int, tuple[float, int | None, torch.Tensor | None]
         ] = {}
+        staged_observation_poses: dict[int, torch.Tensor] = {}
         staged_keyframe_depths: dict[int, torch.Tensor | None] = {}
         for frame_id, update in updates.items():
             fid = int(frame_id)
@@ -3391,6 +3454,7 @@ class PanoGaussianMapper:
             observation = self.observations.get(fid)
             if observation is None:
                 continue
+            staged_observation_poses[fid] = pose.detach().cpu().float()
             depth_owner = int(
                 observation.owner_window_id
                 if observation.owner_window_id is not None
@@ -3448,6 +3512,9 @@ class PanoGaussianMapper:
             self.pose_deltas[fid] = pose_delta
         for fid, (scale, owner, target_depth) in staged_observations.items():
             observation = self.observations[fid]
+            observation.pose_c2w = staged_observation_poses[fid]
+            if revision is not None:
+                observation.pose_revision = int(revision)
             if observation.target_depth_local is None and target_depth is not None:
                 observation.target_depth_local = target_depth / scale
             observation.target_depth_scale = scale
@@ -3466,8 +3533,17 @@ class PanoGaussianMapper:
 
         return {
             "pose_deltas": dict(self.pose_deltas),
+            "pose_delta_values": {
+                int(frame_id): (
+                    pose_delta.base_c2w.detach().clone(),
+                    pose_delta.delta.detach().clone(),
+                )
+                for frame_id, pose_delta in self.pose_deltas.items()
+            },
             "observation_geometry": {
                 int(frame_id): (
+                    observation.pose_c2w,
+                    int(observation.pose_revision),
                     observation.target_depth_local,
                     float(observation.target_depth_scale),
                     observation.owner_window_id,
@@ -3485,12 +3561,23 @@ class PanoGaussianMapper:
         """Restore a state returned by :meth:`snapshot_frontend_geometry_state`."""
 
         self.pose_deltas = dict(state["pose_deltas"])
+        pose_delta_values = dict(state.get("pose_delta_values", {}))
+        with torch.no_grad():
+            for frame_id, values in pose_delta_values.items():
+                pose_delta = self.pose_deltas.get(int(frame_id))
+                if pose_delta is None:
+                    continue
+                base_c2w, delta = values
+                pose_delta.base_c2w.copy_(base_c2w.to(pose_delta.base_c2w))
+                pose_delta.delta.copy_(delta.to(pose_delta.delta))
         observation_geometry = dict(state["observation_geometry"])
         for frame_id, values in observation_geometry.items():
             observation = self.observations.get(int(frame_id))
             if observation is None:
                 continue
             (
+                observation.pose_c2w,
+                observation.pose_revision,
                 observation.target_depth_local,
                 observation.target_depth_scale,
                 observation.owner_window_id,

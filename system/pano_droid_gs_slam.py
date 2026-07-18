@@ -2983,6 +2983,9 @@ class PanoDroidGSSlamSystem:
                 if record is not None:
                     record["pose_c2w"] = pose.clone()
 
+            target_revision = int(
+                revision or spherical_selfi_geometry_revision + 1
+            )
             mapper_state = self.mapper.snapshot_frontend_geometry_state()
             logger_state = {
                 "frontend": list(logger._frontend_pose_history),
@@ -2993,15 +2996,19 @@ class PanoDroidGSSlamSystem:
             }
             try:
                 if complete_snapshot:
-                    self.mapper.apply_frontend_geometry_snapshot(updates)
+                    self.mapper.apply_frontend_geometry_snapshot(
+                        updates,
+                        revision=target_revision,
+                    )
                 else:
-                    self.mapper.apply_frontend_geometry_updates(updates)
+                    self.mapper.apply_frontend_geometry_updates(
+                        updates,
+                        revision=target_revision,
+                    )
                 if complete_snapshot:
                     logger.replace_geometry_history(
                         staged_geometry,
-                        revision=int(
-                            revision or spherical_selfi_geometry_revision + 1
-                        ),
+                        revision=target_revision,
                     )
             except Exception:
                 self.mapper.restore_frontend_geometry_state(mapper_state)

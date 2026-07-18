@@ -134,6 +134,7 @@ def _chunk_stride_backend(
     min_matches: int = 256,
     skip: bool = False,
     periodic: bool = False,
+    hierarchical: bool = False,
 ):
     return SphericalSelfiGlobalBackend(
         PanoGaussianMap(config={}, device="cpu"),
@@ -173,6 +174,11 @@ def _chunk_stride_backend(
             },
             "voxel_fusion": {
                 "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+            },
+            "hierarchical_submaps": {
+                "enabled": bool(hierarchical),
+                "windows_per_submap": 5,
+                "shared_boundary_nodes": 1,
             },
             "map_optimization": {"steps_per_window": 0, "final_steps": 0},
         },
@@ -728,7 +734,7 @@ def test_chunk_first_periodic_ba_starts_at_six_nodes_then_runs_every_three_chunk
     assert scales == pytest.approx([scales[0]] * len(scales))
 
 
-def test_periodic_graph_post_lm_geometry_failures_are_diagnostic_by_default(
+def test_periodic_graph_geometry_failures_are_diagnostic_but_state_is_hard(
     monkeypatch,
 ) -> None:
     packets = [
@@ -763,9 +769,15 @@ def test_periodic_graph_post_lm_geometry_failures_are_diagnostic_by_default(
         node = int(active_node_ids[-1])
         transform = backend.graph.transform(node)
         scale, rotation, translation = sim3_components(transform)
+        updated_rotation = (
+            se3_exp(
+                rotation.new_tensor([0.0, 0.0, 0.0, 0.1, -0.05, 0.02])
+            )[:3, :3]
+            @ rotation
+        )
         updated = sim3_from_components(
             scale,
-            rotation,
+            updated_rotation,
             translation + translation.new_tensor([0.25, 0.0, 0.0]),
         )
         backend.graph.nodes[node] = updated
@@ -786,12 +798,9 @@ def test_periodic_graph_post_lm_geometry_failures_are_diagnostic_by_default(
     monkeypatch.setattr(
         backend,
         "_overlap_seam_diagnostics",
-        lambda: {
-            "enabled": True,
-            "accepted": False,
-            "factor_count": 1,
-            "reason": "synthetic_seam_failure",
-        },
+        lambda: (_ for _ in ()).throw(
+            AssertionError("chunk-first must not compare stale packet seams")
+        ),
     )
     monkeypatch.setattr(
         backend,
@@ -817,13 +826,41 @@ def test_periodic_graph_post_lm_geometry_failures_are_diagnostic_by_default(
     )
     seam = result.diagnostics["post_optimization_seam_check"]
     holdout = result.diagnostics["chunk_stride_holdout_check"]
-    assert seam["accepted"] is False
-    assert seam["enforced"] is False
+    assert seam["mode"] == "canonical_pose_state_consistency"
+    assert seam["accepted"] is True
+    assert seam["enforced"] is True
+    assert seam["candidate_revision"] == seam["committed_revision"]
+    moved_node = int(moved["node"])
+    in_flight = backend._last_full_packet
+    assert in_flight is not None
+    assert in_flight.metadata["canonical_pose_revision"] == seam[
+        "committed_revision"
+    ]
+    in_flight_pose = in_flight.global_poses(
+        backend._window_anchor_transforms()[int(in_flight.window_id)].to(
+            in_flight.local_poses_c2w
+        )
+    )[in_flight.frame_index(moved_node)]
+    canonical_pose = apply_sim3_to_c2w(
+        backend.graph.transform(moved_node).to(
+            backend.frame_local_pose_in_owner[moved_node]
+        ),
+        backend.frame_local_pose_in_owner[moved_node],
+    )
+    torch.testing.assert_close(in_flight_pose, canonical_pose)
+    assert result.fusion["pose_state_committed_revision"] == seam[
+        "committed_revision"
+    ]
+    assert backend._pending_geometry_batch is not None
+    assert backend._pending_geometry_batch.complete_snapshot is True
+    assert backend._pending_geometry_batch.revision == seam[
+        "committed_revision"
+    ]
     assert holdout["accepted"] is False
     assert holdout["enforced"] is False
 
 
-def test_periodic_graph_post_lm_validation_can_restore_pre_lm_state(
+def test_periodic_graph_independent_holdout_can_restore_pre_lm_state(
     monkeypatch,
 ) -> None:
     packets = [
@@ -878,30 +915,129 @@ def test_periodic_graph_post_lm_validation_can_restore_pre_lm_state(
         )
 
     monkeypatch.setattr(backend.graph, "optimize", accepted_optimize)
-    monkeypatch.setattr(
-        backend,
-        "_overlap_seam_diagnostics",
-        lambda: {
-            "enabled": True,
-            "accepted": False,
-            "factor_count": 1,
-            "reason": "synthetic_seam_failure",
-        },
-    )
-
     results = [backend.process_packet(packet) for packet in packets]
     result = results[-1]
 
     assert result.graph is not None
     assert result.graph.accepted is False
-    assert result.graph.reason == "post_optimization_seam_check_rejected"
+    assert result.graph.reason == "chunk_stride_holdout_rejected"
     torch.testing.assert_close(
         backend.graph.transform(int(state["node"])),
         state["before"],
     )
-    seam = result.diagnostics["post_optimization_seam_check"]
-    assert seam["accepted"] is False
-    assert seam["enforced"] is True
+    holdout = result.diagnostics["chunk_stride_holdout_check"]
+    assert holdout["accepted"] is False
+    assert holdout["enforced"] is True
+
+
+def test_post_candidate_fusion_failure_restores_pose_state_transaction(
+    monkeypatch,
+) -> None:
+    packets = [
+        _packet(
+            window_id,
+            torch.eye(4).repeat(4, 1, 1),
+            (
+                2 * window_id,
+                2 * window_id + 1,
+                2 * window_id + 2,
+                2 * window_id + 3,
+            ),
+            height=32,
+            width=64,
+        )
+        for window_id in range(5)
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        periodic=True,
+    )
+    monkeypatch.setattr(backend.loop_detector, "detect", lambda packet: [])
+    for packet in packets[:4]:
+        backend.process_packet(packet)
+    backend.pop_frame_geometry_update_batch()
+
+    graph_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    packet_before = {
+        id(packet): (
+            packet.local_poses_c2w.clone(),
+            dict(packet.metadata),
+        )
+        for window_id in backend.window_order
+        for packet in backend._packet_variants(window_id)
+    }
+    map_count_before = backend.map.anchor_count()
+    lazy_owner_before = {
+        owner: transform.clone()
+        for owner, transform in backend.map._lazy_owner_current_transforms.items()
+    }
+    window_order_before = list(backend.window_order)
+    geometry_revision_before = backend._geometry_revision
+    pose_revision_before = backend._pose_state_revision
+
+    def accepted_optimize(active_node_ids=None, *, fixed_node_ids=None):
+        node = int(active_node_ids[-1])
+        transform = backend.graph.transform(node)
+        scale, rotation, translation = sim3_components(transform)
+        backend.graph.nodes[node] = sim3_from_components(
+            scale,
+            rotation,
+            translation + translation.new_tensor([0.2, 0.0, 0.0]),
+        )
+        return Sim3GraphOptimizeResult(
+            accepted=True,
+            iterations=1,
+            initial_objective=1.0,
+            final_objective=0.5,
+            max_update_norm=0.2,
+            optimized_node_ids=tuple(int(value) for value in active_node_ids),
+            reason="synthetic_accepted",
+            final_damping=float(backend.graph.damping),
+        )
+
+    monkeypatch.setattr(backend.graph, "optimize", accepted_optimize)
+    monkeypatch.setattr(
+        backend.fusion,
+        "fuse_packet",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic post-candidate fusion failure")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic post-candidate fusion failure",
+    ):
+        backend.process_packet(packets[-1])
+
+    assert backend.window_order == window_order_before
+    assert backend.map.anchor_count() == map_count_before
+    assert set(backend.map._lazy_owner_current_transforms) == set(
+        lazy_owner_before
+    )
+    for owner, transform in lazy_owner_before.items():
+        torch.testing.assert_close(
+            backend.map._lazy_owner_current_transforms[owner],
+            transform,
+        )
+    assert backend._geometry_revision == geometry_revision_before
+    assert backend._pose_state_revision == pose_revision_before
+    for node, transform in graph_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    for window_id in backend.window_order:
+        for packet in backend._packet_variants(window_id):
+            local_poses, metadata = packet_before[id(packet)]
+            torch.testing.assert_close(packet.local_poses_c2w, local_poses)
+            assert packet.metadata == metadata
+    failure = backend._last_pose_state_diagnostic
+    assert failure is not None
+    assert failure["transaction_committed"] is False
+    assert failure["candidate_revision"] > failure["committed_revision"]
 
 
 def test_chunk_stride_holdout_validation_only_checks_affected_edges(
@@ -1087,7 +1223,7 @@ def test_chunk_first_nodes_rigidly_publish_both_frames_in_each_segment() -> None
         )
 
 
-def test_mapper_internal_frame_seam_failure_is_zero_state_commit() -> None:
+def test_mapper_internal_frame_motion_is_not_rejected_by_stale_packet_seam() -> None:
     packets = [
         _packet(
             0,
@@ -1113,6 +1249,25 @@ def test_mapper_internal_frame_seam_failure_is_zero_state_commit() -> None:
     backend.process_packet(packets[0])
     backend.process_packet(packets[1])
     backend.pop_frame_geometry_update_batch()
+    assert backend._last_full_packet is not None
+    backend._optimization_packets[1] = replace(
+        backend._last_full_packet,
+        local_poses_c2w=backend._last_full_packet.local_poses_c2w.clone(),
+        metadata=dict(backend._last_full_packet.metadata),
+    )
+    for window_id in backend.window_order:
+        variant = backend.packets[window_id]
+        refined = _refined_packet(
+            window_id,
+            variant.local_poses_c2w,
+            variant.frame_ids,
+        )
+        assert refined.anchor_observation is not None
+        for packet_variant in backend._packet_variants(window_id):
+            packet_variant.anchor_observation = replace(
+                refined.anchor_observation,
+                local_poses_c2w=packet_variant.local_poses_c2w.unsqueeze(0),
+            )
 
     proposals: dict[int, torch.Tensor] = {}
     for frame_id, owner in backend.frame_pose_owner_node.items():
@@ -1132,43 +1287,38 @@ def test_mapper_internal_frame_seam_failure_is_zero_state_commit() -> None:
             return proposals[int(frame_id)]
 
     backend.mapper = MapperProposal()
-    graph_before = {
-        node: transform.clone() for node, transform in backend.graph.nodes.items()
-    }
-    local_before = {
-        frame: pose.clone()
-        for frame, pose in backend.frame_local_pose_in_owner.items()
-    }
-    packet_before = {
-        window_id: packet.local_poses_c2w.clone()
-        for window_id, packet in backend.packets.items()
-    }
     revision_before = backend._geometry_revision
-    map_lazy_before = {
-        owner: transform.clone()
-        for owner, transform in backend.map._lazy_owner_current_transforms.items()
-    }
 
-    with pytest.raises(RuntimeError, match="seam=False"):
-        backend._synchronize_chunk_stride_optimized_window(1)
+    backend._synchronize_chunk_stride_optimized_window(1)
 
-    assert backend._geometry_revision == revision_before
-    assert backend._pending_geometry_batch is None
-    for node, transform in graph_before.items():
-        torch.testing.assert_close(backend.graph.transform(node), transform)
-    for frame, pose in local_before.items():
-        torch.testing.assert_close(backend.frame_local_pose_in_owner[frame], pose)
-    for window_id, poses in packet_before.items():
-        torch.testing.assert_close(
-            backend.packets[window_id].local_poses_c2w,
-            poses,
+    assert backend._geometry_revision == revision_before + 1
+    assert backend._pose_state_revision == backend._geometry_revision
+    state = backend._last_pose_state_diagnostic
+    assert state is not None
+    assert state["accepted"] is True
+    assert state["max_matrix_error"] <= 1.0e-5
+    assert state["max_center_error"] <= 1.0e-5
+    for window_id in (0, 1):
+        packet = backend.packets[window_id]
+        frame_index = packet.frame_index(3)
+        packet_pose = apply_sim3_to_c2w(
+            backend._window_anchor_transforms()[window_id].to(
+                packet.local_poses_c2w
+            ),
+            packet.local_poses_c2w[frame_index],
         )
-    assert set(backend.map._lazy_owner_current_transforms) == set(map_lazy_before)
-    for owner, transform in map_lazy_before.items():
+        torch.testing.assert_close(packet_pose, proposals[3])
+        assert packet.anchor_observation is not None
         torch.testing.assert_close(
-            backend.map._lazy_owner_current_transforms[owner],
-            transform,
+            packet.anchor_observation.local_poses_c2w[0],
+            packet.local_poses_c2w,
         )
+        for packet_variant in backend._packet_variants(window_id):
+            assert packet_variant.anchor_observation is not None
+            torch.testing.assert_close(
+                packet_variant.anchor_observation.local_poses_c2w[0],
+                packet_variant.local_poses_c2w,
+            )
 
 
 def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch() -> None:
@@ -1216,6 +1366,14 @@ def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch
             return proposals[int(frame_id)]
 
     backend.mapper = MapperProposal()
+    factor_measurements = {
+        id(factor): (
+            factor.source_local_pose.clone(),
+            factor.target_local_pose.clone(),
+        )
+        for factor in backend.graph.edges
+        if isinstance(factor, DenseSphericalFactorBlock)
+    }
     backend._synchronize_chunk_stride_optimized_window(1)
 
     batch = backend.pop_frame_geometry_update_batch()
@@ -1235,6 +1393,184 @@ def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch
             packet.local_poses_c2w[frame_index],
         )
         torch.testing.assert_close(packet_pose, proposals[3])
+    for factor in backend.graph.edges:
+        poses = factor_measurements.get(id(factor))
+        if poses is None:
+            continue
+        torch.testing.assert_close(factor.source_local_pose, poses[0])
+        torch.testing.assert_close(factor.target_local_pose, poses[1])
+
+
+def test_pose_state_consistency_failure_rolls_back_graph_packets_and_revision(
+    monkeypatch,
+) -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+    backend.process_packet(packets[0])
+    backend.process_packet(packets[1])
+    backend.pop_frame_geometry_update_batch()
+
+    proposals: dict[int, torch.Tensor] = {}
+    for frame_id, owner in backend.frame_pose_owner_node.items():
+        local = backend.frame_local_pose_in_owner[frame_id]
+        proposals[frame_id] = apply_sim3_to_c2w(
+            backend.graph.transform(owner).to(local),
+            local,
+        )
+    proposals[3] = proposals[3].clone()
+    proposals[3][0, 3] += 0.1
+
+    class MapperProposal:
+        optimizer = None
+        stats = SimpleNamespace(n_anchors=backend.map.anchor_count())
+
+        def refined_pose_c2w(self, frame_id: int):
+            return proposals[int(frame_id)]
+
+    backend.mapper = MapperProposal()
+    graph_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    local_before = {
+        frame: pose.clone()
+        for frame, pose in backend.frame_local_pose_in_owner.items()
+    }
+    packet_before = {
+        id(packet): (
+            packet.local_poses_c2w.clone(),
+            dict(packet.metadata),
+        )
+        for window_id in backend.window_order
+        for packet in backend._packet_variants(window_id)
+    }
+    geometry_revision_before = backend._geometry_revision
+    pose_revision_before = backend._pose_state_revision
+    original_report = backend._pose_state_consistency_report
+
+    def reject_report(candidate, *, extra_packets=()):
+        report = original_report(
+            candidate,
+            extra_packets=extra_packets,
+        )
+        return replace(
+            report,
+            accepted=False,
+            reason="synthetic_state_mismatch",
+        )
+
+    monkeypatch.setattr(
+        backend,
+        "_pose_state_consistency_report",
+        reject_report,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Canonical pose-state consistency failed",
+    ):
+        backend._synchronize_chunk_stride_optimized_window(1)
+
+    assert backend._geometry_revision == geometry_revision_before
+    assert backend._pose_state_revision == pose_revision_before
+    assert backend._pending_geometry_batch is None
+    for node, transform in graph_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    for frame_id, local_pose in local_before.items():
+        torch.testing.assert_close(
+            backend.frame_local_pose_in_owner[frame_id],
+            local_pose,
+        )
+    for window_id in backend.window_order:
+        for packet in backend._packet_variants(window_id):
+            local_poses, metadata = packet_before[id(packet)]
+            torch.testing.assert_close(packet.local_poses_c2w, local_poses)
+            assert packet.metadata == metadata
+
+
+def test_pose_state_rotation_error_is_stable_at_float32_round_trip_scale() -> None:
+    rotation = se3_exp(
+        torch.tensor([0.0, 0.0, 0.0, 0.3, -0.2, 0.1])
+    )[:3, :3]
+    estimate = rotation.clone()
+    estimate[0, 0] -= 5.0e-7
+
+    assert float((estimate - rotation).abs().max()) <= 1.0e-5
+    assert (
+        SphericalSelfiGlobalBackend._pose_state_rotation_error_deg(
+            rotation,
+            estimate,
+        )
+        <= 1.0e-4
+    )
+
+
+def test_hierarchical_pose_candidate_refreshes_local_cache_before_check() -> None:
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        hierarchical=True,
+    )
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+        backend.process_packet(packet)
+
+    assert backend.submap_graph is not None
+    old_window_transforms = backend._window_anchor_transforms()
+    moved = backend.graph.transform(4).clone()
+    moved[1, 3] += 0.2
+    backend.graph.nodes[4] = moved
+
+    candidate, report, _ = backend._materialize_pose_state_candidate(
+        affected_node_ids={4},
+        affected_submap_ids={0},
+        old_window_transforms=old_window_transforms,
+        reason="synthetic_hierarchical_candidate",
+    )
+
+    assert candidate.affected_submap_ids == (0,)
+    assert report.accepted is True
+    assert report.max_submap_matrix_error <= 1.0e-5
+    record = backend.submaps[0]
+    reconstructed = (
+        backend.submap_graph.transform(0).to(
+            record.local_boundary_transforms[4]
+        )
+        @ record.local_boundary_transforms[4]
+    )
+    torch.testing.assert_close(reconstructed, backend.graph.transform(4))
 
 
 def test_skip_factor_recomputes_independent_c0_to_c2_correspondences() -> None:
@@ -1430,7 +1766,9 @@ def test_new_frame_support_and_four_view_visibility_jointly_gate_first_fusion() 
     assert backend.map.anchor_count() == 1
 
 
-def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None:
+def test_chunk_first_hash_uses_committed_pose_revision_for_all_four_views(
+    monkeypatch,
+) -> None:
     packet0 = _refined_packet(
         0,
         torch.eye(4).repeat(4, 1, 1),
@@ -1504,7 +1842,10 @@ def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None
             "global_graph": {
                 "node_mode": "chunk_first_stride",
                 "expected_overlap_frames": 2,
-                "optimization_trigger": "loop_only",
+                "optimization_trigger": "periodic_and_loop",
+                "optimization_start_nodes": 3,
+                "optimization_interval_edges": 1,
+                "active_nodes": 3,
                 "min_depth": 0.05,
                 "max_depth": 20.0,
                 "min_match_cosine": 0.2,
@@ -1527,6 +1868,39 @@ def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None
     )
 
     backend.process_packet(packet0)
+    rendered_global_poses: list[torch.Tensor] = []
+    original_render_global = backend._render_global_pose_frame
+
+    def record_global_pose(pose_c2w, *, image_size):
+        rendered_global_poses.append(pose_c2w.detach().clone())
+        return original_render_global(pose_c2w, image_size=image_size)
+
+    def move_tail_node(active_node_ids=None, *, fixed_node_ids=None):
+        node = int(active_node_ids[-1])
+        transform = backend.graph.transform(node)
+        scale, rotation, translation = sim3_components(transform)
+        backend.graph.nodes[node] = sim3_from_components(
+            scale,
+            rotation,
+            translation + translation.new_tensor([0.25, 0.0, 0.0]),
+        )
+        return Sim3GraphOptimizeResult(
+            accepted=True,
+            iterations=1,
+            initial_objective=1.0,
+            final_objective=0.5,
+            max_update_norm=0.25,
+            optimized_node_ids=tuple(int(value) for value in active_node_ids),
+            reason="synthetic_pose_commit",
+            final_damping=float(backend.graph.damping),
+        )
+
+    monkeypatch.setattr(
+        backend,
+        "_render_global_pose_frame",
+        record_global_pose,
+    )
+    monkeypatch.setattr(backend.graph, "optimize", move_tail_node)
     result = backend.process_packet(packet1)
 
     assert result.fusion["hash_visibility_views"] == 4
@@ -1543,6 +1917,16 @@ def test_chunk_first_hash_visibility_is_union_of_all_four_packet_views() -> None
     assert result.fusion["posthash_new_frame_valid_coverage_delta"] == pytest.approx(0.0)
     assert result.fusion["chunk_anchor_delta"] == (
         result.fusion["anchors_after"] - result.fusion["anchors_before"]
+    )
+    assert result.graph is not None and result.graph.accepted is True
+    pose_state = result.diagnostics["pose_state_consistency"]
+    assert pose_state["accepted"] is True
+    assert result.fusion["pose_state_committed_revision"] == pose_state[
+        "committed_revision"
+    ]
+    assert any(
+        float(pose[0, 3]) == pytest.approx(0.25)
+        for pose in rendered_global_poses
     )
     alignment = result.diagnostics["alignment"]
     assert alignment["global_render_used_for_scale"] is False
@@ -4477,6 +4861,24 @@ def test_mapper_complete_geometry_snapshot_validates_before_atomic_commit() -> N
     mapper.restore_frontend_geometry_state(transaction)
     torch.testing.assert_close(mapper.refined_pose_c2w(5), before_pose)
     torch.testing.assert_close(mapper.observations[5].target_depth, before_depth)
+
+    canonical_pose = torch.eye(4)
+    canonical_pose[1, 3] = 3.0
+    transaction = mapper.snapshot_frontend_geometry_state()
+    assert mapper.apply_canonical_pose_state(
+        {5: canonical_pose},
+        revision=17,
+    ) == 1
+    torch.testing.assert_close(mapper.refined_pose_c2w(5), canonical_pose)
+    torch.testing.assert_close(
+        mapper.observations[5].pose_c2w,
+        canonical_pose,
+    )
+    assert mapper.observations[5].pose_revision == 17
+    mapper.restore_frontend_geometry_state(transaction)
+    torch.testing.assert_close(mapper.refined_pose_c2w(5), before_pose)
+    torch.testing.assert_close(mapper.observations[5].pose_c2w, before_pose)
+    assert mapper.observations[5].pose_revision == 0
 
 
 def test_overlap_pose_owner_does_not_rescale_depth_from_another_window() -> None:

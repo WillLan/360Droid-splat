@@ -92,6 +92,73 @@ class FrameGeometryUpdateBatch:
 
 
 @dataclass(frozen=True)
+class PoseStateCandidate:
+    """One fully materialized canonical pose state awaiting transaction commit."""
+
+    revision: int
+    reason: str
+    affected_node_ids: tuple[int, ...]
+    affected_frame_ids: tuple[int, ...]
+    affected_window_ids: tuple[int, ...]
+    affected_submap_ids: tuple[int, ...]
+    frame_global_poses: dict[int, torch.Tensor]
+    window_transforms: dict[int, torch.Tensor]
+    packet_variant_count: int
+
+
+@dataclass(frozen=True)
+class PoseStateConsistencyReport:
+    """Hard consistency check across canonical state and all derived caches."""
+
+    candidate_revision: int
+    committed_revision: int
+    accepted: bool
+    frame_count: int
+    packet_variant_count: int
+    submap_transform_count: int
+    lazy_owner_count: int
+    mapper_pose_count: int
+    max_matrix_error: float
+    max_rotation_error_deg: float
+    max_center_error: float
+    max_submap_matrix_error: float
+    max_lazy_owner_matrix_error: float
+    max_mapper_matrix_error: float
+    non_finite_count: int
+    revision_mismatch_count: int
+    reason: str
+
+    def as_diagnostics(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "mode": "canonical_pose_state_consistency",
+            "accepted": bool(self.accepted),
+            "candidate_revision": int(self.candidate_revision),
+            "committed_revision": int(self.committed_revision),
+            "frame_count": int(self.frame_count),
+            "packet_variant_count": int(self.packet_variant_count),
+            "submap_transform_count": int(self.submap_transform_count),
+            "lazy_owner_count": int(self.lazy_owner_count),
+            "mapper_pose_count": int(self.mapper_pose_count),
+            "max_matrix_error": float(self.max_matrix_error),
+            "max_rotation_error_deg": float(self.max_rotation_error_deg),
+            "max_center_error": float(self.max_center_error),
+            "max_submap_matrix_error": float(self.max_submap_matrix_error),
+            "max_lazy_owner_matrix_error": float(
+                self.max_lazy_owner_matrix_error
+            ),
+            "max_mapper_matrix_error": float(
+                self.max_mapper_matrix_error
+            ),
+            "non_finite_count": int(self.non_finite_count),
+            "revision_mismatch_count": int(
+                self.revision_mismatch_count
+            ),
+            "reason": str(self.reason),
+        }
+
+
+@dataclass(frozen=True)
 class ChunkStrideHoldout:
     source: int
     target: int
@@ -1017,6 +1084,11 @@ class SphericalSelfiGlobalBackend:
         self._has_run_global_ba = False
         self._geometry_updates: dict[int, FrameGeometryUpdate] = {}
         self._geometry_revision = 0
+        self._pose_state_revision = 0
+        self._window_pose_revision: dict[int, int] = {}
+        self._mapper_pose_revision_by_frame: dict[int, int] = {}
+        self._last_pose_state_diagnostic: dict[str, Any] | None = None
+        self._last_mapper_committed_state_diagnostic: dict[str, Any] | None = None
         self._pending_geometry_batch: FrameGeometryUpdateBatch | None = None
         self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
@@ -1073,7 +1145,11 @@ class SphericalSelfiGlobalBackend:
             "last_normal_condition_estimate"
         ]
 
-    def _snapshot_boundary_transaction(self) -> dict[str, Any]:
+    def _snapshot_boundary_transaction(
+        self,
+        *,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+    ) -> dict[str, Any]:
         loop_database = getattr(self.loop_detector, "_descriptor_database", None)
         packet_variants: list[
             tuple[
@@ -1081,12 +1157,14 @@ class SphericalSelfiGlobalBackend:
                 torch.Tensor,
                 Any,
                 Any,
+                dict[str, Any],
             ]
         ] = []
         for candidate in (
             list(self.packets.values())
             + list(self._optimization_packets.values())
             + ([self._last_full_packet] if self._last_full_packet is not None else [])
+            + list(extra_packets)
         ):
             if all(id(candidate) != id(item[0]) for item in packet_variants):
                 packet_variants.append(
@@ -1095,6 +1173,7 @@ class SphericalSelfiGlobalBackend:
                         candidate.local_poses_c2w.detach().clone(),
                         candidate.observation,
                         candidate.anchor_observation,
+                        dict(candidate.metadata),
                     )
                 )
         return {
@@ -1127,6 +1206,17 @@ class SphericalSelfiGlobalBackend:
             "has_run_global_ba": self._has_run_global_ba,
             "geometry_updates": dict(self._geometry_updates),
             "geometry_revision": int(self._geometry_revision),
+            "pose_state_revision": int(self._pose_state_revision),
+            "window_pose_revision": dict(self._window_pose_revision),
+            "mapper_pose_revision_by_frame": dict(
+                self._mapper_pose_revision_by_frame
+            ),
+            "last_pose_state_diagnostic": copy.deepcopy(
+                self._last_pose_state_diagnostic
+            ),
+            "last_mapper_committed_state_diagnostic": copy.deepcopy(
+                self._last_mapper_committed_state_diagnostic
+            ),
             "pending_geometry_batch": self._pending_geometry_batch,
             "pending_map_optimization": list(self._pending_map_optimization),
             "optimization_packets": dict(self._optimization_packets),
@@ -1165,6 +1255,18 @@ class SphericalSelfiGlobalBackend:
             "mapper_optimizer": (
                 None if self.mapper is None else self.mapper.optimizer
             ),
+            "mapper_geometry_state": (
+                None
+                if self.mapper is None
+                or not callable(
+                    getattr(
+                        self.mapper,
+                        "snapshot_frontend_geometry_state",
+                        None,
+                    )
+                )
+                else self.mapper.snapshot_frontend_geometry_state()
+            ),
             "mapper_anchor_count": (
                 None
                 if self.mapper is None
@@ -1198,15 +1300,34 @@ class SphericalSelfiGlobalBackend:
         self._has_run_global_ba = state["has_run_global_ba"]
         self._geometry_updates = state["geometry_updates"]
         self._geometry_revision = state["geometry_revision"]
+        self._pose_state_revision = state["pose_state_revision"]
+        self._window_pose_revision = state["window_pose_revision"]
+        self._mapper_pose_revision_by_frame = state[
+            "mapper_pose_revision_by_frame"
+        ]
+        self._last_pose_state_diagnostic = state[
+            "last_pose_state_diagnostic"
+        ]
+        self._last_mapper_committed_state_diagnostic = state[
+            "last_mapper_committed_state_diagnostic"
+        ]
         self._pending_geometry_batch = state["pending_geometry_batch"]
         self._pending_map_optimization = state["pending_map_optimization"]
         self._optimization_packets = state["optimization_packets"]
-        for variant, local_poses, observation, anchor_observation in state.get(
+        for (
+            variant,
+            local_poses,
+            observation,
+            anchor_observation,
+            metadata,
+        ) in state.get(
             "packet_geometry_variants", ()
         ):
             variant.local_poses_c2w = local_poses
             variant.observation = observation
             variant.anchor_observation = anchor_observation
+            variant.metadata.clear()
+            variant.metadata.update(metadata)
         self._pending_seam_owner_windows = state[
             "pending_seam_owner_windows"
         ]
@@ -1238,8 +1359,21 @@ class SphericalSelfiGlobalBackend:
             "loop_descriptor_database"
         ]
         if self.mapper is not None:
-            self.mapper.optimizer = state["mapper_optimizer"]
-            self.mapper.stats.n_anchors = state["mapper_anchor_count"]
+            mapper_geometry_state = state.get("mapper_geometry_state")
+            if mapper_geometry_state is not None and callable(
+                getattr(
+                    self.mapper,
+                    "restore_frontend_geometry_state",
+                    None,
+                )
+            ):
+                self.mapper.restore_frontend_geometry_state(
+                    mapper_geometry_state
+                )
+            if hasattr(self.mapper, "optimizer"):
+                self.mapper.optimizer = state["mapper_optimizer"]
+            if hasattr(self.mapper, "stats"):
+                self.mapper.stats.n_anchors = state["mapper_anchor_count"]
 
     def _dense_factor_information_options(self) -> dict[str, bool | float]:
         return {
@@ -1332,85 +1466,18 @@ class SphericalSelfiGlobalBackend:
         affected_window_ids: set[int] | None = None,
     ) -> dict[str, Any]:
         if self.chunk_first_stride_graph:
-            rotation_errors: list[float] = []
-            center_errors: list[float] = []
-            per_frame: list[dict[str, Any]] = []
-            window_transforms = self._window_anchor_transforms()
-            selected_windows = (
-                None
-                if affected_window_ids is None
-                else {int(value) for value in affected_window_ids}
+            del affected_window_ids
+            return dict(
+                self._last_pose_state_diagnostic
+                or {
+                    "enabled": True,
+                    "mode": "canonical_pose_state_consistency",
+                    "accepted": True,
+                    "candidate_revision": int(self._pose_state_revision),
+                    "committed_revision": int(self._pose_state_revision),
+                    "reason": "no_pose_candidate",
+                }
             )
-            for window_id in self.window_order[1:]:
-                if (
-                    selected_windows is not None
-                    and int(window_id) not in selected_windows
-                ):
-                    continue
-                packet = self.packets[int(window_id)]
-                owner_transform = window_transforms[int(window_id)].to(
-                    packet.local_poses_c2w
-                )
-                for index in range(
-                    min(self.chunk_stride_target_index, len(packet.frame_ids))
-                ):
-                    frame = int(packet.frame_ids[index])
-                    owner_node = self.frame_pose_owner_node.get(frame)
-                    local_pose = self.frame_local_pose_in_owner.get(frame)
-                    if (
-                        owner_node is None
-                        or local_pose is None
-                        or int(owner_node) not in self.graph.nodes
-                    ):
-                        continue
-                    canonical_pose = apply_sim3_to_c2w(
-                        self.graph.transform(int(owner_node)).to(local_pose),
-                        local_pose,
-                    )
-                    packet_pose = apply_sim3_to_c2w(
-                        owner_transform, packet.local_poses_c2w[index]
-                    )
-                    rotation_error = self._rotation_error_deg(
-                        canonical_pose[:3, :3].to(packet_pose),
-                        packet_pose[:3, :3],
-                    )
-                    center_error = float(
-                        torch.linalg.norm(
-                            canonical_pose[:3, 3].to(packet_pose)
-                            - packet_pose[:3, 3]
-                        )
-                        .detach()
-                        .cpu()
-                    )
-                    rotation_errors.append(rotation_error)
-                    center_errors.append(center_error)
-                    per_frame.append(
-                        {
-                            "window_id": int(window_id),
-                            "frame_id": frame,
-                            "rotation_error_deg": rotation_error,
-                            "center_error": center_error,
-                        }
-                    )
-            max_rotation = max(rotation_errors, default=0.0)
-            max_center = max(center_errors, default=0.0)
-            return {
-                "enabled": self.post_optimization_seam_check_enabled,
-                "mode": "chunk_overlap_acceptance_only",
-                "factor_count": 0,
-                "validation_count": len(per_frame),
-                "max_rotation_error_deg": max_rotation,
-                "max_center_error": max_center,
-                "rotation_errors_deg": rotation_errors,
-                "center_errors": center_errors,
-                "per_frame": per_frame,
-                "accepted": bool(
-                    max_rotation
-                    <= self.post_optimization_seam_max_rotation_deg
-                    and max_center
-                    <= self.post_optimization_seam_max_center_error
-                ),
-            }
         rotation_errors: list[float] = []
         center_errors: list[float] = []
         factor_count = 0
@@ -2254,6 +2321,30 @@ class SphericalSelfiGlobalBackend:
         relative = reference.transpose(-1, -2) @ estimate
         cosine = ((relative.diagonal().sum() - 1.0) * 0.5).clamp(-1.0, 1.0)
         return float(torch.rad2deg(torch.acos(cosine)).detach().cpu())
+
+    @staticmethod
+    def _pose_state_rotation_error_deg(
+        reference: torch.Tensor,
+        estimate: torch.Tensor,
+    ) -> float:
+        """Stable near-zero SO(3) error for strict cache consistency checks."""
+
+        relative = (
+            reference.detach().double().transpose(-1, -2)
+            @ estimate.detach().double()
+        )
+        skew = torch.stack(
+            [
+                relative[2, 1] - relative[1, 2],
+                relative[0, 2] - relative[2, 0],
+                relative[1, 0] - relative[0, 1],
+            ]
+        )
+        sine = 0.5 * torch.linalg.norm(skew)
+        cosine = 0.5 * (torch.trace(relative) - 1.0)
+        return float(
+            torch.rad2deg(torch.atan2(sine, cosine)).detach().cpu()
+        )
 
     @staticmethod
     def _average_rotations(rotations: list[torch.Tensor]) -> torch.Tensor:
@@ -6200,6 +6291,8 @@ class SphericalSelfiGlobalBackend:
             if self.chunk_first_stride_graph
             else None
         )
+        if self.chunk_first_stride_graph:
+            self._last_mapper_committed_state_diagnostic = None
         try:
             live_packet = self._optimization_packets.get(int(window_id))
             if live_packet is not None and not self.boundary_frame_graph:
@@ -6279,6 +6372,26 @@ class SphericalSelfiGlobalBackend:
                     )
                 else:
                     self.mapper.commit_spherical_selfi_window()
+                    committed = self._last_mapper_committed_state_diagnostic
+                    if committed:
+                        metrics["committed_pose_revision"] = float(
+                            committed.get(
+                                "committed_revision",
+                                self._pose_state_revision,
+                            )
+                        )
+                        metrics["committed_render_views"] = float(
+                            committed.get("view_count", 0)
+                        )
+                        metrics["committed_render_loss"] = float(
+                            committed.get("mean_loss", 0.0)
+                        )
+                        metrics["committed_render_psnr"] = float(
+                            committed.get("mean_psnr", 0.0)
+                        )
+                        metrics["committed_tail_render_loss"] = float(
+                            committed.get("tail_mean_loss", 0.0)
+                        )
             return metrics
         except (RuntimeError, ValueError, KeyError) as exc:
             if backend_transaction is not None:
@@ -6477,12 +6590,18 @@ class SphericalSelfiGlobalBackend:
                         selected.add(int(self.window_order[neighbor]))
         return [window_id for window_id in self.window_order if int(window_id) in selected]
 
-    def _packet_variants(self, window_id: int) -> list[LocalGaussianWindowPacket]:
+    def _packet_variants(
+        self,
+        window_id: int,
+        *,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+    ) -> list[LocalGaussianWindowPacket]:
         variants: list[LocalGaussianWindowPacket] = []
         for candidate in (
             self.packets.get(int(window_id)),
             self._optimization_packets.get(int(window_id)),
             self._last_full_packet,
+            *extra_packets,
         ):
             if candidate is None or int(candidate.window_id) != int(window_id):
                 continue
@@ -6654,15 +6773,22 @@ class SphericalSelfiGlobalBackend:
     def _synchronize_chunk_packet_variants(
         self,
         affected_windows: set[int],
-    ) -> None:
+        *,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+        revision: int | None = None,
+    ) -> int:
         """Make every retained packet mirror the canonical rigid segments."""
 
         window_transforms = self._window_anchor_transforms()
+        synchronized = 0
         for window_id in sorted(int(value) for value in affected_windows):
             if window_id not in window_transforms:
                 continue
             owner_transform = window_transforms[window_id]
-            for variant in self._packet_variants(window_id):
+            for variant in self._packet_variants(
+                window_id,
+                extra_packets=extra_packets,
+            ):
                 local_poses = variant.local_poses_c2w.detach().clone()
                 changed = False
                 for index, frame_id in enumerate(variant.frame_ids):
@@ -6700,6 +6826,476 @@ class SphericalSelfiGlobalBackend:
                                 variant.anchor_observation.local_poses_c2w
                             ),
                         )
+                    if revision is not None:
+                        variant.metadata["canonical_pose_revision"] = int(
+                            revision
+                        )
+                    synchronized += 1
+        return synchronized
+
+    def _pose_state_affected_sets(
+        self,
+        affected_node_ids: set[int],
+        *,
+        affected_submap_ids: set[int] | None = None,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+    ) -> tuple[set[int], set[int], set[int], set[int]]:
+        nodes = {int(value) for value in affected_node_ids}
+        submaps = {
+            int(value) for value in (affected_submap_ids or set())
+        }
+        windows: set[int] = set()
+        for submap_id, record in self.submaps.items():
+            if (
+                int(submap_id) in submaps
+                or not nodes.isdisjoint(
+                    int(value) for value in record.boundary_node_ids
+                )
+            ):
+                submaps.add(int(submap_id))
+                nodes.update(int(value) for value in record.boundary_node_ids)
+                windows.update(int(value) for value in record.window_ids)
+        frames = {
+            int(frame_id)
+            for frame_id, owner in self.frame_pose_owner_node.items()
+            if int(owner) in nodes
+        }
+        for frame_id in frames:
+            windows.update(
+                int(value) for value in self.frame_windows.get(frame_id, set())
+            )
+        windows.update(
+            int(window_id)
+            for window_id, anchor_node in self.window_anchor_nodes.items()
+            if int(anchor_node) in nodes
+        )
+        for packet in extra_packets:
+            windows.add(int(packet.window_id))
+            frames.update(
+                int(frame_id)
+                for frame_id in packet.frame_ids
+                if int(frame_id) in self.frame_pose_owner_node
+                and int(frame_id) in self.frame_local_pose_in_owner
+            )
+        for window_id in tuple(windows):
+            submap_id = self.window_to_submap.get(int(window_id))
+            if submap_id is not None:
+                submaps.add(int(submap_id))
+        return nodes, frames, windows, submaps
+
+    def _canonical_frame_global_poses(
+        self,
+        frame_ids: set[int],
+    ) -> dict[int, torch.Tensor]:
+        poses: dict[int, torch.Tensor] = {}
+        for frame_id in sorted(int(value) for value in frame_ids):
+            owner_node = self.frame_pose_owner_node.get(frame_id)
+            local_pose = self.frame_local_pose_in_owner.get(frame_id)
+            if (
+                owner_node is None
+                or local_pose is None
+                or int(owner_node) not in self.graph.nodes
+            ):
+                raise RuntimeError(
+                    f"Frame {frame_id} has no complete canonical pose state"
+                )
+            pose = apply_sim3_to_c2w(
+                self.graph.transform(int(owner_node)).to(local_pose),
+                local_pose,
+            )
+            if not bool(torch.isfinite(pose).all()):
+                raise RuntimeError(
+                    f"Frame {frame_id} has a non-finite canonical pose"
+                )
+            poses[frame_id] = pose.detach().clone()
+        return poses
+
+    def _refresh_affected_submap_local_geometry(
+        self,
+        submap_ids: set[int],
+    ) -> None:
+        if not self.hierarchical_submaps_enabled:
+            return
+        for submap_id in sorted(int(value) for value in submap_ids):
+            if submap_id in self.submaps:
+                self._update_submap_local_geometry(submap_id)
+
+    def _synchronize_mapper_pose_cache(
+        self,
+        frame_global_poses: dict[int, torch.Tensor],
+        *,
+        revision: int,
+    ) -> int:
+        if self.mapper is None or not frame_global_poses:
+            return 0
+        apply_state = getattr(
+            self.mapper,
+            "apply_canonical_pose_state",
+            None,
+        )
+        if not callable(apply_state):
+            return 0
+        applied = apply_state(
+            frame_global_poses,
+            revision=int(revision),
+        )
+        for frame_id in frame_global_poses:
+            if (
+                int(frame_id) in getattr(self.mapper, "pose_deltas", {})
+                or int(frame_id) in getattr(self.mapper, "observations", {})
+            ):
+                self._mapper_pose_revision_by_frame[int(frame_id)] = int(
+                    revision
+                )
+        return int(applied)
+
+    def _pose_state_consistency_report(
+        self,
+        candidate: PoseStateCandidate,
+        *,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+    ) -> PoseStateConsistencyReport:
+        matrix_errors: list[float] = []
+        rotation_errors: list[float] = []
+        center_errors: list[float] = []
+        submap_errors: list[float] = []
+        lazy_owner_errors: list[float] = []
+        mapper_errors: list[float] = []
+        non_finite_count = 0
+        revision_mismatch_count = 0
+        packet_variant_count = 0
+        submap_transform_count = 0
+        lazy_owner_count = 0
+        mapper_pose_count = 0
+
+        def matrix_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+            nonlocal non_finite_count
+            actual_value = actual.detach().to(expected)
+            expected_value = expected.detach()
+            if not bool(torch.isfinite(actual_value).all()) or not bool(
+                torch.isfinite(expected_value).all()
+            ):
+                non_finite_count += 1
+                return float("inf")
+            return float(
+                (actual_value - expected_value).abs().max().detach().cpu()
+            )
+
+        for window_id in candidate.affected_window_ids:
+            window_transform = candidate.window_transforms.get(int(window_id))
+            if window_transform is None:
+                continue
+            for packet in self._packet_variants(
+                int(window_id),
+                extra_packets=extra_packets,
+            ):
+                packet_variant_count += 1
+                if int(
+                    packet.metadata.get("canonical_pose_revision", -1)
+                ) != int(candidate.revision):
+                    revision_mismatch_count += 1
+                packet_poses = packet.global_poses(
+                    window_transform.to(packet.local_poses_c2w)
+                )
+                for index, frame_id in enumerate(packet.frame_ids):
+                    expected = candidate.frame_global_poses.get(int(frame_id))
+                    if expected is None:
+                        continue
+                    actual = packet_poses[index]
+                    matrix_errors.append(matrix_error(actual, expected))
+                    rotation_errors.append(
+                        self._pose_state_rotation_error_deg(
+                            actual[:3, :3].to(expected),
+                            expected[:3, :3],
+                        )
+                    )
+                    center_errors.append(
+                        float(
+                            torch.linalg.norm(
+                                actual[:3, 3].to(expected)
+                                - expected[:3, 3]
+                            )
+                            .detach()
+                            .cpu()
+                        )
+                    )
+
+        if self.hierarchical_submaps_enabled:
+            assert self.submap_graph is not None
+            for submap_id in candidate.affected_submap_ids:
+                if (
+                    int(submap_id) not in self.submaps
+                    or int(submap_id) not in self.submap_graph.nodes
+                ):
+                    continue
+                record = self.submaps[int(submap_id)]
+                submap_transform = self.submap_graph.transform(int(submap_id))
+                for node_id, local in record.local_boundary_transforms.items():
+                    if int(node_id) not in self.graph.nodes:
+                        continue
+                    reconstructed = submap_transform.to(local) @ local
+                    submap_errors.append(
+                        matrix_error(
+                            reconstructed,
+                            self.graph.transform(int(node_id)),
+                        )
+                    )
+                    submap_transform_count += 1
+                for window_id, local in record.local_window_transforms.items():
+                    anchor_node = self.window_anchor_nodes.get(int(window_id))
+                    if anchor_node is None or int(anchor_node) not in self.graph.nodes:
+                        continue
+                    reconstructed = submap_transform.to(local) @ local
+                    submap_errors.append(
+                        matrix_error(
+                            reconstructed,
+                            self.graph.transform(int(anchor_node)),
+                        )
+                    )
+                    submap_transform_count += 1
+
+        lazy_current = self.map._lazy_owner_current_transforms
+        for window_id, expected in candidate.window_transforms.items():
+            current = lazy_current.get(int(window_id))
+            if current is None:
+                continue
+            lazy_owner_errors.append(matrix_error(current, expected))
+            lazy_owner_count += 1
+
+        if self.mapper is not None and callable(
+            getattr(self.mapper, "apply_canonical_pose_state", None)
+        ):
+            mapper_observations = getattr(self.mapper, "observations", {})
+            refined_pose = getattr(self.mapper, "refined_pose_c2w", None)
+            for frame_id, expected in candidate.frame_global_poses.items():
+                observation = mapper_observations.get(int(frame_id))
+                refined = (
+                    refined_pose(int(frame_id))
+                    if callable(refined_pose)
+                    else None
+                )
+                if observation is None and refined is None:
+                    continue
+                mapper_pose_count += 1
+                if refined is not None:
+                    mapper_errors.append(matrix_error(refined, expected))
+                if observation is not None:
+                    mapper_errors.append(
+                        matrix_error(observation.pose_c2w, expected)
+                    )
+                    if int(observation.pose_revision) != int(
+                        candidate.revision
+                    ):
+                        revision_mismatch_count += 1
+                if int(
+                    self._mapper_pose_revision_by_frame.get(
+                        int(frame_id), -1
+                    )
+                ) != int(candidate.revision):
+                    revision_mismatch_count += 1
+
+        max_matrix = max(matrix_errors, default=0.0)
+        max_rotation = max(rotation_errors, default=0.0)
+        max_center = max(center_errors, default=0.0)
+        max_submap = max(submap_errors, default=0.0)
+        max_lazy = max(lazy_owner_errors, default=0.0)
+        max_mapper = max(mapper_errors, default=0.0)
+        accepted = bool(
+            non_finite_count == 0
+            and revision_mismatch_count == 0
+            and max_matrix <= 1.0e-5
+            and max_rotation <= 1.0e-4
+            and max_center <= 1.0e-5
+            and max_submap <= 1.0e-5
+            and max_lazy <= 1.0e-5
+            and max_mapper <= 1.0e-5
+        )
+        reason = "accepted"
+        if non_finite_count:
+            reason = "non_finite_pose_state"
+        elif revision_mismatch_count:
+            reason = "pose_revision_mismatch"
+        elif not accepted:
+            reason = "pose_round_trip_mismatch"
+        return PoseStateConsistencyReport(
+            candidate_revision=int(candidate.revision),
+            committed_revision=int(self._pose_state_revision),
+            accepted=accepted,
+            frame_count=len(candidate.frame_global_poses),
+            packet_variant_count=packet_variant_count,
+            submap_transform_count=submap_transform_count,
+            lazy_owner_count=lazy_owner_count,
+            mapper_pose_count=mapper_pose_count,
+            max_matrix_error=max_matrix,
+            max_rotation_error_deg=max_rotation,
+            max_center_error=max_center,
+            max_submap_matrix_error=max_submap,
+            max_lazy_owner_matrix_error=max_lazy,
+            max_mapper_matrix_error=max_mapper,
+            non_finite_count=non_finite_count,
+            revision_mismatch_count=revision_mismatch_count,
+            reason=reason,
+        )
+
+    def _materialize_pose_state_candidate(
+        self,
+        *,
+        affected_node_ids: set[int],
+        old_window_transforms: dict[int, torch.Tensor],
+        reason: str,
+        affected_submap_ids: set[int] | None = None,
+        extra_packets: tuple[LocalGaussianWindowPacket, ...] = (),
+    ) -> tuple[
+        PoseStateCandidate,
+        PoseStateConsistencyReport,
+        dict[str, int],
+    ]:
+        nodes, frames, windows, submaps = self._pose_state_affected_sets(
+            affected_node_ids,
+            affected_submap_ids=affected_submap_ids,
+            extra_packets=extra_packets,
+        )
+        revision = max(
+            int(self._geometry_revision),
+            int(self._pose_state_revision),
+        ) + 1
+        self._refresh_affected_submap_local_geometry(submaps)
+        all_window_transforms = self._window_anchor_transforms()
+        missing_windows = windows.difference(all_window_transforms)
+        if missing_windows:
+            raise RuntimeError(
+                "Canonical pose candidate is missing window transforms: "
+                f"{sorted(missing_windows)}"
+            )
+        frame_global_poses = self._canonical_frame_global_poses(frames)
+        packet_variant_count = self._synchronize_chunk_packet_variants(
+            windows,
+            extra_packets=extra_packets,
+            revision=revision,
+        )
+        candidate = PoseStateCandidate(
+            revision=revision,
+            reason=str(reason),
+            affected_node_ids=tuple(sorted(nodes)),
+            affected_frame_ids=tuple(sorted(frames)),
+            affected_window_ids=tuple(sorted(windows)),
+            affected_submap_ids=tuple(sorted(submaps)),
+            frame_global_poses=frame_global_poses,
+            window_transforms={
+                int(window_id): all_window_transforms[int(window_id)].clone()
+                for window_id in windows
+            },
+            packet_variant_count=packet_variant_count,
+        )
+        correction = (
+            self.fusion.apply_owner_corrections(
+                old_window_transforms,
+                all_window_transforms,
+            )
+            if self._owner_transforms_changed(
+                old_window_transforms,
+                all_window_transforms,
+            )
+            else {"moved": 0, "deduplicated": 0}
+        )
+        self._synchronize_mapper_pose_cache(
+            frame_global_poses,
+            revision=revision,
+        )
+        report = self._pose_state_consistency_report(
+            candidate,
+            extra_packets=extra_packets,
+        )
+        self._last_pose_state_diagnostic = report.as_diagnostics()
+        if not report.accepted:
+            raise RuntimeError(
+                "Canonical pose-state consistency failed: "
+                f"{report.reason}; matrix={report.max_matrix_error:.3e}, "
+                f"rotation={report.max_rotation_error_deg:.3e}deg, "
+                f"center={report.max_center_error:.3e}, "
+                f"revision_mismatches={report.revision_mismatch_count}"
+            )
+        self._pose_state_revision = int(revision)
+        for window_id in windows:
+            self._window_pose_revision[int(window_id)] = int(revision)
+        report = replace(report, committed_revision=int(revision))
+        self._last_pose_state_diagnostic = report.as_diagnostics()
+        self._last_pose_state_diagnostic["transaction_committed"] = True
+        return candidate, report, correction
+
+    def _committed_mapper_render_diagnostics(
+        self,
+        frame_ids: set[int],
+        *,
+        revision: int,
+    ) -> dict[str, Any]:
+        """Render the map after owner/camera state has reached one revision."""
+
+        if self.mapper is None:
+            return {
+                "enabled": False,
+                "candidate_revision": int(revision),
+                "committed_revision": int(self._pose_state_revision),
+                "reason": "mapper_unavailable",
+            }
+        render_diagnostic = getattr(
+            self.mapper,
+            "render_keyframe_diagnostic",
+            None,
+        )
+        if not callable(render_diagnostic):
+            return {
+                "enabled": False,
+                "candidate_revision": int(revision),
+                "committed_revision": int(self._pose_state_revision),
+                "reason": "mapper_render_diagnostic_unavailable",
+            }
+        rows: list[dict[str, Any]] = []
+        started = time.perf_counter()
+        for frame_id in sorted(int(value) for value in frame_ids):
+            diagnostic = render_diagnostic(frame_id)
+            if diagnostic is None:
+                continue
+            owner_node = self.frame_pose_owner_node.get(frame_id)
+            rows.append(
+                {
+                    "frame_id": frame_id,
+                    "pose_owner_node_id": (
+                        None if owner_node is None else int(owner_node)
+                    ),
+                    "is_segment_tail": bool(
+                        owner_node is not None and int(owner_node) != frame_id
+                    ),
+                    "loss": float(diagnostic.loss),
+                    "psnr": float(diagnostic.psnr),
+                    "anchor_count": int(diagnostic.anchor_count),
+                }
+            )
+        losses = [float(row["loss"]) for row in rows]
+        psnrs = [float(row["psnr"]) for row in rows]
+        tail_rows = [row for row in rows if bool(row["is_segment_tail"])]
+        return {
+            "enabled": True,
+            "candidate_revision": int(revision),
+            "committed_revision": int(self._pose_state_revision),
+            "view_count": len(rows),
+            "tail_view_count": len(tail_rows),
+            "mean_loss": (
+                sum(losses) / len(losses) if losses else 0.0
+            ),
+            "mean_psnr": (
+                sum(psnrs) / len(psnrs) if psnrs else 0.0
+            ),
+            "tail_mean_loss": (
+                sum(float(row["loss"]) for row in tail_rows)
+                / len(tail_rows)
+                if tail_rows
+                else 0.0
+            ),
+            "render_seconds": float(time.perf_counter() - started),
+            "per_frame": rows,
+            "reason": "committed_pose_owner_state",
+        }
 
     def _synchronize_chunk_stride_optimized_window_impl(
         self,
@@ -6726,11 +7322,6 @@ class SphericalSelfiGlobalBackend:
         affected_nodes = {
             int(self.frame_pose_owner_node[int(frame_id)])
             for frame_id in optimized_by_frame
-        }
-        affected_windows = {
-            int(candidate)
-            for frame_id in optimized_by_frame
-            for candidate in self.frame_windows.get(int(frame_id), set())
         }
         affected_factors = tuple(
             factor
@@ -6811,9 +7402,6 @@ class SphericalSelfiGlobalBackend:
         holdout = self._chunk_stride_holdout_diagnostics(
             affected_node_ids=affected_nodes
         )
-        seam = self._overlap_seam_diagnostics(
-            affected_window_ids=affected_windows
-        )
         if (
             not math.isfinite(sequence_after)
             or not math.isfinite(skip_after)
@@ -6831,25 +7419,27 @@ class SphericalSelfiGlobalBackend:
                 )
             )
             or not bool(holdout["accepted"])
-            or (
-                self.post_optimization_seam_check_enabled
-                and not bool(seam["accepted"])
-            )
         ):
             raise RuntimeError(
                 "mapper pose proposal failed sequential/skip transaction gates: "
                 f"sequence_ratio={sequence_ratio:.6f}, "
                 f"skip_ratio={skip_ratio:.6f}, "
-                f"holdout={holdout.get('accepted')}, "
-                f"seam={seam.get('accepted')}"
+                f"holdout={holdout.get('accepted')}"
             )
-        self._synchronize_chunk_packet_variants(affected_windows)
-        self._refresh_factor_local_poses(affected_windows)
-        new_window_transforms = self._window_anchor_transforms()
-        self.fusion.apply_owner_corrections(
-            old_window_transforms,
-            new_window_transforms,
+        candidate, report, _ = self._materialize_pose_state_candidate(
+            affected_node_ids=affected_nodes,
+            old_window_transforms=old_window_transforms,
+            reason="mapper_pose_candidate",
         )
+        self._last_mapper_committed_state_diagnostic = (
+            self._committed_mapper_render_diagnostics(
+                set(candidate.affected_frame_ids),
+                revision=int(candidate.revision),
+            )
+        )
+        self._last_mapper_committed_state_diagnostic[
+            "pose_state_consistency"
+        ] = report.as_diagnostics()
         self._refresh_geometry_updates(
             complete_snapshot=True,
             affected_node_ids=affected_nodes,
@@ -8211,10 +8801,23 @@ class SphericalSelfiGlobalBackend:
         pre_submap_graph_state = self._snapshot_graph_state(self.submap_graph)
         graph_result: Sim3GraphOptimizeResult | None = None
         seam_diagnostics: dict[str, Any] = {
-            "enabled": self.post_optimization_seam_check_enabled,
-            "enforced": self.enforce_post_optimization_validation,
+            "enabled": bool(
+                self.chunk_first_stride_graph
+                or self.post_optimization_seam_check_enabled
+            ),
+            "mode": (
+                "canonical_pose_state_consistency"
+                if self.chunk_first_stride_graph
+                else "legacy_overlap_seam"
+            ),
+            "enforced": bool(
+                self.chunk_first_stride_graph
+                or self.enforce_post_optimization_validation
+            ),
             "accepted": True,
             "factor_count": 0,
+            "candidate_revision": int(self._pose_state_revision),
+            "committed_revision": int(self._pose_state_revision),
         }
         recent_window_count = len(self.window_order) + 1
         periodic_start_ready = (
@@ -8594,7 +9197,11 @@ class SphericalSelfiGlobalBackend:
                     max_update_norm=0.0,
                     reason="chunk_sequence_objective_rejected",
                 )
-        if graph_result is not None and self.post_optimization_seam_check_enabled:
+        if (
+            graph_result is not None
+            and not self.chunk_first_stride_graph
+            and self.post_optimization_seam_check_enabled
+        ):
             seam_diagnostics = self._overlap_seam_diagnostics()
             seam_diagnostics["enforced"] = (
                 self.enforce_post_optimization_validation
@@ -8683,21 +9290,59 @@ class SphericalSelfiGlobalBackend:
                     max_update_norm=0.0,
                     reason="chunk_stride_holdout_rejected",
                 )
+        correction: dict[str, int] = {"moved": 0, "deduplicated": 0}
+        if (
+            graph_result is not None
+            and bool(graph_result.accepted)
+            and self.chunk_first_stride_graph
+        ):
+            affected_submap_ids: set[int] = set()
+            if (
+                self.hierarchical_submaps_enabled
+                and loop_graph is self.submap_graph
+            ):
+                affected_submap_ids = {
+                    int(value) for value in graph_result.optimized_node_ids
+                }
+                affected_pose_nodes = {
+                    int(node)
+                    for submap_id in affected_submap_ids
+                    if submap_id in self.submaps
+                    for node in self.submaps[submap_id].boundary_node_ids
+                }
+            else:
+                affected_pose_nodes = {
+                    int(value) for value in graph_result.optimized_node_ids
+                }
+            if affected_pose_nodes:
+                _, state_report, correction = (
+                    self._materialize_pose_state_candidate(
+                        affected_node_ids=affected_pose_nodes,
+                        affected_submap_ids=affected_submap_ids,
+                        old_window_transforms=old_window_transforms,
+                        reason="chunk_graph_optimization_candidate",
+                        extra_packets=(packet,),
+                    )
+                )
+                seam_diagnostics = state_report.as_diagnostics()
+                seam_diagnostics["enforced"] = True
+                seam_diagnostics["transaction_committed"] = True
         if self.hierarchical_submaps_enabled and self._active_submap_id is not None:
             self._update_submap_local_geometry(self._active_submap_id)
         submap_frozen = self._freeze_active_submap_if_ready()
         new_window_transforms = self._window_anchor_transforms()
-        correction = (
-            self.fusion.apply_owner_corrections(
-                old_window_transforms,
-                new_window_transforms,
+        if not self.chunk_first_stride_graph:
+            correction = (
+                self.fusion.apply_owner_corrections(
+                    old_window_transforms,
+                    new_window_transforms,
+                )
+                if graph_result is not None
+                and self._owner_transforms_changed(
+                    old_window_transforms, new_window_transforms
+                )
+                else {"moved": 0, "deduplicated": 0}
             )
-            if graph_result is not None
-            and self._owner_transforms_changed(
-                old_window_transforms, new_window_transforms
-            )
-            else {"moved": 0, "deduplicated": 0}
-        )
 
         window_transform = self._window_anchor_transforms()[window_id]
         if refined_packet:
@@ -9323,6 +9968,15 @@ class SphericalSelfiGlobalBackend:
                 window_transform,
             )
 
+        fusion_stats["pose_state_candidate_revision"] = int(
+            seam_diagnostics.get(
+                "candidate_revision", self._pose_state_revision
+            )
+        )
+        fusion_stats["pose_state_committed_revision"] = int(
+            self._pose_state_revision
+        )
+
         compact_packet = packet.compact_for_memory()
         self.packets[window_id] = compact_packet
         self._last_full_packet = packet
@@ -9430,6 +10084,7 @@ class SphericalSelfiGlobalBackend:
                     else 0
                 ),
                 "post_optimization_seam_check": seam_diagnostics,
+                "pose_state_consistency": seam_diagnostics,
                 "chunk_stride_holdout_check": stride_holdout_diagnostics,
                 "chunk_scale_check": chunk_scale_diagnostics,
                 "chunk_sequence_objective_check": (
@@ -9450,12 +10105,15 @@ class SphericalSelfiGlobalBackend:
             and not self.chunk_first_stride_graph
         ):
             return self._process_boundary_packet_impl(packet)
-        transaction = self._snapshot_boundary_transaction()
+        transaction = self._snapshot_boundary_transaction(
+            extra_packets=(packet,),
+        )
         try:
             return self._process_boundary_packet_impl(packet)
         except Exception as exc:
             failure_diagnostic = self._last_rendered_overlap_diagnostic
             failure_alignment = self._last_overlap_alignment_failure
+            failure_pose_state = self._last_pose_state_diagnostic
             if (
                 failure_alignment is None
                 and self.two_frame_known_pose_bridge_enabled
@@ -9470,6 +10128,20 @@ class SphericalSelfiGlobalBackend:
             self._restore_boundary_transaction(transaction)
             self._last_rendered_overlap_diagnostic = failure_diagnostic
             self._last_overlap_alignment_failure = failure_alignment
+            if failure_pose_state is not None:
+                failure_pose_state = dict(failure_pose_state)
+                failure_pose_state["consistency_accepted"] = bool(
+                    failure_pose_state.get("accepted", False)
+                )
+                failure_pose_state["accepted"] = False
+                failure_pose_state["transaction_committed"] = False
+                failure_pose_state["committed_revision"] = int(
+                    self._pose_state_revision
+                )
+                failure_pose_state["reason"] = (
+                    "pose_candidate_transaction_rolled_back"
+                )
+            self._last_pose_state_diagnostic = failure_pose_state
             raise
         finally:
             if (
