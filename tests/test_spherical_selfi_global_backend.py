@@ -2118,7 +2118,11 @@ def test_two_stage_candidate_prepare_is_state_free_and_refiner_runs_after_graph(
             }
 
         def refined_pose_c2w(self, frame_id: int):
-            return self.canonical_poses.get(int(frame_id))
+            pose = self.canonical_poses.get(int(frame_id))
+            # Exercise the same conversion boundary as CUDA tracking: the
+            # Mapper pose may live on a different device/dtype than the CPU
+            # packet and its Sim(3) anchor.
+            return None if pose is None else pose.double()
 
     mapper = _Mapper()
     refiner_calls: list[dict[str, object]] = []

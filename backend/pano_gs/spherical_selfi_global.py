@@ -8696,10 +8696,14 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError(
                     f"Pose-only tracking did not retain frame {int(frame_id)}"
                 )
+            tracking_anchor = start_transform.to(
+                device=refined_global.device,
+                dtype=refined_global.dtype,
+            )
             local_poses[index] = canonicalize_c2w(
                 rebase_c2w_to_sim3_anchor(
-                    start_transform.to(refined_global),
-                    refined_global.to(start_transform),
+                    tracking_anchor,
+                    refined_global.to(tracking_anchor),
                 )
             ).to(local_poses)
         observation = packet.observation.with_geometry(
