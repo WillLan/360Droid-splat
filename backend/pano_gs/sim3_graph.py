@@ -71,6 +71,8 @@ class DenseSphericalFactorBlock:
     dcs_phi: float | None = None
     normalize_information_by_count: bool = False
     information_reference_count: float = 64.0
+    s2_information_scale: float = 1.0
+    depth_information_scale: float = 1.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -278,6 +280,14 @@ class GlobalSim3FactorGraph:
                     raise ValueError("Dense spherical depth/weight arrays must share correspondence count")
             if edge.source_local_pose.shape != (4, 4) or edge.target_local_pose.shape != (4, 4):
                 raise ValueError("Dense spherical local poses must be 4x4")
+            for name, value in (
+                ("s2_information_scale", edge.s2_information_scale),
+                ("depth_information_scale", edge.depth_information_scale),
+            ):
+                if not math.isfinite(float(value)) or float(value) < 0.0:
+                    raise ValueError(
+                        f"Dense spherical {name} must be finite and non-negative"
+                    )
         # Materialize all factor constants as ordinary tensors. This keeps the
         # graph independent from the frontend's inference-mode tensor lifetime.
         with torch.inference_mode(False):
@@ -331,7 +341,15 @@ class GlobalSim3FactorGraph:
                 s2_norm.new_tensor(s2_delta) / s2_norm.clamp_min(1.0e-8),
             ).detach()
             residual_parts = [s2.reshape(-1)]
-            information_parts = [(weight * s2_robust).repeat_interleave(2)]
+            s2_information_scale = max(
+                float(factor.s2_information_scale), 0.0
+            )
+            depth_information_scale = max(
+                float(factor.depth_information_scale), 0.0
+            )
+            information_parts = [
+                (weight * s2_robust * s2_information_scale).repeat_interleave(2)
+            ]
             if factor.use_depth:
                 depth_residual = torch.log(predicted_depth / target_depth.clamp_min(1.0e-8))
                 depth_delta = 0.25
@@ -341,7 +359,10 @@ class GlobalSim3FactorGraph:
                 ).detach()
                 residual_parts.append(depth_residual)
                 information_parts.append(
-                    weight * depth_robust * max(float(factor.depth_factor_weight), 0.0)
+                    weight
+                    * depth_robust
+                    * max(float(factor.depth_factor_weight), 0.0)
+                    * depth_information_scale
                 )
             return torch.cat(residual_parts), torch.cat(information_parts).clamp_min(0.0)
 
@@ -526,6 +547,10 @@ class GlobalSim3FactorGraph:
         source_depth = factor.source_depth.to(source_transform).reshape(-1)
         target_depth = factor.target_depth.to(source_transform).reshape(-1)
         factor_weight = _dense_factor_weight(factor, source_transform)
+        s2_information_scale = max(float(factor.s2_information_scale), 0.0)
+        depth_information_scale = max(
+            float(factor.depth_information_scale), 0.0
+        )
         target_scale, target_rotation, _ = sim3_components(target_transform)
         camera_from_global = (
             target_pose[:3, :3].transpose(0, 1)
@@ -557,7 +582,11 @@ class GlobalSim3FactorGraph:
                 torch.ones_like(s2_norm),
                 s2_norm.new_tensor(s2_delta) / s2_norm.clamp_min(1.0e-8),
             ).detach()
-            s2_information = factor_weight[start:stop] * s2_robust
+            s2_information = (
+                factor_weight[start:stop]
+                * s2_robust
+                * s2_information_scale
+            )
 
             bearing_projection = (
                 identity.unsqueeze(0)
@@ -602,6 +631,7 @@ class GlobalSim3FactorGraph:
                     factor_weight[start:stop]
                     * depth_robust
                     * max(float(factor.depth_factor_weight), 0.0)
+                    * depth_information_scale
                 )
                 depth_from_camera = predicted_bearing[:, None, :] / predicted_depth[:, None, None]
                 residual_rows.append(depth_residual[:, None])

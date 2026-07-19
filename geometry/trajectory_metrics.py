@@ -10,7 +10,16 @@ import torch
 def _rotation_angle_deg(rotation: torch.Tensor) -> torch.Tensor:
     trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
     cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
-    return torch.rad2deg(torch.acos(cosine))
+    skew = torch.stack(
+        [
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = 0.5 * torch.linalg.norm(skew, dim=-1)
+    return torch.rad2deg(torch.atan2(sine, cosine))
 
 
 def _align_centers(
@@ -37,6 +46,24 @@ def _align_centers(
     translation = target_mean - scale * (rotation @ source_mean)
     aligned = scale * (predicted @ rotation.transpose(0, 1)) + translation
     return aligned, scale, rotation, translation
+
+
+def _align_rotations(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Return the global SO(3) gauge minimizing chordal orientation error."""
+
+    covariance = (
+        target @ predicted.transpose(1, 2)
+    ).sum(dim=0)
+    u, _, vh = torch.linalg.svd(covariance)
+    correction = torch.eye(
+        3, device=predicted.device, dtype=predicted.dtype
+    )
+    if float(torch.linalg.det(u @ vh)) < 0.0:
+        correction[-1, -1] = -1.0
+    return u @ correction @ vh
 
 
 def c2w_trajectory_metrics(
@@ -78,6 +105,17 @@ def c2w_trajectory_metrics(
     rotation_ape = _rotation_angle_deg(
         target[:, :3, :3].transpose(1, 2) @ aligned_rotation
     )
+    orientation_alignment = _align_rotations(
+        predicted[:, :3, :3],
+        target[:, :3, :3],
+    )
+    orientation_aligned_rotation = (
+        orientation_alignment.unsqueeze(0) @ predicted[:, :3, :3]
+    )
+    so3_rotation_ape = _rotation_angle_deg(
+        target[:, :3, :3].transpose(1, 2)
+        @ orientation_aligned_rotation
+    )
 
     metrics = {
         "alignment_scale": float(scale.cpu()),
@@ -88,6 +126,12 @@ def c2w_trajectory_metrics(
         "se3_ate_rmse": float(se3_error.square().mean().sqrt().cpu()),
         "rotation_ape_mean_deg": float(rotation_ape.mean().cpu()),
         "rotation_ape_median_deg": float(rotation_ape.median().cpu()),
+        "so3_aligned_rotation_ape_mean_deg": float(
+            so3_rotation_ape.mean().cpu()
+        ),
+        "so3_aligned_rotation_ape_median_deg": float(
+            so3_rotation_ape.median().cpu()
+        ),
     }
 
     for delta in sorted({int(value) for value in deltas if 0 < int(value) < count}):
@@ -126,4 +170,3 @@ def c2w_trajectory_metrics(
     metrics["path_length_scale_ratio"] = float(path_ratio.cpu())
     metrics["scale_drift_percent"] = float((100.0 * (path_ratio - 1.0).abs()).cpu())
     return metrics
-

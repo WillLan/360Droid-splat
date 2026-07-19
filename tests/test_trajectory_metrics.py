@@ -31,6 +31,7 @@ def test_trajectory_metrics_remove_one_global_sim3_gauge() -> None:
     assert metrics["sim3_ate_rmse"] < 1.0e-5
     assert metrics["rpe_delta_1_translation_rmse"] < 1.0e-5
     assert metrics["rpe_delta_1_rotation_mean_deg"] < 1.0e-2
+    assert metrics["so3_aligned_rotation_ape_mean_deg"] < 1.0e-3
     assert metrics["scale_drift_percent"] < 1.0e-4
     assert metrics["se3_ate_rmse"] > 0.1
 
@@ -44,3 +45,16 @@ def test_trajectory_metrics_detect_local_scale_drift() -> None:
     assert metrics["rpe_delta_1_translation_rmse"] > 0.01
     assert metrics["rpe_delta_1_log_scale_error_mean"] > 0.01
     assert metrics["scale_drift_percent"] > 1.0
+
+
+def test_orientation_alignment_is_independent_from_center_alignment() -> None:
+    target = _trajectory()
+    predicted = target.clone()
+    orientation_gauge = so3_exp(torch.tensor([0.15, -0.08, 0.04]))
+    predicted[:, :3, :3] = orientation_gauge @ target[:, :3, :3]
+
+    metrics = c2w_trajectory_metrics(predicted, target)
+
+    assert metrics["sim3_ate_rmse"] < 1.0e-6
+    assert metrics["rotation_ape_mean_deg"] > 5.0
+    assert metrics["so3_aligned_rotation_ape_mean_deg"] < 1.0e-3

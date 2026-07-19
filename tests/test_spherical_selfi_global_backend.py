@@ -515,6 +515,14 @@ def test_chunk_stride_factor_uses_holdout_without_ba_quality_rejection() -> None
     assert diagnostics["quality_gating_enabled"] is False
     assert diagnostics["train_matches"] > diagnostics["holdout_matches"] > 0
     assert diagnostics["information_confidence"] > 0.0
+    assert 0.0 < diagnostics["s2_information_scale"] <= 1.0
+    assert 0.0 < diagnostics["depth_information_scale"] <= 1.0
+    assert factor.s2_information_scale == pytest.approx(
+        diagnostics["s2_information_scale"]
+    )
+    assert factor.depth_information_scale == pytest.approx(
+        diagnostics["depth_information_scale"]
+    )
     torch.testing.assert_close(measurement, sim3_identity(), atol=1.0e-4, rtol=1.0e-4)
 
     packet.metadata["local_ba_trust_region_touched"] = True
@@ -642,7 +650,13 @@ def test_chunk_stride_factor_does_not_gate_on_holdout_angular_error() -> None:
     assert holdout is not None
     assert diagnostics["accepted"] is True
     assert diagnostics["holdout_median_angular_error_deg"] > 90.0
-    assert "angular_score" not in diagnostics
+    assert diagnostics["angular_score"] < 1.0e-3
+    assert diagnostics["s2_information_scale"] < diagnostics[
+        "depth_information_scale"
+    ]
+    assert factor.s2_information_scale == pytest.approx(
+        diagnostics["s2_information_scale"]
+    )
 
 
 def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
@@ -2723,6 +2737,8 @@ def test_dense_spherical_analytic_normal_equations_match_autodiff() -> None:
         factor_weight=torch.rand(count) + 0.1,
         depth_factor_weight=0.2,
         s2_huber_delta_deg=5.0,
+        s2_information_scale=0.4,
+        depth_information_scale=0.7,
     )
     graph.add_edge(factor)
 
@@ -2773,6 +2789,41 @@ def test_dense_information_count_normalization_is_duplicate_invariant() -> None:
         return float(graph.objective())
 
     assert abs(objective(1) - objective(20)) < 1.0e-6
+
+
+def test_dense_information_scale_survives_count_normalization() -> None:
+    source = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    target = torch.nn.functional.normalize(
+        source + torch.tensor([[0.0, 0.02, 0.0], [0.01, 0.0, 0.0]]),
+        dim=-1,
+    )
+
+    def objective(information_scale: float) -> float:
+        graph = GlobalSim3FactorGraph()
+        graph.add_node(0, sim3_identity())
+        graph.add_node(1, sim3_identity())
+        graph.add_edge(
+            DenseSphericalFactorBlock(
+                source=0,
+                target=1,
+                source_local_pose=torch.eye(4),
+                target_local_pose=torch.eye(4),
+                source_bearing=source,
+                target_bearing=target,
+                source_depth=torch.ones(2),
+                target_depth=torch.ones(2),
+                factor_weight=torch.ones(2),
+                use_depth=False,
+                normalize_information_by_count=True,
+                information_reference_count=64.0,
+                s2_information_scale=information_scale,
+            )
+        )
+        return float(graph.objective())
+
+    full = objective(1.0)
+    quarter = objective(0.25)
+    assert quarter == pytest.approx(0.25 * full, rel=1.0e-5)
 
 
 def test_s2_log_antipodal_is_finite_and_not_zero() -> None:

@@ -1653,8 +1653,22 @@ class SphericalSelfiGlobalBackend:
             # improve certainty without allowing a single dense block to
             # dominate the complete graph solely because it is larger.
             confidence = min(8.0, max(1.0, math.sqrt(float(count) / 64.0)))
+            s2_information_scale = max(
+                0.0, float(factor.s2_information_scale)
+            )
+            depth_information_scale = max(
+                0.0, float(factor.depth_information_scale)
+            )
             information = source_transform.new_tensor(
-                [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.5]
+                [
+                    depth_information_scale,
+                    depth_information_scale,
+                    depth_information_scale,
+                    2.0 * s2_information_scale,
+                    2.0 * s2_information_scale,
+                    2.0 * s2_information_scale,
+                    0.5 * depth_information_scale,
+                ]
             ) * confidence
             retained.append(
                 Sim3GraphEdge(
@@ -1670,6 +1684,8 @@ class SphericalSelfiGlobalBackend:
                         "source_edge_type": factor.edge_type,
                         "source_correspondence_count": count,
                         "information_confidence": confidence,
+                        "s2_information_scale": s2_information_scale,
+                        "depth_information_scale": depth_information_scale,
                     },
                 )
             )
@@ -4898,8 +4914,9 @@ class SphericalSelfiGlobalBackend:
         selected: torch.Tensor,
         *,
         dtype: torch.dtype,
+        quality: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Balance available query directions without requiring both sides."""
+        """Balance query directions while retaining soft row quality."""
 
         weights = torch.zeros(
             int(direction.numel()),
@@ -4913,11 +4930,24 @@ class SphericalSelfiGlobalBackend:
         ]
         if not present:
             raise RuntimeError("Chunk-stride weights require at least one row")
+        row_quality = (
+            torch.ones_like(direction, dtype=dtype)
+            if quality is None
+            else quality.to(device=direction.device, dtype=dtype).reshape(-1)
+        )
+        if int(row_quality.numel()) != int(direction.numel()):
+            raise ValueError("Chunk-stride quality must match correspondence count")
+        row_quality = row_quality.clamp_min(0.0)
         direction_weight = 1.0 / float(len(present))
         for value in present:
             rows = selected & (direction == value)
             count = int(rows.sum().item())
-            weights[rows] = direction_weight / float(count)
+            values = row_quality[rows]
+            total = values.sum()
+            if float(total.detach().cpu()) <= 1.0e-12:
+                weights[rows] = direction_weight / float(count)
+            else:
+                weights[rows] = direction_weight * values / total
         return weights
 
     @staticmethod
@@ -5220,6 +5250,15 @@ class SphericalSelfiGlobalBackend:
         target_bearing = matches.target_bearing[keep].to(source_depth)
         source_depth = source_depth[keep]
         target_depth = target_depth[keep]
+        descriptor_quality = (
+            matches.top1_cosine[keep].to(source_depth).clamp(0.0, 1.0)
+            * (
+                1.0
+                - matches.normalized_entropy[keep]
+                .to(source_depth)
+                .clamp(0.0, 1.0)
+            )
+        ).clamp_min(1.0e-3)
         try:
             holdout_mask = self._chunk_stride_holdout_mask(
                 direction,
@@ -5228,10 +5267,21 @@ class SphericalSelfiGlobalBackend:
                 stride=self.chunk_stride_holdout_stride,
             )
             train_mask = ~holdout_mask
+            descriptor_reference_weight = self._balanced_chunk_stride_weights(
+                direction,
+                train_mask,
+                dtype=source_depth.dtype,
+            )
+            descriptor_score = float(
+                (
+                    descriptor_reference_weight * descriptor_quality
+                ).sum().detach().cpu()
+            )
             base_weight = self._balanced_chunk_stride_weights(
                 direction,
                 train_mask,
                 dtype=source_depth.dtype,
+                quality=descriptor_quality,
             )
         except RuntimeError as error:
             diagnostics.update(
@@ -5321,6 +5371,7 @@ class SphericalSelfiGlobalBackend:
             direction,
             diagnostic_mask,
             dtype=source_depth.dtype,
+            quality=descriptor_quality,
         )
         source_singular = self._weighted_point_singular_values(
             source_points[diagnostic_mask], inlier_weight[diagnostic_mask]
@@ -5353,6 +5404,24 @@ class SphericalSelfiGlobalBackend:
             torch.linalg.norm(translation - local_pose[:3, 3]).detach().cpu()
         )
         holdout_available = bool(holdout_mask.any())
+        train_angular, train_depth_error = self._chunk_stride_alignment_errors(
+            measurement,
+            source_bearing[train_mask],
+            target_bearing[train_mask],
+            source_depth[train_mask],
+            target_depth[train_mask],
+        )
+        train_weight = base_weight[train_mask]
+        train_angular_median = float(
+            self._weighted_median_1d(
+                train_angular, train_weight
+            ).detach().cpu()
+        )
+        train_depth_median = float(
+            self._weighted_median_1d(
+                train_depth_error, train_weight
+            ).detach().cpu()
+        )
         if holdout_available:
             holdout_angular, holdout_depth = self._chunk_stride_alignment_errors(
                 measurement,
@@ -5365,6 +5434,7 @@ class SphericalSelfiGlobalBackend:
                 direction,
                 holdout_mask,
                 dtype=source_depth.dtype,
+                quality=descriptor_quality,
             )[holdout_mask]
             holdout_angular_median = float(
                 self._weighted_median_1d(
@@ -5391,18 +5461,42 @@ class SphericalSelfiGlobalBackend:
             float(train_mask.sum().item())
             / float(max(self.dense_information_reference_count, 1.0)),
         )
-        depth_score = 1.0 / (1.0 + max(0.0, holdout_depth_median))
-        information_confidence = max(
+        angular_reference = (
+            holdout_angular_median
+            if holdout_available
+            else train_angular_median
+        )
+        depth_reference = (
+            holdout_depth_median if holdout_available else train_depth_median
+        )
+        angular_scale_deg = max(float(self.s2_huber_delta_deg), 1.0e-3)
+        angular_score = 1.0 / (
+            1.0 + (max(0.0, angular_reference) / angular_scale_deg) ** 2
+        )
+        depth_score = 1.0 / (
+            1.0 + (max(0.0, depth_reference) / 0.25) ** 2
+        )
+        common_quality = (
+            max(support_score, 1.0e-6)
+            * max(coverage, 1.0e-6)
+            * max(descriptor_score, 1.0e-6)
+        )
+        s2_information_scale = max(
             0.05,
             min(
                 1.0,
-                (
-                    max(support_score, 1.0e-6)
-                    * max(coverage, 1.0e-6)
-                    * depth_score
-                )
-                ** (1.0 / 3.0),
+                (common_quality * max(angular_score, 1.0e-6)) ** 0.25,
             ),
+        )
+        depth_information_scale = max(
+            0.05,
+            min(
+                1.0,
+                (common_quality * max(depth_score, 1.0e-6)) ** 0.25,
+            ),
+        )
+        information_confidence = math.sqrt(
+            s2_information_scale * depth_information_scale
         )
         scale_value = float(scale.detach().cpu())
         diagnostics.update(
@@ -5431,11 +5525,26 @@ class SphericalSelfiGlobalBackend:
                 "covariance_ratio": covariance_ratio,
                 "holdout_median_angular_error_deg": holdout_angular_median,
                 "holdout_median_relative_depth_error": holdout_depth_median,
+                "train_median_angular_error_deg": train_angular_median,
+                "train_median_relative_depth_error": train_depth_median,
                 "source_spherical_coverage": source_coverage,
                 "target_spherical_coverage": target_coverage,
                 "support_score": support_score,
+                "descriptor_score": descriptor_score,
+                "angular_score": angular_score,
                 "depth_score": depth_score,
                 "information_confidence": information_confidence,
+                "s2_information_scale": s2_information_scale,
+                "depth_information_scale": depth_information_scale,
+                "effective_s2_information": (
+                    self.dense_information_reference_count
+                    * s2_information_scale
+                ),
+                "effective_depth_information": (
+                    self.dense_information_reference_count
+                    * max(float(self.depth_factor_weight), 0.0)
+                    * depth_information_scale
+                ),
                 "local_ba_final_median_residual_deg": (
                     None if ba_residual is None else float(ba_residual)
                 ),
@@ -5456,13 +5565,14 @@ class SphericalSelfiGlobalBackend:
             source_depth=source_depth.index_select(0, selected),
             target_depth=target_depth.index_select(0, selected),
             factor_weight=(
-                information_confidence
-                * robust_weight.index_select(0, selected)
+                robust_weight.index_select(0, selected)
             ),
             depth_factor_weight=self.depth_factor_weight,
             s2_huber_delta_deg=self.s2_huber_delta_deg,
             use_depth=True,
             edge_type=str(edge_type),
+            s2_information_scale=s2_information_scale,
+            depth_information_scale=depth_information_scale,
             **self._dense_factor_information_options(),
             metadata=dict(diagnostics),
         )
