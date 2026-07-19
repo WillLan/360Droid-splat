@@ -87,7 +87,19 @@ def pano_photometric_loss(
         dssim = _dssim_loss(render_rgb, target_rgb, mask=mask)
         return float(rgb_l1_weight) * l1_loss + float(dssim_weight) * dssim
     err = charbonnier(render_rgb - target_rgb, eps).mean(dim=0, keepdim=True)
-    return (err * weight).sum() / weight.sum().clamp_min(1e-8)
+    charbonnier_loss = (err * weight).sum() / weight.sum().clamp_min(1e-8)
+    if mode in {
+        "charbonnier_dssim",
+        "rgb_charbonnier_dssim",
+        "charbonnier+ssim",
+        "charbonnier+dssim",
+    }:
+        dssim = _dssim_loss(render_rgb, target_rgb, mask=mask)
+        return (
+            float(rgb_l1_weight) * charbonnier_loss
+            + float(dssim_weight) * dssim
+        )
+    return charbonnier_loss
 
 
 def pano_depth_loss(

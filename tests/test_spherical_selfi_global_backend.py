@@ -463,6 +463,36 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert map_optimization["s2_loss_weight"] == 0.0
     assert map_optimization["match_depth_loss_weight"] == 0.0
     assert map_optimization["visible_neighbor_lr_scale"] == 0.0
+    assert map_optimization["two_stage"] == {
+        "enabled": True,
+        "prefusion_pose_tracking": {
+            "enabled": True,
+            "quarter_resolution_scale": 0.25,
+            "quarter_resolution_steps": 12,
+            "half_resolution_scale": 0.5,
+            "half_resolution_steps": 18,
+            "full_resolution_steps": 30,
+            "pose_lr": 2.0e-4,
+            "pose_grad_clip": 0.001,
+            "alpha_threshold": 0.05,
+            "holdout_fraction": 0.20,
+            "validation_interval": 10,
+            "min_validation_improvement": 0.0,
+            "photometric_loss_mode": "charbonnier_dssim",
+            "charbonnier_weight": 0.85,
+            "dssim_weight": 0.15,
+        },
+        "postfusion_gaussian_mapping": {
+            "replay_every": 2,
+            "validation_interval": 25,
+            "restore_best_gaussians": True,
+            "holdout_fraction": 0.20,
+            "alpha_threshold": 0.05,
+            "photometric_loss_mode": "charbonnier_dssim",
+            "charbonnier_weight": 0.85,
+            "dssim_weight": 0.15,
+        },
+    }
     assert {
         name: map_optimization[name]
         for name in (
@@ -518,6 +548,7 @@ def test_photometric_recent3_configs_only_change_iteration_count() -> None:
         )
         optimization = config["SphericalSelfiGlobalBackend"]["map_optimization"]
         assert optimization == {
+            "two_stage": {"enabled": False},
             "steps_per_window": steps,
             "recent_window_count": 3,
             "photometric_only": True,
@@ -2042,6 +2073,271 @@ def test_new_frame_support_and_four_view_visibility_jointly_gate_first_fusion() 
     assert backend.map.anchor_count() == 1
 
 
+def test_two_stage_candidate_prepare_is_state_free_and_refiner_runs_after_graph() -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    _attach_identity_stride_matches(packet)
+    packet.metadata.update(
+        {
+            "voxel_anchor_refiner_requested": True,
+            "voxel_anchor_refiner_pending": True,
+            "voxel_anchor_refiner_enabled": False,
+        }
+    )
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.canonical_poses: dict[int, torch.Tensor] = {}
+            self.pose_deltas: dict[int, object] = {}
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def apply_canonical_pose_state(self, poses, *, revision: int) -> int:
+            self.canonical_poses.update(
+                {
+                    int(frame_id): pose.detach().clone()
+                    for frame_id, pose in poses.items()
+                }
+            )
+            self.pose_deltas.update(
+                {int(frame_id): object() for frame_id in poses}
+            )
+            return len(poses)
+
+        def optimize_spherical_selfi_pose_only(self, **kwargs):
+            return {
+                "steps": 0.0,
+                "validation_improved": 0.0,
+                "restored_initial_pose": 1.0,
+            }
+
+        def refined_pose_c2w(self, frame_id: int):
+            return self.canonical_poses.get(int(frame_id))
+
+    mapper = _Mapper()
+    refiner_calls: list[dict[str, object]] = []
+
+    def finalize_refiner(value: LocalGaussianWindowPacket):
+        refiner_calls.append(
+            {
+                "nodes": tuple(sorted(backend.graph.nodes)),
+                "poses": value.local_poses_c2w.detach().clone(),
+                "global_poses": value.global_poses(
+                    backend._window_anchor_transforms()[
+                        int(value.window_id)
+                    ].to(value.local_poses_c2w)
+                ).detach().clone(),
+                "revision": int(backend._pose_state_revision),
+            }
+        )
+        metadata = dict(value.metadata)
+        metadata.update(
+            {
+                "voxel_anchor_refiner_pending": False,
+                "voxel_anchor_refiner_enabled": True,
+            }
+        )
+        anchors = value.anchor_observation
+        if anchors is None:
+            images = torch.zeros(
+                1,
+                len(value.frame_ids),
+                3,
+                *value.observation.image_size,
+            )
+            anchors = voxelize_per_pixel_gaussians(
+                value.observation,
+                value.adapter_features,
+                images,
+                VoxelAnchorConfig(
+                    use_resnet_error=False,
+                    pretrained_resnet=False,
+                ),
+                valid_mask=value.finite_gaussian_mask,
+            ).detach_for_backend()
+        return replace(
+            value,
+            anchor_observation=anchors,
+            metadata=metadata,
+        )
+
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        mapper=mapper,
+        renderer=_SyntheticSharedDepthRenderer(
+            local_depth=2.0,
+            global_depth=2.0,
+        ),
+        pose_canonicalized_packet_refiner=finalize_refiner,
+        config={
+            "enabled": True,
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "two_frame_bridge_depth_scale",
+                "min_points": 8,
+                "max_points": 64,
+                "min_points_per_frame": 8,
+                "max_points_per_frame": 32,
+                "post_refiner_scale_recheck": False,
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "radius_voxels": 1.5,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "update_existing_statistics": True,
+                "require_new_frame_support": False,
+                "log_posthash_coverage": False,
+            },
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "optimization_trigger": "periodic_and_loop",
+                "optimization_start_nodes": 3,
+                "optimization_interval_edges": 1,
+                "active_nodes": 3,
+                "chunk_stride": {
+                    "target_index": 2,
+                    "min_matches": 8,
+                    "holdout_stride": 5,
+                },
+                "skip_edge": {"enabled": False},
+            },
+            "loop_closure": {"exclude_recent_windows": 100},
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+                "min_confidence": 0.0,
+                "min_opacity": 0.0,
+            },
+            "map_optimization": {
+                "steps_per_window": 0,
+                "final_steps": 0,
+                "two_stage": {
+                    "enabled": True,
+                    "prefusion_pose_tracking": {"enabled": True},
+                },
+            },
+        },
+    )
+
+    candidate_id = backend.prepare_packet_candidate(packet)
+
+    assert candidate_id == 0
+    assert backend.graph.nodes == {}
+    assert backend.graph.edges == []
+    assert backend.window_order == []
+    assert backend.map.anchor_count() == 0
+    assert backend._pending_geometry_batch is None
+    assert backend._pose_state_revision == 0
+    assert refiner_calls == []
+    assert "two_stage_candidate_prepared" not in packet.metadata
+
+    result = backend.track_and_commit_candidate(candidate_id)
+
+    assert result.window_id == 0
+    assert refiner_calls and refiner_calls[0]["nodes"] == (0, 2)
+    assert result.diagnostics["prefusion_pose_tracking"]["reason"] == (
+        "first_window_has_no_committed_map"
+    )
+    assert backend.map.anchor_count() > 0
+    assert backend.pending_packet_candidate_ids() == ()
+    assert backend._last_full_packet is not None
+    assert backend._last_full_packet.metadata["refiner_after_prefusion_tracking"]
+    assert backend._last_full_packet.metadata["refiner_pose_revision"] == (
+        result.fusion["pose_state_committed_revision"]
+    )
+    assert backend._pending_geometry_batch is not None
+    assert backend._pending_geometry_batch.revision == (
+        result.fusion["pose_state_committed_revision"]
+    )
+
+    next_packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    _attach_identity_stride_matches(next_packet)
+    next_packet.metadata.update(
+        {
+            "voxel_anchor_refiner_requested": True,
+            "voxel_anchor_refiner_pending": True,
+            "voxel_anchor_refiner_enabled": False,
+        }
+    )
+    next_candidate_id = backend.prepare_packet_candidate(next_packet)
+
+    def move_new_node(active_node_ids=None, *, fixed_node_ids=None):
+        node = int(active_node_ids[-1])
+        transform = backend.graph.transform(node)
+        scale, rotation, translation = sim3_components(transform)
+        backend.graph.nodes[node] = sim3_from_components(
+            scale,
+            rotation,
+            translation + translation.new_tensor([0.25, 0.0, 0.0]),
+        )
+        return Sim3GraphOptimizeResult(
+            accepted=True,
+            iterations=1,
+            initial_objective=1.0,
+            final_objective=0.5,
+            max_update_norm=0.25,
+            optimized_node_ids=tuple(int(value) for value in active_node_ids),
+            reason="synthetic_prefusion_graph_commit",
+            final_damping=float(backend.graph.damping),
+        )
+
+    backend.graph.optimize = move_new_node
+    second = backend.track_and_commit_candidate(next_candidate_id)
+
+    assert second.graph is not None and second.graph.accepted is True
+    assert refiner_calls[1]["nodes"] == (0, 2, 4)
+    second_refiner_global = refiner_calls[1]["global_poses"]
+    assert isinstance(second_refiner_global, torch.Tensor)
+    assert float(second_refiner_global[2, 0, 3]) == pytest.approx(0.25)
+    assert refiner_calls[1]["revision"] == second.fusion[
+        "pose_state_committed_revision"
+    ]
+
+    failed_packet = _refined_packet(
+        2,
+        torch.eye(4).repeat(4, 1, 1),
+        (4, 5, 6, 7),
+    )
+    _attach_identity_stride_matches(failed_packet)
+    failed_packet.metadata.update(
+        {
+            "voxel_anchor_refiner_requested": True,
+            "voxel_anchor_refiner_pending": True,
+            "voxel_anchor_refiner_enabled": False,
+        }
+    )
+    nodes_before = {
+        node: transform.clone() for node, transform in backend.graph.nodes.items()
+    }
+    anchors_before = backend.map.anchor_count()
+    revision_before = backend._pose_state_revision
+    failed_candidate_id = backend.prepare_packet_candidate(failed_packet)
+    mapper.prepare_spherical_selfi_window = lambda frame_ids: len(frame_ids) - 1
+
+    with pytest.raises(RuntimeError, match="registered RGB observations"):
+        backend.track_and_commit_candidate(failed_candidate_id)
+
+    assert backend.pending_packet_candidate_ids() == ()
+    assert set(backend.graph.nodes) == set(nodes_before)
+    for node, transform in nodes_before.items():
+        torch.testing.assert_close(backend.graph.transform(node), transform)
+    assert backend.map.anchor_count() == anchors_before
+    assert backend._pose_state_revision == revision_before
+
+
 def test_chunk_first_hash_uses_committed_pose_revision_for_all_four_views(
     monkeypatch,
 ) -> None:
@@ -2620,6 +2916,7 @@ def test_posebaseline_ablation_explicitly_uses_legacy_boundary_graph() -> None:
 
     backend = config["SphericalSelfiGlobalBackend"]
     assert backend["global_graph"]["node_mode"] == "boundary_frame"
+    assert backend["map_optimization"]["two_stage"]["enabled"] is False
     assert (
         backend["rendered_overlap_alignment"]["mode"]
         == "two_frame_bridge_pose_scale"
@@ -4963,6 +5260,85 @@ def test_recent_three_window_photometric_optimization_uses_eight_unique_frames()
     assert metrics["optimized_frame_count"] == 8.0
     assert metrics["active_owner_window_count"] == 3.0
     assert metrics["photometric_only"] == 1.0
+    assert mapper.commits == 1
+
+
+def test_two_stage_postfusion_optimization_is_gaussian_only_with_replay() -> None:
+    packets = [
+        _packet(0, torch.eye(4).repeat(4, 1, 1), (0, 1, 2, 3)),
+        _packet(1, torch.eye(4).repeat(4, 1, 1), (2, 3, 4, 5)),
+        _packet(2, torch.eye(4).repeat(4, 1, 1), (4, 5, 6, 7)),
+    ]
+    packets[-1].metadata["two_stage_candidate_prepared"] = True
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.observations = {frame_id: object() for frame_id in range(12)}
+            self.frame_ids = None
+            self.settings = None
+            self.commits = 0
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_gaussian_only(
+            self, *, frame_ids, settings, **kwargs
+        ):
+            self.frame_ids = tuple(int(value) for value in frame_ids)
+            self.settings = dict(settings)
+            return {
+                "steps": 100.0,
+                "window_rollback": 0.0,
+                "pose_bitwise_unchanged": 1.0,
+            }
+
+        def optimize_spherical_selfi_window(self, **kwargs):
+            raise AssertionError("Two-stage mapping must not call the joint optimizer")
+
+        def commit_spherical_selfi_window(self) -> None:
+            self.commits += 1
+
+    mapper = _Mapper()
+    backend = _chunk_stride_backend(min_matches=8, mapper=mapper)
+    backend.two_stage_map_optimization_enabled = True
+    backend.postfusion_gaussian_mapping_config = {
+        "replay_every": 2,
+        "validation_interval": 25,
+        "restore_best_gaussians": True,
+        "holdout_fraction": 0.20,
+        "alpha_threshold": 0.05,
+        "photometric_loss_mode": "charbonnier_dssim",
+        "charbonnier_weight": 0.85,
+        "dssim_weight": 0.15,
+    }
+    backend.map_optimize_recent_windows = 3
+    backend.map_optimize_photometric_only = True
+    backend.window_order = [0, 1, 2]
+    backend.packets = {
+        packet.window_id: packet.compact_for_memory() for packet in packets
+    }
+    backend._optimization_packets[2] = packets[-1]
+    backend._synchronize_joint_optimized_window = lambda *args, **kwargs: (
+        (_ for _ in ()).throw(
+            AssertionError("Gaussian-only mapping must not synchronize poses")
+        )
+    )
+
+    metrics = backend._run_map_optimization(2, tuple(range(8)), 100)
+
+    assert mapper.frame_ids == tuple(range(8))
+    assert mapper.settings["pose_refine_enable"] is False
+    assert mapper.settings["active_owner_window_ids"] == (0, 1, 2)
+    assert mapper.settings["replay_frame_ids"] == (8, 9, 10, 11)
+    assert mapper.settings["replay_every"] == 2
+    assert mapper.settings["validation_frame_ids"] == (0, 2, 5, 7)
+    assert mapper.settings["restore_best_gaussians"] is True
+    assert mapper.settings["photometric_loss_mode"] == "charbonnier_dssim"
+    assert metrics["gaussian_only_mapping"] == 1.0
+    assert metrics["pose_refine_enabled"] == 0.0
+    assert metrics["pose_bitwise_unchanged"] == 1.0
     assert mapper.commits == 1
 
 

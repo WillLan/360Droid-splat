@@ -375,6 +375,33 @@ SphericalSelfiGlobalBackend:
   map_optimization:
     renderer: gsplat360
     steps_per_window: 100
+    two_stage:
+      enabled: true
+      prefusion_pose_tracking:
+        enabled: true
+        quarter_resolution_scale: 0.25
+        quarter_resolution_steps: 12
+        half_resolution_scale: 0.5
+        half_resolution_steps: 18
+        full_resolution_steps: 30
+        pose_lr: 2.0e-4
+        pose_grad_clip: 0.001
+        alpha_threshold: 0.05
+        holdout_fraction: 0.20
+        validation_interval: 10
+        min_validation_improvement: 0.0
+        photometric_loss_mode: charbonnier_dssim
+        charbonnier_weight: 0.85
+        dssim_weight: 0.15
+      postfusion_gaussian_mapping:
+        replay_every: 2
+        validation_interval: 25
+        restore_best_gaussians: true
+        holdout_fraction: 0.20
+        alpha_threshold: 0.05
+        photometric_loss_mode: charbonnier_dssim
+        charbonnier_weight: 0.85
+        dssim_weight: 0.15
     # Optimize the current chunk and its two immediate predecessors. With the
     # 4-frame/stride-2 schedule this is at most eight unique physical frames.
     recent_window_count: 3

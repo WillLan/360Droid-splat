@@ -30,6 +30,40 @@ class _CountingRenderer:
         return {"render": render, "depth": render.new_ones(1, H, W)}
 
 
+class _PoseOnlyPhotometricRenderer:
+    def render(
+        self,
+        camera: PanoRenderCamera,
+        gaussian_map: PanoGaussianMap,
+    ) -> dict:
+        height, width = int(camera.image_height), int(camera.image_width)
+        value = camera.c2w[0, 3]
+        render = value.expand(3, height, width)
+        alpha = render.new_ones(1, height, width)
+        return {
+            "render": render,
+            "depth": alpha,
+            "alpha": alpha,
+        }
+
+
+class _GaussianOnlyPhotometricRenderer:
+    def render(
+        self,
+        camera: PanoRenderCamera,
+        gaussian_map: PanoGaussianMap,
+    ) -> dict:
+        height, width = int(camera.image_height), int(camera.image_width)
+        color = gaussian_map.get_features.mean(dim=0)
+        render = color.view(3, 1, 1).expand(3, height, width)
+        alpha = render.new_ones(1, height, width)
+        return {
+            "render": render,
+            "depth": alpha,
+            "alpha": alpha,
+        }
+
+
 class _DepthGateRenderer:
     def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
         H, W = int(camera.image_height), int(camera.image_width)
@@ -960,6 +994,221 @@ def test_spherical_selfi_window_runs_twenty_balanced_steps_and_reuses_overlap_po
         )
     assert mapper.prepare_spherical_selfi_window((3, 4, 5, 6)) == 4
     assert mapper.pose_deltas[3] is overlap_pose_delta
+
+
+def test_prefusion_pose_only_freezes_gaussians_and_overlap_poses():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "pose_refine_enable": True,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map,
+        renderer=_PoseOnlyPhotometricRenderer(),
+    )
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.6),
+    )
+    for frame_id in range(4):
+        mapper.register_observation(
+            _frontend_output_with_size(frame_id, 20, 40),
+            torch.full((3, 20, 40), 0.6),
+            is_keyframe=True,
+            sky_mask=torch.zeros(1, 20, 40, dtype=torch.bool),
+        )
+    assert mapper.prepare_spherical_selfi_window((0, 1, 2, 3)) == 4
+    overlap_before = {
+        frame_id: mapper.pose_deltas[frame_id].delta.detach().clone()
+        for frame_id in (0, 1)
+    }
+    new_before = {
+        frame_id: mapper.pose_deltas[frame_id].delta.detach().clone()
+        for frame_id in (2, 3)
+    }
+    gaussian_before = {
+        name: parameter.detach().clone()
+        for name, parameter in gaussian_map.named_parameters()
+    }
+
+    metrics = mapper.optimize_spherical_selfi_pose_only(
+        frame_ids=(2, 3),
+        pyramid_steps=((0.25, 2), (0.5, 2), (1.0, 4)),
+        pose_lr=1.0e-2,
+        pose_grad_clip=1.0,
+        alpha_threshold=0.05,
+        holdout_fraction=0.20,
+        validation_interval=2,
+    )
+
+    assert metrics["trainable_pose_count"] == 2.0
+    assert metrics["configured_steps"] == 8.0
+    for frame_id, before in overlap_before.items():
+        torch.testing.assert_close(mapper.pose_deltas[frame_id].delta, before)
+    assert any(
+        not torch.equal(mapper.pose_deltas[frame_id].delta, before)
+        for frame_id, before in new_before.items()
+    )
+    for name, parameter in gaussian_map.named_parameters():
+        assert torch.equal(parameter.detach(), gaussian_before[name])
+
+
+def test_prefusion_pose_only_restores_map_grad_state_on_initial_render_failure(
+    monkeypatch,
+):
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "pose_refine_enable": True,
+            "optimize_skybox": False,
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map,
+        renderer=_PoseOnlyPhotometricRenderer(),
+    )
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.6),
+    )
+    for frame_id in (2, 3):
+        mapper.register_observation(
+            _frontend_output_with_size(frame_id, 20, 40),
+            torch.full((3, 20, 40), 0.6),
+            is_keyframe=True,
+            sky_mask=torch.zeros(1, 20, 40, dtype=torch.bool),
+        )
+    assert mapper.prepare_spherical_selfi_window((2, 3)) == 2
+    first_parameter = next(gaussian_map.parameters())
+    first_parameter.requires_grad_(False)
+    requires_grad_before = {
+        name: bool(parameter.requires_grad)
+        for name, parameter in gaussian_map.named_parameters()
+    }
+    gaussian_before = {
+        name: parameter.detach().clone()
+        for name, parameter in gaussian_map.named_parameters()
+    }
+    pose_before = {
+        frame_id: mapper.pose_deltas[frame_id].delta.detach().clone()
+        for frame_id in (2, 3)
+    }
+
+    def fail_initial_validation(*args, **kwargs):
+        raise RuntimeError("synthetic initial pose-only render failure")
+
+    monkeypatch.setattr(
+        mapper,
+        "_spherical_selfi_rgb_objective",
+        fail_initial_validation,
+    )
+    with pytest.raises(RuntimeError, match="synthetic initial pose-only render failure"):
+        mapper.optimize_spherical_selfi_pose_only(
+            frame_ids=(2, 3),
+            pyramid_steps=((1.0, 1),),
+            pose_lr=1.0e-2,
+            pose_grad_clip=1.0,
+            alpha_threshold=0.05,
+        )
+
+    assert {
+        name: bool(parameter.requires_grad)
+        for name, parameter in gaussian_map.named_parameters()
+    } == requires_grad_before
+    for name, parameter in gaussian_map.named_parameters():
+        assert torch.equal(parameter.detach(), gaussian_before[name])
+    for frame_id, before in pose_before.items():
+        assert torch.equal(mapper.pose_deltas[frame_id].delta, before)
+
+
+def test_postfusion_gaussian_only_replays_history_and_keeps_poses_bitwise():
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": True,
+            "optimize_skybox": False,
+            "scale_gaussian_parameter_updates": True,
+            "FeedForwardWindow": {
+                "enabled": True,
+                "prune": {"enabled": False},
+            },
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map,
+        renderer=_GaussianOnlyPhotometricRenderer(),
+    )
+    for frame_id in (0, 1):
+        mapper.insert_keyframe(
+            _small_seed_batch(frame_id),
+            _frontend_output_with_size(frame_id, 20, 40),
+            image=torch.full((3, 20, 40), 0.8),
+        )
+    gaussian_map._anchor_owner_window_id = torch.tensor(
+        [0, 1], dtype=torch.int32
+    )
+    for frame_id in (2, 3):
+        mapper.register_observation(
+            _frontend_output_with_size(frame_id, 20, 40),
+            torch.full((3, 20, 40), 0.8),
+            is_keyframe=True,
+            sky_mask=torch.zeros(1, 20, 40, dtype=torch.bool),
+        )
+    assert mapper.prepare_spherical_selfi_window((0, 1, 2, 3)) == 4
+    pose_before = {
+        frame_id: value.delta.detach().clone()
+        for frame_id, value in mapper.pose_deltas.items()
+    }
+    frozen_before = gaussian_map.features.detach()[0].clone()
+
+    metrics = mapper.optimize_spherical_selfi_gaussian_only(
+        window_id=1,
+        frame_ids=(2, 3),
+        iters=4,
+        settings={
+            "active_owner_window_ids": (1,),
+            "replay_frame_ids": (0, 1),
+            "replay_every": 2,
+            "validation_frame_ids": (2, 3),
+            "validation_interval": 1,
+            "restore_best_gaussians": True,
+            "holdout_fraction": 0.20,
+            "alpha_threshold": 0.05,
+            "photometric_only": True,
+            "photometric_loss_mode": "charbonnier_dssim",
+            "charbonnier_weight": 0.85,
+            "dssim_weight": 0.15,
+            "scale_gaussian_parameter_updates": True,
+            "separate_gaussian_lrs": True,
+            "feature_lr": 1.0e-2,
+            "sampler_seed": 7,
+        },
+    )
+
+    assert metrics["pose_bitwise_unchanged"] == 1.0
+    assert metrics["trainable_pose_count"] == 0.0
+    assert metrics["replay_sample_count"] == 2.0
+    assert metrics["sample_count_frame_2"] == 2.0
+    assert metrics["sample_count_frame_3"] == 2.0
+    for frame_id, before in pose_before.items():
+        assert torch.equal(mapper.pose_deltas[frame_id].delta, before)
+    assert torch.equal(gaussian_map.features.detach()[0], frozen_before)
+    assert not torch.equal(
+        gaussian_map.features.detach()[1],
+        _small_seed_batch(1).rgb[0],
+    )
+    mapper.commit_spherical_selfi_window()
 
 
 def test_spherical_selfi_window_initializes_cubemap_from_head_sky_mask():

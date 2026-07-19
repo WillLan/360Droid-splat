@@ -2,6 +2,8 @@ base_config: spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml
 
 SphericalSelfiGlobalBackend:
   map_optimization:
+    two_stage:
+      enabled: false
     steps_per_window: 100
     recent_window_count: 3
     photometric_only: true
