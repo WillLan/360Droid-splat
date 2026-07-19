@@ -8203,34 +8203,20 @@ class SphericalSelfiGlobalBackend:
                     .detach()
                     .cpu()
                 )
-                overlap_accepted = (
-                    overlap_rotation_error
-                    <= self.rendered_alignment_max_shared_rotation_error_deg
-                    and overlap_center_error
-                    <= self.rendered_alignment_max_shared_center_error
-                )
                 alignment_diagnostics.update(
                     {
-                        "graph_role": "acceptance_only_no_factor",
+                        "graph_role": "diagnostic_only_no_factor",
                         "existing_node_id": start_frame,
                         "raw_ba_to_canonical_rotation_error_deg": (
                             overlap_rotation_error
                         ),
                         "raw_ba_to_canonical_center_error": overlap_center_error,
                         "node_sim3_scale_updated": False,
-                        "accepted": bool(overlap_accepted),
-                        "reason": (
-                            "accepted_ba_overlap_depth_normalization"
-                            if overlap_accepted
-                            else "ba_overlap_pose_gate_rejected"
-                        ),
+                        "quality_gating_enabled": False,
+                        "accepted": True,
+                        "reason": "accepted_without_overlap_pose_gate",
                     }
                 )
-                if not overlap_accepted:
-                    raise RuntimeError(
-                        f"Window {window_id} overlap acceptance failed for "
-                        f"existing node {start_frame}"
-                    )
                 packet = self._canonicalize_packet_from_two_known_poses(
                     normalized_packet,
                     start_transform,

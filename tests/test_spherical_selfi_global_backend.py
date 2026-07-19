@@ -705,6 +705,48 @@ def test_chunk_first_pure_chain_inherits_parent_scale_from_canonical_packet(
     assert stride_edges[0].depth_factor_weight > 0.0
 
 
+def test_chunk_first_overlap_pose_difference_is_diagnostic_only() -> None:
+    packet0 = _packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+        height=32,
+        width=64,
+    )
+    poses1 = torch.eye(4).repeat(4, 1, 1)
+    poses1[1] = se3_exp(
+        torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, math.radians(30.0)])
+    )
+    packet1 = _packet(
+        1,
+        poses1,
+        (2, 3, 4, 5),
+        height=32,
+        width=64,
+    )
+    _attach_identity_stride_matches(packet0)
+    _attach_identity_stride_matches(packet1)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+
+    backend.process_packet(packet0)
+    result = backend.process_packet(packet1)
+
+    alignment = result.diagnostics["alignment"]
+    assert result.aligned is True
+    assert alignment["quality_gating_enabled"] is False
+    assert alignment["accepted"] is True
+    assert alignment["reason"] == "accepted_without_overlap_pose_gate"
+    assert alignment["raw_ba_to_canonical_rotation_error_deg"] > 29.0
+    assert alignment["raw_ba_to_canonical_center_error"] > 0.9
+    assert backend.window_order == [0, 1]
+    assert set(backend.graph.nodes) == {0, 2, 4}
+    assert backend._last_full_packet is not None
+    torch.testing.assert_close(
+        backend._last_full_packet.local_poses_c2w[1],
+        torch.eye(4),
+    )
+
+
 def test_chunk_first_periodic_ba_starts_at_six_nodes_then_runs_every_three_chunks(
     monkeypatch,
 ) -> None:

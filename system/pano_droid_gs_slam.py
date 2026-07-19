@@ -3279,6 +3279,14 @@ class PanoDroidGSSlamSystem:
                         ("chunk_scale_normalization", "chunk_scale_normalization"),
                         ("canonical_rotation_mismatch_deg", "canonical_rotation_mismatch_deg"),
                         ("canonical_translation_mismatch", "canonical_translation_mismatch"),
+                        (
+                            "raw_ba_to_canonical_rotation_error_deg",
+                            "raw_ba_to_canonical_rotation_error_deg",
+                        ),
+                        (
+                            "raw_ba_to_canonical_center_error",
+                            "raw_ba_to_canonical_center_error",
+                        ),
                         ("overlap_residual", "overlap_residual"),
                         ("overlap_inlier_ratio", "overlap_inlier_ratio"),
                         ("shared_scale", "shared_scale"),
