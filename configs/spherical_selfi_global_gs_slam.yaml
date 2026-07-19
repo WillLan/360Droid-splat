@@ -374,9 +374,16 @@ SphericalSelfiGlobalBackend:
     max_render_error: null
   map_optimization:
     renderer: gsplat360
-    steps_per_window: 20
+    steps_per_window: 100
+    # Optimize the current chunk and its two immediate predecessors. With the
+    # 4-frame/stride-2 schedule this is at most eight unique physical frames.
+    recent_window_count: 3
     sample_observations_per_step: 1
     sampler: shuffled_cycle
+    # This Mapper pass is a pure RGB joint pose/Gaussian refinement. Depth,
+    # graph-factor, opacity, pose-prior, and skybox objectives stay disabled.
+    photometric_only: true
+    optimize_skybox: false
     gaussian_lr: 0.002
     separate_gaussian_lrs: true
     xyz_lr: 5.0e-4
@@ -388,13 +395,15 @@ SphericalSelfiGlobalBackend:
     scale_gaussian_parameter_updates: true
     pose_refine_enable: true
     pose_lr: 2.0e-4
-    pose_prior_weight: 1.0e-3
+    pose_prior_weight: 0.0
     lazy_submap_transforms:
       enabled: true
     pose_grad_clip: 0.001
-    s2_loss_weight: 0.1
-    match_depth_loss_weight: 0.01
-    visible_neighbor_lr_scale: 0.1
+    s2_loss_weight: 0.0
+    match_depth_loss_weight: 0.0
+    # Older owners are rendered for occlusion/context but remain bitwise
+    # frozen. This legacy knob remains zero as an additional safety guard.
+    visible_neighbor_lr_scale: 0.0
     extra_steps_on_loop: 20
     loop_neighborhood_refinement: true
     loop_neighborhood_submap_radius: 1

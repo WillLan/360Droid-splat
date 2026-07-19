@@ -785,6 +785,16 @@ class SphericalSelfiGlobalBackend:
             graph_cfg.get("max_scale_change", 2.5)
         )
         self.map_steps_per_window = max(0, int(optimize_cfg.get("steps_per_window", 0)))
+        self.map_optimize_recent_windows = max(
+            1,
+            int(optimize_cfg.get("recent_window_count", 1)),
+        )
+        self.map_optimize_photometric_only = bool(
+            optimize_cfg.get("photometric_only", False)
+        )
+        self.map_optimize_skybox = bool(
+            optimize_cfg.get("optimize_skybox", True)
+        )
         self.map_steps_on_loop = max(
             0,
             int(optimize_cfg.get("extra_steps_on_loop", optimize_cfg.get("steps_on_loop", 0))),
@@ -6472,6 +6482,12 @@ class SphericalSelfiGlobalBackend:
                 )
             if self.chunk_first_stride_graph:
                 backend_transaction = self._snapshot_boundary_transaction()
+            optimized_frame_ids = tuple(
+                dict.fromkeys(int(frame_id) for frame_id in frame_ids)
+            )
+            active_owner_window_ids = self._map_optimization_window_ids(
+                int(window_id)
+            )
             fixed_frame_ids: list[int] = []
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
@@ -6489,27 +6505,46 @@ class SphericalSelfiGlobalBackend:
                 "pose_refine_enable": bool(
                     self.map_optimize_config.get("pose_refine_enable", True)
                 ),
-                "pose_prior_weight": float(self.map_optimize_config.get("pose_prior_weight", 0.0)),
+                "pose_prior_weight": (
+                    0.0
+                    if self.map_optimize_photometric_only
+                    else float(self.map_optimize_config.get("pose_prior_weight", 0.0))
+                ),
                 "pose_grad_clip": float(self.map_optimize_config.get("pose_grad_clip", 1.0e-3)),
                 "visible_neighbor_lr_scale": float(self.map_optimize_config.get("visible_neighbor_lr_scale", 0.1)),
                 "sampler_seed": int(self.map_optimize_config.get("seed", 123)) + int(window_id),
                 "fixed_pose_frame_ids": fixed_frame_ids,
+                "active_owner_window_ids": active_owner_window_ids,
+                "photometric_only": self.map_optimize_photometric_only,
+                "optimize_skybox": self.map_optimize_skybox,
             }
             metrics = self.mapper.optimize_spherical_selfi_window(
                 window_id=int(window_id),
-                frame_ids=list(frame_ids),
+                frame_ids=list(optimized_frame_ids),
                 iters=int(steps),
                 settings=settings,
                 extra_loss_fn=(
-                    lambda trainable_pose_ids: self._joint_graph_pose_loss(
+                    None
+                    if self.map_optimize_photometric_only
+                    else lambda trainable_pose_ids: self._joint_graph_pose_loss(
                         int(window_id), trainable_pose_ids
                     )
                 ),
             )
             metrics["pose_refine_enabled"] = float(settings["pose_refine_enable"])
+            metrics["optimized_frame_count"] = float(len(optimized_frame_ids))
+            metrics["active_owner_window_count"] = float(
+                len(active_owner_window_ids)
+            )
+            metrics["photometric_only"] = float(
+                self.map_optimize_photometric_only
+            )
             if float(metrics.get("window_rollback", 0.0)) == 0.0:
                 try:
-                    self._synchronize_joint_optimized_window(int(window_id))
+                    self._synchronize_joint_optimized_window(
+                        int(window_id),
+                        optimized_frame_ids=optimized_frame_ids,
+                    )
                 except (RuntimeError, ValueError, KeyError) as exc:
                     if backend_transaction is not None:
                         self._restore_boundary_transaction(backend_transaction)
@@ -6681,6 +6716,11 @@ class SphericalSelfiGlobalBackend:
         if int(steps) <= 0:
             return
         window = int(window_id)
+        selected_frame_ids = tuple(int(value) for value in frame_ids)
+        if self.map_optimize_recent_windows > 1:
+            recent_frame_ids = self._map_optimization_frame_ids(window)
+            if recent_frame_ids:
+                selected_frame_ids = recent_frame_ids
         for index, (queued_window, queued_frames, queued_steps) in enumerate(
             self._pending_map_optimization
         ):
@@ -6690,13 +6730,38 @@ class SphericalSelfiGlobalBackend:
                     tuple(
                         dict.fromkeys(
                             [int(value) for value in queued_frames]
-                            + [int(value) for value in frame_ids]
+                            + [int(value) for value in selected_frame_ids]
                         )
                     ),
                     max(int(queued_steps), int(steps)),
                 )
                 return
-        self._pending_map_optimization.append((window, tuple(frame_ids), int(steps)))
+        self._pending_map_optimization.append(
+            (window, selected_frame_ids, int(steps))
+        )
+
+    def _map_optimization_window_ids(self, window_id: int) -> tuple[int, ...]:
+        window = int(window_id)
+        try:
+            index = self.window_order.index(window)
+        except ValueError:
+            return (window,) if window in self.packets else ()
+        start = max(0, index - self.map_optimize_recent_windows + 1)
+        return tuple(int(value) for value in self.window_order[start : index + 1])
+
+    def _map_optimization_frame_ids(self, window_id: int) -> tuple[int, ...]:
+        frame_ids: list[int] = []
+        for selected_window in self._map_optimization_window_ids(window_id):
+            packet = self._optimization_packets.get(int(selected_window))
+            if packet is None:
+                packet = self.packets.get(int(selected_window))
+            if packet is None:
+                continue
+            for frame_id in packet.frame_ids:
+                value = int(frame_id)
+                if value not in frame_ids:
+                    frame_ids.append(value)
+        return tuple(frame_ids)
 
     def _loop_neighborhood_windows(
         self,
@@ -6822,11 +6887,19 @@ class SphericalSelfiGlobalBackend:
                 f"Sim(3) pose round-trip failed for window={window_id} frame={frame_id}: max_error={error:.3e}"
             )
 
-    def _synchronize_joint_optimized_window(self, window_id: int) -> None:
+    def _synchronize_joint_optimized_window(
+        self,
+        window_id: int,
+        *,
+        optimized_frame_ids: tuple[int, ...] | None = None,
+    ) -> None:
         """Transactionally rebase optimized SE(3) poses while graph scale stays authoritative."""
 
         if self.chunk_first_stride_graph:
-            self._synchronize_chunk_stride_optimized_window(window_id)
+            self._synchronize_chunk_stride_optimized_window(
+                window_id,
+                optimized_frame_ids=optimized_frame_ids,
+            )
             return
         if self.boundary_frame_graph:
             self._synchronize_boundary_optimized_window(window_id)
@@ -7453,14 +7526,21 @@ class SphericalSelfiGlobalBackend:
     def _synchronize_chunk_stride_optimized_window_impl(
         self,
         window_id: int,
+        *,
+        optimized_frame_ids: tuple[int, ...] | None = None,
     ) -> None:
         """Validate and publish one mapper pose proposal to canonical segments."""
 
         if self.mapper is None or int(window_id) not in self.packets:
             return
         packet = self.packets[int(window_id)]
+        selected_frame_ids = (
+            tuple(int(value) for value in packet.frame_ids)
+            if optimized_frame_ids is None
+            else tuple(dict.fromkeys(int(value) for value in optimized_frame_ids))
+        )
         optimized_by_frame: dict[int, torch.Tensor] = {}
-        for frame_id in packet.frame_ids:
+        for frame_id in selected_frame_ids:
             pose = self.mapper.refined_pose_c2w(int(frame_id))
             if pose is None:
                 raise RuntimeError(f"missing optimized pose for frame {frame_id}")
@@ -7596,10 +7676,18 @@ class SphericalSelfiGlobalBackend:
             reason="mapper_pose_transaction_commit",
         )
 
-    def _synchronize_chunk_stride_optimized_window(self, window_id: int) -> None:
+    def _synchronize_chunk_stride_optimized_window(
+        self,
+        window_id: int,
+        *,
+        optimized_frame_ids: tuple[int, ...] | None = None,
+    ) -> None:
         transaction = self._snapshot_boundary_transaction()
         try:
-            self._synchronize_chunk_stride_optimized_window_impl(window_id)
+            self._synchronize_chunk_stride_optimized_window_impl(
+                window_id,
+                optimized_frame_ids=optimized_frame_ids,
+            )
         except Exception:
             self._restore_boundary_transaction(transaction)
             raise

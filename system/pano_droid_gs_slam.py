@@ -3828,11 +3828,30 @@ class PanoDroidGSSlamSystem:
                     window_id=window_id,
                     step=max(1, int(logger._step)),
                 )
+            scalar_metrics = {
+                str(key): float(value)
+                for key, value in metrics.items()
+                if isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            }
+            if scalar_metrics:
+                logger._log_wandb_payload(
+                    {
+                        f"backend/map_optimization/{key}": value
+                        for key, value in scalar_metrics.items()
+                    },
+                    step=max(1, int(logger._step)),
+                )
             write_profile(
                 "backend_spherical_selfi_map_optimization",
                 optimize_steps=float(metrics.get("steps", 0.0)),
                 optimize_loss=float(metrics.get("loss", 0.0)),
                 total_sec=float(time.perf_counter() - section_start),
+                **{
+                    f"metric_{key}": value
+                    for key, value in scalar_metrics.items()
+                    if key not in {"steps", "loss"}
+                },
             )
 
         def process_output(out) -> None:

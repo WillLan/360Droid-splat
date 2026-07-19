@@ -1559,6 +1559,7 @@ class PanoGaussianMapper:
                 "pose_lr",
                 "pose_prior_weight",
                 "pose_grad_clip",
+                "optimize_skybox",
                 "gaussian_lr",
                 "separate_gaussian_lrs",
                 "xyz_lr",
@@ -1577,6 +1578,13 @@ class PanoGaussianMapper:
         ff_cfg["gaussian_scope"] = str(effective_cfg.get("gaussian_scope", "all"))
         if "active_owner_window_id" in effective_cfg:
             ff_cfg["active_owner_window_id"] = int(effective_cfg["active_owner_window_id"])
+        if "active_owner_window_ids" in effective_cfg:
+            ff_cfg["active_owner_window_ids"] = tuple(
+                int(value) for value in effective_cfg["active_owner_window_ids"]
+            )
+        ff_cfg["photometric_only"] = bool(
+            effective_cfg.get("photometric_only", False)
+        )
         ff_cfg["visible_neighbor_lr_scale"] = float(effective_cfg.get("visible_neighbor_lr_scale", 0.1))
         ff_cfg["optimize_non_keyframe_observations"] = True
         ff_cfg["random_observation_per_iter"] = bool(effective_cfg.get("random_observation_per_iter", False))
@@ -1644,7 +1652,11 @@ class PanoGaussianMapper:
         cfg = dict(settings or {})
         cfg.update(
             {
-                "gaussian_scope": "owner_window_visible",
+                "gaussian_scope": (
+                    "owner_windows"
+                    if cfg.get("active_owner_window_ids") is not None
+                    else "owner_window_visible"
+                ),
                 "active_owner_window_id": int(window_id),
                 "pose_refine_enable": bool(cfg.get("pose_refine_enable", True)),
                 "random_observation_per_iter": True,
@@ -3910,7 +3922,15 @@ class PanoGaussianMapper:
             param_groups,
             weight_decay=float(self.optim_cfg.get("weight_decay", 0.0)),
         )
-        pose_prior_weight = float(self.optim_cfg.get("pose_prior_weight", 1e-3))
+        photometric_only = bool(cfg.get("photometric_only", False))
+        loss_weights = self._feedforward_loss_weights(
+            photometric_only=photometric_only
+        )
+        pose_prior_weight = (
+            0.0
+            if photometric_only
+            else float(self.optim_cfg.get("pose_prior_weight", 1e-3))
+        )
         min_delta, patience = self._early_stop_options()
         best = float("inf")
         stale = 0
@@ -3969,8 +3989,16 @@ class PanoGaussianMapper:
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
                 non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=device, dtype=torch.bool)
-                target_depth = None if obs.target_depth is None else obs.target_depth.to(device=device, dtype=dtype)
-                depth_confidence = None if obs.depth_confidence is None else obs.depth_confidence.to(device=device, dtype=dtype)
+                target_depth = (
+                    None
+                    if photometric_only or obs.target_depth is None
+                    else obs.target_depth.to(device=device, dtype=dtype)
+                )
+                depth_confidence = (
+                    None
+                    if photometric_only or obs.depth_confidence is None
+                    else obs.depth_confidence.to(device=device, dtype=dtype)
+                )
                 loss_start = time.perf_counter()
                 loss_i, metrics_i = backend_render_loss(
                     pkg,
@@ -3978,7 +4006,7 @@ class PanoGaussianMapper:
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
                     depth_mask=non_sky_mask,
-                    weights=self.loss_weights,
+                    weights=loss_weights,
                 )
                 loss_eval_sec += time.perf_counter() - loss_start
                 if sky_mask is not None:
@@ -3994,7 +4022,11 @@ class PanoGaussianMapper:
             if pose_params and pose_prior_weight > 0.0:
                 prior = torch.stack([param.square().mean() for param in pose_params]).mean()
                 loss = loss + pose_prior_weight * prior
-            extra_loss_fn = getattr(self, "_spherical_selfi_extra_loss_fn", None)
+            extra_loss_fn = (
+                None
+                if photometric_only
+                else getattr(self, "_spherical_selfi_extra_loss_fn", None)
+            )
             if callable(extra_loss_fn):
                 extra_loss = extra_loss_fn(trainable_pose_ids)
                 if torch.is_tensor(extra_loss):
@@ -4030,12 +4062,8 @@ class PanoGaussianMapper:
                 if gaussian_enabled and gaussian_scales is not None and true_update_scaling:
                     self._apply_gaussian_adamw_update_scales(optimizer, gaussian_scales)
                 with torch.no_grad():
-                    if hasattr(self.map, "rotation") and torch.is_tensor(self.map.rotation):
-                        self.map.rotation.copy_(F.normalize(self.map.rotation, dim=-1, eps=1.0e-8))
-                    if hasattr(self.map, "scaling") and torch.is_tensor(self.map.scaling):
-                        self.map.scaling.clamp_(-20.0, 20.0)
-                    if hasattr(self.map, "opacity_logit") and torch.is_tensor(self.map.opacity_logit):
-                        self.map.opacity_logit.clamp_(-12.0, 12.0)
+                    if gaussian_enabled and gaussian_scales is not None:
+                        self._sanitize_active_gaussian_rows(gaussian_scales)
                 parameters_finite = all(
                     bool(torch.isfinite(value).all().detach().cpu())
                     for group in param_groups
@@ -4099,6 +4127,7 @@ class PanoGaussianMapper:
         last["sampled_window_size"] = float(len(last_sampled_ids))
         last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
         last["trainable_pose_count"] = float(len(trainable_pose_ids))
+        last["photometric_only"] = float(photometric_only)
         last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
         last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
         last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
@@ -4285,6 +4314,26 @@ class PanoGaussianMapper:
             scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
             return scales
         scope = str(cfg.get("gaussian_scope", "selected_birth_keyframes")).lower()
+        if scope == "owner_windows":
+            owner_window_ids = tuple(
+                dict.fromkeys(
+                    int(value)
+                    for value in cfg.get("active_owner_window_ids", ())
+                )
+            )
+            owner = getattr(self.map, "_anchor_owner_window_id", None)
+            if (
+                not owner_window_ids
+                or not torch.is_tensor(owner)
+                or int(owner.numel()) != n
+            ):
+                return scales
+            owner_rows = owner.to(device=device, dtype=torch.long)
+            active = torch.zeros(n, device=device, dtype=torch.bool)
+            for owner_window_id in owner_window_ids:
+                active |= owner_rows == int(owner_window_id)
+            scales[active] = float(cfg.get("gaussian_lr_scale", 1.0))
+            return scales
         if scope == "owner_window_visible":
             owner_window_id = cfg.get("active_owner_window_id")
             owner = getattr(self.map, "_anchor_owner_window_id", None)
@@ -4300,6 +4349,26 @@ class PanoGaussianMapper:
         active = self._active_anchor_mask_for_keyframes(selected_keyframe_ids)
         scales[active] = float(cfg.get("gaussian_lr_scale", self.optim_cfg.get("new_gaussian_lr_scale", 1.0)))
         return scales
+
+    def _feedforward_loss_weights(
+        self,
+        *,
+        photometric_only: bool,
+    ) -> BackendLossWeights:
+        if not photometric_only:
+            return self.loss_weights
+        return BackendLossWeights(
+            photometric=float(self.loss_weights.photometric),
+            depth=0.0,
+            opacity=0.0,
+            distortion=0.0,
+            sky_alpha=0.0,
+            photometric_mode=str(self.loss_weights.photometric_mode),
+            rgb_l1_weight=float(self.loss_weights.rgb_l1_weight),
+            dssim_weight=float(self.loss_weights.dssim_weight),
+            depth_loss_mode=str(self.loss_weights.depth_loss_mode),
+            depth_residual_clamp=float(self.loss_weights.depth_residual_clamp),
+        )
 
     def _sample_observations_for_step(self, observations: list[MapperObservation]) -> list[MapperObservation]:
         cfg = self._feedforward_window_cfg()
@@ -5191,6 +5260,26 @@ class PanoGaussianMapper:
                 continue
             view_shape = (scales.shape[0],) + (1,) * (param.grad.ndim - 1)
             param.grad.mul_(scales.view(view_shape).to(device=param.grad.device, dtype=param.grad.dtype))
+
+    @torch.no_grad()
+    def _sanitize_active_gaussian_rows(self, scales: torch.Tensor) -> None:
+        if int(scales.numel()) != self.map.anchor_count():
+            return
+        active = scales.to(device=self.map.xyz.device) > 0.0
+        if not bool(active.any()):
+            return
+        if hasattr(self.map, "rotation") and torch.is_tensor(self.map.rotation):
+            self.map.rotation[active] = F.normalize(
+                self.map.rotation[active],
+                dim=-1,
+                eps=1.0e-8,
+            )
+        if hasattr(self.map, "scaling") and torch.is_tensor(self.map.scaling):
+            self.map.scaling[active] = self.map.scaling[active].clamp(-20.0, 20.0)
+        if hasattr(self.map, "opacity_logit") and torch.is_tensor(self.map.opacity_logit):
+            self.map.opacity_logit[active] = self.map.opacity_logit[active].clamp(
+                -12.0, 12.0
+            )
 
     @torch.no_grad()
     def _apply_gaussian_adamw_update_scales(

@@ -1,0 +1,23 @@
+base_config: spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml
+
+SphericalSelfiGlobalBackend:
+  map_optimization:
+    steps_per_window: 100
+    recent_window_count: 3
+    photometric_only: true
+    optimize_skybox: false
+
+WeightsAndBiases:
+  group: ob3d-sponza-photometric-recent3-iterations
+  run_name: ob3d100_photometric_recent3_iter100
+  tags:
+    - spherical-selfi
+    - pure-rgb-photometric
+    - recent3-chunks
+    - eight-free-poses
+    - gaussian-recent3-only
+    - iter100
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_photometric_recent3_iter100

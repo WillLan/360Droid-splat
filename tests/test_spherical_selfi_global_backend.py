@@ -453,6 +453,16 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert map_optimization["pose_refine_enable"] is True
     assert map_optimization["separate_gaussian_lrs"] is True
     assert map_optimization["scale_gaussian_parameter_updates"] is True
+    assert map_optimization["steps_per_window"] == 100
+    assert map_optimization["recent_window_count"] == 3
+    assert map_optimization["sample_observations_per_step"] == 1
+    assert map_optimization["sampler"] == "shuffled_cycle"
+    assert map_optimization["photometric_only"] is True
+    assert map_optimization["optimize_skybox"] is False
+    assert map_optimization["pose_prior_weight"] == 0.0
+    assert map_optimization["s2_loss_weight"] == 0.0
+    assert map_optimization["match_depth_loss_weight"] == 0.0
+    assert map_optimization["visible_neighbor_lr_scale"] == 0.0
     assert {
         name: map_optimization[name]
         for name in (
@@ -492,6 +502,26 @@ def test_hash_radius20_configs_only_sweep_the_radius_algorithmically() -> None:
                 "radius_voxels": radius,
                 "log_posthash_coverage": True,
             }
+        }
+
+
+def test_photometric_recent3_configs_only_change_iteration_count() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    expected = {
+        "spherical_selfi_ob3d_photometric_recent3_iter100.yaml": 100,
+        "spherical_selfi_ob3d_photometric_recent3_iter200.yaml": 200,
+    }
+    for name, steps in expected.items():
+        config = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+        assert config["base_config"] == (
+            "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml"
+        )
+        optimization = config["SphericalSelfiGlobalBackend"]["map_optimization"]
+        assert optimization == {
+            "steps_per_window": steps,
+            "recent_window_count": 3,
+            "photometric_only": True,
+            "optimize_skybox": False,
         }
 
 
@@ -1571,6 +1601,80 @@ def test_mapper_internal_frame_commit_updates_all_packet_variants_and_full_batch
             continue
         torch.testing.assert_close(factor.source_local_pose, poses[0])
         torch.testing.assert_close(factor.target_local_pose, poses[1])
+
+
+def test_mapper_recent_three_window_commit_updates_all_eight_canonical_frames() -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            2,
+            torch.eye(4).repeat(4, 1, 1),
+            (4, 5, 6, 7),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(min_matches=64, skip=False)
+    for packet in packets:
+        backend.process_packet(packet)
+    backend.pop_frame_geometry_update_batch()
+
+    proposals: dict[int, torch.Tensor] = {}
+    for frame_id, owner in backend.frame_pose_owner_node.items():
+        local = backend.frame_local_pose_in_owner[frame_id]
+        proposals[frame_id] = apply_sim3_to_c2w(
+            backend.graph.transform(owner).to(local),
+            local,
+        )
+    for frame_id, offset in ((1, 0.01), (3, 0.02), (7, 0.03)):
+        proposals[frame_id] = proposals[frame_id].clone()
+        proposals[frame_id][0, 3] += offset
+
+    class MapperProposal:
+        optimizer = None
+        stats = SimpleNamespace(n_anchors=backend.map.anchor_count())
+
+        def refined_pose_c2w(self, frame_id: int):
+            return proposals[int(frame_id)]
+
+    backend.mapper = MapperProposal()
+    backend._synchronize_chunk_stride_optimized_window(
+        2,
+        optimized_frame_ids=tuple(range(8)),
+    )
+
+    batch = backend.pop_frame_geometry_update_batch()
+    assert batch is not None and batch.complete_snapshot is True
+    assert set(batch.updates) == set(range(8))
+    for frame_id in range(8):
+        torch.testing.assert_close(
+            batch.updates[frame_id].pose_c2w,
+            proposals[frame_id],
+        )
+    for window_id in (0, 1, 2):
+        packet = backend.packets[window_id]
+        window_transform = backend._window_anchor_transforms()[window_id]
+        for frame_id in packet.frame_ids:
+            packet_pose = apply_sim3_to_c2w(
+                window_transform.to(packet.local_poses_c2w),
+                packet.local_poses_c2w[packet.frame_index(frame_id)],
+            )
+            torch.testing.assert_close(packet_pose, proposals[int(frame_id)])
 
 
 def test_pose_state_consistency_failure_rolls_back_graph_packets_and_revision(
@@ -4796,6 +4900,72 @@ def test_boundary_map_optimization_refines_all_poses_and_passes_group_lrs() -> N
     assert mapper.commits == 1
 
 
+def test_recent_three_window_photometric_optimization_uses_eight_unique_frames() -> None:
+    packets = [
+        _packet(0, torch.eye(4).repeat(4, 1, 1), (0, 1, 2, 3)),
+        _packet(1, torch.eye(4).repeat(4, 1, 1), (2, 3, 4, 5)),
+        _packet(2, torch.eye(4).repeat(4, 1, 1), (4, 5, 6, 7)),
+    ]
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.frame_ids = None
+            self.settings = None
+            self.extra_loss_fn = "unset"
+            self.commits = 0
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_window(
+            self, *, frame_ids, settings, extra_loss_fn, **kwargs
+        ):
+            self.frame_ids = tuple(int(value) for value in frame_ids)
+            self.settings = dict(settings)
+            self.extra_loss_fn = extra_loss_fn
+            return {"steps": 100.0, "window_rollback": 0.0}
+
+        def commit_spherical_selfi_window(self) -> None:
+            self.commits += 1
+
+    mapper = _Mapper()
+    backend = _boundary_backend(PanoGaussianMap(config={}, device="cpu"), mapper=mapper)
+    backend.map_optimize_recent_windows = 3
+    backend.map_optimize_photometric_only = True
+    backend.map_optimize_skybox = False
+    backend.window_order = [0, 1, 2]
+    backend.packets = {
+        packet.window_id: packet.compact_for_memory() for packet in packets
+    }
+    synchronized = {}
+
+    def synchronize(window_id: int, *, optimized_frame_ids=None) -> None:
+        synchronized["window_id"] = int(window_id)
+        synchronized["frame_ids"] = tuple(optimized_frame_ids or ())
+
+    backend._synchronize_joint_optimized_window = synchronize
+    backend._enqueue_map_optimization(2, packets[2].frame_ids, 100)
+    assert backend._pending_map_optimization == [(2, tuple(range(8)), 100)]
+    backend._pending_map_optimization.clear()
+
+    metrics = backend._run_map_optimization(2, tuple(range(8)), 100)
+
+    assert mapper.frame_ids == tuple(range(8))
+    assert mapper.settings["active_owner_window_ids"] == (0, 1, 2)
+    assert mapper.settings["fixed_pose_frame_ids"] == []
+    assert mapper.settings["photometric_only"] is True
+    assert mapper.settings["optimize_skybox"] is False
+    assert mapper.settings["pose_prior_weight"] == 0.0
+    assert mapper.extra_loss_fn is None
+    assert synchronized == {"window_id": 2, "frame_ids": tuple(range(8))}
+    assert metrics["optimized_frame_count"] == 8.0
+    assert metrics["active_owner_window_count"] == 3.0
+    assert metrics["photometric_only"] == 1.0
+    assert mapper.commits == 1
+
+
 def test_mapper_rejection_snapshots_after_durable_keyframe_registration() -> None:
     packet = _packet(
         0,
@@ -4847,7 +5017,7 @@ def test_mapper_rejection_snapshots_after_durable_keyframe_registration() -> Non
     backend.packets[0] = packet.compact_for_memory()
     backend._optimization_packets[0] = packet
 
-    def reject_sync(window_id: int) -> None:
+    def reject_sync(window_id: int, *, optimized_frame_ids=None) -> None:
         raise RuntimeError(f"synthetic proposal rejection for {window_id}")
 
     backend._synchronize_joint_optimized_window = reject_sync
@@ -4905,6 +5075,74 @@ def test_separate_gaussian_groups_and_true_adam_update_scaling() -> None:
     owner_step = gaussian_map.xyz.detach()[0].abs().mean()
     neighbor_step = gaussian_map.xyz.detach()[1].abs().mean()
     torch.testing.assert_close(neighbor_step, owner_step * 0.1, atol=1.0e-7, rtol=1.0e-5)
+
+
+def test_recent_owner_gaussian_scope_freezes_older_rows_exactly() -> None:
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    gaussian_map.xyz = torch.nn.Parameter(torch.zeros(4, 3))
+    gaussian_map.rotation = torch.nn.Parameter(
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1)
+    )
+    gaussian_map.scaling = torch.nn.Parameter(torch.zeros(4, 3))
+    gaussian_map.opacity_logit = torch.nn.Parameter(torch.zeros(4, 1))
+    gaussian_map.features = torch.nn.Parameter(torch.zeros(4, 3))
+    gaussian_map.sh_rest = torch.nn.Parameter(torch.zeros(4, 0, 3))
+    gaussian_map._anchor_owner_window_id = torch.tensor(
+        [0, 1, 2, 3], dtype=torch.int32
+    )
+    mapper = PanoGaussianMapper(gaussian_map)
+    mapper.optim_cfg["FeedForwardWindow"] = {
+        "gaussian_scope": "owner_windows",
+        "active_owner_window_ids": (1, 2, 3),
+        "gaussian_lr_scale": 1.0,
+    }
+
+    scales = mapper._feedforward_gaussian_scales([])
+    assert scales is not None
+    torch.testing.assert_close(scales, torch.tensor([0.0, 1.0, 1.0, 1.0]))
+
+    with torch.no_grad():
+        gaussian_map.rotation[:, 0] = 2.0
+        gaussian_map.scaling.fill_(30.0)
+        gaussian_map.opacity_logit.fill_(20.0)
+    frozen_rotation = gaussian_map.rotation.detach()[0].clone()
+    frozen_scaling = gaussian_map.scaling.detach()[0].clone()
+    frozen_opacity = gaussian_map.opacity_logit.detach()[0].clone()
+    mapper._sanitize_active_gaussian_rows(scales)
+    torch.testing.assert_close(gaussian_map.rotation.detach()[0], frozen_rotation)
+    torch.testing.assert_close(gaussian_map.scaling.detach()[0], frozen_scaling)
+    torch.testing.assert_close(gaussian_map.opacity_logit.detach()[0], frozen_opacity)
+    torch.testing.assert_close(
+        torch.linalg.norm(gaussian_map.rotation.detach()[1:], dim=-1),
+        torch.ones(3),
+    )
+    torch.testing.assert_close(
+        gaussian_map.scaling.detach()[1:], torch.full((3, 3), 20.0)
+    )
+    torch.testing.assert_close(
+        gaussian_map.opacity_logit.detach()[1:], torch.full((3, 1), 12.0)
+    )
+
+    optimizer = torch.optim.AdamW(
+        [{"params": [gaussian_map.xyz], "lr": 1.0e-2}], weight_decay=0.0
+    )
+    gaussian_map.xyz.grad = torch.ones_like(gaussian_map.xyz)
+    optimizer.step()
+    mapper._apply_gaussian_adamw_update_scales(optimizer, scales)
+    torch.testing.assert_close(gaussian_map.xyz.detach()[0], torch.zeros(3))
+    assert bool((gaussian_map.xyz.detach()[1:].abs() > 0.0).all())
+
+
+def test_photometric_only_mapper_loss_disables_all_non_rgb_terms() -> None:
+    mapper = PanoGaussianMapper(PanoGaussianMap(config={}, device="cpu"))
+    weights = mapper._feedforward_loss_weights(photometric_only=True)
+
+    assert weights.photometric == mapper.loss_weights.photometric
+    assert weights.photometric_mode == mapper.loss_weights.photometric_mode
+    assert weights.depth == 0.0
+    assert weights.opacity == 0.0
+    assert weights.distortion == 0.0
+    assert weights.sky_alpha == 0.0
 
 
 def test_global_graph_rolls_back_transaction_on_non_finite_factor() -> None:
