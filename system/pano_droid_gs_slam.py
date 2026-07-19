@@ -164,19 +164,21 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
         files = discover_erp_images(root, sequence=ds_cfg.get("sequence"))
     begin = int(ds_cfg.get("begin", 0))
     end = ds_cfg.get("end")
-    files = files[begin:end]
+    frame_stride = int(ds_cfg.get("frame_stride", 1))
+    if frame_stride <= 0:
+        raise ValueError("Dataset.frame_stride must be a positive integer.")
+    indexed_files = list(enumerate(files))[begin:end:frame_stride]
     h = ds_cfg.get("erp_resize_height")
     w = ds_cfg.get("erp_resize_width")
     resize = (int(h), int(w)) if h is not None and w is not None else None
     gt_poses = {} if dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"} else _load_panocity_gt_poses(root)
-    for local_idx, path in enumerate(files):
-        frame_id = begin + local_idx
+    for frame_id, path in indexed_files:
         gt = gt_poses.get(str(Path(path).resolve()))
         if gt is None:
             gt = gt_poses.get(Path(path).name)
         if gt is None and dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"}:
             gt = load_ob3d_camera_c2w(path)
-        meta = {"path": path}
+        meta = {"path": path, "source_frame_index": int(frame_id)}
         if gt is not None:
             meta["gt_c2w"] = torch.from_numpy(gt).float()
         yield PanoFrame(
@@ -185,6 +187,32 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
             frame_id=frame_id,
             meta=meta,
         )
+
+
+def _chronological_previous_frame_ids(
+    frame_ids: Iterable[int],
+) -> dict[int, int]:
+    ordered = sorted({int(frame_id) for frame_id in frame_ids})
+    return {
+        current: previous
+        for previous, current in zip(ordered, ordered[1:])
+    }
+
+
+def _relative_pose_from_chronological_previous(
+    poses_c2w: dict[int, torch.Tensor],
+    previous_frame_by_id: dict[int, int],
+    frame_id: int,
+    fallback: torch.Tensor | None,
+) -> torch.Tensor | None:
+    previous_frame = previous_frame_by_id.get(int(frame_id))
+    if previous_frame is None:
+        return fallback
+    previous_pose = poses_c2w.get(previous_frame)
+    current_pose = poses_c2w.get(int(frame_id))
+    if previous_pose is None or current_pose is None:
+        return fallback
+    return relative_c2w(previous_pose, current_pose).detach().cpu().float()
 
 
 def _scalar_to_rgb(values: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
@@ -2919,6 +2947,10 @@ class PanoDroidGSSlamSystem:
                 staged_geometry[frame] = update
                 staged_poses[frame] = pose
 
+            previous_frame_by_id = _chronological_previous_frame_ids(
+                staged_poses
+            )
+
             staged_output_by_frame = dict(spherical_selfi_output_by_frame)
             current_output_ids = {int(output.frame_id) for output in outputs}
             for output in outputs:
@@ -2947,9 +2979,12 @@ class PanoDroidGSSlamSystem:
                         ),
                     ).detach().cpu().float()
                 relative_pose = output.relative_pose
-                previous_pose = staged_poses.get(frame_id - 1)
-                if previous_pose is not None:
-                    relative_pose = relative_c2w(previous_pose, pose).detach().cpu().float()
+                relative_pose = _relative_pose_from_chronological_previous(
+                    staged_poses,
+                    previous_frame_by_id,
+                    frame_id,
+                    relative_pose,
+                )
                 staged_output_by_frame[frame_id] = replace(
                     output,
                     pose_c2w=pose,

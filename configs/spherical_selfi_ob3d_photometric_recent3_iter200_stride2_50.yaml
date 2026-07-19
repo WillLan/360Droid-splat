@@ -1,0 +1,22 @@
+base_config: spherical_selfi_ob3d_photometric_recent3_iter200.yaml
+
+Dataset:
+  begin: 0
+  end: 100
+  frame_stride: 2
+
+WeightsAndBiases:
+  group: ob3d-sponza-photometric-recent3-iterations
+  run_name: ob3d50_stride2_photometric_recent3_iter200
+  tags:
+    - spherical-selfi
+    - pure-rgb-photometric
+    - recent3-chunks
+    - eight-free-poses
+    - gaussian-recent3-only
+    - iter200
+    - source100-stride2
+    - input50
+
+Results:
+  save_dir: outputs/ob3d50_stride2_photometric_recent3_iter200

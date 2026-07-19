@@ -20,7 +20,13 @@ from frontend.pano_vggt import (
 from frontend.pano_vggt.alignment import sample_overlap_points
 from frontend.pano_vggt.engine import _ceil_size_to_multiple, _resize_prediction, normalize_panovggt_output
 from scripts.run_pano_vggt_panocity_blocks import build_block_config, discover_panocity_blocks
-from system.pano_droid_gs_slam import PanoDroidGSSlamSystem, iter_sequence_frames
+from system.pano_droid_gs_slam import (
+    PanoDroidGSSlamSystem,
+    _chronological_previous_frame_ids,
+    _relative_pose_from_chronological_previous,
+    iter_sequence_frames,
+    load_config,
+)
 
 
 def _write_rgb(path: Path) -> None:
@@ -321,6 +327,115 @@ def test_panocity_gt_pose_is_attached_to_runtime_frames(tmp_path: Path):
     frame = next(iter_sequence_frames(cfg))
     assert frame.meta is not None
     assert torch.allclose(frame.meta["gt_c2w"], pose)
+
+
+def test_runtime_frame_stride_preserves_source_ids_and_gt(tmp_path: Path):
+    image_dir = tmp_path / "sponza" / "Non-Egocentric" / "images"
+    camera_dir = tmp_path / "sponza" / "Non-Egocentric" / "cameras"
+    for frame_id in range(6):
+        _write_rgb(image_dir / f"{frame_id:05d}_rgb.png")
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        (camera_dir / f"{frame_id:05d}_cam.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "extrinsics": {
+                            "rotation": [
+                                [1.0, 0.0, 0.0],
+                                [0.0, 1.0, 0.0],
+                                [0.0, 0.0, 1.0],
+                            ],
+                            "translation": [float(frame_id), 0.0, 0.0],
+                        }
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    common = {
+        "synthetic": False,
+        "type": "ob3d",
+        "dataset_path": str(tmp_path),
+        "scene": "sponza",
+        "split": "Non-Egocentric",
+        "begin": 1,
+        "end": 6,
+    }
+    dense = list(iter_sequence_frames({"Dataset": common}))
+    sparse = list(
+        iter_sequence_frames(
+            {"Dataset": {**common, "frame_stride": 2}}
+        )
+    )
+
+    assert [frame.frame_id for frame in dense] == [1, 2, 3, 4, 5]
+    assert [frame.frame_id for frame in sparse] == [1, 3, 5]
+    assert [frame.meta["source_frame_index"] for frame in sparse] == [1, 3, 5]
+    assert [float(frame.meta["gt_c2w"][0, 3]) for frame in sparse] == [
+        -1.0,
+        -3.0,
+        -5.0,
+    ]
+
+
+def test_runtime_frame_stride_must_be_positive(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    _write_rgb(image_dir / "00000.png")
+    config = {
+        "Dataset": {
+            "dataset_path": str(image_dir),
+            "frame_stride": 0,
+        }
+    }
+    with pytest.raises(ValueError, match="frame_stride must be a positive"):
+        list(iter_sequence_frames(config))
+
+
+def test_sparse_frame_history_uses_chronological_predecessor() -> None:
+    previous = _chronological_previous_frame_ids([4, 0, 2])
+    assert previous == {2: 0, 4: 2}
+    poses = {frame_id: torch.eye(4) for frame_id in (0, 2, 4)}
+    poses[0][0, 3] = 0.0
+    poses[2][0, 3] = 0.7
+    poses[4][0, 3] = 2.0
+
+    relative = _relative_pose_from_chronological_previous(
+        poses,
+        previous,
+        4,
+        None,
+    )
+
+    assert relative is not None
+    torch.testing.assert_close(relative, torch.linalg.inv(poses[4]) @ poses[2])
+
+
+def test_stride2_iter200_experiment_only_changes_sampling_and_run_identity() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    baseline = load_config(
+        root / "spherical_selfi_ob3d_photometric_recent3_iter200.yaml"
+    )
+    sampled = load_config(
+        root
+        / "spherical_selfi_ob3d_photometric_recent3_iter200_stride2_50.yaml"
+    )
+
+    assert sampled["Dataset"] == {
+        **baseline["Dataset"],
+        "begin": 0,
+        "end": 100,
+        "frame_stride": 2,
+    }
+    assert (
+        sampled["SphericalSelfiGlobalBackend"]
+        == baseline["SphericalSelfiGlobalBackend"]
+    )
+    assert sampled["SphericalSelfiRuntime"] == baseline["SphericalSelfiRuntime"]
+    assert sampled["VoxelAnchorRefiner"] == baseline["VoxelAnchorRefiner"]
+    assert sampled["Results"]["save_dir"].endswith(
+        "ob3d50_stride2_photometric_recent3_iter200"
+    )
 
 
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
