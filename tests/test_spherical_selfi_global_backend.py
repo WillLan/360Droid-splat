@@ -61,7 +61,7 @@ from geometry.panorama_loop_contracts import (
     DenseSphericalLoopMeasurement,
     LoopPoseMeasurement,
 )
-from geometry.spherical_erp import erp_pixel_to_unit_ray
+from geometry.spherical_erp import erp_pixel_to_unit_ray, sample_erp_with_wrap
 from models.per_pixel_gaussian_observation import real_sh_basis
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from models.spherical_selfi_stage3_ba import Stage3MatchCache
@@ -177,6 +177,88 @@ def _chunk_stride_backend(
             "map_optimization": {"steps_per_window": 0, "final_steps": 0},
         },
     )
+
+
+def _pointmap_chunk_backend(
+    *,
+    min_points: int = 32,
+    min_points_per_frame: int = 16,
+    max_points_per_frame: int = 32,
+    renderer=None,
+    packet_refiner=None,
+    hierarchical: bool = False,
+) -> SphericalSelfiGlobalBackend:
+    return SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        renderer=renderer,
+        pose_canonicalized_packet_refiner=packet_refiner,
+        config={
+            "enabled": True,
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "two_frame_pointmap_full_sim3",
+                "min_points": int(min_points),
+                "max_points": int(max_points_per_frame) * 2,
+                "min_points_per_frame": int(min_points_per_frame),
+                "max_points_per_frame": int(max_points_per_frame),
+                "holdout_stride": 5,
+                "covariance_min_ratio": 1.0e-5,
+                "failure_policy": "error",
+            },
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "enforce_exact_overlap": True,
+                "optimization_trigger": "loop_only",
+                "min_depth": 0.05,
+                "max_depth": 20.0,
+                "min_match_cosine": 0.2,
+                "max_match_entropy": 1.0,
+                "min_overlap_points": 8,
+                "max_overlap_residual": 1.0e-3,
+                "min_overlap_inlier_ratio": 0.95,
+                "max_scale_change": 2.5,
+                "fibonacci_oversample_factor": 4,
+                "umeyama_irls_iterations": 5,
+                "chunk_stride": {
+                    "target_index": 2,
+                    "holdout_stride": 5,
+                    "irls_iterations": 5,
+                },
+                "skip_edge": {"enabled": False},
+            },
+            "insertion_dedup": {
+                "enabled": renderer is not None,
+                "visible_only": True,
+                "same_level_only": True,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+            },
+            "voxel_fusion": {
+                "voxel_sizes": [0.04, 0.08, 0.16, 0.32],
+            },
+            "hierarchical_submaps": {
+                "enabled": bool(hierarchical),
+                "windows_per_submap": 5,
+                "shared_boundary_nodes": 1,
+                "local_camera_model": "se3_shared_scale",
+            },
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+
+
+def _replace_packet_depth(
+    packet: LocalGaussianWindowPacket,
+    depth_by_view: torch.Tensor,
+) -> None:
+    depth = depth_by_view.to(packet.observation.refined_depth).reshape(
+        1,
+        len(packet.frame_ids),
+        1,
+        *packet.observation.image_size,
+    )
+    packet.observation = packet.observation.with_geometry(refined_depth=depth)
 
 
 def _attach_identity_stride_matches(
@@ -481,6 +563,38 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "scaling_lr": 1.0e-4,
         "rotation_lr": 1.0e-4,
     }
+
+
+def test_pointmap_sim3_config_is_explicit_opt_in() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "spherical_selfi_global_gs_slam_pointmap_sim3.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    backend = config["SphericalSelfiGlobalBackend"]
+    alignment = backend["rendered_overlap_alignment"]
+    graph = backend["global_graph"]
+
+    assert config["base_config"] == "spherical_selfi_global_gs_slam.yaml"
+    assert alignment == {
+        "enabled": True,
+        "mode": "two_frame_pointmap_full_sim3",
+        "min_points": 2048,
+        "max_points": 4096,
+        "min_points_per_frame": 512,
+        "max_points_per_frame": 2048,
+        "irls_iterations": 5,
+        "failure_policy": "error",
+    }
+    assert graph["node_mode"] == "chunk_first_stride"
+    assert graph["expected_overlap_frames"] == 2
+    assert graph["enforce_exact_overlap"] is True
+    assert graph["fibonacci_oversample_factor"] == 8
+    assert graph["umeyama_irls_iterations"] == 5
+    assert graph["allow_unaligned_fallback"] is False
+    assert graph["chunk_stride"]["target_index"] == 2
+    assert graph["skip_edge"]["enabled"] is False
 
 
 def test_hash_radius20_configs_only_sweep_the_radius_algorithmically() -> None:
@@ -5830,3 +5944,316 @@ def test_packet_hard_sky_defines_finite_gaussian_mask() -> None:
     assert packet.sky_mask[..., :2, :].all()
     assert not packet.finite_gaussian_mask[..., :2, :].any()
     assert torch.equal(packet.valid_mask, packet.finite_gaussian_mask)
+
+
+def test_pointmap_overlap_recovers_full_current_to_previous_sim3() -> None:
+    height, width = 24, 48
+    angle = 0.23
+    rotation = torch.tensor(
+        [
+            [math.cos(angle), 0.0, math.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(angle), 0.0, math.cos(angle)],
+        ],
+        dtype=torch.float32,
+    )
+    expected = sim3_from_components(
+        1.4,
+        rotation,
+        torch.tensor([0.35, -0.08, 0.18]),
+    )
+    current_poses = torch.eye(4).repeat(4, 1, 1)
+    current_poses[1, :3, 3] = torch.tensor([0.22, 0.03, -0.04])
+    previous_poses = torch.eye(4).repeat(4, 1, 1)
+    previous_poses[2] = apply_sim3_to_c2w(expected, current_poses[0])
+    previous_poses[3] = apply_sim3_to_c2w(expected, current_poses[1])
+    previous = _packet(
+        0,
+        previous_poses,
+        (0, 1, 2, 3),
+        height=height,
+        width=width,
+    )
+    current = _packet(
+        1,
+        current_poses,
+        (2, 3, 4, 5),
+        height=height,
+        width=width,
+    )
+    current_depth = torch.full((4, 1, height, width), 2.0)
+    previous_depth = torch.full((4, 1, height, width), 2.0)
+    previous_depth[2:] = 2.8
+    _replace_packet_depth(previous, previous_depth)
+    _replace_packet_depth(current, current_depth)
+    backend = _pointmap_chunk_backend(
+        min_points=64,
+        min_points_per_frame=24,
+        max_points_per_frame=64,
+    )
+
+    measurement, diagnostics = backend._pointmap_overlap_alignment(
+        previous,
+        current,
+    )
+
+    assert measurement is not None, diagnostics
+    assert diagnostics["accepted"] is True
+    assert diagnostics["weight_mode"] == "uniform_then_huber_irls"
+    assert diagnostics["confidence_weighting"] is False
+    assert diagnostics["pose_prior_used"] is False
+    expected_scale, expected_rotation, expected_translation = sim3_components(expected)
+    scale, recovered_rotation, recovered_translation = sim3_components(measurement)
+    assert float(scale) == pytest.approx(float(expected_scale), rel=2.0e-3)
+    assert torch.allclose(recovered_rotation, expected_rotation, atol=2.0e-3)
+    assert torch.allclose(recovered_translation, expected_translation, atol=2.0e-3)
+
+
+def test_pointmap_sampling_jointly_filters_sky_dynamic_and_invalid_geometry() -> None:
+    height, width = 24, 48
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(
+        0,
+        poses,
+        (0, 1, 2, 3),
+        height=height,
+        width=width,
+    )
+    current = _packet(
+        1,
+        poses,
+        (2, 3, 4, 5),
+        height=height,
+        width=width,
+    )
+    previous.sky_prob[:, 2, :, :4] = 1.0
+    previous.sky_mask[:, 2, :, :4] = True
+    current.static_mask[:, 0, :, 4:6] = False
+    previous.geometry_consistency[:, 2, :, 6:8] = False
+    current.finite_gaussian_mask[:, 0, :, 8:10] = False
+    current.valid_mask[:, 0, :, 8:10] = False
+    current_depth = current.observation.refined_depth.detach().clone()
+    current_depth[:, 0, :, 10:12] = torch.nan
+    current.observation = current.observation.with_geometry(
+        refined_depth=current_depth
+    )
+    backend = _pointmap_chunk_backend(
+        min_points=64,
+        min_points_per_frame=32,
+        max_points_per_frame=64,
+    )
+
+    geometry = backend._collect_pointmap_overlap_frame_geometry(
+        previous,
+        current,
+        2,
+    )
+
+    assert int(geometry.uv.shape[0]) == 64
+    sampled_previous_valid = sample_erp_with_wrap(
+        geometry.previous_valid_image.float(), geometry.uv
+    )[..., 0]
+    sampled_current_valid = sample_erp_with_wrap(
+        geometry.current_valid_image.float(), geometry.uv
+    )[..., 0]
+    sampled_sky = sample_erp_with_wrap(
+        geometry.sky_union_image.float(), geometry.uv
+    )[..., 0]
+    assert bool((sampled_previous_valid >= 0.5).all())
+    assert bool((sampled_current_valid >= 0.5).all())
+    assert bool((sampled_sky < 0.5).all())
+    assert bool(torch.isfinite(geometry.previous_points).all())
+    assert bool(torch.isfinite(geometry.current_points).all())
+
+
+def test_pointmap_chunk_graph_delays_node_and_uses_current_first_depth() -> None:
+    height, width = 16, 32
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(
+        0,
+        poses,
+        (0, 1, 2, 3),
+        height=height,
+        width=width,
+    )
+    current = _packet(
+        1,
+        poses,
+        (2, 3, 4, 5),
+        height=height,
+        width=width,
+    )
+    _replace_packet_depth(
+        previous,
+        torch.full((4, 1, height, width), 3.0),
+    )
+    _replace_packet_depth(
+        current,
+        torch.full((4, 1, height, width), 2.0),
+    )
+    _attach_identity_stride_matches(previous)
+    backend = _pointmap_chunk_backend(hierarchical=True)
+
+    first_result = backend.process_packet(previous)
+    assert set(backend.graph.nodes) == {0}
+    assert backend.graph.edges == []
+    assert "q" not in first_result.diagnostics["alignment"]
+    assert "c" not in first_result.diagnostics["alignment"]
+
+    result = backend.process_packet(current)
+
+    assert set(backend.graph.nodes) == {0, 2}
+    assert 4 not in backend.graph.nodes
+    assert backend.window_anchor_nodes == {0: 0, 1: 2}
+    assert len(backend.graph.edges) == 1
+    factor = backend.graph.edges[0]
+    assert isinstance(factor, DenseSphericalFactorBlock)
+    assert (factor.source, factor.target) == (0, 2)
+    assert torch.allclose(
+        factor.target_depth,
+        torch.full_like(factor.target_depth, 2.0),
+    )
+    assert factor.metadata["cross_packet_geometry"] is True
+    assert factor.metadata["matched_target_index"] == 2
+    assert factor.metadata["geometry_target_index"] == 0
+    assert float(sim3_components(backend.graph.transform(2))[0]) == pytest.approx(
+        1.5, rel=2.0e-3
+    )
+    assert float(backend.graph.objective().detach().cpu()) < 1.0e-8
+    assert backend.frame_pose_owner_node[2] == 2
+    assert backend.frame_pose_owner_node[3] == 2
+    assert torch.allclose(backend.frame_local_pose_in_owner[2], torch.eye(4))
+    assert (
+        result.diagnostics["boundary_factor"]["transferred_overlap_frames"]
+        == 2
+    )
+
+    following = _packet(
+        2,
+        poses,
+        (4, 5, 6, 7),
+        height=height,
+        width=width,
+    )
+    _replace_packet_depth(
+        following,
+        torch.full((4, 1, height, width), 4.0),
+    )
+    _attach_identity_stride_matches(current)
+    backend.process_packet(following)
+
+    assert set(backend.graph.nodes) == {0, 2, 4}
+    assert 6 not in backend.graph.nodes
+    assert [(edge.source, edge.target) for edge in backend.graph.edges] == [
+        (0, 2),
+        (2, 4),
+    ]
+    assert backend.frame_pose_owner_node[4] == 4
+    assert backend.frame_pose_owner_node[5] == 4
+    assert backend.submaps[0].boundary_node_ids == [0, 2, 4]
+    assert backend.submaps[0].window_ids == [0, 1, 2]
+    assert float(sim3_components(backend.graph.transform(4))[0]) == pytest.approx(
+        0.75, rel=2.0e-3
+    )
+    geometry = backend.pop_frame_geometry_updates()
+    assert geometry[4].depth_scale == pytest.approx(0.75, rel=2.0e-3)
+    torch.testing.assert_close(
+        geometry[4].pose_c2w,
+        apply_sim3_to_c2w(
+            backend.graph.transform(4),
+            following.local_poses_c2w[0],
+        ),
+    )
+    assert float(following.observation.refined_depth[0, 0].mean()) == 4.0
+
+
+def test_pointmap_alignment_finalizes_refiner_once_before_sampling(
+    monkeypatch,
+) -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _refined_packet(0, poses, (0, 1, 2, 3))
+    current = _refined_packet(1, poses, (2, 3, 4, 5))
+    for packet in (previous, current):
+        _attach_identity_stride_matches(packet)
+        packet.metadata["voxel_anchor_refiner_requested"] = True
+        packet.metadata["voxel_anchor_refiner_pending"] = True
+
+    events: list[tuple[str, int]] = []
+
+    def finalize_refiner(packet: LocalGaussianWindowPacket):
+        assert packet.metadata["local_ba_accepted"] is True
+        events.append(("refiner", int(packet.window_id)))
+        metadata = dict(packet.metadata)
+        metadata["voxel_anchor_refiner_pending"] = False
+        metadata["voxel_anchor_refiner_enabled"] = True
+        return replace(packet, metadata=metadata)
+
+    backend = _pointmap_chunk_backend(
+        renderer=_SyntheticSharedDepthRenderer(
+            local_depth=2.0,
+            global_depth=2.0,
+        ),
+        packet_refiner=finalize_refiner,
+    )
+    pointmap_alignment = backend._pointmap_overlap_alignment
+
+    def record_pointmap_alignment(
+        previous_packet: LocalGaussianWindowPacket,
+        current_packet: LocalGaussianWindowPacket,
+    ):
+        assert current_packet.metadata["voxel_anchor_refiner_pending"] is False
+        events.append(("sim3", int(current_packet.window_id)))
+        return pointmap_alignment(previous_packet, current_packet)
+
+    monkeypatch.setattr(
+        backend,
+        "_pointmap_overlap_alignment",
+        record_pointmap_alignment,
+    )
+
+    backend.process_packet(previous)
+    backend.process_packet(current)
+
+    assert events == [("refiner", 0), ("refiner", 1), ("sim3", 1)]
+
+
+def test_pointmap_alignment_failure_rolls_back_node_and_owner_transfer() -> None:
+    height, width = 16, 32
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(
+        0,
+        poses,
+        (0, 1, 2, 3),
+        height=height,
+        width=width,
+    )
+    current = _packet(
+        1,
+        poses,
+        (2, 3, 4, 5),
+        height=height,
+        width=width,
+    )
+    _replace_packet_depth(
+        previous,
+        torch.full((4, 1, height, width), 2.0),
+    )
+    _replace_packet_depth(
+        current,
+        torch.full((4, 1, height, width), 2.0),
+    )
+    _attach_identity_stride_matches(previous)
+    current.sky_prob = torch.ones_like(current.sky_prob)
+    current.sky_mask = torch.ones_like(current.sky_mask)
+    backend = _pointmap_chunk_backend()
+    backend.process_packet(previous)
+    owners_before = dict(backend.frame_pose_owner_node)
+
+    with pytest.raises(RuntimeError, match=r"point-map Sim\(3\) alignment failed"):
+        backend.process_packet(current)
+
+    assert set(backend.graph.nodes) == {0}
+    assert backend.window_order == [0]
+    assert backend.frame_pose_owner_node == owners_before
+    assert backend._last_overlap_alignment_failure is not None
+    assert backend._last_overlap_alignment_failure["accepted"] is False

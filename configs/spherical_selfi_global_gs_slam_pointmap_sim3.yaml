@@ -1,0 +1,26 @@
+base_config: spherical_selfi_global_gs_slam.yaml
+
+# Explicit opt-in for independent chunk-local coordinates aligned by the two
+# shared PanoVGGT point maps. The base adapter+BA configuration remains the
+# default and continues to use its existing depth-scale bridge.
+SphericalSelfiGlobalBackend:
+  rendered_overlap_alignment:
+    enabled: true
+    mode: two_frame_pointmap_full_sim3
+    min_points: 2048
+    max_points: 4096
+    min_points_per_frame: 512
+    max_points_per_frame: 2048
+    irls_iterations: 5
+    failure_policy: error
+  global_graph:
+    node_mode: chunk_first_stride
+    expected_overlap_frames: 2
+    enforce_exact_overlap: true
+    fibonacci_oversample_factor: 8
+    umeyama_irls_iterations: 5
+    allow_unaligned_fallback: false
+    chunk_stride:
+      target_index: 2
+    skip_edge:
+      enabled: false
