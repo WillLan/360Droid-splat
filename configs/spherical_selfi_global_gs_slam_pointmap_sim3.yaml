@@ -26,3 +26,9 @@ SphericalSelfiGlobalBackend:
       target_index: 2
     skip_edge:
       enabled: false
+
+# PointMap-Sim3 is the formal experiment mainline.  Keep W&B focused on the
+# core trajectory/render metrics instead of expanding per-view backend
+# diagnostics into hundreds of panels.  Detailed diagnostics remain local.
+WeightsAndBiases:
+  runtime_log_preset: slam_core_visuals
