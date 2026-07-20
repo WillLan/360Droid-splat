@@ -4,12 +4,14 @@ Dataset:
   begin: 0
   end: 100
   frame_stride: 1
+  erp_resize_height: 504
+  erp_resize_width: 1008
 
 WeightsAndBiases:
   enabled: true
   mode: online
   group: pointmap-sim3-adapter-ba-100
-  run_name: pointmap_sim3_adapter_ba_100
+  run_name: pointmap_sim3_adapter_ba_100_r2
   tags:
     - spherical-selfi
     - adapter-ba
@@ -28,6 +30,6 @@ Visualization:
   post_opt_log_depth: false
 
 Results:
-  save_dir: outputs/pointmap_sim3_adapter_ba_100
+  save_dir: outputs/pointmap_sim3_adapter_ba_100_r2
   render_final_all_frames: true
   kf_render_format: png
