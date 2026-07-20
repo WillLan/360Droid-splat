@@ -566,6 +566,7 @@ class SlamRuntimeLogger:
         self._frontend_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_pose_history: list[tuple[int, np.ndarray]] = []
         self._frontend_raw_pose_history: list[tuple[int, np.ndarray]] = []
+        self._frontend_sim3_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_graph_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_global_pose_history: list[tuple[int, np.ndarray]] = []
         self._slam_final_pose_history: list[tuple[int, np.ndarray]] = []
@@ -672,6 +673,26 @@ class SlamRuntimeLogger:
             frame_id,
             pose[:3, 3].numpy(),
         )
+
+    def replace_frontend_sim3_history(
+        self,
+        poses_c2w: dict[int, torch.Tensor],
+    ) -> None:
+        """Replace the feedback-free point-map Sim(3) trajectory mirror."""
+
+        staged: list[tuple[int, np.ndarray]] = []
+        for frame_id, pose in sorted(poses_c2w.items()):
+            value = torch.as_tensor(pose).detach().cpu().float()
+            if tuple(value.shape) != (4, 4) or not bool(
+                torch.isfinite(value).all()
+            ):
+                raise ValueError(
+                    f"Invalid frontend Sim(3) pose for frame {int(frame_id)}"
+                )
+            staged.append(
+                (int(frame_id), value[:3, 3].numpy().copy())
+            )
+        self._frontend_sim3_pose_history = staged
 
     def _wandb_step(self, step: int | None = None) -> int:
         return max(1, int(self._step if step is None else step))
@@ -858,7 +879,9 @@ class SlamRuntimeLogger:
             output,
             kind="frontend",
             pred_history=(
-                self._frontend_raw_pose_history or self._frontend_pose_history
+                self._frontend_sim3_pose_history
+                or self._frontend_raw_pose_history
+                or self._frontend_pose_history
             ),
         )
         backend_traj_path = self._save_trajectory_panel(
@@ -1753,7 +1776,7 @@ class SlamRuntimeLogger:
         path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_{kind}_trajectory_vs_gt.png"
         legacy_path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_trajectory.png" if kind == "frontend" else None
         display_name = {
-            "frontend": "Frontend pre-backend",
+            "frontend": "Frontend point-map Sim(3)-aligned",
             "backend": "Backend graph pre-photo",
             "slam": "SLAM post-photo",
             "slam_final": "Final SLAM post-photo",
@@ -3195,6 +3218,7 @@ class PanoDroidGSSlamSystem:
                 "frontend": list(logger._frontend_pose_history),
                 "backend": list(logger._backend_pose_history),
                 "frontend_raw": list(logger._frontend_raw_pose_history),
+                "frontend_sim3": list(logger._frontend_sim3_pose_history),
                 "backend_graph": list(logger._backend_graph_pose_history),
                 "backend_global": list(logger._backend_global_pose_history),
                 "slam_final": list(logger._slam_final_pose_history),
@@ -3225,6 +3249,9 @@ class PanoDroidGSSlamSystem:
                 logger._frontend_pose_history = logger_state["frontend"]
                 logger._backend_pose_history = logger_state["backend"]
                 logger._frontend_raw_pose_history = logger_state["frontend_raw"]
+                logger._frontend_sim3_pose_history = logger_state[
+                    "frontend_sim3"
+                ]
                 logger._backend_graph_pose_history = logger_state[
                     "backend_graph"
                 ]
@@ -3439,6 +3466,15 @@ class PanoDroidGSSlamSystem:
                         except Exception:
                             pass
                         raise
+                    pointmap_pose_snapshot = getattr(
+                        self.spherical_selfi_global_backend,
+                        "pointmap_sim3_aligned_pose_snapshot",
+                        None,
+                    )
+                    if callable(pointmap_pose_snapshot):
+                        sim3_poses = pointmap_pose_snapshot()
+                        if sim3_poses:
+                            logger.replace_frontend_sim3_history(sim3_poses)
                     elapsed = float(time.perf_counter() - section_start)
                     fusion_profile = {
                         f"fusion_{key}": float(value)

@@ -472,19 +472,31 @@ def test_ob3d_pointmap_sim3_config_preserves_adapter_ba_refiner_baseline() -> No
         root
         / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_prepost.yaml"
     )
-    for section in (
+    stages = load_config(
+        root
+        / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_stages.yaml"
+    )
+    algorithm_sections = (
         "Dataset",
         "SphericalSelfiRuntime",
         "VoxelAnchorRefiner",
         "SphericalSelfiGlobalBackend",
         "Mapping",
-    ):
+    )
+    for section in algorithm_sections:
         assert prepost.get(section) == pointmap.get(section)
     assert prepost["WeightsAndBiases"]["runtime_log_preset"] == (
         "slam_core_visuals"
     )
     assert prepost["WeightsAndBiases"]["run_name"].endswith("prepost_r2")
     assert prepost["Results"]["save_dir"].endswith("prepost_r2")
+    for section in algorithm_sections:
+        assert stages.get(section) == pointmap.get(section)
+    assert stages["WeightsAndBiases"]["runtime_log_preset"] == (
+        "slam_core_visuals"
+    )
+    assert stages["WeightsAndBiases"]["run_name"].endswith("stages_r3")
+    assert stages["Results"]["save_dir"].endswith("stages_r3")
 
 
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):

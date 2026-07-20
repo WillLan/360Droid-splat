@@ -1105,6 +1105,8 @@ class SphericalSelfiGlobalBackend:
         self._active_submap_id: int | None = None
         self._last_full_packet: LocalGaussianWindowPacket | None = None
         self.window_order: list[int] = []
+        self._pointmap_sim3_window_transforms: dict[int, torch.Tensor] = {}
+        self._pointmap_sim3_pose_by_frame: dict[int, torch.Tensor] = {}
         self.frame_owner_window: dict[int, int] = {}
         self.frame_depth_owner_window: dict[int, int] = {}
         self.frame_windows: dict[int, set[int]] = {}
@@ -1223,6 +1225,14 @@ class SphericalSelfiGlobalBackend:
             "active_submap_id": self._active_submap_id,
             "last_full_packet": self._last_full_packet,
             "window_order": list(self.window_order),
+            "pointmap_sim3_window_transforms": {
+                int(window): transform.clone()
+                for window, transform in self._pointmap_sim3_window_transforms.items()
+            },
+            "pointmap_sim3_pose_by_frame": {
+                int(frame): pose.clone()
+                for frame, pose in self._pointmap_sim3_pose_by_frame.items()
+            },
             "frame_owner_window": dict(self.frame_owner_window),
             "frame_depth_owner_window": dict(self.frame_depth_owner_window),
             "frame_windows": {
@@ -1321,6 +1331,12 @@ class SphericalSelfiGlobalBackend:
         self._active_submap_id = state["active_submap_id"]
         self._last_full_packet = state["last_full_packet"]
         self.window_order = state["window_order"]
+        self._pointmap_sim3_window_transforms = state[
+            "pointmap_sim3_window_transforms"
+        ]
+        self._pointmap_sim3_pose_by_frame = state[
+            "pointmap_sim3_pose_by_frame"
+        ]
         self.frame_owner_window = state["frame_owner_window"]
         self.frame_depth_owner_window = state["frame_depth_owner_window"]
         self.frame_windows = state["frame_windows"]
@@ -7064,6 +7080,43 @@ class SphericalSelfiGlobalBackend:
             for frame_id, update in self.pop_frame_geometry_updates().items()
         }
 
+    def pointmap_sim3_aligned_pose_snapshot(self) -> dict[int, torch.Tensor]:
+        """Return the diagnostic point-map Sim(3) chain before graph feedback."""
+
+        return {
+            int(frame_id): pose.detach().cpu().float().clone()
+            for frame_id, pose in self._pointmap_sim3_pose_by_frame.items()
+        }
+
+    def _record_pointmap_sim3_alignment(
+        self,
+        packet: LocalGaussianWindowPacket,
+        transform: torch.Tensor,
+    ) -> None:
+        """Extend the feedback-free point-map Sim(3) trajectory."""
+
+        window_id = int(packet.window_id)
+        value = canonicalize_sim3(transform.detach()).to(
+            packet.local_poses_c2w
+        )
+        poses = packet.global_poses(value)
+        if len(poses) != len(packet.frame_ids):
+            raise RuntimeError(
+                f"Window {window_id} produced {len(poses)} Sim(3)-aligned "
+                f"poses for {len(packet.frame_ids)} frames"
+            )
+        self._pointmap_sim3_window_transforms[window_id] = value.detach().clone()
+        for frame_id, pose in zip(packet.frame_ids, poses):
+            canonical = canonicalize_c2w(pose.detach().float())
+            if not bool(torch.isfinite(canonical).all()):
+                raise RuntimeError(
+                    f"Window {window_id} produced a non-finite Sim(3)-aligned "
+                    f"pose for frame {int(frame_id)}"
+                )
+            self._pointmap_sim3_pose_by_frame[int(frame_id)] = (
+                canonical.detach().cpu().clone()
+            )
+
     def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
             return {}
@@ -8947,10 +9000,12 @@ class SphericalSelfiGlobalBackend:
         sequential_overlap_dense: tuple[DenseSphericalFactorBlock, ...] = ()
         sequential_overlap_pose: tuple[CoincidentPanoramaFactor, ...] = ()
         pointmap_overlap_measurement: torch.Tensor | None = None
+        pointmap_sim3_start_transform: torch.Tensor | None = None
         if not self.window_order:
             aligned = True
             start_transform = sim3_identity(device=packet.local_poses_c2w.device)
             if self.two_frame_pointmap_full_sim3_enabled:
+                pointmap_sim3_start_transform = start_transform.detach().clone()
                 alignment_diagnostics = {
                     "reason": "first_window",
                     "mode": "two_frame_pointmap_full_sim3",
@@ -9019,6 +9074,18 @@ class SphericalSelfiGlobalBackend:
                 start_transform = (
                     previous_transform
                     @ pointmap_overlap_measurement.to(previous_transform)
+                )
+                previous_sim3_transform = (
+                    self._pointmap_sim3_window_transforms.get(previous_id)
+                )
+                if previous_sim3_transform is None:
+                    raise RuntimeError(
+                        f"Previous window {previous_id} has no point-map Sim(3) "
+                        "diagnostic transform"
+                    )
+                pointmap_sim3_start_transform = (
+                    previous_sim3_transform
+                    @ pointmap_overlap_measurement.to(previous_sim3_transform)
                 )
                 absolute_scale = float(
                     sim3_components(start_transform)[0].detach().cpu()
@@ -9523,6 +9590,15 @@ class SphericalSelfiGlobalBackend:
                 owner_node=start_frame,
             )
             boundary_diagnostics.update(ownership_diagnostics)
+            if pointmap_sim3_start_transform is None:
+                raise RuntimeError(
+                    f"Window {window_id} has no point-map Sim(3) diagnostic "
+                    "transform"
+                )
+            self._record_pointmap_sim3_alignment(
+                packet,
+                pointmap_sim3_start_transform,
+            )
             self._register_hierarchical_window(
                 window_id, start_frame, start_frame
             )

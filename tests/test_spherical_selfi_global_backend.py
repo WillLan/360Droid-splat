@@ -6155,8 +6155,20 @@ def test_pointmap_chunk_graph_delays_node_and_uses_current_first_depth() -> None
     first_result = backend.process_packet(previous)
     assert set(backend.graph.nodes) == {0}
     assert backend.graph.edges == []
+    first_sim3 = backend.pointmap_sim3_aligned_pose_snapshot()
+    assert set(first_sim3) == {0, 1, 2, 3}
+    torch.testing.assert_close(first_sim3[0], torch.eye(4))
     assert "q" not in first_result.diagnostics["alignment"]
     assert "c" not in first_result.diagnostics["alignment"]
+
+    # Simulate graph/photo feedback and verify that the diagnostic frontend
+    # snapshot owns independent tensors rather than aliases of graph nodes.
+    backend.graph.nodes[0][0, 3] = 5.0
+    torch.testing.assert_close(
+        backend.pointmap_sim3_aligned_pose_snapshot()[0],
+        torch.eye(4),
+    )
+    backend.graph.nodes[0][0, 3] = 0.0
 
     result = backend.process_packet(current)
 
@@ -6177,6 +6189,9 @@ def test_pointmap_chunk_graph_delays_node_and_uses_current_first_depth() -> None
     assert float(sim3_components(backend.graph.transform(2))[0]) == pytest.approx(
         1.5, rel=2.0e-3
     )
+    sim3_only = backend.pointmap_sim3_aligned_pose_snapshot()
+    assert set(sim3_only) == {0, 1, 2, 3, 4, 5}
+    assert float(sim3_only[2][0, 3]) == pytest.approx(0.0, abs=1.0e-6)
     assert float(backend.graph.objective().detach().cpu()) < 1.0e-8
     assert backend.frame_pose_owner_node[2] == 2
     assert backend.frame_pose_owner_node[3] == 2
@@ -6306,6 +6321,7 @@ def test_pointmap_alignment_failure_rolls_back_node_and_owner_transfer() -> None
     backend = _pointmap_chunk_backend()
     backend.process_packet(previous)
     owners_before = dict(backend.frame_pose_owner_node)
+    sim3_before = backend.pointmap_sim3_aligned_pose_snapshot()
 
     with pytest.raises(RuntimeError, match=r"point-map Sim\(3\) alignment failed"):
         backend.process_packet(current)
@@ -6313,5 +6329,9 @@ def test_pointmap_alignment_failure_rolls_back_node_and_owner_transfer() -> None
     assert set(backend.graph.nodes) == {0}
     assert backend.window_order == [0]
     assert backend.frame_pose_owner_node == owners_before
+    sim3_after = backend.pointmap_sim3_aligned_pose_snapshot()
+    assert set(sim3_after) == set(sim3_before)
+    for frame_id in sim3_before:
+        torch.testing.assert_close(sim3_after[frame_id], sim3_before[frame_id])
     assert backend._last_overlap_alignment_failure is not None
     assert backend._last_overlap_alignment_failure["accepted"] is False

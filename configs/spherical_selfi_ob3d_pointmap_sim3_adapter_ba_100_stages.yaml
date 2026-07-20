@@ -1,0 +1,11 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100.yaml
+
+# OB3D 100-frame run with the three diagnostic trajectory stages separated:
+# frontend = feedback-free overlap point-map Sim(3) chain,
+# backend = factor-graph state before the current photometric window,
+# slam = final state after that photometric window commits.
+WeightsAndBiases:
+  run_name: ob3d100_pointmap_sim3_adapter_ba_stages_r3
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_adapter_ba_stages_r3

@@ -1868,6 +1868,7 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
         tracking_status="tracked",
     )
     logger.record_frontend_raw(output)
+    logger.replace_frontend_sim3_history({1: pose_x(1.5)})
     logger.replace_geometry_history(
         {1: SimpleNamespace(pose_c2w=pose_x(2.0))},
         revision=1,
@@ -1925,9 +1926,11 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     )
 
     assert logger._frontend_raw_pose_history[-1][1][0] == pytest.approx(1.0)
+    assert logger._frontend_sim3_pose_history[-1][1][0] == pytest.approx(1.5)
     assert logger._backend_graph_pose_history[-1][1][0] == pytest.approx(2.0)
     assert logger._backend_global_pose_history[-1][1][0] == pytest.approx(2.5)
     assert logger._slam_final_pose_history[-1][1][0] == pytest.approx(3.0)
+    assert plotted_histories["frontend"][-1][1][0] == pytest.approx(1.5)
     assert plotted_histories["backend"][-1][1][0] == pytest.approx(2.0)
     assert plotted_histories["slam"][-1][1][0] == pytest.approx(3.0)
     assert (
