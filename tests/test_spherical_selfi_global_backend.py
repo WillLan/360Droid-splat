@@ -184,6 +184,7 @@ def _pointmap_chunk_backend(
     min_points: int = 32,
     min_points_per_frame: int = 16,
     max_points_per_frame: int = 32,
+    acceptance_policy: str = "strict",
     renderer=None,
     packet_refiner=None,
     hierarchical: bool = False,
@@ -203,6 +204,7 @@ def _pointmap_chunk_backend(
                 "max_points_per_frame": int(max_points_per_frame),
                 "holdout_stride": 5,
                 "covariance_min_ratio": 1.0e-5,
+                "acceptance_policy": str(acceptance_policy),
                 "failure_policy": "error",
             },
             "global_graph": {
@@ -585,6 +587,7 @@ def test_pointmap_sim3_config_is_explicit_opt_in() -> None:
         "min_points_per_frame": 512,
         "max_points_per_frame": 2048,
         "irls_iterations": 5,
+        "acceptance_policy": "diagnostics_only",
         "failure_policy": "error",
     }
     assert graph["node_mode"] == "chunk_first_stride"
@@ -6007,6 +6010,61 @@ def test_pointmap_overlap_recovers_full_current_to_previous_sim3() -> None:
     assert float(scale) == pytest.approx(float(expected_scale), rel=2.0e-3)
     assert torch.allclose(recovered_rotation, expected_rotation, atol=2.0e-3)
     assert torch.allclose(recovered_translation, expected_translation, atol=2.0e-3)
+
+
+def test_pointmap_diagnostics_only_accepts_finite_rejected_sim3() -> None:
+    height, width = 24, 48
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(
+        0,
+        poses,
+        (0, 1, 2, 3),
+        height=height,
+        width=width,
+    )
+    current = _packet(
+        1,
+        poses,
+        (2, 3, 4, 5),
+        height=height,
+        width=width,
+    )
+    previous_depth = torch.full((4, 1, height, width), 2.0)
+    current_depth = torch.full((4, 1, height, width), 2.0)
+    current_depth[:, :, :, 1::2] = 4.0
+    _replace_packet_depth(previous, previous_depth)
+    _replace_packet_depth(current, current_depth)
+
+    strict_backend = _pointmap_chunk_backend(
+        min_points=64,
+        min_points_per_frame=24,
+        max_points_per_frame=64,
+    )
+    strict_measurement, strict_diagnostics = (
+        strict_backend._pointmap_overlap_alignment(previous, current)
+    )
+    assert strict_measurement is None
+    assert strict_diagnostics["pointmap_sim3_quality_gate_passed"] is False
+
+    diagnostic_backend = _pointmap_chunk_backend(
+        min_points=64,
+        min_points_per_frame=24,
+        max_points_per_frame=64,
+        acceptance_policy="diagnostics_only",
+    )
+    measurement, diagnostics = diagnostic_backend._pointmap_overlap_alignment(
+        previous,
+        current,
+    )
+
+    assert measurement is not None
+    assert bool(torch.isfinite(measurement).all())
+    assert diagnostics["accepted"] is True
+    assert diagnostics["reason"] == "accepted_diagnostics_only"
+    assert diagnostics["pointmap_sim3_accepted"] is True
+    assert diagnostics["pointmap_sim3_quality_gate_passed"] is False
+    assert diagnostics["pointmap_sim3_acceptance_overridden"] is True
+    assert diagnostics["pointmap_sim3_acceptance_policy"] == "diagnostics_only"
 
 
 def test_pointmap_sampling_jointly_filters_sky_dynamic_and_invalid_geometry() -> None:

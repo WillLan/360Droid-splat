@@ -12,6 +12,8 @@ SphericalSelfiGlobalBackend:
     min_points_per_frame: 512
     max_points_per_frame: 2048
     irls_iterations: 5
+    # Keep all quality metrics as diagnostics, but do not reject a finite Sim(3).
+    acceptance_policy: diagnostics_only
     failure_policy: error
   global_graph:
     node_mode: chunk_first_stride

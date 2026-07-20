@@ -383,6 +383,24 @@ class SphericalSelfiGlobalBackend:
             self.two_frame_overlap_enabled
             and self.rendered_overlap_alignment_mode == "two_frame_scale_pose"
         )
+        self.rendered_alignment_acceptance_policy = str(
+            rendered_alignment_cfg.get("acceptance_policy", "strict")
+        ).strip().lower()
+        allowed_acceptance_policies = (
+            {"strict", "diagnostics_only"}
+            if self.two_frame_pointmap_full_sim3_enabled
+            else {"strict"}
+        )
+        if (
+            self.rendered_overlap_alignment_enabled
+            and self.rendered_alignment_acceptance_policy
+            not in allowed_acceptance_policies
+        ):
+            raise ValueError(
+                "Unsupported rendered_overlap_alignment.acceptance_policy "
+                f"{self.rendered_alignment_acceptance_policy!r} for mode "
+                f"{self.rendered_overlap_alignment_mode!r}"
+            )
         self.rendered_alignment_min_points = max(
             3, int(rendered_alignment_cfg.get("min_points", 256))
         )
@@ -4159,7 +4177,7 @@ class SphericalSelfiGlobalBackend:
             <= scale_value
             <= self.rendered_alignment_max_scale_change
         )
-        accepted = (
+        quality_accepted = (
             bool(alignment.accepted)
             and scale_ok
             and covariance_ok
@@ -4169,22 +4187,30 @@ class SphericalSelfiGlobalBackend:
             and holdout_median <= self.max_overlap_residual
         )
         if not bool(alignment.accepted):
-            reason = "robust_alignment_rejected"
+            quality_reason = "robust_alignment_rejected"
         elif not scale_ok:
-            reason = "scale_gate_rejected"
+            quality_reason = "scale_gate_rejected"
         elif not covariance_ok:
-            reason = "covariance_degenerate"
+            quality_reason = "covariance_degenerate"
         elif train_ratio < self.rendered_alignment_min_inlier_ratio:
-            reason = "training_inlier_gate_rejected"
+            quality_reason = "training_inlier_gate_rejected"
         elif train_mean > self.max_overlap_residual:
-            reason = "training_residual_gate_rejected"
+            quality_reason = "training_residual_gate_rejected"
         elif (
             holdout_ratio < self.rendered_alignment_min_inlier_ratio
             or holdout_median > self.max_overlap_residual
         ):
-            reason = "holdout_gate_rejected"
+            quality_reason = "holdout_gate_rejected"
         else:
-            reason = "accepted"
+            quality_reason = "accepted"
+        acceptance_overridden = (
+            not quality_accepted
+            and self.rendered_alignment_acceptance_policy == "diagnostics_only"
+        )
+        accepted = bool(quality_accepted or acceptance_overridden)
+        reason = (
+            "accepted_diagnostics_only" if acceptance_overridden else quality_reason
+        )
         diagnostics.update(
             {
                 "pointmap_sim3_scale": scale_value,
@@ -4208,6 +4234,14 @@ class SphericalSelfiGlobalBackend:
                 "pointmap_sim3_per_frame_median_residual": per_frame_medians,
                 "pointmap_sim3_accepted": bool(accepted),
                 "pointmap_sim3_reason": reason,
+                "pointmap_sim3_acceptance_policy": (
+                    self.rendered_alignment_acceptance_policy
+                ),
+                "pointmap_sim3_quality_gate_passed": bool(quality_accepted),
+                "pointmap_sim3_quality_gate_reason": quality_reason,
+                "pointmap_sim3_acceptance_overridden": bool(
+                    acceptance_overridden
+                ),
                 "pose_prior_used": False,
                 "overlap_pose_factor_inserted": False,
             }
@@ -4298,7 +4332,7 @@ class SphericalSelfiGlobalBackend:
             {
                 "accepted": measurement is not None,
                 "reason": (
-                    "accepted"
+                    fit_diagnostics.get("pointmap_sim3_reason", "accepted")
                     if measurement is not None
                     else fit_diagnostics.get(
                         "pointmap_sim3_reason", "alignment_failed"
