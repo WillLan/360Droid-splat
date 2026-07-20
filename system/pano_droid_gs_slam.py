@@ -3117,9 +3117,7 @@ class PanoDroidGSSlamSystem:
             )
             apply_spherical_selfi_geometry_updates(updates, outputs)
 
-        def prepare_spherical_selfi_windows(
-            outputs: list[FrontendOutput],
-        ) -> None:
+        def drain_spherical_selfi_windows(outputs: list[FrontendOutput]) -> None:
             for output in outputs:
                 logger.record_frontend_raw(output)
                 if output.inverse_depth is not None:
@@ -3161,23 +3159,11 @@ class PanoDroidGSSlamSystem:
                         "consume_local_gaussian_windows()."
                     )
                 for packet in consume():
-                    self.spherical_selfi_global_backend.prepare_packet_candidate(
-                        packet
-                    )
-
-        def commit_spherical_selfi_windows(
-            outputs: list[FrontendOutput],
-        ) -> None:
-            if spherical_selfi_global_enabled:
-                candidate_ids = (
-                    self.spherical_selfi_global_backend.pending_packet_candidate_ids()
-                )
-                for packet_window_id in candidate_ids:
                     section_start = time.perf_counter()
                     try:
                         result = (
-                            self.spherical_selfi_global_backend.track_and_commit_candidate(
-                                int(packet_window_id)
+                            self.spherical_selfi_global_backend.process_packet(
+                                packet
                             )
                         )
                     except Exception as exc:
@@ -3202,7 +3188,7 @@ class PanoDroidGSSlamSystem:
                                 failure_dir.mkdir(parents=True, exist_ok=True)
                                 failure_path = (
                                     failure_dir
-                                    / f"window_{int(packet_window_id):06d}.json"
+                                    / f"window_{int(packet.window_id):06d}.json"
                                 )
                                 failure_path.write_text(
                                     json.dumps(
@@ -3245,13 +3231,13 @@ class PanoDroidGSSlamSystem:
                             if callable(consume_overlap):
                                 logger.observe_rendered_overlap_alignment(
                                     consume_overlap(),
-                                    window_id=int(packet_window_id),
+                                    window_id=int(packet.window_id),
                                     step=max(1, int(logger._step) + 1),
                                 )
                             logger._log_wandb_payload(
                                 {
                                     "backend/selfi_window_id": int(
-                                        packet_window_id
+                                        packet.window_id
                                     ),
                                     "backend/selfi_window_failed": 1,
                                     "backend/selfi_failure": repr(exc),
@@ -3262,7 +3248,7 @@ class PanoDroidGSSlamSystem:
                             )
                             write_profile(
                                 "backend_spherical_selfi_window_failure",
-                                window_id=float(packet_window_id),
+                                window_id=float(packet.window_id),
                                 total_sec=elapsed,
                             )
                         except Exception:
@@ -3324,22 +3310,6 @@ class PanoDroidGSSlamSystem:
                     }
                     alignment_diag = dict(result.diagnostics.get("alignment", {}) or {})
                     boundary_diag = dict(result.diagnostics.get("boundary_factor", {}) or {})
-                    prefusion_pose_diag = dict(
-                        result.diagnostics.get(
-                            "prefusion_pose_tracking", {}
-                        )
-                        or {}
-                    )
-                    for key, value in prefusion_pose_diag.items():
-                        metric = f"backend/prefusion_pose/{str(key)}"
-                        if isinstance(value, bool):
-                            wandb_payload[metric] = int(value)
-                        elif isinstance(value, (int, float)) and math.isfinite(
-                            float(value)
-                        ):
-                            wandb_payload[metric] = float(value)
-                        elif key == "reason" and isinstance(value, str):
-                            wandb_payload[metric] = value
                     for metric_name, source_name in (
                         ("chunk_scale_normalization", "chunk_scale_normalization"),
                         ("canonical_rotation_mismatch_deg", "canonical_rotation_mismatch_deg"),
@@ -4589,10 +4559,9 @@ class PanoDroidGSSlamSystem:
                 section_start = time.perf_counter()
                 outputs = pop_ready() if callable(pop_ready) else [out]
                 pop_ready_sec = float(time.perf_counter() - section_start)
-                prepare_spherical_selfi_windows(outputs)
+                drain_spherical_selfi_windows(outputs)
                 for ready in outputs:
                     process_output(ready)
-                commit_spherical_selfi_windows(outputs)
                 optimize_spherical_selfi_windows(outputs)
                 drain_resplat_artifacts()
                 for ready in outputs:
@@ -4616,10 +4585,9 @@ class PanoDroidGSSlamSystem:
                 for ready in flush():
                     flushed += 1
                     flushed_outputs.append(ready)
-                prepare_spherical_selfi_windows(flushed_outputs)
+                drain_spherical_selfi_windows(flushed_outputs)
                 for ready in flushed_outputs:
                     process_output(ready)
-                commit_spherical_selfi_windows(flushed_outputs)
                 optimize_spherical_selfi_windows(flushed_outputs)
                 drain_resplat_artifacts()
                 for ready in flushed_outputs:

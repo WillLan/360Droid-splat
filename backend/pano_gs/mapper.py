@@ -18,11 +18,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from backend.pano_gs.adapter import PFGS360Renderer, PanoRenderCamera
-from backend.pano_gs.losses import (
-    BackendLossWeights,
-    backend_render_loss,
-    pano_photometric_loss,
-)
+from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from backend.pano_gs.pose_param import PoseDelta
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
@@ -1596,36 +1592,6 @@ class PanoGaussianMapper:
         ff_cfg["sampler"] = str(effective_cfg.get("sampler", "random"))
         ff_cfg["sampler_seed"] = int(effective_cfg.get("sampler_seed", 123))
         ff_cfg["skip_prune"] = bool(effective_cfg.get("skip_prune", False))
-        ff_cfg["replay_frame_ids"] = tuple(
-            int(value) for value in effective_cfg.get("replay_frame_ids", ())
-        )
-        ff_cfg["replay_every"] = max(
-            0, int(effective_cfg.get("replay_every", 0))
-        )
-        ff_cfg["validation_frame_ids"] = tuple(
-            int(value) for value in effective_cfg.get("validation_frame_ids", ())
-        )
-        ff_cfg["validation_interval"] = max(
-            1, int(effective_cfg.get("validation_interval", 25))
-        )
-        ff_cfg["restore_best_gaussians"] = bool(
-            effective_cfg.get("restore_best_gaussians", False)
-        )
-        ff_cfg["holdout_fraction"] = float(
-            effective_cfg.get("holdout_fraction", 0.20)
-        )
-        ff_cfg["alpha_threshold"] = float(
-            effective_cfg.get("alpha_threshold", 0.05)
-        )
-        ff_cfg["photometric_loss_mode"] = str(
-            effective_cfg.get("photometric_loss_mode", "charbonnier")
-        )
-        ff_cfg["charbonnier_weight"] = float(
-            effective_cfg.get("charbonnier_weight", 0.85)
-        )
-        ff_cfg["dssim_weight"] = float(
-            effective_cfg.get("dssim_weight", 0.15)
-        )
         self.optim_cfg["enabled"] = True
         self.optim_cfg["pose_refine_enable"] = bool(effective_cfg.get("pose_refine_enable", False))
         for key in overridden_root:
@@ -1724,359 +1690,6 @@ class PanoGaussianMapper:
             metrics["steps"] = 0.0
             metrics["window_rollback"] = 1.0
         metrics["spherical_selfi_window_id"] = float(window_id)
-        return metrics
-
-    @staticmethod
-    def _deterministic_rgb_split_mask(
-        height: int,
-        width: int,
-        *,
-        frame_id: int,
-        holdout_fraction: float,
-        validation: bool,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Return a stable panoramic pixel split shared by tracking/validation."""
-
-        fraction = min(0.5, max(0.0, float(holdout_fraction)))
-        if fraction <= 0.0:
-            return torch.ones(
-                1, int(height), int(width), device=device, dtype=torch.bool
-            )
-        period = max(2, int(round(1.0 / fraction)))
-        rows = torch.arange(int(height), device=device, dtype=torch.long)[:, None]
-        cols = torch.arange(int(width), device=device, dtype=torch.long)[None, :]
-        token = (
-            rows * 73856093
-            + cols * 19349663
-            + int(frame_id) * 83492791
-        ).remainder(period)
-        selected = token == 0
-        return (selected if validation else ~selected).unsqueeze(0)
-
-    def _spherical_selfi_rgb_objective(
-        self,
-        observation: MapperObservation,
-        pose_c2w: torch.Tensor,
-        *,
-        resolution_scale: float,
-        validation: bool,
-        holdout_fraction: float,
-        alpha_threshold: float,
-        photometric_mode: str,
-        charbonnier_weight: float,
-        dssim_weight: float,
-    ) -> tuple[torch.Tensor | None, dict[str, float]]:
-        device = self.map.get_xyz.device
-        dtype = self.map.get_xyz.dtype
-        target_full = observation.image.to(device=device, dtype=dtype)
-        full_height, full_width = (
-            int(target_full.shape[-2]),
-            int(target_full.shape[-1]),
-        )
-        scale = min(1.0, max(1.0e-3, float(resolution_scale)))
-        height = max(1, int(round(full_height * scale)))
-        width = max(2, int(round(full_width * scale)))
-        if (height, width) == (full_height, full_width):
-            target = target_full
-        else:
-            target = F.interpolate(
-                target_full.unsqueeze(0),
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            )[0]
-        camera = PanoRenderCamera(
-            image_height=height,
-            image_width=width,
-            c2w=pose_c2w.to(device=device, dtype=dtype),
-        )
-        package = self.renderer.render(camera, self.map)
-        rendered = package.get("render")
-        alpha = package.get("alpha")
-        if not torch.is_tensor(rendered) or not torch.is_tensor(alpha):
-            return None, {"valid_pixels": 0.0, "coverage": 0.0}
-        if alpha.ndim == 2:
-            alpha = alpha.unsqueeze(0)
-        elif alpha.ndim == 4 and int(alpha.shape[0]) == 1:
-            alpha = alpha[0]
-        if tuple(alpha.shape[-2:]) != (height, width):
-            return None, {"valid_pixels": 0.0, "coverage": 0.0}
-        finite = torch.isfinite(target).all(dim=0, keepdim=True)
-        finite &= torch.isfinite(rendered).all(dim=0, keepdim=True)
-        finite &= torch.isfinite(alpha)
-        visible = alpha >= float(alpha_threshold)
-        sky_mask = self._skybox_mask_for_target(target, observation.sky_mask)
-        if sky_mask is not None:
-            visible &= ~sky_mask.to(device=device, dtype=torch.bool)
-        split = self._deterministic_rgb_split_mask(
-            height,
-            width,
-            frame_id=int(observation.frame_id),
-            holdout_fraction=holdout_fraction,
-            validation=validation,
-            device=device,
-        )
-        mask = finite & visible & split
-        valid_pixels = int(mask.sum().detach().cpu())
-        coverage = valid_pixels / float(max(1, height * width))
-        if valid_pixels < 64:
-            return None, {
-                "valid_pixels": float(valid_pixels),
-                "coverage": float(coverage),
-            }
-        loss = pano_photometric_loss(
-            rendered,
-            target,
-            mask=mask,
-            mode=str(photometric_mode),
-            rgb_l1_weight=float(charbonnier_weight),
-            dssim_weight=float(dssim_weight),
-        )
-        return loss, {
-            "valid_pixels": float(valid_pixels),
-            "coverage": float(coverage),
-        }
-
-    def optimize_spherical_selfi_pose_only(
-        self,
-        *,
-        frame_ids: list[int] | tuple[int, ...],
-        pyramid_steps: list[tuple[float, int]] | tuple[tuple[float, int], ...],
-        pose_lr: float,
-        pose_grad_clip: float,
-        alpha_threshold: float,
-        holdout_fraction: float = 0.20,
-        validation_interval: int = 10,
-        min_validation_improvement: float = 0.0,
-        photometric_mode: str = "charbonnier_dssim",
-        charbonnier_weight: float = 0.85,
-        dssim_weight: float = 0.15,
-    ) -> dict[str, float]:
-        """Track selected frames against the committed map with Gaussian state frozen."""
-
-        selected_ids = tuple(dict.fromkeys(int(value) for value in frame_ids))
-        if not selected_ids:
-            return {"steps": 0.0, "reason_no_frames": 1.0}
-        observations: list[MapperObservation] = []
-        for frame_id in selected_ids:
-            observation = self.observations.get(frame_id)
-            pose_delta = self.pose_deltas.get(frame_id)
-            if observation is None or pose_delta is None:
-                raise RuntimeError(
-                    f"Pose-only tracking frame {frame_id} is not registered"
-                )
-            observations.append(observation)
-        if self.map.anchor_count() <= 0:
-            return {
-                "steps": 0.0,
-                "reason_empty_committed_map": 1.0,
-                "trainable_pose_count": float(len(selected_ids)),
-            }
-
-        total_start = time.perf_counter()
-        pose_snapshot = {
-            frame_id: self.pose_deltas[frame_id].delta.detach().clone()
-            for frame_id in selected_ids
-        }
-        map_requires_grad = {
-            name: bool(parameter.requires_grad)
-            for name, parameter in self.map.named_parameters()
-        }
-        for parameter in self.map.parameters():
-            parameter.requires_grad_(False)
-            parameter.grad = None
-
-        def restore_map_gradient_state() -> None:
-            for name, parameter in self.map.named_parameters():
-                parameter.requires_grad_(map_requires_grad[name])
-                parameter.grad = None
-
-        pose_parameters = [self.pose_deltas[value].delta for value in selected_ids]
-        try:
-            optimizer = torch.optim.Adam(
-                pose_parameters,
-                lr=float(pose_lr),
-            )
-        except Exception:
-            restore_map_gradient_state()
-            raise
-        configured_steps = sum(max(0, int(steps)) for _, steps in pyramid_steps)
-        interval = max(1, int(validation_interval))
-
-        def validation_loss() -> tuple[float, float]:
-            values: list[float] = []
-            coverages: list[float] = []
-            with torch.no_grad():
-                for observation in observations:
-                    loss, diagnostic = self._spherical_selfi_rgb_objective(
-                        observation,
-                        self.pose_deltas[int(observation.frame_id)](),
-                        resolution_scale=1.0,
-                        validation=True,
-                        holdout_fraction=holdout_fraction,
-                        alpha_threshold=alpha_threshold,
-                        photometric_mode=photometric_mode,
-                        charbonnier_weight=charbonnier_weight,
-                        dssim_weight=dssim_weight,
-                    )
-                    if loss is not None and bool(torch.isfinite(loss)):
-                        values.append(float(loss.detach().cpu()))
-                        coverages.append(float(diagnostic["coverage"]))
-            if not values:
-                return float("inf"), 0.0
-            return sum(values) / len(values), sum(coverages) / len(coverages)
-
-        try:
-            initial_validation, initial_coverage = validation_loss()
-        except Exception:
-            restore_map_gradient_state()
-            raise
-        best_validation = initial_validation
-        best_pose_state = {
-            frame_id: value.clone() for frame_id, value in pose_snapshot.items()
-        }
-        actual_steps = 0
-        non_finite = False
-        train_losses: list[float] = []
-        sampled_counts = {frame_id: 0 for frame_id in selected_ids}
-        try:
-            for resolution_scale, steps in pyramid_steps:
-                for _ in range(max(0, int(steps))):
-                    observation = observations[actual_steps % len(observations)]
-                    optimizer.zero_grad(set_to_none=True)
-                    loss, _ = self._spherical_selfi_rgb_objective(
-                        observation,
-                        self.pose_deltas[int(observation.frame_id)](),
-                        resolution_scale=float(resolution_scale),
-                        validation=False,
-                        holdout_fraction=holdout_fraction,
-                        alpha_threshold=alpha_threshold,
-                        photometric_mode=photometric_mode,
-                        charbonnier_weight=charbonnier_weight,
-                        dssim_weight=dssim_weight,
-                    )
-                    sampled_counts[int(observation.frame_id)] += 1
-                    actual_steps += 1
-                    if loss is None:
-                        continue
-                    if not bool(torch.isfinite(loss).detach().cpu()):
-                        non_finite = True
-                        break
-                    loss.backward()
-                    if float(pose_grad_clip) > 0.0:
-                        torch.nn.utils.clip_grad_norm_(
-                            pose_parameters,
-                            max_norm=float(pose_grad_clip),
-                        )
-                    if not all(
-                        parameter.grad is None
-                        or bool(torch.isfinite(parameter.grad).all().detach().cpu())
-                        for parameter in pose_parameters
-                    ):
-                        non_finite = True
-                        break
-                    optimizer.step()
-                    train_losses.append(float(loss.detach().cpu()))
-                    if actual_steps % interval == 0:
-                        current_validation, _ = validation_loss()
-                        if current_validation < best_validation:
-                            best_validation = current_validation
-                            best_pose_state = {
-                                frame_id: self.pose_deltas[frame_id]
-                                .delta.detach()
-                                .clone()
-                                for frame_id in selected_ids
-                            }
-                if non_finite:
-                    break
-            final_validation, final_coverage = validation_loss()
-            if final_validation < best_validation:
-                best_validation = final_validation
-                best_pose_state = {
-                    frame_id: self.pose_deltas[frame_id].delta.detach().clone()
-                    for frame_id in selected_ids
-                }
-            improved = (
-                math.isfinite(best_validation)
-                and best_validation
-                < initial_validation - float(min_validation_improvement)
-                and not non_finite
-            )
-            selected_state = best_pose_state if improved else pose_snapshot
-            with torch.no_grad():
-                for frame_id, value in selected_state.items():
-                    self.pose_deltas[frame_id].delta.copy_(
-                        value.to(self.pose_deltas[frame_id].delta)
-                    )
-            committed_validation, committed_coverage = validation_loss()
-        finally:
-            restore_map_gradient_state()
-
-        metrics: dict[str, float] = {
-            "steps": float(actual_steps),
-            "configured_steps": float(configured_steps),
-            "trainable_pose_count": float(len(selected_ids)),
-            "map_anchor_count": float(self.map.anchor_count()),
-            "total_seconds": float(time.perf_counter() - total_start),
-            "initial_validation_loss": float(initial_validation),
-            "best_validation_loss": float(best_validation),
-            "final_validation_loss": float(final_validation),
-            "committed_validation_loss": float(committed_validation),
-            "initial_validation_coverage": float(initial_coverage),
-            "final_validation_coverage": float(final_coverage),
-            "committed_validation_coverage": float(committed_coverage),
-            "validation_improved": float(improved),
-            "restored_initial_pose": float(not improved),
-            "non_finite_window": float(non_finite),
-            "loss": (
-                float(sum(train_losses) / len(train_losses))
-                if train_losses
-                else 0.0
-            ),
-        }
-        for frame_id, count in sampled_counts.items():
-            metrics[f"sample_count_frame_{frame_id}"] = float(count)
-        return metrics
-
-    def optimize_spherical_selfi_gaussian_only(
-        self,
-        *,
-        window_id: int,
-        frame_ids: list[int] | tuple[int, ...],
-        iters: int,
-        settings: dict | None = None,
-    ) -> dict[str, float]:
-        """Run one map pass while enforcing bitwise-invariant pose parameters."""
-
-        pose_snapshot = {
-            int(frame_id): pose_delta.delta.detach().clone()
-            for frame_id, pose_delta in self.pose_deltas.items()
-        }
-        cfg = dict(settings or {})
-        cfg["pose_refine_enable"] = False
-        metrics = self.optimize_spherical_selfi_window(
-            window_id=int(window_id),
-            frame_ids=frame_ids,
-            iters=int(iters),
-            settings=cfg,
-            extra_loss_fn=None,
-        )
-        pose_changed = False
-        for frame_id, before in pose_snapshot.items():
-            current = self.pose_deltas.get(frame_id)
-            if current is None or not torch.equal(
-                current.delta.detach().cpu(), before.detach().cpu()
-            ):
-                pose_changed = True
-                break
-        if pose_changed:
-            self.rollback_spherical_selfi_window()
-            raise RuntimeError(
-                "Gaussian-only spherical-Selfi mapping modified a pose parameter"
-            )
-        metrics["pose_bitwise_unchanged"] = 1.0
-        metrics["trainable_pose_count"] = 0.0
         return metrics
 
     def commit_spherical_selfi_window(self) -> None:
@@ -4231,18 +3844,6 @@ class PanoGaussianMapper:
         observations = self._selected_observations_for_ids(window_ids)
         if not observations:
             return {"loss": 0.0, "steps": 0.0, "window_size": 0.0}
-        replay_ids = [
-            int(value)
-            for value in cfg.get("replay_frame_ids", ())
-            if int(value) not in {int(obs.frame_id) for obs in observations}
-        ]
-        replay_observations = self._selected_observations_for_ids(replay_ids)
-        validation_ids = [
-            int(value) for value in cfg.get("validation_frame_ids", ())
-        ]
-        validation_observations = self._selected_observations_for_ids(
-            validation_ids
-        )
         if not bool(cfg.get("optimize_non_keyframe_observations", True)):
             observations = [obs for obs in observations if bool(obs.is_keyframe)]
         if not observations:
@@ -4323,8 +3924,7 @@ class PanoGaussianMapper:
         )
         photometric_only = bool(cfg.get("photometric_only", False))
         loss_weights = self._feedforward_loss_weights(
-            photometric_only=photometric_only,
-            config=cfg,
+            photometric_only=photometric_only
         )
         pose_prior_weight = (
             0.0
@@ -4346,7 +3946,6 @@ class PanoGaussianMapper:
         sky_pruned_total = 0
         chunk_compacted = 0
         sampling_schedule: list[MapperObservation] | None = None
-        replay_schedule: list[MapperObservation] = []
         sampled_frame_counts: dict[int, int] = {}
         if str(cfg.get("sampler", "")).lower() == "shuffled_cycle":
             rng = random.Random(int(cfg.get("sampler_seed", 123)) + sum(int(obs.frame_id) for obs in observations))
@@ -4356,123 +3955,17 @@ class PanoGaussianMapper:
                 rng.shuffle(cycle)
                 sampling_schedule.extend(cycle)
             sampling_schedule = sampling_schedule[: max(0, steps)]
-            if replay_observations:
-                while len(replay_schedule) < max(0, steps):
-                    cycle = list(replay_observations)
-                    rng.shuffle(cycle)
-                    replay_schedule.extend(cycle)
-                replay_schedule = replay_schedule[: max(0, steps)]
-        active_rows = (
-            torch.nonzero(gaussian_scales > 0.0, as_tuple=False).flatten()
-            if gaussian_scales is not None
-            else torch.zeros(0, device=device, dtype=torch.long)
-        )
-        restore_best_gaussians = bool(
-            cfg.get("restore_best_gaussians", False)
-        ) and int(active_rows.numel()) > 0
-
-        def snapshot_active_gaussians() -> dict[str, torch.Tensor]:
-            if not restore_best_gaussians:
-                return {}
-            count = self.map.anchor_count()
-            return {
-                name: parameter.detach().index_select(0, active_rows).clone()
-                for name, parameter in self.map.named_parameters()
-                if parameter.ndim > 0 and int(parameter.shape[0]) == count
-            }
-
-        def restore_active_gaussians(
-            state: dict[str, torch.Tensor],
-        ) -> None:
-            if not state:
-                return
-            with torch.no_grad():
-                for name, parameter in self.map.named_parameters():
-                    saved = state.get(name)
-                    if saved is not None:
-                        parameter.index_copy_(
-                            0,
-                            active_rows,
-                            saved.to(parameter),
-                        )
-
-        def validation_objective() -> tuple[float, float]:
-            if not validation_observations:
-                return float("inf"), 0.0
-            values: list[float] = []
-            coverages: list[float] = []
-            with torch.no_grad():
-                for observation in validation_observations:
-                    pose = self._observation_pose(
-                        observation,
-                        trainable_pose_ids=set(),
-                    ).detach()
-                    value, diagnostic = self._spherical_selfi_rgb_objective(
-                        observation,
-                        pose,
-                        resolution_scale=1.0,
-                        validation=True,
-                        holdout_fraction=float(
-                            cfg.get("holdout_fraction", 0.20)
-                        ),
-                        alpha_threshold=float(
-                            cfg.get("alpha_threshold", 0.05)
-                        ),
-                        photometric_mode=str(
-                            cfg.get(
-                                "photometric_loss_mode",
-                                "charbonnier_dssim",
-                            )
-                        ),
-                        charbonnier_weight=float(
-                            cfg.get("charbonnier_weight", 0.85)
-                        ),
-                        dssim_weight=float(cfg.get("dssim_weight", 0.15)),
-                    )
-                    if value is not None and bool(torch.isfinite(value)):
-                        values.append(float(value.detach().cpu()))
-                        coverages.append(float(diagnostic["coverage"]))
-            if not values:
-                return float("inf"), 0.0
-            return sum(values) / len(values), sum(coverages) / len(coverages)
-
-        initial_validation, initial_validation_coverage = validation_objective()
-        best_validation = initial_validation
-        best_gaussian_state = snapshot_active_gaussians()
-        validation_interval = max(1, int(cfg.get("validation_interval", 25)))
-        replay_every = max(0, int(cfg.get("replay_every", 0)))
-        replay_cursor = 0
-        primary_cursor = 0
         non_finite_window = False
         for step_idx in range(max(0, steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
             section_start = time.perf_counter()
-            use_replay = bool(
-                replay_observations
-                and replay_every > 0
-                and (step_idx + 1) % replay_every == 0
+            sampled = (
+                [sampling_schedule[step_idx]]
+                if sampling_schedule is not None
+                else self._sample_observations_for_step(observations)
             )
-            if sampling_schedule is not None:
-                sampled = [
-                    sampling_schedule[primary_cursor % len(sampling_schedule)]
-                ]
-                primary_cursor += 1
-            else:
-                sampled = self._sample_observations_for_step(observations)
-            if use_replay:
-                if replay_schedule:
-                    sampled.append(
-                        replay_schedule[replay_cursor % len(replay_schedule)]
-                    )
-                else:
-                    sampled.append(
-                        replay_observations[
-                            replay_cursor % len(replay_observations)
-                        ]
-                    )
-                replay_cursor += 1
             sample_sec += time.perf_counter() - section_start
             last_sampled_ids = [int(obs.frame_id) for obs in sampled]
             for frame_id in last_sampled_ids:
@@ -4496,26 +3989,6 @@ class PanoGaussianMapper:
                 sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
                 pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
                 non_sky_mask = None if sky_mask is None else ~sky_mask.to(device=device, dtype=torch.bool)
-                photometric_mask = non_sky_mask
-                if restore_best_gaussians:
-                    finite_rgb = torch.isfinite(target).all(
-                        dim=0, keepdim=True
-                    ) & torch.isfinite(pkg["render"]).all(
-                        dim=0, keepdim=True
-                    )
-                    train_split = self._deterministic_rgb_split_mask(
-                        H,
-                        W,
-                        frame_id=int(obs.frame_id),
-                        holdout_fraction=float(
-                            cfg.get("holdout_fraction", 0.20)
-                        ),
-                        validation=False,
-                        device=device,
-                    )
-                    photometric_mask = finite_rgb & train_split
-                    if non_sky_mask is not None:
-                        photometric_mask &= non_sky_mask
                 target_depth = (
                     None
                     if photometric_only or obs.target_depth is None
@@ -4532,7 +4005,6 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
-                    photometric_mask=photometric_mask,
                     depth_mask=non_sky_mask,
                     weights=loss_weights,
                 )
@@ -4611,14 +4083,6 @@ class PanoGaussianMapper:
             }
             last["loss"] = float(loss.detach().cpu())
             current = float(last["loss"])
-            if (
-                restore_best_gaussians
-                and actual_steps % validation_interval == 0
-            ):
-                current_validation, _ = validation_objective()
-                if current_validation < best_validation:
-                    best_validation = current_validation
-                    best_gaussian_state = snapshot_active_gaussians()
             if min_delta > 0.0 and patience > 0:
                 if current < best - min_delta:
                     best = current
@@ -4628,15 +4092,6 @@ class PanoGaussianMapper:
                     if stale >= patience:
                         last["early_stop_step"] = float(actual_steps)
                         break
-        final_validation, final_validation_coverage = validation_objective()
-        if restore_best_gaussians:
-            if final_validation < best_validation:
-                best_validation = final_validation
-                best_gaussian_state = snapshot_active_gaussians()
-            restore_active_gaussians(best_gaussian_state)
-        committed_validation, committed_validation_coverage = (
-            validation_objective()
-        )
         active_mask = None
         if self.map.anchor_count() > 0:
             active_mask = self._active_anchor_mask_for_keyframes(active_keyframe_ids_for_update)
@@ -4673,30 +4128,6 @@ class PanoGaussianMapper:
         last["last_sampled_keyframe"] = float(last_sampled_ids[0]) if last_sampled_ids else -1.0
         last["trainable_pose_count"] = float(len(trainable_pose_ids))
         last["photometric_only"] = float(photometric_only)
-        last["replay_frame_count"] = float(len(replay_observations))
-        last["replay_sample_count"] = float(
-            sum(
-                sampled_frame_counts.get(int(obs.frame_id), 0)
-                for obs in replay_observations
-            )
-        )
-        last["validation_frame_count"] = float(
-            len(validation_observations)
-        )
-        last["initial_validation_loss"] = float(initial_validation)
-        last["best_validation_loss"] = float(best_validation)
-        last["final_validation_loss"] = float(final_validation)
-        last["committed_validation_loss"] = float(committed_validation)
-        last["initial_validation_coverage"] = float(
-            initial_validation_coverage
-        )
-        last["final_validation_coverage"] = float(
-            final_validation_coverage
-        )
-        last["committed_validation_coverage"] = float(
-            committed_validation_coverage
-        )
-        last["restored_best_gaussians"] = float(restore_best_gaussians)
         last["frontend_graph_window_hint_count"] = float(len(self.frontend_graph_window_ids))
         last["feedforward_opacity_resets"] = float(prune_stats.get("opacity_resets", 0))
         last["feedforward_pruned"] = float(prune_stats.get("pruned", 0))
@@ -4923,29 +4354,18 @@ class PanoGaussianMapper:
         self,
         *,
         photometric_only: bool,
-        config: dict | None = None,
     ) -> BackendLossWeights:
         if not photometric_only:
             return self.loss_weights
-        cfg = dict(config or {})
         return BackendLossWeights(
             photometric=float(self.loss_weights.photometric),
             depth=0.0,
             opacity=0.0,
             distortion=0.0,
             sky_alpha=0.0,
-            photometric_mode=str(
-                cfg.get(
-                    "photometric_loss_mode",
-                    self.loss_weights.photometric_mode,
-                )
-            ),
-            rgb_l1_weight=float(
-                cfg.get("charbonnier_weight", self.loss_weights.rgb_l1_weight)
-            ),
-            dssim_weight=float(
-                cfg.get("dssim_weight", self.loss_weights.dssim_weight)
-            ),
+            photometric_mode=str(self.loss_weights.photometric_mode),
+            rgb_l1_weight=float(self.loss_weights.rgb_l1_weight),
+            dssim_weight=float(self.loss_weights.dssim_weight),
             depth_loss_mode=str(self.loss_weights.depth_loss_mode),
             depth_residual_clamp=float(self.loss_weights.depth_residual_clamp),
         )

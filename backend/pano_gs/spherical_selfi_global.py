@@ -158,19 +158,6 @@ class PoseStateConsistencyReport:
         }
 
 
-@dataclass
-class _PreparedPacketCandidate:
-    """Backend-owned packet state prepared before RGB registration."""
-
-    packet: LocalGaussianWindowPacket
-    start_transform: torch.Tensor | None = None
-    alignment_diagnostics: dict[str, Any] = field(default_factory=dict)
-    aligned: bool = False
-    refined_packet: bool = False
-    refiner_pending: bool = False
-    canonicalized: bool = False
-
-
 @dataclass(frozen=True)
 class ChunkStrideHoldout:
     source: int
@@ -319,13 +306,6 @@ class SphericalSelfiGlobalBackend:
         hierarchical_cfg = dict(self.config.get("hierarchical_submaps", {}) or {})
         fusion_cfg = dict(self.config.get("voxel_fusion", {}) or {})
         optimize_cfg = dict(self.config.get("map_optimization", {}) or {})
-        two_stage_cfg = dict(optimize_cfg.get("two_stage", {}) or {})
-        pose_tracking_cfg = dict(
-            two_stage_cfg.get("prefusion_pose_tracking", {}) or {}
-        )
-        gaussian_mapping_cfg = dict(
-            two_stage_cfg.get("postfusion_gaussian_mapping", {}) or {}
-        )
         lazy_map_cfg = dict(optimize_cfg.get("lazy_submap_transforms", {}) or {})
         validation_cfg = dict(self.config.get("geometry_validation", {}) or {})
         seam_check_cfg = dict(
@@ -805,23 +785,6 @@ class SphericalSelfiGlobalBackend:
             graph_cfg.get("max_scale_change", 2.5)
         )
         self.map_steps_per_window = max(0, int(optimize_cfg.get("steps_per_window", 0)))
-        self.two_stage_map_optimization_enabled = bool(
-            two_stage_cfg.get("enabled", False)
-        )
-        self.prefusion_pose_tracking_enabled = bool(
-            pose_tracking_cfg.get("enabled", True)
-        )
-        self.prefusion_pose_tracking_config = pose_tracking_cfg
-        self.postfusion_gaussian_mapping_config = gaussian_mapping_cfg
-        if self.two_stage_map_optimization_enabled:
-            if not self.chunk_first_stride_graph:
-                raise ValueError(
-                    "map_optimization.two_stage requires chunk_first_stride graph mode"
-                )
-            if self.mapper is None:
-                raise ValueError(
-                    "map_optimization.two_stage requires a backend Mapper"
-                )
         self.map_optimize_recent_windows = max(
             1,
             int(optimize_cfg.get("recent_window_count", 1)),
@@ -1090,8 +1053,6 @@ class SphericalSelfiGlobalBackend:
         self._pending_geometry_batch: FrameGeometryUpdateBatch | None = None
         self._pending_map_optimization: list[tuple[int, tuple[int, ...], int]] = []
         self._optimization_packets: dict[int, LocalGaussianWindowPacket] = {}
-        self._prepared_packet_candidates: dict[int, _PreparedPacketCandidate] = {}
-        self._prepared_packet_candidate_order: list[int] = []
         self._pending_seam_owner_windows: set[int] = set()
         self._last_rendered_overlap_diagnostic: dict[str, torch.Tensor] | None = None
         self._last_overlap_alignment_failure: dict[str, Any] | None = None
@@ -1899,212 +1860,6 @@ class SphericalSelfiGlobalBackend:
         if bool(refined.metadata.get("voxel_anchor_refiner_pending", False)):
             raise RuntimeError("Pose-canonicalized Refiner packet is still pending")
         return refined
-
-    def _prepare_chunk_first_two_stage_candidate(
-        self,
-        packet: LocalGaussianWindowPacket,
-    ) -> _PreparedPacketCandidate:
-        """Canonicalize one packet without mutating graph, map, or history."""
-
-        if not self.chunk_first_stride_graph:
-            raise RuntimeError(
-                "Two-stage packet preparation requires chunk_first_stride"
-            )
-        refined_packet = self._validate_refined_packet(packet)
-        refiner_pending = bool(
-            packet.metadata.get("voxel_anchor_refiner_pending", False)
-        )
-        if refined_packet:
-            packet = self._rescaled_packet_copy(packet, 1.0)
-        window_id = int(packet.window_id)
-        if window_id in self.packets:
-            raise ValueError(f"Duplicate local Gaussian window id {window_id}")
-        if len(packet.frame_ids) <= self.chunk_stride_target_index:
-            raise ValueError(
-                "chunk_first_stride requires the configured next-anchor frame"
-            )
-        start_frame = int(packet.frame_ids[0])
-        if not self.window_order:
-            start_transform = sim3_identity(
-                device=packet.local_poses_c2w.device,
-                dtype=packet.local_poses_c2w.dtype,
-            )
-            diagnostics: dict[str, Any] = {
-                "reason": "first_window",
-                "mode": self.rendered_overlap_alignment_mode,
-                "shared_scale": 1.0,
-                "s_shared": 1.0,
-                "absolute_scale": 1.0,
-                "s_absolute": 1.0,
-                "chunk_scale_normalization": 1.0,
-                "c": 1.0,
-                "accepted": True,
-            }
-        else:
-            previous_id = int(self.window_order[-1])
-            previous_packet = self._last_full_packet
-            if (
-                previous_packet is None
-                or int(previous_packet.window_id) != previous_id
-            ):
-                raise RuntimeError(
-                    "The previous full-resolution window packet is unavailable"
-                )
-            if start_frame not in self.graph.nodes:
-                raise RuntimeError(
-                    f"Canonical chunk-first node {start_frame} is missing"
-                )
-            previous_transform = self._window_anchor_transforms()[
-                previous_id
-            ].to(packet.local_poses_c2w)
-            local_scale, diagnostics = self._estimate_canonical_ba_overlap_scale(
-                previous_packet,
-                packet,
-            )
-            if local_scale is None:
-                raise RuntimeError(
-                    f"Window {window_id} BA-overlap scale failed: "
-                    f"{diagnostics.get('reason', 'unknown')}"
-                )
-            normalized = self._rescaled_packet_copy(packet, local_scale)
-            start_transform = self.graph.transform(start_frame).clone().to(
-                normalized.local_poses_c2w
-            )
-            overlap = self._overlap_frame_ids(previous_packet, normalized)
-            known_global_poses = tuple(
-                self._known_overlap_global_pose(
-                    previous_packet,
-                    frame_id,
-                    previous_transform,
-                )
-                for frame_id in overlap
-            )
-            predicted_second = apply_sim3_to_c2w(
-                start_transform,
-                normalized.local_poses_c2w[1],
-            )
-            overlap_rotation_error = self._rotation_error_deg(
-                known_global_poses[1][:3, :3].to(predicted_second),
-                predicted_second[:3, :3],
-            )
-            overlap_center_error = float(
-                torch.linalg.norm(
-                    known_global_poses[1][:3, 3].to(predicted_second)
-                    - predicted_second[:3, 3]
-                )
-                .detach()
-                .cpu()
-            )
-            diagnostics = dict(diagnostics)
-            diagnostics.update(
-                {
-                    "graph_role": "diagnostic_only_no_factor",
-                    "existing_node_id": start_frame,
-                    "raw_ba_to_canonical_rotation_error_deg": (
-                        overlap_rotation_error
-                    ),
-                    "raw_ba_to_canonical_center_error": overlap_center_error,
-                    "node_sim3_scale_updated": False,
-                    "quality_gating_enabled": False,
-                    "accepted": True,
-                    "reason": "accepted_without_overlap_pose_gate",
-                }
-            )
-            packet = self._canonicalize_packet_from_two_known_poses(
-                normalized,
-                start_transform,
-                (known_global_poses[0], known_global_poses[1]),
-            )
-            packet.metadata["global_alignment_local_scale"] = float(local_scale)
-        packet.metadata["two_stage_candidate_prepared"] = True
-        packet.metadata["two_stage_candidate_map_anchor_count"] = int(
-            self.map.anchor_count()
-        )
-        return _PreparedPacketCandidate(
-            packet=packet,
-            start_transform=start_transform.detach().clone(),
-            alignment_diagnostics=dict(diagnostics),
-            aligned=True,
-            refined_packet=bool(refined_packet),
-            refiner_pending=bool(refiner_pending),
-            canonicalized=True,
-        )
-
-    def prepare_packet_candidate(
-        self,
-        packet: LocalGaussianWindowPacket,
-    ) -> int:
-        """Prepare an immutable backend candidate before its RGB is registered."""
-
-        window_id = int(packet.window_id)
-        if (
-            window_id in self._prepared_packet_candidates
-            or window_id in self.packets
-        ):
-            raise ValueError(f"Duplicate local Gaussian window id {window_id}")
-        use_two_stage = bool(
-            self.two_stage_map_optimization_enabled
-            and self.boundary_frame_graph
-            and self.chunk_first_stride_graph
-            and self._packet_uses_voxel_refiner(packet)
-            and len(packet.frame_ids) == 4
-        )
-        try:
-            candidate = (
-                self._prepare_chunk_first_two_stage_candidate(packet)
-                if use_two_stage
-                else _PreparedPacketCandidate(packet=packet)
-            )
-        except Exception:
-            if (
-                self._packet_uses_voxel_refiner(packet)
-                and self.packet_refiner_release is not None
-            ):
-                self.packet_refiner_release(window_id)
-            raise
-        self._prepared_packet_candidates[window_id] = candidate
-        self._prepared_packet_candidate_order.append(window_id)
-        return window_id
-
-    def pending_packet_candidate_ids(self) -> tuple[int, ...]:
-        return tuple(self._prepared_packet_candidate_order)
-
-    def track_and_commit_candidate(
-        self,
-        window_id: int,
-    ) -> GlobalWindowBackendResult:
-        """Track, refine, fuse, and atomically commit one prepared candidate."""
-
-        value = int(window_id)
-        candidate = self._prepared_packet_candidates.get(value)
-        if candidate is None:
-            raise KeyError(f"Unknown prepared packet candidate {value}")
-        try:
-            if candidate.canonicalized and self.mapper is not None:
-                prepared = self.mapper.prepare_spherical_selfi_window(
-                    candidate.packet.frame_ids
-                )
-                if prepared != len(candidate.packet.frame_ids):
-                    raise RuntimeError(
-                        f"window {value} has "
-                        f"{prepared}/{len(candidate.packet.frame_ids)} "
-                        "registered RGB observations"
-                    )
-            if self.boundary_frame_graph:
-                return self._process_boundary_packet(
-                    candidate.packet,
-                    prepared_candidate=(
-                        candidate if candidate.canonicalized else None
-                    ),
-                )
-            return self._process_window_anchor_packet(candidate.packet)
-        finally:
-            self._prepared_packet_candidates.pop(value, None)
-            self._prepared_packet_candidate_order = [
-                item
-                for item in self._prepared_packet_candidate_order
-                if int(item) != value
-            ]
 
     @staticmethod
     def _single_camera_render_tensor(
@@ -6734,35 +6489,6 @@ class SphericalSelfiGlobalBackend:
                 int(window_id)
             )
             fixed_frame_ids: list[int] = []
-            gaussian_only = bool(
-                self.two_stage_map_optimization_enabled
-                and live_packet is not None
-                and live_packet.metadata.get(
-                    "two_stage_candidate_prepared", False
-                )
-            )
-            gaussian_config = self.postfusion_gaussian_mapping_config
-            replay_frame_ids: tuple[int, ...] = ()
-            validation_frame_ids: tuple[int, ...] = ()
-            if gaussian_only:
-                primary = list(optimized_frame_ids)
-                replay_frame_ids = tuple(
-                    int(frame_id)
-                    for frame_id in sorted(self.mapper.observations)
-                    if int(frame_id) not in set(primary)
-                )
-                if len(primary) <= 4:
-                    validation_frame_ids = tuple(primary)
-                elif primary:
-                    selected_indices = tuple(
-                        dict.fromkeys(
-                            int(round(index * (len(primary) - 1) / 3.0))
-                            for index in range(4)
-                        )
-                    )
-                    validation_frame_ids = tuple(
-                        primary[index] for index in selected_indices
-                    )
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
                 "separate_gaussian_lrs": bool(self.map_optimize_config.get("separate_gaussian_lrs", False)),
@@ -6776,14 +6502,8 @@ class SphericalSelfiGlobalBackend:
                     self.map_optimize_config.get("scale_gaussian_parameter_updates", False)
                 ),
                 "pose_lr": float(self.map_optimize_config.get("pose_lr", 1.0e-3)),
-                "pose_refine_enable": (
-                    False
-                    if gaussian_only
-                    else bool(
-                        self.map_optimize_config.get(
-                            "pose_refine_enable", True
-                        )
-                    )
+                "pose_refine_enable": bool(
+                    self.map_optimize_config.get("pose_refine_enable", True)
                 ),
                 "pose_prior_weight": (
                     0.0
@@ -6797,58 +6517,21 @@ class SphericalSelfiGlobalBackend:
                 "active_owner_window_ids": active_owner_window_ids,
                 "photometric_only": self.map_optimize_photometric_only,
                 "optimize_skybox": self.map_optimize_skybox,
-                "replay_frame_ids": replay_frame_ids,
-                "replay_every": int(
-                    gaussian_config.get("replay_every", 2)
-                ),
-                "validation_frame_ids": validation_frame_ids,
-                "validation_interval": int(
-                    gaussian_config.get("validation_interval", 25)
-                ),
-                "restore_best_gaussians": bool(
-                    gaussian_config.get("restore_best_gaussians", True)
-                ),
-                "holdout_fraction": float(
-                    gaussian_config.get("holdout_fraction", 0.20)
-                ),
-                "alpha_threshold": float(
-                    gaussian_config.get("alpha_threshold", 0.05)
-                ),
-                "photometric_loss_mode": str(
-                    gaussian_config.get(
-                        "photometric_loss_mode", "charbonnier_dssim"
+            }
+            metrics = self.mapper.optimize_spherical_selfi_window(
+                window_id=int(window_id),
+                frame_ids=list(optimized_frame_ids),
+                iters=int(steps),
+                settings=settings,
+                extra_loss_fn=(
+                    None
+                    if self.map_optimize_photometric_only
+                    else lambda trainable_pose_ids: self._joint_graph_pose_loss(
+                        int(window_id), trainable_pose_ids
                     )
                 ),
-                "charbonnier_weight": float(
-                    gaussian_config.get("charbonnier_weight", 0.85)
-                ),
-                "dssim_weight": float(
-                    gaussian_config.get("dssim_weight", 0.15)
-                ),
-            }
-            if gaussian_only:
-                metrics = self.mapper.optimize_spherical_selfi_gaussian_only(
-                    window_id=int(window_id),
-                    frame_ids=list(optimized_frame_ids),
-                    iters=int(steps),
-                    settings=settings,
-                )
-            else:
-                metrics = self.mapper.optimize_spherical_selfi_window(
-                    window_id=int(window_id),
-                    frame_ids=list(optimized_frame_ids),
-                    iters=int(steps),
-                    settings=settings,
-                    extra_loss_fn=(
-                        None
-                        if self.map_optimize_photometric_only
-                        else lambda trainable_pose_ids: self._joint_graph_pose_loss(
-                            int(window_id), trainable_pose_ids
-                        )
-                    ),
-                )
+            )
             metrics["pose_refine_enabled"] = float(settings["pose_refine_enable"])
-            metrics["gaussian_only_mapping"] = float(gaussian_only)
             metrics["optimized_frame_count"] = float(len(optimized_frame_ids))
             metrics["active_owner_window_count"] = float(
                 len(active_owner_window_ids)
@@ -6857,9 +6540,6 @@ class SphericalSelfiGlobalBackend:
                 self.map_optimize_photometric_only
             )
             if float(metrics.get("window_rollback", 0.0)) == 0.0:
-                if gaussian_only:
-                    self.mapper.commit_spherical_selfi_window()
-                    return metrics
                 try:
                     self._synchronize_joint_optimized_window(
                         int(window_id),
@@ -7733,19 +7413,15 @@ class SphericalSelfiGlobalBackend:
             },
             packet_variant_count=packet_variant_count,
         )
-        owner_sync_required = bool(
-            self.fusion.lazy_owner_transforms
-            or self._owner_transforms_changed(
-                old_window_transforms,
-                all_window_transforms,
-            )
-        )
         correction = (
             self.fusion.apply_owner_corrections(
                 old_window_transforms,
                 all_window_transforms,
             )
-            if owner_sync_required
+            if self._owner_transforms_changed(
+                old_window_transforms,
+                all_window_transforms,
+            )
             else {"moved": 0, "deduplicated": 0}
         )
         self._synchronize_mapper_pose_cache(
@@ -7763,9 +7439,6 @@ class SphericalSelfiGlobalBackend:
                 f"{report.reason}; matrix={report.max_matrix_error:.3e}, "
                 f"rotation={report.max_rotation_error_deg:.3e}deg, "
                 f"center={report.max_center_error:.3e}, "
-                f"submap={report.max_submap_matrix_error:.3e}, "
-                f"lazy_owner={report.max_lazy_owner_matrix_error:.3e}, "
-                f"mapper={report.max_mapper_matrix_error:.3e}, "
                 f"revision_mismatches={report.revision_mismatch_count}"
             )
         self._pose_state_revision = int(revision)
@@ -8612,151 +8285,9 @@ class SphericalSelfiGlobalBackend:
             metadata=metadata,
         )
 
-    def _run_prefusion_pose_tracking(
-        self,
-        packet: LocalGaussianWindowPacket,
-        start_transform: torch.Tensor,
-    ) -> tuple[LocalGaussianWindowPacket, dict[str, Any]]:
-        """Refine only the two new global poses against the committed map."""
-
-        if (
-            not self.two_stage_map_optimization_enabled
-            or not self.prefusion_pose_tracking_enabled
-        ):
-            return packet, {
-                "enabled": False,
-                "reason": "prefusion_pose_tracking_disabled",
-            }
-        if self.mapper is None:
-            raise RuntimeError("Pre-fusion pose tracking requires a Mapper")
-        if not self.window_order:
-            return packet, {
-                "enabled": True,
-                "accepted": True,
-                "steps": 0,
-                "reason": "first_window_has_no_committed_map",
-            }
-        if len(packet.frame_ids) != 4:
-            raise RuntimeError(
-                "Pre-fusion pose tracking currently requires a four-frame packet"
-            )
-        owner_rows = getattr(self.map, "_anchor_owner_window_id", None)
-        if torch.is_tensor(owner_rows) and bool(
-            (owner_rows == int(packet.window_id)).any().detach().cpu()
-        ):
-            raise RuntimeError(
-                "Candidate owner is already present in the committed map before tracking"
-            )
-        initial_global_poses = packet.global_poses(start_transform)
-        prepared = self.mapper.prepare_spherical_selfi_window(packet.frame_ids)
-        if prepared != len(packet.frame_ids):
-            raise RuntimeError(
-                f"window {packet.window_id} has {prepared}/{len(packet.frame_ids)} "
-                "registered RGB observations before pose-only tracking"
-            )
-        provisional_revision = max(
-            int(self._pose_state_revision),
-            int(self._geometry_revision),
-        ) + 1
-        self.mapper.apply_canonical_pose_state(
-            {
-                int(frame_id): initial_global_poses[index]
-                for index, frame_id in enumerate(packet.frame_ids)
-            },
-            revision=provisional_revision,
-        )
-        config = self.prefusion_pose_tracking_config
-        pyramid_steps = (
-            (
-                float(config.get("quarter_resolution_scale", 0.25)),
-                int(config.get("quarter_resolution_steps", 12)),
-            ),
-            (
-                float(config.get("half_resolution_scale", 0.5)),
-                int(config.get("half_resolution_steps", 18)),
-            ),
-            (1.0, int(config.get("full_resolution_steps", 30))),
-        )
-        new_frame_ids = tuple(int(value) for value in packet.frame_ids[2:4])
-        metrics = self.mapper.optimize_spherical_selfi_pose_only(
-            frame_ids=new_frame_ids,
-            pyramid_steps=pyramid_steps,
-            pose_lr=float(config.get("pose_lr", 2.0e-4)),
-            pose_grad_clip=float(config.get("pose_grad_clip", 1.0e-3)),
-            alpha_threshold=float(config.get("alpha_threshold", 0.05)),
-            holdout_fraction=float(config.get("holdout_fraction", 0.20)),
-            validation_interval=int(config.get("validation_interval", 10)),
-            min_validation_improvement=float(
-                config.get("min_validation_improvement", 0.0)
-            ),
-            photometric_mode=str(
-                config.get("photometric_loss_mode", "charbonnier_dssim")
-            ),
-            charbonnier_weight=float(config.get("charbonnier_weight", 0.85)),
-            dssim_weight=float(config.get("dssim_weight", 0.15)),
-        )
-        local_poses = packet.local_poses_c2w.detach().clone()
-        # The two overlap poses are immutable anchors for this tracking pass.
-        for index, frame_id in enumerate(packet.frame_ids[2:4], start=2):
-            refined_global = self.mapper.refined_pose_c2w(int(frame_id))
-            if refined_global is None:
-                raise RuntimeError(
-                    f"Pose-only tracking did not retain frame {int(frame_id)}"
-                )
-            tracking_anchor = start_transform.to(
-                device=refined_global.device,
-                dtype=refined_global.dtype,
-            )
-            local_poses[index] = canonicalize_c2w(
-                rebase_c2w_to_sim3_anchor(
-                    tracking_anchor,
-                    refined_global.to(tracking_anchor),
-                )
-            ).to(local_poses)
-        observation = packet.observation.with_geometry(
-            poses_c2w=local_poses.unsqueeze(0).to(
-                packet.observation.poses_c2w
-            )
-        )
-        anchor_observation = packet.anchor_observation
-        if anchor_observation is not None:
-            anchor_observation = replace(
-                anchor_observation,
-                local_poses_c2w=local_poses.unsqueeze(0).to(
-                    anchor_observation.local_poses_c2w
-                ),
-            )
-        metadata = dict(packet.metadata)
-        metadata["prefusion_pose_tracking_enabled"] = True
-        metadata["prefusion_pose_tracking_revision"] = int(
-            provisional_revision
-        )
-        metadata["prefusion_pose_tracking_metrics"] = dict(metrics)
-        tracked = replace(
-            packet,
-            local_poses_c2w=local_poses,
-            observation=observation,
-            anchor_observation=anchor_observation,
-            metadata=metadata,
-        )
-        diagnostics: dict[str, Any] = {
-            "enabled": True,
-            "accepted": bool(metrics.get("validation_improved", 0.0)),
-            "candidate_owner_excluded": True,
-            "fixed_overlap_frame_ids": [
-                int(value) for value in packet.frame_ids[:2]
-            ],
-            "optimized_new_frame_ids": list(new_frame_ids),
-            "candidate_revision": int(provisional_revision),
-            **metrics,
-        }
-        return tracked, diagnostics
-
     def _process_boundary_packet_impl(
         self,
         packet: LocalGaussianWindowPacket,
-        *,
-        prepared_candidate: _PreparedPacketCandidate | None = None,
     ) -> GlobalWindowBackendResult:
         if not self.enabled:
             raise RuntimeError("SphericalSelfiGlobalBackend is disabled")
@@ -8772,19 +8303,14 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(
                 "chunk_first_stride requires the configured next-anchor frame"
             )
-        if prepared_candidate is not None:
-            packet = prepared_candidate.packet
-            refined_packet = bool(prepared_candidate.refined_packet)
-            refiner_pending = bool(prepared_candidate.refiner_pending)
-        else:
-            refined_packet = self._validate_refined_packet(packet)
-            refiner_pending = bool(
-                packet.metadata.get("voxel_anchor_refiner_pending", False)
-            )
-            if refined_packet:
-                # Keep the frontend-owned packet immutable even for the first
-                # chunk or for failures after alignment has succeeded.
-                packet = self._rescaled_packet_copy(packet, 1.0)
+        refined_packet = self._validate_refined_packet(packet)
+        refiner_pending = bool(
+            packet.metadata.get("voxel_anchor_refiner_pending", False)
+        )
+        if refined_packet:
+            # Keep the frontend-owned packet immutable even for the first
+            # chunk or for failures after alignment has succeeded.
+            packet = self._rescaled_packet_copy(packet, 1.0)
 
         start_frame = int(packet.frame_ids[0])
         end_frame = int(packet.frame_ids[-1])
@@ -8792,18 +8318,7 @@ class SphericalSelfiGlobalBackend:
         sequential_overlap_edge: Sim3GraphEdge | None = None
         sequential_overlap_dense: tuple[DenseSphericalFactorBlock, ...] = ()
         sequential_overlap_pose: tuple[CoincidentPanoramaFactor, ...] = ()
-        previous_packet = self._last_full_packet
-        if prepared_candidate is not None:
-            if prepared_candidate.start_transform is None:
-                raise RuntimeError("Prepared packet has no canonical transform")
-            aligned = bool(prepared_candidate.aligned)
-            start_transform = prepared_candidate.start_transform.clone().to(
-                packet.local_poses_c2w
-            )
-            alignment_diagnostics = dict(
-                prepared_candidate.alignment_diagnostics
-            )
-        elif not self.window_order:
+        if not self.window_order:
             aligned = True
             start_transform = sim3_identity(device=packet.local_poses_c2w.device)
             alignment_diagnostics = {
@@ -8829,6 +8344,7 @@ class SphericalSelfiGlobalBackend:
                 packet = self._finalize_pose_canonicalized_refiner_packet(packet)
         else:
             previous_id = int(self.window_order[-1])
+            previous_packet = self._last_full_packet
             if previous_packet is None or int(previous_packet.window_id) != previous_id:
                 raise RuntimeError("The previous full-resolution window packet is unavailable")
             if self.chunk_first_stride_graph:
@@ -9241,18 +8757,6 @@ class SphericalSelfiGlobalBackend:
                         }
                     )
                     aligned = True
-
-        prefusion_pose_diagnostics: dict[str, Any] = {
-            "enabled": False,
-            "reason": "legacy_single_stage_packet",
-        }
-        if prepared_candidate is not None:
-            packet, prefusion_pose_diagnostics = (
-                self._run_prefusion_pose_tracking(packet, start_transform)
-            )
-            alignment_diagnostics["prefusion_pose_tracking"] = dict(
-                prefusion_pose_diagnostics
-            )
 
         # Recovery state is needed only while this packet is the incoming
         # target.  Once admitted it becomes the canonical source for the next
@@ -9892,20 +9396,6 @@ class SphericalSelfiGlobalBackend:
                 seam_diagnostics = state_report.as_diagnostics()
                 seam_diagnostics["enforced"] = True
                 seam_diagnostics["transaction_committed"] = True
-        elif prepared_candidate is not None and self.chunk_first_stride_graph:
-            # A pure-chain append still commits new canonical camera state.
-            # Materialize that state before Refiner/Hash/fusion so every
-            # downstream consumer observes one shared pose revision even when
-            # no graph LM happened in this window.
-            _, state_report, correction = self._materialize_pose_state_candidate(
-                affected_node_ids={int(start_frame), int(next_frame)},
-                old_window_transforms=old_window_transforms,
-                reason="prefusion_pose_tracking_candidate",
-                extra_packets=(packet,),
-            )
-            seam_diagnostics = state_report.as_diagnostics()
-            seam_diagnostics["enforced"] = True
-            seam_diagnostics["transaction_committed"] = True
         if self.hierarchical_submaps_enabled and self._active_submap_id is not None:
             self._update_submap_local_geometry(self._active_submap_id)
         submap_frozen = self._freeze_active_submap_if_ready()
@@ -9924,22 +9414,6 @@ class SphericalSelfiGlobalBackend:
             )
 
         window_transform = self._window_anchor_transforms()[window_id]
-        if (
-            prepared_candidate is not None
-            and refined_packet
-            and refiner_pending
-        ):
-            # Refiner must observe the final packet pose after both RGB
-            # tracking and any graph LM accepted in this transaction.
-            packet = self._finalize_pose_canonicalized_refiner_packet(packet)
-            if bool(packet.metadata.get("voxel_anchor_refiner_pending", False)):
-                raise RuntimeError(
-                    "Final Refiner still reports a pending packet"
-                )
-            packet.metadata["refiner_pose_revision"] = int(
-                self._pose_state_revision
-            )
-            packet.metadata["refiner_after_prefusion_tracking"] = True
         if refined_packet:
             prepare_start = time.perf_counter()
             prepared = self.fusion.prepare_packet_batch(packet, window_transform)
@@ -10685,7 +10159,6 @@ class SphericalSelfiGlobalBackend:
                 "chunk_sequence_objective_check": (
                     chunk_sequence_diagnostics
                 ),
-                "prefusion_pose_tracking": prefusion_pose_diagnostics,
             },
         )
         self.results.append(result)
@@ -10694,26 +10167,18 @@ class SphericalSelfiGlobalBackend:
     def _process_boundary_packet(
         self,
         packet: LocalGaussianWindowPacket,
-        *,
-        prepared_candidate: _PreparedPacketCandidate | None = None,
     ) -> GlobalWindowBackendResult:
         if (
             not self._packet_uses_voxel_refiner(packet)
             and not self.two_frame_overlap_enabled
             and not self.chunk_first_stride_graph
         ):
-            return self._process_boundary_packet_impl(
-                packet,
-                prepared_candidate=prepared_candidate,
-            )
+            return self._process_boundary_packet_impl(packet)
         transaction = self._snapshot_boundary_transaction(
             extra_packets=(packet,),
         )
         try:
-            return self._process_boundary_packet_impl(
-                packet,
-                prepared_candidate=prepared_candidate,
-            )
+            return self._process_boundary_packet_impl(packet)
         except Exception as exc:
             failure_diagnostic = self._last_rendered_overlap_diagnostic
             failure_alignment = self._last_overlap_alignment_failure
