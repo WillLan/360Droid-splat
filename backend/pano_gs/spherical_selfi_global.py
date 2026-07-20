@@ -7733,15 +7733,19 @@ class SphericalSelfiGlobalBackend:
             },
             packet_variant_count=packet_variant_count,
         )
+        owner_sync_required = bool(
+            self.fusion.lazy_owner_transforms
+            or self._owner_transforms_changed(
+                old_window_transforms,
+                all_window_transforms,
+            )
+        )
         correction = (
             self.fusion.apply_owner_corrections(
                 old_window_transforms,
                 all_window_transforms,
             )
-            if self._owner_transforms_changed(
-                old_window_transforms,
-                all_window_transforms,
-            )
+            if owner_sync_required
             else {"moved": 0, "deduplicated": 0}
         )
         self._synchronize_mapper_pose_cache(

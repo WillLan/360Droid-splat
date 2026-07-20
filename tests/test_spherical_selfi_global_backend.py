@@ -135,6 +135,7 @@ def _chunk_stride_backend(
     skip: bool = False,
     periodic: bool = False,
     hierarchical: bool = False,
+    lazy_owner: bool = False,
     mapper=None,
 ):
     return SphericalSelfiGlobalBackend(
@@ -174,7 +175,11 @@ def _chunk_stride_backend(
                 "windows_per_submap": 5,
                 "shared_boundary_nodes": 1,
             },
-            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+            "map_optimization": {
+                "steps_per_window": 0,
+                "final_steps": 0,
+                "lazy_submap_transforms": {"enabled": bool(lazy_owner)},
+            },
         },
     )
 
@@ -1706,6 +1711,55 @@ def test_mapper_recent_three_window_commit_updates_all_eight_canonical_frames() 
                 packet.local_poses_c2w[packet.frame_index(frame_id)],
             )
             torch.testing.assert_close(packet_pose, proposals[int(frame_id)])
+
+
+def test_pose_state_materialization_repairs_stale_lazy_owner_cache() -> None:
+    packets = [
+        _packet(
+            0,
+            torch.eye(4).repeat(4, 1, 1),
+            (0, 1, 2, 3),
+            height=32,
+            width=64,
+        ),
+        _packet(
+            1,
+            torch.eye(4).repeat(4, 1, 1),
+            (2, 3, 4, 5),
+            height=32,
+            width=64,
+        ),
+    ]
+    for packet in packets:
+        _attach_identity_stride_matches(packet)
+    backend = _chunk_stride_backend(
+        min_matches=64,
+        skip=False,
+        hierarchical=True,
+        lazy_owner=True,
+    )
+    for packet in packets:
+        backend.process_packet(packet)
+
+    owner = 0
+    expected = backend._window_anchor_transforms()[owner]
+    stale = expected.clone()
+    stale[0, 3] += 0.25
+    backend.map._lazy_owner_current_transforms[owner] = stale
+    old_window_transforms = backend._window_anchor_transforms()
+
+    _, report, correction = backend._materialize_pose_state_candidate(
+        affected_node_ids={int(backend.window_anchor_nodes[owner])},
+        old_window_transforms=old_window_transforms,
+        reason="repair_stale_lazy_owner_test",
+    )
+
+    assert report.accepted is True
+    assert correction["moved"] > 0
+    torch.testing.assert_close(
+        backend.map._lazy_owner_current_transforms[owner],
+        expected,
+    )
 
 
 def test_pose_state_consistency_failure_rolls_back_graph_packets_and_revision(

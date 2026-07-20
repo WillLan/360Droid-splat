@@ -1432,11 +1432,20 @@ class Stage2GlobalMapFusion:
         if self.lazy_owner_transforms:
             moved = 0
             owners = self.map._anchor_owner_window_id
-            for owner in sorted(set(old_transforms) & set(new_transforms)):
+            for owner in sorted(new_transforms):
                 count = int((owners == int(owner)).sum().item())
                 if count <= 0:
                     continue
-                self.map.set_lazy_owner_transform(int(owner), new_transforms[owner])
+                target = new_transforms[owner].detach().cpu().float()
+                current = self.map._lazy_owner_current_transforms.get(int(owner))
+                if current is not None and torch.allclose(
+                    current.to(target),
+                    target,
+                    atol=1.0e-8,
+                    rtol=1.0e-8,
+                ):
+                    continue
+                self.map.set_lazy_owner_transform(int(owner), target)
                 moved += count
             return {"moved": moved, "deduplicated": 0, "lazy": 1}
         batch = self._batch_from_map()
