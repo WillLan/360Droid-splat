@@ -1,7 +1,9 @@
 import inspect
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
@@ -1806,6 +1808,128 @@ def test_slam_logger_compact_wandb_keeps_depth_insertion_and_insert_count(tmp_pa
     assert "mapping/depth_insertion" in logged_keys
     assert "mapping/depth_insertion_need_pixels" in logged_keys
     assert "mapping/depth_insertion_png" not in logged_keys
+
+
+def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value)
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {
+                "mode": "disabled",
+                "runtime_log_preset": "slam_core_visuals",
+            },
+            "Visualization": {"save_local": True, "log_every": 1},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+
+    def pose_x(value: float) -> torch.Tensor:
+        pose = torch.eye(4)
+        pose[0, 3] = float(value)
+        return pose
+
+    output = FrontendOutput(
+        frame_id=1,
+        timestamp=1.0,
+        pose_c2w=pose_x(1.0),
+        relative_pose=None,
+        pose_confidence=1.0,
+        inverse_depth=None,
+        depth_confidence=None,
+        spherical_flow=None,
+        keyframe_score=0.0,
+        is_keyframe=False,
+        ba_residual=None,
+        tracking_status="tracked",
+    )
+    logger.record_frontend_raw(output)
+    logger.replace_geometry_history(
+        {1: SimpleNamespace(pose_c2w=pose_x(2.0))},
+        revision=1,
+    )
+    logger.observe(
+        output,
+        PanoFrame(
+            image=torch.rand(3, 4, 8),
+            timestamp=1.0,
+            frame_id=1,
+            meta={"gt_c2w": pose_x(4.0)},
+        ),
+        anchor_count=10,
+        keyframe_count=1,
+        backend_loss=0.5,
+        backend_pose_c2w=pose_x(2.0),
+        slam_refined_poses_c2w={1: pose_x(3.0)},
+        backend_render_pkg={
+            "render": torch.rand(3, 4, 8),
+            "depth": torch.ones(1, 4, 8),
+        },
+    )
+    logger._log_wandb_payload(
+        {
+            "backend/new_gaussians_per_chunk": 123,
+            "backend/selfi_graph_objective": 9.0,
+        },
+        step=7,
+    )
+    final_path = logger.log_final_slam_trajectory(
+        [(0, pose_x(0.0)), (1, pose_x(1.0)), (2, pose_x(2.0))],
+        trajectory_metrics={
+            "sim3_ate_rmse": 0.12,
+            "se3_ate_rmse": 0.34,
+        },
+        fallback_ate_rmse=None,
+        step=8,
+    )
+
+    assert logger._frontend_raw_pose_history[-1][1][0] == pytest.approx(1.0)
+    assert logger._backend_global_pose_history[-1][1][0] == pytest.approx(2.0)
+    assert logger._slam_final_pose_history[-1][1][0] == pytest.approx(3.0)
+    assert (
+        tmp_path
+        / "visualizations"
+        / "frame_000001_frontend_trajectory_vs_gt.png"
+    ).is_file()
+    assert (
+        tmp_path
+        / "visualizations"
+        / "frame_000001_backend_trajectory_vs_gt.png"
+    ).is_file()
+    assert (
+        tmp_path
+        / "visualizations"
+        / "frame_000001_slam_trajectory_vs_gt.png"
+    ).is_file()
+    assert final_path is not None
+    assert Path(final_path).is_file()
+    logged_keys = set().union(
+        *(payload.keys() for payload, _ in logger.run.logged)
+    )
+    assert logged_keys == {
+        "frontend/trajectory_vs_gt",
+        "backend/trajectory_vs_gt",
+        "slam/trajectory_vs_gt",
+        "slam/final_trajectory_vs_gt",
+        "slam/final_ate_rmse",
+        "slam/final_sim3_ate_rmse",
+        "slam/final_se3_ate_rmse",
+        "backend/render_vs_gt_panorama",
+        "backend/new_gaussians_per_chunk",
+    }
+    assert all(step is None for _, step in logger.run.logged)
 
 
 def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):

@@ -438,6 +438,37 @@ def test_stride2_iter200_experiment_only_changes_sampling_and_run_identity() -> 
     )
 
 
+def test_ob3d_pointmap_sim3_config_preserves_adapter_ba_refiner_baseline() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    baseline = load_config(
+        root / "spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml"
+    )
+    pointmap = load_config(
+        root / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100.yaml"
+    )
+
+    assert pointmap["Dataset"] == baseline["Dataset"]
+    assert pointmap["SphericalSelfiRuntime"] == baseline["SphericalSelfiRuntime"]
+    assert pointmap["VoxelAnchorRefiner"] == baseline["VoxelAnchorRefiner"]
+    alignment = pointmap["SphericalSelfiGlobalBackend"][
+        "rendered_overlap_alignment"
+    ]
+    assert alignment["mode"] == "two_frame_pointmap_full_sim3"
+    assert alignment["acceptance_policy"] == "diagnostics_only"
+    assert alignment["min_points"] == 2048
+    assert alignment["min_points_per_frame"] == 512
+    graph = pointmap["SphericalSelfiGlobalBackend"]["global_graph"]
+    assert graph["node_mode"] == "chunk_first_stride"
+    assert graph["fibonacci_oversample_factor"] == 8
+    assert graph["skip_edge"]["enabled"] is False
+    assert pointmap["WeightsAndBiases"]["runtime_log_preset"] == (
+        "slam_core_visuals"
+    )
+    assert pointmap["Results"]["save_dir"].endswith(
+        "ob3d100_pointmap_sim3_adapter_ba_r1"
+    )
+
+
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 16, "width": 32},

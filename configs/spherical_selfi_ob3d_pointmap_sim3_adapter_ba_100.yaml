@@ -1,0 +1,59 @@
+base_config: spherical_selfi_ob3d_bridge_depthscale_refiner_ba8_100.yaml
+
+# OB3D Sponza Non-Egocentric adapter+BA8/refiner baseline with only the
+# cross-chunk alignment replaced by overlap point-map full Sim(3).
+SphericalSelfiGlobalBackend:
+  rendered_overlap_alignment:
+    enabled: true
+    mode: two_frame_pointmap_full_sim3
+    min_points: 2048
+    max_points: 4096
+    min_points_per_frame: 512
+    max_points_per_frame: 2048
+    irls_iterations: 5
+    acceptance_policy: diagnostics_only
+    failure_policy: error
+  global_graph:
+    node_mode: chunk_first_stride
+    expected_overlap_frames: 2
+    enforce_exact_overlap: true
+    fibonacci_oversample_factor: 8
+    umeyama_irls_iterations: 5
+    allow_unaligned_fallback: false
+    chunk_stride:
+      target_index: 2
+    skip_edge:
+      enabled: false
+
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  runtime_log_preset: slam_core_visuals
+  group: ob3d-sponza-pointmap-sim3-adapter-ba-100
+  run_name: ob3d100_pointmap_sim3_adapter_ba_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - adapter-ba
+    - localba8-single-stage
+    - refiner
+    - overlap-pointmap
+    - full-sim3
+    - overlap2
+    - formal100
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  post_opt_all_frames: true
+  post_opt_log_depth: false
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_adapter_ba_r1
+  render_final_all_frames: true
+  kf_render_format: png

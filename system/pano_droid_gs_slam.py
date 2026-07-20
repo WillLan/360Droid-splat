@@ -505,6 +505,20 @@ _COMPACT_SLAM_WANDB_KEYS = frozenset(
 )
 _COMPACT_SLAM_WANDB_PREFIXES = ("mapping/depth_insertion_",)
 
+_SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
+    {
+        "frontend/trajectory_vs_gt",
+        "backend/trajectory_vs_gt",
+        "slam/trajectory_vs_gt",
+        "slam/final_trajectory_vs_gt",
+        "slam/final_ate_rmse",
+        "slam/final_sim3_ate_rmse",
+        "slam/final_se3_ate_rmse",
+        "backend/render_vs_gt_panorama",
+        "backend/new_gaussians_per_chunk",
+    }
+)
+
 
 class SlamRuntimeLogger:
     """Runtime W&B and local visualization logger for online SLAM runs."""
@@ -527,7 +541,12 @@ class SlamRuntimeLogger:
             wb_cfg.get("runtime_log_preset", wb_cfg.get("log_preset", "")) or ""
         ).strip().lower()
         self.compact_slam_wandb = self.runtime_log_preset in {"compact", "compact_slam", "minimal", "minimal_slam"}
-        self.log_image_paths = bool(wb_cfg.get("log_image_paths", not self.compact_slam_wandb))
+        self.slam_core_visual_wandb = self.runtime_log_preset in {
+            "slam_core_visuals",
+            "slam_core",
+        }
+        filtered_wandb = self.compact_slam_wandb or self.slam_core_visual_wandb
+        self.log_image_paths = bool(wb_cfg.get("log_image_paths", not filtered_wandb))
         self.log_keyframe_inserted_gaussians = bool(
             wb_cfg.get("log_keyframe_inserted_gaussians", self.compact_slam_wandb)
         )
@@ -548,6 +567,7 @@ class SlamRuntimeLogger:
         self._backend_pose_history: list[tuple[int, np.ndarray]] = []
         self._frontend_raw_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_global_pose_history: list[tuple[int, np.ndarray]] = []
+        self._slam_final_pose_history: list[tuple[int, np.ndarray]] = []
         self._backend_global_revision = 0
         self._gt_pose_history: list[tuple[int, np.ndarray]] = []
 
@@ -617,6 +637,7 @@ class SlamRuntimeLogger:
         self._frontend_pose_history = list(staged)
         self._backend_pose_history = list(staged)
         self._backend_global_pose_history = list(staged)
+        self._slam_final_pose_history = list(staged)
         self._backend_global_revision = int(revision)
         if self.run is not None and self._wandb is not None:
             self._log_wandb_payload(
@@ -647,6 +668,8 @@ class SlamRuntimeLogger:
         return max(1, int(self._step if step is None else step))
 
     def _should_log_wandb_key(self, key: str) -> bool:
+        if self.slam_core_visual_wandb:
+            return key in _SLAM_CORE_VISUAL_WANDB_KEYS
         if not self.compact_slam_wandb:
             return True
         if key.endswith("_png"):
@@ -656,7 +679,7 @@ class SlamRuntimeLogger:
         return any(key.startswith(prefix) for prefix in _COMPACT_SLAM_WANDB_PREFIXES)
 
     def _filter_wandb_payload(self, payload: dict) -> dict:
-        if not self.compact_slam_wandb:
+        if not self.compact_slam_wandb and not self.slam_core_visual_wandb:
             return payload
         return {key: value for key, value in payload.items() if self._should_log_wandb_key(str(key))}
 
@@ -665,7 +688,13 @@ class SlamRuntimeLogger:
             return
         filtered = self._filter_wandb_payload(payload)
         if filtered:
-            self.run.log(filtered, step=self._wandb_step(step))
+            if self.slam_core_visual_wandb:
+                # This preset emits several independent events per input frame.
+                # Let W&B allocate a monotonic event step so later trajectory
+                # images are never discarded as out-of-order writes.
+                self.run.log(filtered)
+            else:
+                self.run.log(filtered, step=self._wandb_step(step))
 
     def observe(
         self,
@@ -676,6 +705,7 @@ class SlamRuntimeLogger:
         keyframe_count: int,
         backend_loss: float | None,
         backend_pose_c2w: torch.Tensor | None = None,
+        slam_refined_poses_c2w: dict[int, torch.Tensor] | None = None,
         backend_render_pkg: dict | None = None,
         m3_debug: dict | None = None,
     ) -> None:
@@ -694,6 +724,25 @@ class SlamRuntimeLogger:
                 self._backend_pose_history,
                 int(output.frame_id),
                 backend_pose[:3, 3].numpy(),
+            )
+        slam_base = (
+            self._backend_global_pose_history
+            or self._backend_pose_history
+            or self._frontend_raw_pose_history
+        )
+        self._slam_final_pose_history = list(slam_base)
+        for frame_id, refined_pose in sorted(
+            (slam_refined_poses_c2w or {}).items()
+        ):
+            pose_cpu = refined_pose.detach().cpu().float()
+            if tuple(pose_cpu.shape) != (4, 4) or not bool(
+                torch.isfinite(pose_cpu).all()
+            ):
+                continue
+            self._slam_final_pose_history = self._upsert_pose_history(
+                self._slam_final_pose_history,
+                int(frame_id),
+                pose_cpu[:3, 3].numpy(),
             )
         gt_xyz = _pose_xyz_from_meta(source_frame)
         if gt_xyz is not None:
@@ -754,12 +803,21 @@ class SlamRuntimeLogger:
         frontend_traj_path = self._save_trajectory_panel(
             output,
             kind="frontend",
-            pred_history=self._frontend_pose_history,
+            pred_history=(
+                self._frontend_raw_pose_history or self._frontend_pose_history
+            ),
         )
         backend_traj_path = self._save_trajectory_panel(
             output,
             kind="backend",
-            pred_history=self._backend_pose_history,
+            pred_history=(
+                self._backend_global_pose_history or self._backend_pose_history
+            ),
+        )
+        slam_traj_path = self._save_trajectory_panel(
+            output,
+            kind="slam",
+            pred_history=self._slam_final_pose_history,
         )
         backend_rgb_path = None
         backend_depth_path = None
@@ -769,7 +827,9 @@ class SlamRuntimeLogger:
         if self.run is not None and self._wandb is not None:
             image_payload["frontend/trajectory_vs_gt"] = self._wandb.Image(str(frontend_traj_path))
             image_payload["backend/trajectory_vs_gt"] = self._wandb.Image(str(backend_traj_path))
-            image_payload["slam/trajectory"] = self._wandb.Image(str(frontend_traj_path))
+            image_payload["slam/trajectory_vs_gt"] = self._wandb.Image(str(slam_traj_path))
+            # Preserve the legacy key outside the strict visualization preset.
+            image_payload["slam/trajectory"] = self._wandb.Image(str(slam_traj_path))
             if depth_path is not None:
                 image_payload["slam/depth_png"] = str(depth_path)
             if backend_rgb_path is not None:
@@ -1643,6 +1703,13 @@ class SlamRuntimeLogger:
     ) -> Path:
         path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_{kind}_trajectory_vs_gt.png"
         legacy_path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_trajectory.png" if kind == "frontend" else None
+        display_name = {
+            "frontend": "Frontend pre-backend",
+            "backend": "Backend graph-only",
+            "slam": "SLAM graph+photometric",
+            "slam_final": "Final SLAM graph+photometric",
+            "backend_final": "Final backend keyframes",
+        }.get(kind, kind)
         positions = np.asarray([p for _, p in pred_history], dtype=np.float32)
         frame_ids = np.asarray([fid for fid, _ in pred_history], dtype=np.float32)
         if positions.size == 0:
@@ -1709,7 +1776,7 @@ class SlamRuntimeLogger:
                         segment_errors = np.zeros((len(segments),), dtype=np.float32)
                     line_collection = Line3DCollection(segments, cmap="turbo", linewidth=2.2)
                     line_collection.set_array(segment_errors.astype(np.float32))
-                    line_collection.set_label(f"{kind} pred")
+                    line_collection.set_label(f"{display_name} pred")
                     ax.add_collection3d(line_collection)
                     fig.colorbar(
                         line_collection,
@@ -1720,7 +1787,7 @@ class SlamRuntimeLogger:
                     )
                 else:
                     line_collection = Line3DCollection(segments, colors="#1f77b4", linewidth=2.2)
-                    line_collection.set_label(f"{kind} pred")
+                    line_collection.set_label(f"{display_name} pred")
                     ax.add_collection3d(line_collection)
             else:
                 ax.plot(
@@ -1729,7 +1796,7 @@ class SlamRuntimeLogger:
                     plot_pred[:, 2],
                     color="#1f77b4",
                     linewidth=2.2,
-                    label=f"{kind} pred",
+                    label=f"{display_name} pred",
                 )
             ax.scatter(plot_pred[0, 0], plot_pred[0, 1], plot_pred[0, 2], c="limegreen", s=64, label="start")
             ax.scatter(plot_pred[-1, 0], plot_pred[-1, 1], plot_pred[-1, 2], c="red", s=64, label="latest")
@@ -1747,14 +1814,14 @@ class SlamRuntimeLogger:
                 metric_text = ""
                 if ape_metrics:
                     metric_text = (
-                        f"\nAPE trans. {align_text}: "
-                        f"RMSE={ape_metrics['rmse']:.3f}, "
+                        f"\nATE RMSE ({align_text})="
+                        f"{ape_metrics['rmse']:.3f} m, "
                         f"mean={ape_metrics['mean']:.3f}, "
                         f"max={ape_metrics['max']:.3f}"
                     )
-                ax.set_title(f"{kind} trajectory APE vs GT{metric_text}")
+                ax.set_title(f"{display_name} trajectory vs GT{metric_text}")
             else:
-                ax.set_title(f"{kind} trajectory")
+                ax.set_title(f"{display_name} trajectory (GT unavailable)")
             ax.view_init(elev=24, azim=-58)
             ax.legend(loc="upper left")
             fig.tight_layout()
@@ -1765,6 +1832,58 @@ class SlamRuntimeLogger:
         if legacy_path is not None:
             shutil.copyfile(path, legacy_path)
         return path
+
+    def log_final_slam_trajectory(
+        self,
+        poses: list[tuple[int, torch.Tensor]],
+        *,
+        trajectory_metrics: dict[str, float],
+        fallback_ate_rmse: float | None,
+        step: int,
+    ) -> str | None:
+        """Log the final all-frame graph-plus-photometric trajectory."""
+
+        if not poses or not self.save_local:
+            return None
+        history = [
+            (int(frame_id), pose.detach().cpu().float()[:3, 3].numpy())
+            for frame_id, pose in poses
+            if tuple(pose.shape) == (4, 4)
+            and bool(torch.isfinite(pose).all())
+        ]
+        if not history:
+            return None
+        dummy = FrontendOutput(
+            frame_id=history[-1][0],
+            timestamp=float(history[-1][0]),
+            pose_c2w=torch.eye(4),
+            relative_pose=None,
+            pose_confidence=0.0,
+            inverse_depth=None,
+            depth_confidence=None,
+            spherical_flow=None,
+            keyframe_score=0.0,
+            is_keyframe=False,
+            ba_residual=None,
+            tracking_status="final_slam_trajectory",
+        )
+        path = self._save_trajectory_panel(
+            dummy,
+            kind="slam_final",
+            pred_history=history,
+        )
+        sim3_ate = trajectory_metrics.get("sim3_ate_rmse", fallback_ate_rmse)
+        payload: dict[str, object] = {}
+        if self.run is not None and self._wandb is not None:
+            payload["slam/final_trajectory_vs_gt"] = self._wandb.Image(str(path))
+        if sim3_ate is not None:
+            payload["slam/final_ate_rmse"] = float(sim3_ate)
+            payload["slam/final_sim3_ate_rmse"] = float(sim3_ate)
+        se3_ate = trajectory_metrics.get("se3_ate_rmse")
+        if se3_ate is not None:
+            payload["slam/final_se3_ate_rmse"] = float(se3_ate)
+        self._log_wandb_payload(payload, step=step)
+        return str(path)
 
     def _save_backend_render_panel(
         self,
@@ -3027,6 +3146,7 @@ class PanoDroidGSSlamSystem:
                 "backend": list(logger._backend_pose_history),
                 "frontend_raw": list(logger._frontend_raw_pose_history),
                 "backend_global": list(logger._backend_global_pose_history),
+                "slam_final": list(logger._slam_final_pose_history),
                 "backend_global_revision": int(logger._backend_global_revision),
             }
             try:
@@ -3053,6 +3173,7 @@ class PanoDroidGSSlamSystem:
                 logger._backend_global_pose_history = logger_state[
                     "backend_global"
                 ]
+                logger._slam_final_pose_history = logger_state["slam_final"]
                 logger._backend_global_revision = logger_state[
                     "backend_global_revision"
                 ]
@@ -3290,6 +3411,9 @@ class PanoDroidGSSlamSystem:
                     )
                     wandb_payload = {
                         "backend/selfi_window_id": int(result.window_id),
+                        "backend/new_gaussians_per_chunk": int(
+                            result.fusion.get("chunk_anchor_delta", 0)
+                        ),
                         "backend/selfi_loop_accepted": int(result.loop_accepted),
                         "backend/selfi_window_compacted": int(result.fusion.get("window_compacted", 0)),
                         "backend/selfi_global_anchors": int(result.fusion.get("anchors_after", self.map.anchor_count())),
@@ -4318,6 +4442,9 @@ class PanoDroidGSSlamSystem:
                 keyframe_count=keyframes,
                 backend_loss=backend_loss,
                 backend_pose_c2w=backend_pose,
+                slam_refined_poses_c2w=dict(
+                    self.mapper.refined_keyframe_poses()
+                ),
                 backend_render_pkg=backend_render_pkg,
                 m3_debug=getattr(self.frontend, "last_m3_debug", None),
             )
@@ -4437,6 +4564,12 @@ class PanoDroidGSSlamSystem:
             trajectory_path = root / "trajectory.json"
             with open(trajectory_path, "w", encoding="utf-8") as f:
                 json.dump(trajectory_payload, f, indent=2)
+            final_trajectory_png = logger.log_final_slam_trajectory(
+                sorted(pose_by_frame.items()),
+                trajectory_metrics=trajectory_metrics,
+                fallback_ate_rmse=ate_metrics.get("rmse"),
+                step=max(1, int(logger._step) + 1),
+            )
             metrics = {
                 "render_count": int(len(per_frame)),
                 "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
@@ -4448,6 +4581,7 @@ class PanoDroidGSSlamSystem:
                 "metrics": metrics,
                 "frames": per_frame,
                 "trajectory": str(trajectory_path),
+                "trajectory_png": final_trajectory_png,
             }
             with open(root / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
