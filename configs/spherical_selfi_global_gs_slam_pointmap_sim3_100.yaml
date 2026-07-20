@@ -1,0 +1,33 @@
+base_config: spherical_selfi_global_gs_slam_pointmap_sim3.yaml
+
+Dataset:
+  begin: 0
+  end: 100
+  frame_stride: 1
+
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  group: pointmap-sim3-adapter-ba-100
+  run_name: pointmap_sim3_adapter_ba_100
+  tags:
+    - spherical-selfi
+    - adapter-ba
+    - overlap-pointmap
+    - full-sim3
+    - overlap2
+    - formal100
+
+Visualization:
+  enabled: true
+  save_local: true
+  log_every: 5
+  save_kf_opt: true
+  kf_opt_log_every: 1
+  post_opt_all_frames: true
+  post_opt_log_depth: false
+
+Results:
+  save_dir: outputs/pointmap_sim3_adapter_ba_100
+  render_final_all_frames: true
+  kf_render_format: png
