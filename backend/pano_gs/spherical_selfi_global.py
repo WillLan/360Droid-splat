@@ -8979,7 +8979,8 @@ class SphericalSelfiGlobalBackend:
                     )
                     raise RuntimeError(
                         f"Window {window_id} point-map Sim(3) alignment failed: "
-                        f"{alignment_diagnostics.get('reason', 'unknown')}"
+                        f"{alignment_diagnostics.get('reason', 'unknown')}; "
+                        f"diagnostics={alignment_diagnostics!r}"
                     )
                 start_transform = (
                     previous_transform

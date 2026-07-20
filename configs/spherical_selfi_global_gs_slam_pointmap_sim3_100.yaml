@@ -11,7 +11,7 @@ WeightsAndBiases:
   enabled: true
   mode: online
   group: pointmap-sim3-adapter-ba-100
-  run_name: pointmap_sim3_adapter_ba_100_r2
+  run_name: pointmap_sim3_adapter_ba_100_r3
   tags:
     - spherical-selfi
     - adapter-ba
@@ -30,6 +30,6 @@ Visualization:
   post_opt_log_depth: false
 
 Results:
-  save_dir: outputs/pointmap_sim3_adapter_ba_100_r2
+  save_dir: outputs/pointmap_sim3_adapter_ba_100_r3
   render_final_all_frames: true
   kf_render_format: png
