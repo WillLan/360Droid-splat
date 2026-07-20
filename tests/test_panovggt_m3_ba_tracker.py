@@ -1814,6 +1814,7 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     class _Run:
         def __init__(self):
             self.logged = []
+            self.summary = {}
 
         def log(self, payload, step=None):
             self.logged.append((payload, step))
@@ -1904,16 +1905,16 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     assert "frontend/trajectory_vs_gt" not in keys_before_post_photo
     assert "backend/trajectory_vs_gt" not in keys_before_post_photo
     assert "slam/trajectory_vs_gt" not in keys_before_post_photo
-    logger.observe_trajectory_comparison(
-        output,
-        slam_refined_poses_c2w={1: pose_x(3.0)},
-    )
     logger._log_wandb_payload(
         {
             "backend/new_gaussians_per_chunk": 123,
             "backend/selfi_graph_objective": 9.0,
         },
-        step=7,
+        step=1,
+    )
+    logger.observe_trajectory_comparison(
+        output,
+        slam_refined_poses_c2w={1: pose_x(3.0)},
     )
     final_path = logger.log_final_slam_trajectory(
         [(0, pose_x(0.0)), (1, pose_x(1.0)), (2, pose_x(2.0))],
@@ -1950,27 +1951,32 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     ).is_file()
     assert final_path is not None
     assert Path(final_path).is_file()
-    logged_keys = set().union(
-        *(payload.keys() for payload, _ in logger.run.logged)
-    )
+    assert len(logger.run.logged) == 1
+    logged_payload, logged_step = logger.run.logged[0]
+    logged_keys = set(logged_payload)
     assert logged_keys == {
+        "slam/frame_id",
+        "slam/frame_index",
         "frontend/trajectory_vs_gt",
         "backend/trajectory_vs_gt",
         "slam/trajectory_vs_gt",
+        "backend/render_vs_gt_panorama",
+        "backend/new_gaussians_per_chunk",
+    }
+    assert logged_step == 1
+    assert logger.run.summary.keys() >= {
         "slam/final_trajectory_vs_gt",
         "slam/final_ate_rmse",
         "slam/final_sim3_ate_rmse",
         "slam/final_se3_ate_rmse",
-        "backend/render_vs_gt_panorama",
-        "backend/new_gaussians_per_chunk",
     }
-    assert all(step is None for _, step in logger.run.logged)
 
 
 def test_slam_logger_both_ate_mode_keeps_standard_primary_metric(tmp_path):
     class _Run:
         def __init__(self):
             self.logged = []
+            self.summary = {}
 
         def log(self, payload, step=None):
             self.logged.append((payload, step))
@@ -2010,16 +2016,127 @@ def test_slam_logger_both_ate_mode_keeps_standard_primary_metric(tmp_path):
         step=8,
     )
 
-    scalar_payload = {
-        key: value
-        for payload, _ in logger.run.logged
-        for key, value in payload.items()
-        if not isinstance(value, tuple)
-    }
+    scalar_payload = logger.run.summary
     assert scalar_payload["slam/final_ate_rmse"] == pytest.approx(0.12)
     assert scalar_payload["slam/final_sim3_ate_rmse"] == pytest.approx(0.12)
     assert scalar_payload["slam/final_pfgs360_ate"] == pytest.approx(0.045)
     assert scalar_payload["slam/final_se3_ate_rmse"] == pytest.approx(0.34)
+
+
+def test_slam_core_visuals_commit_one_step_per_frame_and_clip_future_poses(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+            self.summary = {}
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value)
+
+    def pose_x(value: float) -> torch.Tensor:
+        pose = torch.eye(4)
+        pose[0, 3] = float(value)
+        return pose
+
+    def output(frame_id: int) -> FrontendOutput:
+        return FrontendOutput(
+            frame_id=frame_id,
+            timestamp=float(frame_id),
+            pose_c2w=pose_x(float(frame_id)),
+            relative_pose=None,
+            pose_confidence=1.0,
+            inverse_depth=None,
+            depth_confidence=None,
+            spherical_flow=None,
+            keyframe_score=0.0,
+            is_keyframe=False,
+            ba_residual=None,
+            tracking_status="tracked",
+        )
+
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {
+                "mode": "disabled",
+                "runtime_log_preset": "slam_core_visuals",
+            },
+            # Core visuals must still be emitted for every frame.
+            "Visualization": {"save_local": True, "log_every": 100},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+    logger.replace_frontend_sim3_history({10: pose_x(1.0), 20: pose_x(2.0)})
+    logger.replace_geometry_history(
+        {
+            10: SimpleNamespace(pose_c2w=pose_x(1.5)),
+            20: SimpleNamespace(pose_c2w=pose_x(2.5)),
+        },
+        revision=1,
+        record_backend_graph=True,
+    )
+
+    plotted: list[tuple[int, str, list[int]]] = []
+    save_trajectory_panel = logger._save_trajectory_panel
+
+    def capture(output_value, *, kind, pred_history):
+        plotted.append(
+            (
+                int(output_value.frame_id),
+                str(kind),
+                [int(frame_id) for frame_id, _ in pred_history],
+            )
+        )
+        return save_trajectory_panel(
+            output_value,
+            kind=kind,
+            pred_history=pred_history,
+        )
+
+    logger._save_trajectory_panel = capture
+    for frame_id in (10, 20):
+        current = output(frame_id)
+        logger.observe(
+            current,
+            PanoFrame(
+                image=torch.rand(3, 4, 8),
+                timestamp=float(frame_id),
+                frame_id=frame_id,
+                meta={"gt_c2w": pose_x(float(frame_id))},
+            ),
+            anchor_count=10,
+            keyframe_count=1,
+            backend_loss=None,
+            backend_pose_c2w=pose_x(float(frame_id)),
+            slam_refined_poses_c2w={
+                10: pose_x(1.75),
+                20: pose_x(2.75),
+            },
+            backend_render_pkg={
+                "render": torch.rand(3, 4, 8),
+                "depth": torch.ones(1, 4, 8),
+            },
+        )
+
+    assert [step for _, step in logger.run.logged] == [1, 2]
+    assert all(
+        {
+            "frontend/trajectory_vs_gt",
+            "backend/trajectory_vs_gt",
+            "slam/trajectory_vs_gt",
+            "backend/render_vs_gt_panorama",
+        }
+        <= set(payload)
+        for payload, _ in logger.run.logged
+    )
+    first_frame_histories = [ids for frame_id, _, ids in plotted if frame_id == 10]
+    assert first_frame_histories
+    assert all(ids == [10] for ids in first_frame_histories)
 
 
 def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):

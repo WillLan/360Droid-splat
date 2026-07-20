@@ -539,6 +539,8 @@ _COMPACT_SLAM_WANDB_PREFIXES = ("mapping/depth_insertion_",)
 
 _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
     {
+        "slam/frame_id",
+        "slam/frame_index",
         "frontend/trajectory_vs_gt",
         "backend/trajectory_vs_gt",
         "slam/trajectory_vs_gt",
@@ -610,6 +612,9 @@ class SlamRuntimeLogger:
         self.wandb_mode = mode
         self.wandb_init_error: str | None = None
         self._step = 0
+        self._frame_step_by_id: dict[int, int] = {}
+        self._core_pending_payloads: dict[int, dict[str, object]] = {}
+        self._core_committed_steps: set[int] = set()
         self._last_m3_chunk_logged: int | None = None
         self._kf_opt_count = 0
         self._frontend_pose_history: list[tuple[int, np.ndarray]] = []
@@ -768,12 +773,36 @@ class SlamRuntimeLogger:
         filtered = self._filter_wandb_payload(payload)
         if filtered:
             if self.slam_core_visual_wandb:
-                # This preset emits several independent events per input frame.
-                # Let W&B allocate a monotonic event step so later trajectory
-                # images are never discarded as out-of-order writes.
-                self.run.log(filtered)
+                # Core visual logging is committed exactly once per processed
+                # frame.  Calls made by alignment, mapping, rendering, and pose
+                # visualization accumulate here until the frame snapshot is
+                # complete, avoiding both duplicate W&B steps and out-of-order
+                # media writes.
+                frame_step = self._wandb_step(step)
+                if frame_step not in self._core_committed_steps:
+                    self._core_pending_payloads.setdefault(frame_step, {}).update(
+                        filtered
+                    )
             else:
                 self.run.log(filtered, step=self._wandb_step(step))
+
+    def _flush_core_frame(self, step: int) -> None:
+        """Commit one consolidated core-visual payload for one processed frame."""
+
+        if self.run is None or not self.slam_core_visual_wandb:
+            return
+        frame_step = self._wandb_step(step)
+        if frame_step in self._core_committed_steps:
+            return
+        payload = self._core_pending_payloads.pop(frame_step, {})
+        if not payload:
+            return
+        payload.setdefault("slam/frame_index", int(frame_step))
+        self.run.log(payload, step=frame_step)
+        self._core_committed_steps.add(frame_step)
+
+    def _frame_step(self, frame_id: int) -> int:
+        return self._frame_step_by_id.get(int(frame_id), self._wandb_step())
 
     def observe(
         self,
@@ -790,6 +819,7 @@ class SlamRuntimeLogger:
         defer_trajectory_logging: bool = False,
     ) -> None:
         self._step += 1
+        self._frame_step_by_id[int(output.frame_id)] = int(self._step)
         pose = output.pose_c2w.detach().cpu().float()
         if pose.shape == (4, 4):
             self.record_frontend_raw(output)
@@ -881,6 +911,8 @@ class SlamRuntimeLogger:
                 image_payload["backend/render_depth"] = self._wandb.Image(str(backend_depth_path))
                 image_payload["backend/render_depth_png"] = str(backend_depth_path)
             self._log_wandb_payload(image_payload, step=self._step)
+        if not defer_trajectory_logging:
+            self._flush_core_frame(self._step)
 
     def observe_trajectory_comparison(
         self,
@@ -894,7 +926,9 @@ class SlamRuntimeLogger:
         if not self._should_visualize(output):
             return
         payload = self._trajectory_comparison_payload(output)
-        self._log_wandb_payload(payload, step=self._step)
+        frame_step = self._frame_step(int(output.frame_id))
+        self._log_wandb_payload(payload, step=frame_step)
+        self._flush_core_frame(frame_step)
 
     def _refresh_slam_pose_history(
         self,
@@ -946,28 +980,42 @@ class SlamRuntimeLogger:
         self,
         output: FrontendOutput,
     ) -> dict[str, object]:
+        max_frame_id = int(output.frame_id)
+
+        def prefix(
+            history: list[tuple[int, np.ndarray]],
+        ) -> list[tuple[int, np.ndarray]]:
+            return [
+                (int(frame_id), position)
+                for frame_id, position in history
+                if int(frame_id) <= max_frame_id
+            ]
+
+        frontend_history = prefix(
+            self._frontend_sim3_pose_history
+            or self._frontend_raw_pose_history
+            or self._frontend_pose_history
+        )
+        backend_history = prefix(
+            self._backend_graph_pose_history
+            or self._backend_global_pose_history
+            or self._backend_pose_history
+        )
+        slam_history = prefix(self._slam_final_pose_history)
         frontend_traj_path = self._save_trajectory_panel(
             output,
             kind="frontend",
-            pred_history=(
-                self._frontend_sim3_pose_history
-                or self._frontend_raw_pose_history
-                or self._frontend_pose_history
-            ),
+            pred_history=frontend_history,
         )
         backend_traj_path = self._save_trajectory_panel(
             output,
             kind="backend",
-            pred_history=(
-                self._backend_graph_pose_history
-                or self._backend_global_pose_history
-                or self._backend_pose_history
-            ),
+            pred_history=backend_history,
         )
         slam_traj_path = self._save_trajectory_panel(
             output,
             kind="slam",
-            pred_history=self._slam_final_pose_history,
+            pred_history=slam_history,
         )
         if self.run is None or self._wandb is None:
             return {}
@@ -984,24 +1032,14 @@ class SlamRuntimeLogger:
             "frontend/trajectory_png": str(frontend_traj_path),
             "backend/trajectory_png": str(backend_traj_path),
         }
-        for prefix, history in (
-            (
-                "frontend",
-                self._frontend_sim3_pose_history
-                or self._frontend_raw_pose_history
-                or self._frontend_pose_history,
-            ),
-            (
-                "backend",
-                self._backend_graph_pose_history
-                or self._backend_global_pose_history
-                or self._backend_pose_history,
-            ),
-            ("slam", self._slam_final_pose_history),
+        for metric_prefix, history in (
+            ("frontend", frontend_history),
+            ("backend", backend_history),
+            ("slam", slam_history),
         ):
             metrics = self._pfgs360_metrics_for_history(history)
             if "pfgs360_ate" in metrics:
-                payload[f"{prefix}/pfgs360_ate"] = float(
+                payload[f"{metric_prefix}/pfgs360_ate"] = float(
                     metrics["pfgs360_ate"]
                 )
         return payload
@@ -1837,6 +1875,8 @@ class SlamRuntimeLogger:
     def _should_visualize(self, output: FrontendOutput) -> bool:
         if not self.save_local:
             return False
+        if self.slam_core_visual_wandb:
+            return True
         return self._step == 1 or self._step % self.log_every == 0 or (
             self.log_keyframes and bool(output.is_keyframe)
         )
@@ -2097,7 +2137,14 @@ class SlamRuntimeLogger:
         se3_ate = trajectory_metrics.get("se3_ate_rmse")
         if se3_ate is not None:
             payload["slam/final_se3_ate_rmse"] = float(se3_ate)
-        self._log_wandb_payload(payload, step=step)
+        if self.slam_core_visual_wandb and self.run is not None:
+            # The final all-frame result is a run summary, not an extra
+            # timeline event.  A 100-frame run therefore remains Step 1..100.
+            summary = getattr(self.run, "summary", None)
+            if summary is not None:
+                summary.update(payload)
+        else:
+            self._log_wandb_payload(payload, step=step)
         return str(path)
 
     def _save_backend_render_panel(
@@ -2121,6 +2168,32 @@ class SlamRuntimeLogger:
         path = self.visualization_dir / f"frame_{int(output.frame_id):06d}_backend_render_vs_gt.png"
         canvas.save(path)
         return path
+
+    def observe_core_post_opt_render(self, diagnostic) -> None:
+        """Replace a frame's buffered render with its post-optimization result."""
+
+        if (
+            not self.slam_core_visual_wandb
+            or diagnostic is None
+            or not self.save_local
+        ):
+            return
+        frame_id = int(getattr(diagnostic, "frame_id"))
+        frame_step = self._frame_step_by_id.get(frame_id)
+        if frame_step is None or frame_step in self._core_committed_steps:
+            return
+        panel = self._make_keyframe_opt_render_panel(diagnostic)
+        path = self.visualization_dir / (
+            f"frame_{frame_id:06d}_backend_render_vs_gt.png"
+        )
+        panel.save(path)
+        if self.run is not None and self._wandb is not None:
+            self._log_wandb_payload(
+                {
+                    "backend/render_vs_gt_panorama": self._wandb.Image(str(path)),
+                },
+                step=frame_step,
+            )
 
     def _save_backend_depth_panel(self, output: FrontendOutput, render_pkg: dict) -> Path:
         depth = render_pkg.get("depth")
@@ -2227,6 +2300,9 @@ class SlamRuntimeLogger:
     def finish(self, summary: dict | None = None) -> None:
         if self.run is None:
             return
+        if self.slam_core_visual_wandb:
+            for frame_step in sorted(self._core_pending_payloads):
+                self._flush_core_frame(frame_step)
         if summary:
             self.run.summary.update(summary)
         self.run.finish()
@@ -4212,7 +4288,9 @@ class PanoDroidGSSlamSystem:
             last_feedforward_metrics = dict(metrics)
             successful_steps = float(metrics.get("steps", 0.0))
             rolled_back = float(metrics.get("window_rollback", 0.0)) > 0.0
-            if logger.post_opt_all_frames and successful_steps > 0.0 and not rolled_back:
+            if (
+                logger.post_opt_all_frames or logger.slam_core_visual_wandb
+            ) and successful_steps > 0.0 and not rolled_back:
                 window_id = int(metrics.get("spherical_selfi_window_id", -1))
                 diagnostics = []
                 for frame_id in self.mapper.stats.last_window_observations:
@@ -4224,6 +4302,7 @@ class PanoDroidGSSlamSystem:
                         )
                         continue
                     if diagnostic is not None:
+                        logger.observe_core_post_opt_render(diagnostic)
                         diagnostics.append(diagnostic)
                 logger.observe_post_optimized_window(
                     diagnostics,
