@@ -1835,6 +1835,18 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     )
     logger.run = _Run()
     logger._wandb = _Wandb()
+    plotted_histories = {}
+    save_trajectory_panel = logger._save_trajectory_panel
+
+    def capture_trajectory_panel(output, *, kind, pred_history):
+        plotted_histories[kind] = list(pred_history)
+        return save_trajectory_panel(
+            output,
+            kind=kind,
+            pred_history=pred_history,
+        )
+
+    logger._save_trajectory_panel = capture_trajectory_panel
 
     def pose_x(value: float) -> torch.Tensor:
         pose = torch.eye(4)
@@ -1859,6 +1871,12 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     logger.replace_geometry_history(
         {1: SimpleNamespace(pose_c2w=pose_x(2.0))},
         revision=1,
+        record_backend_graph=True,
+    )
+    logger.replace_geometry_history(
+        {1: SimpleNamespace(pose_c2w=pose_x(2.5))},
+        revision=2,
+        record_backend_graph=False,
     )
     logger.observe(
         output,
@@ -1877,6 +1895,17 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
             "render": torch.rand(3, 4, 8),
             "depth": torch.ones(1, 4, 8),
         },
+        defer_trajectory_logging=True,
+    )
+    keys_before_post_photo = set().union(
+        *(payload.keys() for payload, _ in logger.run.logged)
+    )
+    assert "frontend/trajectory_vs_gt" not in keys_before_post_photo
+    assert "backend/trajectory_vs_gt" not in keys_before_post_photo
+    assert "slam/trajectory_vs_gt" not in keys_before_post_photo
+    logger.observe_trajectory_comparison(
+        output,
+        slam_refined_poses_c2w={1: pose_x(3.0)},
     )
     logger._log_wandb_payload(
         {
@@ -1896,8 +1925,11 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     )
 
     assert logger._frontend_raw_pose_history[-1][1][0] == pytest.approx(1.0)
-    assert logger._backend_global_pose_history[-1][1][0] == pytest.approx(2.0)
+    assert logger._backend_graph_pose_history[-1][1][0] == pytest.approx(2.0)
+    assert logger._backend_global_pose_history[-1][1][0] == pytest.approx(2.5)
     assert logger._slam_final_pose_history[-1][1][0] == pytest.approx(3.0)
+    assert plotted_histories["backend"][-1][1][0] == pytest.approx(2.0)
+    assert plotted_histories["slam"][-1][1][0] == pytest.approx(3.0)
     assert (
         tmp_path
         / "visualizations"

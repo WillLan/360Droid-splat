@@ -1,0 +1,10 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100.yaml
+
+# Same OB3D 100-frame algorithm as r1.  This run uses the corrected diagnostic
+# split: backend is captured immediately before the current photometric window,
+# while slam is captured after that window commits.
+WeightsAndBiases:
+  run_name: ob3d100_pointmap_sim3_adapter_ba_prepost_r2
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_adapter_ba_prepost_r2
