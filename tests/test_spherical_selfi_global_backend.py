@@ -419,6 +419,33 @@ class _FirstTwoLocalAnchorsVisibleRenderer(_SyntheticSharedDepthRenderer):
         return package
 
 
+class _QueryAttributionRenderer:
+    def __init__(self, responses: list[tuple[float, float]]) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+        self.seen_queries: list[torch.Tensor] = []
+
+    def render(self, camera, gaussians, *, query_values=None):
+        if query_values is None:
+            raise AssertionError("query attribution render omitted query_values")
+        self.seen_queries.append(query_values.detach().cpu().clone())
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        count = gaussians.anchor_count()
+        accumulated = torch.ones(count, device=gaussians.xyz.device)
+        answers = torch.empty(count, 2, device=gaussians.xyz.device)
+        support = query_values.to(device=gaussians.xyz.device).reshape(-1, 2).amax(dim=0)
+        answers[:, 0] = float(response[0]) * support[0]
+        answers[:, 1] = float(response[1]) * support[1]
+        return {
+            "query_answers": answers,
+            "accum_visible": accumulated,
+            "visibility_filter": torch.ones(
+                count, device=gaussians.xyz.device, dtype=torch.bool
+            ),
+        }
+
+
 def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -> None:
     config_path = Path(__file__).parents[1] / "configs" / "spherical_selfi_global_gs_slam.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -533,6 +560,15 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "relative_threshold": 0.15,
         "alpha_threshold": 0.05,
     }
+    assert global_backend["error_gaussian_prune"] == {
+        "enabled": True,
+        "relative_depth_threshold": 0.15,
+        "alpha_threshold": 0.05,
+        "min_depth_confidence": 0.05,
+        "responsibility_threshold": 0.8,
+        "min_replacement_hits": 2,
+        "require_query_attribution": True,
+    }
     assert global_backend["post_optimization_seam_check"] == {"enabled": True}
     assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
     assert global_backend["voxel_fusion"]["max_total_gaussians"] == 3_000_000
@@ -541,7 +577,7 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert map_optimization["loop_seam_deduplication"] is True
     assert map_optimization["extra_steps_on_loop"] == 20
     assert map_optimization["pose_lr"] == 2.0e-4
-    assert map_optimization["strategy"] == "gaussian_only_staged"
+    assert map_optimization["strategy"] == "gaussian_only_joint_3dgs"
     assert map_optimization["pose_refine_enable"] is False
     assert map_optimization["separate_gaussian_lrs"] is True
     assert map_optimization["scale_gaussian_parameter_updates"] is True
@@ -549,41 +585,22 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert map_optimization["recent_window_count"] == 3
     assert map_optimization["sample_observations_per_step"] == 2
     assert map_optimization["sampler"] == "shuffled_cycle"
-    assert map_optimization["photometric_only"] is False
+    assert map_optimization["photometric_only"] is True
     assert map_optimization["optimize_skybox"] is False
     assert map_optimization["pose_prior_weight"] == 0.0
     assert map_optimization["s2_loss_weight"] == 0.0
     assert map_optimization["match_depth_loss_weight"] == 0.0
     assert map_optimization["visible_neighbor_lr_scale"] == 0.0
-    assert map_optimization["appearance"] == {
-        "steps": 30,
-        "dc_lr": 1.0e-3,
-        "sh_lr": 2.0e-4,
-        "opacity_lr": 2.0e-4,
-        "rgb_l1_weight": 0.8,
-        "dssim_weight": 0.2,
-        "opacity_logit_delta": 1.0,
-    }
-    assert map_optimization["geometry"] == {
-        "steps": 10,
-        "xyz_lr": 1.0e-4,
-        "scaling_lr": 2.0e-5,
-        "rotation_lr": 2.0e-5,
-        "depth_weight": 0.05,
-        "depth_huber_delta": 0.1,
-        "position_weight": 0.01,
-        "log_scale_weight": 0.01,
-        "rotation_weight": 0.001,
-        "xyz_voxels": 0.25,
-        "scale_ratio_min": 0.8,
-        "scale_ratio_max": 1.25,
-        "rotation_degrees": 5.0,
-    }
-    assert map_optimization["acceptance"] == {
-        "appearance_min_improvement": 0.001,
-        "geometry_min_improvement": 0.001,
-        "geometry_max_rgb_worsening": 0.005,
-    }
+    assert map_optimization["rgb_l1_weight"] == 0.8
+    assert map_optimization["dssim_weight"] == 0.2
+    assert map_optimization["max_rgb_worsening"] == 0.005
+    assert "appearance" not in map_optimization
+    assert "geometry" not in map_optimization
+    assert "acceptance" not in map_optimization
+    assert "lifecycle_prune_interval_windows" not in global_backend["voxel_fusion"]
+    assert "max_stale_frames" not in global_backend["voxel_fusion"]
+    assert "max_render_error" not in global_backend["voxel_fusion"]
+    assert config["MapRepresentation"]["gaussian_parameterization"] == "traditional_3dgs"
     assert {
         name: map_optimization[name]
         for name in (
@@ -2404,6 +2421,169 @@ def test_depth_gate_uses_exactly_two_global_renders_and_no_incoming_render(
     assert visible_old.tolist() == [True]
 
 
+def _error_prune_fixture(
+    count: int,
+    renderer,
+) -> tuple[SphericalSelfiGlobalBackend, LocalGaussianWindowPacket, dict[int, RenderedSharedFrame]]:
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    packet.observation = replace(
+        packet.observation,
+        refined_depth=torch.full_like(packet.observation.refined_depth, 2.0),
+        confidence=torch.ones_like(packet.observation.confidence),
+    )
+    packet.finite_gaussian_mask.fill_(True)
+    packet.static_mask.fill_(True)
+    packet.geometry_consistency.fill_(True)
+    packet.sky_mask.fill_(False)
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.stack(
+                [torch.tensor([float(row), 0.0, 1.0]) for row in range(count)]
+            ),
+            rgb=torch.zeros(count, 3),
+            confidence=torch.ones(count),
+            scale=torch.full((count,), 0.1),
+            level=torch.zeros(count, dtype=torch.long),
+            frame_id=0,
+        )
+    )
+    backend = SphericalSelfiGlobalBackend(
+        gaussian_map,
+        renderer=renderer,
+        config={
+            "enabled": True,
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "require_new_frame_support": True,
+                "radius_voxels": 1.5,
+            },
+            "insertion_depth_gate": {"enabled": True},
+            "error_gaussian_prune": {"enabled": True},
+        },
+    )
+    height, width = packet.anchor_observation.image_size
+    rendered = {
+        index: RenderedSharedFrame(
+            depth=torch.ones(1, height, width),
+            alpha=torch.ones(1, height, width),
+            anchor_visibility=torch.ones(count, dtype=torch.bool),
+            render_seconds=0.0,
+        )
+        for index in (2, 3)
+    }
+    return backend, packet, rendered
+
+
+def test_error_prune_deletes_every_double_hit_without_window_cap() -> None:
+    count = 37
+    renderer = _QueryAttributionRenderer([(0.9, 0.9), (0.9, 0.9)])
+    backend, packet, rendered = _error_prune_fixture(count, renderer)
+
+    stats, deleted, _ = backend._accumulate_and_prune_error_gaussians(
+        packet,
+        sim3_identity(),
+        new_frame_indices=(2, 3),
+        global_poses=packet.global_poses(sim3_identity()),
+        rendered_views=rendered,
+    )
+
+    assert deleted == count
+    assert stats["error_prune_eligible"] == count
+    assert stats["error_pruned"] == count
+    assert stats["error_prune_deleted_fraction"] == 1.0
+    assert backend.map.anchor_count() == 0
+    assert renderer.calls == 2
+    assert all(tuple(value.shape[-3:]) == (6, 12, 2) for value in renderer.seen_queries)
+    assert bool(renderer.seen_queries[0][..., 1].all())
+
+
+def test_error_prune_requires_two_hits_and_preserves_cross_window_evidence() -> None:
+    renderer = _QueryAttributionRenderer(
+        [(0.9, 0.9), (0.9, 0.0), (0.9, 0.9), (0.9, 0.0)]
+    )
+    backend, packet, rendered = _error_prune_fixture(3, renderer)
+    global_poses = packet.global_poses(sim3_identity())
+
+    first, deleted_first, _ = backend._accumulate_and_prune_error_gaussians(
+        packet,
+        sim3_identity(),
+        new_frame_indices=(2, 3),
+        global_poses=global_poses,
+        rendered_views=rendered,
+    )
+    assert deleted_first == 0
+    assert first["error_prune_new_replacement_hits"] == 3
+    assert backend.map._anchor_inlier_obs.tolist() == [1, 1, 1]
+
+    second, deleted_second, _ = backend._accumulate_and_prune_error_gaussians(
+        packet,
+        sim3_identity(),
+        new_frame_indices=(2, 3),
+        global_poses=global_poses,
+        rendered_views=rendered,
+    )
+    assert second["error_prune_evidence_carryover"] == 3
+    assert deleted_second == 3
+    assert backend.map.anchor_count() == 0
+
+
+def test_error_prune_never_deletes_background_behind_new_foreground() -> None:
+    renderer = _QueryAttributionRenderer([(0.9, 0.9), (0.9, 0.9)])
+    backend, packet, rendered = _error_prune_fixture(2, renderer)
+    for value in rendered.values():
+        value.depth.fill_(4.0)
+
+    stats, deleted, _ = backend._accumulate_and_prune_error_gaussians(
+        packet,
+        sim3_identity(),
+        new_frame_indices=(2, 3),
+        global_poses=packet.global_poses(sim3_identity()),
+        rendered_views=rendered,
+    )
+
+    assert deleted == 0
+    assert stats["error_prune_new_replacement_hits"] == 0
+    assert all(not bool(query[..., 1].any()) for query in renderer.seen_queries)
+    assert backend.map.anchor_count() == 2
+
+
+def test_error_prune_query_output_is_required() -> None:
+    class MissingQueryRenderer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def render(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "query_answers": torch.ones(2, 2),
+                    "accum_visible": torch.ones(2),
+                    "visibility_filter": torch.ones(2, dtype=torch.bool),
+                }
+            return {"visibility_filter": torch.ones(2, dtype=torch.bool)}
+
+    backend, packet, rendered = _error_prune_fixture(2, MissingQueryRenderer())
+    evidence_before = backend.map._anchor_inlier_obs.clone()
+    with pytest.raises(RuntimeError, match="query_answers and accum_visible"):
+        backend._accumulate_and_prune_error_gaussians(
+            packet,
+            sim3_identity(),
+            new_frame_indices=(2, 3),
+            global_poses=packet.global_poses(sim3_identity()),
+            rendered_views=rendered,
+        )
+    torch.testing.assert_close(backend.map._anchor_inlier_obs, evidence_before)
+
+
 def test_chunk_first_hash_uses_committed_pose_revision_for_all_four_views(
     monkeypatch,
 ) -> None:
@@ -3428,6 +3608,73 @@ def test_rgb_sh_rotation_preserves_directional_value() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
+def test_traditional_3dgs_parameterization_keeps_raw_parameters_unbounded() -> None:
+    gaussian_map = PanoGaussianMap(
+        config={
+            "MapRepresentation": {
+                "mode": "anchor_scaffold_panorama",
+                "gaussian_parameterization": "traditional_3dgs",
+            },
+            "BackendOptimization": {"sh_degree": 2},
+        },
+        device="cpu",
+    )
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[1000.0, -2000.0, 3000.0]]),
+            rgb=torch.tensor([[0.2, 0.4, 0.8]]),
+            confidence=torch.tensor([0.25]),
+            scale=torch.tensor([2.5]),
+            level=torch.zeros(1, dtype=torch.long),
+            frame_id=0,
+        )
+    )
+    torch.testing.assert_close(
+        gaussian_map.scaling,
+        torch.full_like(gaussian_map.scaling, math.log(2.5)),
+    )
+    torch.testing.assert_close(
+        gaussian_map.get_scaling, torch.full_like(gaussian_map.get_scaling, 2.5)
+    )
+    expected_dc = (torch.tensor([[0.2, 0.4, 0.8]]) - 0.5) / 0.28209479177387814
+    torch.testing.assert_close(gaussian_map.features, expected_dc)
+    torch.testing.assert_close(
+        gaussian_map.get_sh_coefficients[:, 0], expected_dc
+    )
+    raw_rotation = torch.tensor([[2.0, 1.0, 0.0, 0.0]])
+    gaussian_map.rotation.data.copy_(raw_rotation)
+    _ = gaussian_map.get_rotation
+    torch.testing.assert_close(gaussian_map.rotation, raw_rotation)
+    torch.testing.assert_close(
+        torch.linalg.norm(gaussian_map.get_rotation, dim=-1), torch.ones(1)
+    )
+    gaussian_map.features.data.fill_(12.0)
+    gaussian_map.scaling.data.fill_(10.0)
+    gaussian_map.opacity_logit.data.fill_(-30.0)
+    assert float(gaussian_map.get_sh_coefficients.max()) == 12.0
+    assert float(gaussian_map.get_scaling.min()) > 20_000.0
+    assert float(gaussian_map.get_opacity.max()) < 1.0e-10
+    torch.testing.assert_close(
+        gaussian_map.xyz,
+        torch.tensor([[1000.0, -2000.0, 3000.0]]),
+    )
+    rotation_before = gaussian_map.rotation.detach().clone()
+    opacity_before = gaussian_map.opacity_logit.detach().clone()
+    scaling_before = gaussian_map.scaling.detach().clone()
+    features_before = gaussian_map.features.detach().clone()
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.5,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    fusion._write_map(fusion._batch_from_map())
+    torch.testing.assert_close(gaussian_map.rotation, rotation_before)
+    torch.testing.assert_close(gaussian_map.opacity_logit, opacity_before)
+    torch.testing.assert_close(gaussian_map.scaling, scaling_before)
+    torch.testing.assert_close(gaussian_map.features, features_before)
+
+
 def test_stage2_voxel_fusion_keeps_unique_owner_and_moves_all_attributes() -> None:
     poses = torch.eye(4).repeat(2, 1, 1)
     poses[1, 0, 3] = 0.1
@@ -3498,7 +3745,7 @@ def test_voxel_quality_does_not_apply_latitude_weight_twice() -> None:
     torch.testing.assert_close(batch.quality, torch.full_like(batch.quality, 0.5))
 
 
-def test_low_multiplicative_quality_alone_does_not_prune_gaussian() -> None:
+def test_global_lifecycle_prune_is_removed() -> None:
     packet = _packet(0, torch.eye(4).repeat(1, 1, 1), (0,))
     gaussian_map = PanoGaussianMap(config={}, device="cpu")
     fusion = Stage2GlobalMapFusion(
@@ -3509,9 +3756,51 @@ def test_low_multiplicative_quality_alone_does_not_prune_gaussian() -> None:
     )
     stats = fusion.fuse_packet(packet, sim3_identity())
     assert stats["anchors_after"] > 0
+    count = gaussian_map.anchor_count()
     gaussian_map._anchor_quality.fill_(1.0e-12)
-    removed = fusion.prune_lifecycle(current_frame=1)
-    assert removed == 0
+    with torch.no_grad():
+        gaussian_map.opacity_logit.fill_(-100.0)
+    gaussian_map._anchor_conf_accum.zero_()
+    assert not hasattr(fusion, "prune_lifecycle")
+    assert gaussian_map.anchor_count() == count
+
+
+def test_stage2_writeback_preserves_error_prune_evidence() -> None:
+    packet = _packet(0, torch.eye(4).repeat(1, 1, 1), (0,))
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.5,),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    fusion.fuse_packet(packet, sim3_identity())
+    count = gaussian_map.anchor_count()
+    gaussian_map._anchor_inlier_obs.copy_(torch.arange(count, dtype=torch.int32))
+    gaussian_map._anchor_outlier_obs.copy_(
+        torch.arange(count, dtype=torch.int32).flip(0)
+    )
+    expected_inlier = gaussian_map._anchor_inlier_obs.clone()
+    expected_outlier = gaussian_map._anchor_outlier_obs.clone()
+
+    fusion._write_map(fusion._batch_from_map())
+
+    torch.testing.assert_close(gaussian_map._anchor_inlier_obs, expected_inlier)
+    torch.testing.assert_close(gaussian_map._anchor_outlier_obs, expected_outlier)
+    if count >= 2:
+        batch = fusion._batch_from_map().index(torch.tensor([0, 1]))
+        batch.xyz[1] = batch.xyz[0]
+        batch.level[:] = 0
+        batch.voxel_size[:] = 0.5
+        batch.grid_coord[:] = torch.floor(batch.xyz / 0.5).long()
+        batch.replacement_hits[:] = torch.tensor([1, 2])
+        batch.inconsistency_hits[:] = torch.tensor([3, 4])
+        compacted = fusion._winner_take_global_voxel(
+            batch, preserve_levels=True
+        )
+        assert len(compacted) == 1
+        assert compacted.replacement_hits.tolist() == [3]
+        assert compacted.inconsistency_hits.tolist() == [7]
 
 
 def test_voxel_safety_cap_is_reported_as_saturation() -> None:
@@ -5386,6 +5675,72 @@ def test_gaussian_only_staged_backend_uses_recent_owners_without_pose_sync() -> 
     assert metrics["pose_refine_enabled"] == 0.0
     assert metrics["pose_unchanged"] == 1.0
     assert metrics["owner_transform_unchanged"] == 1.0
+
+
+def test_gaussian_only_joint_3dgs_backend_uses_recent_owners_without_pose_sync() -> None:
+    packets = [
+        _packet(0, torch.eye(4).repeat(4, 1, 1), (0, 1, 2, 3)),
+        _packet(1, torch.eye(4).repeat(4, 1, 1), (2, 3, 4, 5)),
+        _packet(2, torch.eye(4).repeat(4, 1, 1), (4, 5, 6, 7)),
+    ]
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.call = None
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_joint_3dgs(self, **kwargs):
+            self.call = kwargs
+            return {
+                "steps": 40.0,
+                "window_rollback": 0.0,
+                "pose_unchanged": 1.0,
+                "owner_transform_unchanged": 1.0,
+            }
+
+    mapper = _Mapper()
+    gaussian_map = PanoGaussianMap(
+        config={
+            "MapRepresentation": {
+                "gaussian_parameterization": "traditional_3dgs"
+            }
+        },
+        device="cpu",
+    )
+    backend = _boundary_backend(gaussian_map, mapper=mapper)
+    backend.map_optimization_strategy = "gaussian_only_joint_3dgs"
+    backend.map_optimize_recent_windows = 3
+    backend.map_optimize_config.update(
+        {
+            "sample_observations_per_step": 2,
+            "rgb_l1_weight": 0.8,
+            "dssim_weight": 0.2,
+            "max_rgb_worsening": 0.005,
+        }
+    )
+    backend.window_order = [0, 1, 2]
+    backend.packets = {
+        packet.window_id: packet.compact_for_memory() for packet in packets
+    }
+    backend._optimization_packets[2] = packets[2]
+    backend._synchronize_joint_optimized_window = lambda *args, **kwargs: pytest.fail(
+        "Gaussian-only joint optimization synchronized poses"
+    )
+
+    metrics = backend._run_map_optimization(2, packets[2].frame_ids, 40)
+
+    assert mapper.call is not None
+    assert tuple(mapper.call["frame_ids"]) == tuple(range(8))
+    assert tuple(mapper.call["active_owner_window_ids"]) == (0, 1, 2)
+    assert mapper.call["settings"]["steps"] == 40
+    assert mapper.call["settings"]["sample_observations_per_step"] == 2
+    assert mapper.call["settings"]["max_rgb_worsening"] == 0.005
+    assert metrics["pose_refine_enabled"] == 0.0
+    assert metrics["photometric_only"] == 1.0
 
 
 def test_mapper_rejection_snapshots_after_durable_keyframe_registration() -> None:

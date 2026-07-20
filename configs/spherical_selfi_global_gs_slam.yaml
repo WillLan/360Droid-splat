@@ -226,6 +226,14 @@ SphericalSelfiGlobalBackend:
     enabled: true
     relative_threshold: 0.15
     alpha_threshold: 0.05
+  error_gaussian_prune:
+    enabled: true
+    relative_depth_threshold: 0.15
+    alpha_threshold: 0.05
+    min_depth_confidence: 0.05
+    responsibility_threshold: 0.8
+    min_replacement_hits: 2
+    require_query_attribution: true
   post_optimization_seam_check:
     enabled: true
   geometry_validation:
@@ -373,23 +381,18 @@ SphericalSelfiGlobalBackend:
     # of insertion_dedup.max_new_gaussians_per_chunk.
     coverage_aware_budget: true
     coverage_coarse_cell_size: 0.64
-    lifecycle_prune_interval_windows: 8
-    max_stale_frames: 0
-    max_render_error: null
   map_optimization:
-    strategy: gaussian_only_staged
+    strategy: gaussian_only_joint_3dgs
     renderer: gsplat360
-    # The staged strategy uses its own 30+10 step schedule. This value keeps
-    # the existing backend queue enabled.
     steps_per_window: 40
     # Optimize the current chunk and its two immediate predecessors. With the
     # 4-frame/stride-2 schedule this is at most eight unique physical frames.
     recent_window_count: 3
     sample_observations_per_step: 2
     sampler: shuffled_cycle
-    # All poses and lazy owner transforms remain fixed. Appearance and geometry
-    # are accepted independently against all recent observations.
-    photometric_only: false
+    # All poses and lazy owner transforms remain fixed while every Gaussian
+    # parameter group is updated jointly by spherical RGB supervision.
+    photometric_only: true
     optimize_skybox: false
     gaussian_lr: 0.002
     separate_gaussian_lrs: true
@@ -400,6 +403,9 @@ SphericalSelfiGlobalBackend:
     scaling_lr: 1.0e-4
     rotation_lr: 1.0e-4
     scale_gaussian_parameter_updates: true
+    rgb_l1_weight: 0.8
+    dssim_weight: 0.2
+    max_rgb_worsening: 0.005
     pose_refine_enable: false
     pose_lr: 2.0e-4
     pose_prior_weight: 0.0
@@ -408,32 +414,6 @@ SphericalSelfiGlobalBackend:
     pose_grad_clip: 0.001
     s2_loss_weight: 0.0
     match_depth_loss_weight: 0.0
-    appearance:
-      steps: 30
-      dc_lr: 1.0e-3
-      sh_lr: 2.0e-4
-      opacity_lr: 2.0e-4
-      rgb_l1_weight: 0.8
-      dssim_weight: 0.2
-      opacity_logit_delta: 1.0
-    geometry:
-      steps: 10
-      xyz_lr: 1.0e-4
-      scaling_lr: 2.0e-5
-      rotation_lr: 2.0e-5
-      depth_weight: 0.05
-      depth_huber_delta: 0.1
-      position_weight: 0.01
-      log_scale_weight: 0.01
-      rotation_weight: 0.001
-      xyz_voxels: 0.25
-      scale_ratio_min: 0.8
-      scale_ratio_max: 1.25
-      rotation_degrees: 5.0
-    acceptance:
-      appearance_min_improvement: 0.001
-      geometry_min_improvement: 0.001
-      geometry_max_rgb_worsening: 0.005
     # Older owners are rendered for occlusion/context but remain bitwise
     # frozen. This legacy knob remains zero as an additional safety guard.
     visible_neighbor_lr_scale: 0.0
@@ -446,6 +426,7 @@ SphericalSelfiGlobalBackend:
 
 MapRepresentation:
   mode: anchor_scaffold_panorama
+  gaussian_parameterization: traditional_3dgs
 
 BackendOptimization:
   enabled: true

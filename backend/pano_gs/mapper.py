@@ -159,6 +159,17 @@ class PanoGaussianMap(nn.Module):
         super().__init__()
         self.config = config or {}
         self.map_mode = "anchor_scaffold_panorama"
+        map_cfg = self.config.get("MapRepresentation", {}) if isinstance(self.config, dict) else {}
+        self.gaussian_parameterization = str(
+            map_cfg.get("gaussian_parameterization", "legacy")
+            if isinstance(map_cfg, dict)
+            else "legacy"
+        ).strip().lower()
+        if self.gaussian_parameterization not in {"legacy", "traditional_3dgs"}:
+            raise ValueError(
+                "MapRepresentation.gaussian_parameterization must be "
+                "'legacy' or 'traditional_3dgs'"
+            )
         backend_cfg = self.config.get("BackendOptimization", {}) if isinstance(self.config, dict) else {}
         configured_sh_degree = int(backend_cfg.get("sh_degree", sh_degree)) if isinstance(backend_cfg, dict) else int(sh_degree)
         global_selfi_cfg = self.config.get("SphericalSelfiGlobalBackend", {}) if isinstance(self.config, dict) else {}
@@ -265,6 +276,10 @@ class PanoGaussianMap(nn.Module):
 
     @property
     def get_features(self) -> torch.Tensor:
+        if self.gaussian_parameterization == "traditional_3dgs":
+            from backend.pano_gs.adapter import SH_C0
+
+            return 0.5 + SH_C0 * self.features
         return torch.sigmoid(self.features)
 
     @property
@@ -285,7 +300,11 @@ class PanoGaussianMap(nn.Module):
     def _base_sh_coefficients(self) -> torch.Tensor:
         from backend.pano_gs.adapter import SH_C0
 
-        dc = ((self.get_features - 0.5) / SH_C0).unsqueeze(1)
+        dc = (
+            self.features.unsqueeze(1)
+            if self.gaussian_parameterization == "traditional_3dgs"
+            else ((self.get_features - 0.5) / SH_C0).unsqueeze(1)
+        )
         if int(self.sh_rest.shape[1]) <= 0:
             return dc
         return torch.cat([dc, self.sh_rest.to(device=dc.device, dtype=dc.dtype)], dim=1)
@@ -296,6 +315,8 @@ class PanoGaussianMap(nn.Module):
         return torch.nn.functional.normalize(self.rotation, dim=-1, eps=1e-12)
 
     def _base_scaling(self) -> torch.Tensor:
+        if self.gaussian_parameterization == "traditional_3dgs":
+            return torch.exp(self.scaling)
         return torch.nn.functional.softplus(self.scaling) + 1e-5
 
     def configure_lazy_owner_transforms(self, enabled: bool) -> None:
@@ -492,6 +513,26 @@ class PanoGaussianMap(nn.Module):
         target = (scale.clamp_min(2.0e-5) - 1.0e-5).clamp_min(1.0e-8)
         return torch.log(torch.expm1(target).clamp_min(1.0e-8))
 
+    def _scale_parameter_from_actual(self, scale: torch.Tensor) -> torch.Tensor:
+        if self.gaussian_parameterization == "traditional_3dgs":
+            return scale.clamp_min(1.0e-8).log()
+        return self._inverse_softplus_scale(scale)
+
+    def _feature_parameter_from_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
+        if self.gaussian_parameterization == "traditional_3dgs":
+            from backend.pano_gs.adapter import SH_C0
+
+            return (rgb - 0.5) / SH_C0
+        return self._inv_sigmoid(rgb)
+
+    def _feature_parameter_from_sh_dc(self, dc: torch.Tensor) -> torch.Tensor:
+        if self.gaussian_parameterization == "traditional_3dgs":
+            return dc
+        from backend.pano_gs.adapter import SH_C0
+
+        rgb = (0.5 + SH_C0 * dc).clamp(0.0, 1.0)
+        return self._inv_sigmoid(rgb)
+
     @staticmethod
     def _normalize_quaternion(quaternion: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
         quat = torch.nan_to_num(quaternion, nan=0.0, posinf=0.0, neginf=0.0)
@@ -544,9 +585,13 @@ class PanoGaussianMap(nn.Module):
 
         new_xyz = torch.cat([self.xyz.detach(), xyz], dim=0)
         new_rot = torch.cat([self.rotation.detach(), quat], dim=0)
-        new_scaling = torch.cat([self.scaling.detach(), torch.log(torch.expm1(scale.clamp_min(1e-5)))], dim=0)
+        new_scaling = torch.cat(
+            [self.scaling.detach(), self._scale_parameter_from_actual(scale)], dim=0
+        )
         new_opacity = torch.cat([self.opacity_logit.detach(), self._inv_sigmoid(conf)], dim=0)
-        new_features = torch.cat([self.features.detach(), self._inv_sigmoid(rgb)], dim=0)
+        new_features = torch.cat(
+            [self.features.detach(), self._feature_parameter_from_rgb(rgb)], dim=0
+        )
         sh_rest = torch.zeros(xyz.shape[0], int(self.sh_rest.shape[1]), 3, device=device, dtype=dtype)
         new_sh_rest = torch.cat([self.sh_rest.detach(), sh_rest], dim=0)
 
@@ -709,9 +754,14 @@ class PanoGaussianMap(nn.Module):
 
         old_count = self.anchor_count()
         xyz = self.xyz.detach().clone()
-        rot = self.get_rotation.detach().clone()
+        rot = (
+            self.rotation.detach().clone()
+            if self.gaussian_parameterization == "traditional_3dgs"
+            else self.get_rotation.detach().clone()
+        )
         scale_actual = self.get_scaling.detach().clone()
         opacity = self.get_opacity.detach().clone()
+        opacity_parameter = self.opacity_logit.detach().clone()
         old_sh = self.get_sh_coefficients.detach().permute(0, 2, 1).contiguous()
         if int(old_sh.shape[-1]) != target_sh_dim:
             resized = torch.zeros(old_count, 3, target_sh_dim, device=device, dtype=dtype)
@@ -777,6 +827,9 @@ class PanoGaussianMap(nn.Module):
                 scale_actual[global_idx] = torch.exp(log_s).clamp_min(1.0e-5)
                 rot[global_idx] = self._normalize_quaternion((1.0 - a) * old_r + a * new_rot)
                 opacity[global_idx] = ((1.0 - a) * opacity[global_idx] + a * new_opacity).clamp(1.0e-5, 1.0 - 1.0e-5)
+                opacity_parameter[global_idx] = self._inv_sigmoid(
+                    opacity[global_idx].view(1, 1)
+                ).view(1)
                 old_sh[global_idx] = (1.0 - a) * old_sh[global_idx] + a * new_sh
             else:
                 rel = int(global_idx) - old_count
@@ -860,6 +913,13 @@ class PanoGaussianMap(nn.Module):
             rot = torch.cat([rot, torch.stack(insert_rot, dim=0)], dim=0)
             scale_actual = torch.cat([scale_actual, torch.stack(insert_scale, dim=0)], dim=0)
             opacity = torch.cat([opacity, torch.stack(insert_opacity, dim=0)], dim=0)
+            opacity_parameter = torch.cat(
+                [
+                    opacity_parameter,
+                    self._inv_sigmoid(torch.stack(insert_opacity, dim=0)),
+                ],
+                dim=0,
+            )
             old_sh = torch.cat([old_sh, torch.stack(insert_sh, dim=0)], dim=0)
             n_new = len(insert_xyz)
             meta_level = torch.cat([meta_level, torch.zeros(n_new, dtype=torch.int8)], dim=0)
@@ -882,10 +942,15 @@ class PanoGaussianMap(nn.Module):
 
         self.xyz = nn.Parameter(xyz)
         self.rotation = nn.Parameter(rot)
-        self.scaling = nn.Parameter(self._inverse_softplus_scale(scale_actual))
-        self.opacity_logit = nn.Parameter(self._inv_sigmoid(opacity))
-        dc_rgb = (old_sh[..., 0] * SH_C0 + 0.5).clamp(0.0, 1.0)
-        self.features = nn.Parameter(self._inv_sigmoid(dc_rgb))
+        self.scaling = nn.Parameter(self._scale_parameter_from_actual(scale_actual))
+        self.opacity_logit = nn.Parameter(
+            opacity_parameter
+            if self.gaussian_parameterization == "traditional_3dgs"
+            else self._inv_sigmoid(opacity)
+        )
+        self.features = nn.Parameter(
+            self._feature_parameter_from_sh_dc(old_sh[..., 0])
+        )
         rest_dim = int(self.sh_rest.shape[1])
         if rest_dim > 0:
             self.sh_rest = nn.Parameter(old_sh[..., 1 : 1 + rest_dim].permute(0, 2, 1).contiguous())
@@ -1137,9 +1202,14 @@ class PanoGaussianMap(nn.Module):
         xyz = self.get_xyz.detach().cpu().float().numpy()
         n = int(xyz.shape[0])
         normals = np.zeros_like(xyz, dtype=np.float32)
-        rgb = self.get_features.detach().cpu().float().clamp(0.0, 1.0).numpy()
-        f_dc = (rgb - 0.5) / 0.28209479177387814
-        f_rest = np.zeros((n, 24), dtype=np.float32)
+        coefficients = self.get_sh_coefficients.detach().cpu().float()
+        f_dc = coefficients[:, 0].numpy()
+        rest = coefficients[:, 1:9]
+        if int(rest.shape[1]) < 8:
+            padded = torch.zeros(n, 8, 3, dtype=rest.dtype)
+            padded[:, : int(rest.shape[1])] = rest
+            rest = padded
+        f_rest = rest.permute(0, 2, 1).reshape(n, 24).numpy()
         opacity = self.opacity_logit.detach().cpu().float().numpy()
         scale = self.get_scaling.detach().cpu().float().clamp_min(1.0e-8).log().numpy()
         rot = self.get_rotation.detach().cpu().float().numpy()
@@ -1569,6 +1639,8 @@ class PanoGaussianMapper:
                 "scaling_lr",
                 "rotation_lr",
                 "scale_gaussian_parameter_updates",
+                "sanitize_gaussian_parameters",
+                "weight_decay",
                 "fixed_pose_frame_ids",
             )
         }
@@ -1598,6 +1670,7 @@ class PanoGaussianMapper:
             "gaussian_trust",
             "parameter_bounds",
             "frozen_gaussian_parameters",
+            "sanitize_gaussian_parameters",
         ):
             if key in effective_cfg:
                 ff_cfg[key] = effective_cfg[key]
@@ -2209,6 +2282,125 @@ class PanoGaussianMapper:
             geometry_post_rgb if geometry_accepted else geometry_pre_rgb
         )
         return metrics
+
+    def optimize_spherical_selfi_joint_3dgs(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        active_owner_window_ids: list[int] | tuple[int, ...],
+        settings: dict | None = None,
+    ) -> dict[str, float]:
+        """Jointly update unconstrained 3DGS parameters with fixed poses."""
+
+        full_state = self._capture_fixed_optimization_state()
+        try:
+            cfg = dict(settings or {})
+            frame_ids = tuple(dict.fromkeys(int(value) for value in frame_ids))
+            owner_ids = tuple(
+                dict.fromkeys(int(value) for value in active_owner_window_ids)
+            )
+            weights = {
+                "photometric": 1.0,
+                "depth": 0.0,
+                "opacity": 0.0,
+                "distortion": 0.0,
+                "sky_alpha": 0.0,
+                "photometric_mode": "l1_dssim",
+                "rgb_l1_weight": float(cfg.get("rgb_l1_weight", 0.8)),
+                "dssim_weight": float(cfg.get("dssim_weight", 0.2)),
+            }
+            pre = self.evaluate_spherical_selfi_window(
+                frame_ids,
+                loss_weights_override=weights,
+                photometric_mask_non_sky=False,
+            )
+            optimize_metrics = self.optimize_spherical_selfi_window(
+                window_id=int(window_id),
+                frame_ids=list(frame_ids),
+                iters=max(0, int(cfg.get("steps", 40))),
+                settings={
+                    "active_owner_window_ids": owner_ids,
+                    "pose_refine_enable": False,
+                    "fixed_pose_frame_ids": list(self.pose_deltas),
+                    "optimize_skybox": False,
+                    "photometric_only": True,
+                    "photometric_mask_non_sky": False,
+                    "loss_weights_override": weights,
+                    "sample_observations_per_step": max(
+                        1, int(cfg.get("sample_observations_per_step", 2))
+                    ),
+                    "sampler_seed": int(cfg.get("seed", 123)) + int(window_id),
+                    "separate_gaussian_lrs": True,
+                    "scale_gaussian_parameter_updates": True,
+                    "sanitize_gaussian_parameters": False,
+                    "weight_decay": 0.0,
+                    "xyz_lr": float(cfg.get("xyz_lr", 5.0e-4)),
+                    "feature_lr": float(cfg.get("feature_lr", 2.0e-3)),
+                    "sh_rest_lr": float(cfg.get("sh_rest_lr", 1.0e-4)),
+                    "opacity_lr": float(cfg.get("opacity_lr", 1.0e-3)),
+                    "scaling_lr": float(cfg.get("scaling_lr", 1.0e-4)),
+                    "rotation_lr": float(cfg.get("rotation_lr", 1.0e-4)),
+                    "visible_neighbor_lr_scale": 0.0,
+                },
+                extra_loss_fn=None,
+            )
+            post = self.evaluate_spherical_selfi_window(
+                frame_ids,
+                loss_weights_override=weights,
+                photometric_mask_non_sky=False,
+            )
+            pre_rgb = float(pre.get("photometric", float("inf")))
+            post_rgb = float(post.get("photometric", float("inf")))
+            relative_worsening = (post_rgb - pre_rgb) / max(abs(pre_rgb), 1.0e-8)
+            parameters_finite = all(
+                bool(torch.isfinite(value).all().detach().cpu())
+                for value in self.map.gaussian_parameters()
+            )
+            finite = bool(
+                pre.get("finite", 0.0) > 0.0
+                and post.get("finite", 0.0) > 0.0
+                and float(optimize_metrics.get("non_finite_window", 0.0)) == 0.0
+                and parameters_finite
+                and all(
+                    math.isfinite(value)
+                    for value in (pre_rgb, post_rgb, relative_worsening)
+                )
+            )
+            pose_unchanged, owner_unchanged = self._fixed_optimization_state_unchanged(
+                full_state
+            )
+            accepted = bool(
+                finite
+                and pose_unchanged
+                and owner_unchanged
+                and relative_worsening
+                <= float(cfg.get("max_rgb_worsening", 0.005))
+            )
+            metrics = {
+                "strategy_gaussian_only_joint_3dgs": 1.0,
+                "pose_refine_enabled": 0.0,
+                "active_owner_window_count": float(len(owner_ids)),
+                "optimized_frame_count": float(len(frame_ids)),
+                "pre_rgb": pre_rgb,
+                "post_rgb": post_rgb,
+                "rgb_relative_worsening": relative_worsening,
+                "accepted": float(accepted),
+                "pose_unchanged": float(pose_unchanged),
+                "owner_transform_unchanged": float(owner_unchanged),
+                "window_rollback": float(not accepted),
+                "full_rollback": float(not accepted),
+                "steps": float(optimize_metrics.get("steps", 0.0)) if accepted else 0.0,
+                "loss": post_rgb if accepted else pre_rgb,
+            }
+            if accepted:
+                self.commit_spherical_selfi_window()
+            else:
+                self._restore_fixed_optimization_state(full_state)
+            return metrics
+        except Exception:
+            self._restore_fixed_optimization_state(full_state)
+            raise
 
     def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
         """Promote registered RGB/depth observations without inserting legacy seeds."""
@@ -3281,12 +3473,16 @@ class PanoGaussianMapper:
         rows_cpu = torch.tensor(unique_rows, dtype=torch.long)
         with torch.no_grad():
             self.map.xyz.data[keeper] = self.map.xyz.data.index_select(0, rows_t).mean(dim=0)
-            rgb = self.map.get_features.detach().index_select(0, rows_t).mean(dim=0).clamp(0.0, 1.0)
-            self.map.features.data[keeper] = self.map._inv_sigmoid(rgb.view(1, 3)).view(3)
+            sh = self.map.get_sh_coefficients.detach().index_select(0, rows_t).mean(dim=0)
+            self.map.features.data[keeper] = self.map._feature_parameter_from_sh_dc(
+                sh[0].view(1, 3)
+            ).view(3)
             opacity = self.map.get_opacity.detach().index_select(0, rows_t).mean(dim=0).clamp(0.0, 1.0)
             self.map.opacity_logit.data[keeper] = self.map._inv_sigmoid(opacity.view(1, 1)).view(1)
             scale = self.map.get_scaling.detach().index_select(0, rows_t).mean(dim=0)
-            self.map.scaling.data[keeper] = torch.log(torch.expm1(scale.clamp_min(1.0e-5)))
+            self.map.scaling.data[keeper] = self.map._scale_parameter_from_actual(
+                scale.view(1, 3)
+            ).view(3)
             rotations = self.map.get_rotation.detach().index_select(0, rows_t)
             ref_pos = unique_rows.index(int(keeper))
             ref = rotations[ref_pos]
@@ -3303,7 +3499,9 @@ class PanoGaussianMapper:
                 quat = quat / quat_norm
             self.map.rotation.data[keeper] = quat
             if int(self.map.sh_rest.shape[1]) > 0:
-                self.map.sh_rest.data[keeper] = self.map.sh_rest.data.index_select(0, rows_t).mean(dim=0)
+                self.map.sh_rest.data[keeper] = sh[
+                    1 : 1 + int(self.map.sh_rest.shape[1])
+                ]
         self.map._anchor_obs_count[keeper] = self.map._anchor_obs_count.index_select(0, rows_cpu).sum()
         self.map._anchor_conf_accum[keeper] = self.map._anchor_conf_accum.index_select(0, rows_cpu).sum()
         self.map._anchor_last_seen_kf[keeper] = self.map._anchor_last_seen_kf.index_select(0, rows_cpu).max()
@@ -4606,14 +4804,19 @@ class PanoGaussianMapper:
                     self._apply_gaussian_adamw_update_scales(optimizer, gaussian_scales)
                 with torch.no_grad():
                     if gaussian_enabled and gaussian_scales is not None:
-                        self._sanitize_active_gaussian_rows(gaussian_scales)
+                        sanitize = bool(
+                            cfg.get("sanitize_gaussian_parameters", True)
+                        )
+                        if sanitize:
+                            self._sanitize_active_gaussian_rows(gaussian_scales)
                         if gaussian_stage_reference is not None:
                             self._clamp_gaussian_stage_parameters(
                                 gaussian_stage_reference,
                                 gaussian_scales > 0.0,
                                 cfg.get("parameter_bounds", {}),
                             )
-                            self._sanitize_active_gaussian_rows(gaussian_scales)
+                            if sanitize:
+                                self._sanitize_active_gaussian_rows(gaussian_scales)
                             self._restore_frozen_gaussian_parameters(
                                 gaussian_stage_reference,
                                 gaussian_scales > 0.0,
@@ -4627,7 +4830,9 @@ class PanoGaussianMapper:
                 if not parameters_finite:
                     non_finite_window = True
                     break
-                if self.pfgs360_replace_fuse_enabled:
+                if self.pfgs360_replace_fuse_enabled and bool(
+                    cfg.get("sanitize_gaussian_parameters", True)
+                ):
                     self._clamp_replace_fuse_scaling()
                 backward_step_sec += time.perf_counter() - section_start
             actual_steps = step_idx + 1
@@ -6004,7 +6209,7 @@ class PanoGaussianMapper:
                 ),
                 scale_ref[active] * scale_ratio_min,
             )
-            self.map.scaling[active] = self.map._inverse_softplus_scale(bounded)
+            self.map.scaling[active] = self.map._scale_parameter_from_actual(bounded)
 
         max_rotation_deg = float(cfg.get("rotation_degrees", 0.0))
         if max_rotation_deg > 0.0:

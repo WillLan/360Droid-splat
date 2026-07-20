@@ -1100,6 +1100,138 @@ def test_gaussian_only_staged_updates_all_gaussian_groups_but_keeps_pose_and_own
     )
 
 
+def test_gaussian_only_joint_3dgs_updates_every_group_without_parameter_clamps() -> None:
+    config = {
+        "MapRepresentation": {
+            "mode": "anchor_scaffold_panorama",
+            "gaussian_parameterization": "traditional_3dgs",
+        },
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "sh_degree": 2,
+            "gaussian_refine_enable": True,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {"enabled": True},
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map, renderer=_AllGaussianParameterRenderer()
+    )
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.tensor(
+                [
+                    [-1.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 1.0],
+                    [2.0, 0.0, 1.0],
+                ]
+            ),
+            rgb=torch.full((4, 3), 0.2),
+            confidence=torch.ones(4),
+            scale=torch.full((4,), 0.1),
+            level=torch.zeros(4, dtype=torch.long),
+            frame_id=0,
+        )
+    )
+    gaussian_map._anchor_owner_window_id[:] = torch.tensor([-1, 0, 1, 2])
+    gaussian_map.scaling.data.fill_(25.0)
+    gaussian_map.opacity_logit.data.fill_(15.0)
+    gaussian_map.rotation.data.copy_(
+        torch.tensor([[2.0, 1.0, 0.5, -0.25]]).expand(4, -1)
+    )
+    mapper.register_observation(
+        _small_frontend_output(0),
+        torch.full((3, 4, 8), 0.85),
+        is_keyframe=True,
+    )
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    before = {
+        name: value.detach().clone()
+        for name, value in gaussian_map.named_parameters()
+    }
+    pose_before = mapper.pose_deltas[0].delta.detach().clone()
+
+    metrics = mapper.optimize_spherical_selfi_joint_3dgs(
+        window_id=2,
+        frame_ids=(0,),
+        active_owner_window_ids=(0, 1, 2),
+        settings={"steps": 2, "max_rgb_worsening": 100.0},
+    )
+
+    assert metrics["accepted"] == 1.0, metrics
+    assert metrics["pose_unchanged"] == 1.0
+    assert metrics["owner_transform_unchanged"] == 1.0
+    for name in (
+        "features",
+        "sh_rest",
+        "opacity_logit",
+        "xyz",
+        "scaling",
+        "rotation",
+    ):
+        value = dict(gaussian_map.named_parameters())[name]
+        torch.testing.assert_close(value[0], before[name][0])
+        assert not torch.equal(value[1:], before[name][1:]), name
+    assert float(gaussian_map.scaling[1:].min()) > 20.0
+    assert float(gaussian_map.opacity_logit[1:].min()) > 12.0
+    assert not torch.allclose(
+        torch.linalg.norm(gaussian_map.rotation[1:], dim=-1),
+        torch.ones(3),
+    )
+    assert torch.equal(mapper.pose_deltas[0].delta, pose_before)
+
+
+def test_gaussian_only_joint_3dgs_rolls_back_rgb_regression(monkeypatch) -> None:
+    config = {
+        "MapRepresentation": {"gaussian_parameterization": "traditional_3dgs"},
+        "BackendOptimization": {
+            "enabled": True,
+            "sh_degree": 2,
+            "FeedForwardWindow": {"enabled": True},
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map, renderer=_AllGaussianParameterRenderer()
+    )
+    gaussian_map.add_seeds(_small_seed_batch(0))
+    gaussian_map._anchor_owner_window_id[:] = 0
+    mapper.register_observation(
+        _small_frontend_output(0), torch.full((3, 4, 8), 0.5), is_keyframe=True
+    )
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    before = {
+        name: value.detach().clone()
+        for name, value in gaussian_map.named_parameters()
+    }
+    evaluations = iter(
+        (
+            {"loss": 1.0, "photometric": 1.0, "finite": 1.0},
+            {"loss": 1.01, "photometric": 1.01, "finite": 1.0},
+        )
+    )
+    monkeypatch.setattr(
+        mapper,
+        "evaluate_spherical_selfi_window",
+        lambda *args, **kwargs: next(evaluations),
+    )
+
+    metrics = mapper.optimize_spherical_selfi_joint_3dgs(
+        window_id=0,
+        frame_ids=(0,),
+        active_owner_window_ids=(0,),
+        settings={"steps": 1, "max_rgb_worsening": 0.005},
+    )
+
+    assert metrics["accepted"] == 0.0
+    assert metrics["window_rollback"] == 1.0
+    for name, value in gaussian_map.named_parameters():
+        torch.testing.assert_close(value, before[name])
+
+
 def test_staged_geometry_rejection_keeps_accepted_appearance(monkeypatch) -> None:
     config = {
         "BackendOptimization": {
@@ -1711,6 +1843,46 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     assert torch.allclose(seen["colors"], expected_sh)
     assert seen["sh_degree"] == gaussian_map.active_sh_degree
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
+
+
+def test_pfgs360_renderer_forwards_query_attribution_outputs():
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    gaussian_map.add_seeds(_small_seed_batch(0))
+    seen = {}
+
+    def fake_rasterization(**kwargs):
+        seen.update(kwargs)
+        height, width = int(kwargs["height"]), int(kwargs["width"])
+        render = torch.zeros(1, height, width, 4)
+        alpha = torch.ones(1, height, width, 1)
+        info = {
+            "means2d": torch.zeros(1, 1, 2),
+            "radii": torch.ones(1, 1, dtype=torch.int32),
+            "accum_times": torch.ones(1, 1, dtype=torch.int32),
+            "accum_visible": torch.tensor([[0.75]]),
+            "query_answers": torch.tensor([[[0.25, 0.50]]]),
+        }
+        return render, alpha, None, info
+
+    query = torch.zeros(4, 8, 2)
+    query[:, 0, 0] = 1.0
+    query[:, -1, 1] = 1.0
+    renderer = PFGS360Renderer(config={}, allow_fallback=True)
+    package = renderer._render_gsplat360(
+        fake_rasterization,
+        PanoRenderCamera(4, 8, torch.eye(4)),
+        gaussian_map,
+        torch.zeros(3),
+        query_values=query,
+    )
+
+    assert tuple(seen["query_values"].shape) == (1, 4, 8, 2)
+    assert seen["query_values"][0, 0, 0, 0] == 1.0
+    assert seen["query_values"][0, 0, -1, 1] == 1.0
+    torch.testing.assert_close(package["accum_visible"], torch.tensor([0.75]))
+    torch.testing.assert_close(
+        package["query_answers"], torch.tensor([[0.25, 0.50]])
+    )
 
 
 def test_cpu_erp_fallback_keeps_front_and_back_hemispheres():

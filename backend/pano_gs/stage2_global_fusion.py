@@ -18,7 +18,6 @@ from models.per_pixel_gaussian_observation import (
     real_sh_basis,
 )
 
-from .adapter import SH_C0
 from .mapper import PanoGaussianMap
 
 
@@ -28,6 +27,7 @@ class GlobalExplicitGaussianBatch:
     scale: torch.Tensor
     rotation: torch.Tensor
     opacity: torch.Tensor
+    opacity_parameter: torch.Tensor
     sh_coefficients: torch.Tensor
     quality: torch.Tensor
     owner_window_id: torch.Tensor
@@ -40,6 +40,8 @@ class GlobalExplicitGaussianBatch:
     last_seen_frame: torch.Tensor
     visibility_count: torch.Tensor
     render_error_ema: torch.Tensor
+    replacement_hits: torch.Tensor
+    inconsistency_hits: torch.Tensor
 
     def __len__(self) -> int:
         return int(self.xyz.shape[0])
@@ -326,6 +328,7 @@ class Stage2GlobalMapFusion:
             scale=torch.zeros(0, 3, device=device, dtype=dtype),
             rotation=torch.zeros(0, 4, device=device, dtype=dtype),
             opacity=torch.zeros(0, 1, device=device, dtype=dtype),
+            opacity_parameter=torch.zeros(0, 1, device=device, dtype=dtype),
             sh_coefficients=torch.zeros(0, sh_count, 3, device=device, dtype=dtype),
             quality=torch.zeros(0, device=device, dtype=dtype),
             owner_window_id=torch.zeros(0, device=device, dtype=torch.long),
@@ -338,6 +341,8 @@ class Stage2GlobalMapFusion:
             last_seen_frame=torch.zeros(0, device=device, dtype=torch.long),
             visibility_count=torch.zeros(0, device=device, dtype=torch.long),
             render_error_ema=torch.zeros(0, device=device, dtype=dtype),
+            replacement_hits=torch.zeros(0, device=device, dtype=torch.long),
+            inconsistency_hits=torch.zeros(0, device=device, dtype=torch.long),
         )
 
     def packet_to_global_batch(
@@ -422,6 +427,9 @@ class Stage2GlobalMapFusion:
                     scale=selected_scale,
                     rotation=global_quaternion.reshape(-1, 4)[selected],
                     opacity=opacity[view].reshape(-1, 1)[selected],
+                    opacity_parameter=self.map._inv_sigmoid(
+                        opacity[view].reshape(-1, 1)[selected]
+                    ),
                     sh_coefficients=coefficients.reshape(-1, target_sh_count, 3)[selected],
                     quality=quality.reshape(-1)[selected],
                     owner_window_id=torch.full((count,), int(packet.window_id), device=device, dtype=torch.long),
@@ -434,6 +442,8 @@ class Stage2GlobalMapFusion:
                     last_seen_frame=torch.full((count,), int(packet.frame_ids[-1]), device=device, dtype=torch.long),
                     visibility_count=torch.ones(count, device=device, dtype=torch.long),
                     render_error_ema=torch.zeros(count, device=device, dtype=dtype),
+                    replacement_hits=torch.zeros(count, device=device, dtype=torch.long),
+                    inconsistency_hits=torch.zeros(count, device=device, dtype=torch.long),
                 )
             )
         if not parts:
@@ -485,11 +495,18 @@ class Stage2GlobalMapFusion:
         last_seen = batch.last_seen_frame.new_zeros(count)
         last_seen.scatter_reduce_(0, inverse, batch.last_seen_frame, reduce="amax", include_self=True)
         visibility = self._segment_sum(batch.visibility_count[:, None], inverse, count)[:, 0]
+        replacement_hits = self._segment_sum(
+            batch.replacement_hits[:, None], inverse, count
+        )[:, 0]
+        inconsistency_hits = self._segment_sum(
+            batch.inconsistency_hits[:, None], inverse, count
+        )[:, 0]
         return GlobalExplicitGaussianBatch(
             xyz=average(batch.xyz),
             scale=torch.exp(average(batch.scale.clamp_min(1.0e-8).log())),
             rotation=normalize_quaternion(average(quaternion)),
             opacity=average(batch.opacity).clamp(1.0e-5, 1.0 - 1.0e-5),
+            opacity_parameter=average(batch.opacity_parameter),
             sh_coefficients=average(batch.sh_coefficients),
             quality=(weight_sum[:, 0] / observation_count.clamp_min(1).to(weight_sum)).clamp_min(1.0e-8),
             owner_window_id=unique[:, 0].long(),
@@ -502,6 +519,8 @@ class Stage2GlobalMapFusion:
             last_seen_frame=last_seen,
             visibility_count=visibility,
             render_error_ema=average(batch.render_error_ema[:, None])[:, 0],
+            replacement_hits=replacement_hits,
+            inconsistency_hits=inconsistency_hits,
         )
 
     def _winner_take_global_voxel(
@@ -539,6 +558,12 @@ class Stage2GlobalMapFusion:
         winner.scatter_reduce_(0, inverse, candidate, reduce="amin", include_self=True)
         winner = winner[winner < len(batch)]
         result = batch.index(winner)
+        result.replacement_hits = self._segment_sum(
+            batch.replacement_hits[:, None], inverse, int(unique.shape[0])
+        )[:, 0]
+        result.inconsistency_hits = self._segment_sum(
+            batch.inconsistency_hits[:, None], inverse, int(unique.shape[0])
+        )[:, 0]
         self.last_pre_cap_count = len(result)
         self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
         return self._cap_to_budget(result)
@@ -578,7 +603,14 @@ class Stage2GlobalMapFusion:
             (int(unique.shape[0]),), len(batch), device=batch.xyz.device, dtype=torch.long
         )
         winner.scatter_reduce_(0, inverse, candidate, reduce="amin", include_self=True)
-        result = batch.index(winner[winner < len(batch)])
+        winner = winner[winner < len(batch)]
+        result = batch.index(winner)
+        result.replacement_hits = self._segment_sum(
+            batch.replacement_hits[:, None], inverse, int(unique.shape[0])
+        )[:, 0]
+        result.inconsistency_hits = self._segment_sum(
+            batch.inconsistency_hits[:, None], inverse, int(unique.shape[0])
+        )[:, 0]
         self.last_pre_cap_count = len(result)
         self.last_saturated = self.max_total_gaussians > 0 and len(result) > self.max_total_gaussians
         return self._cap_to_budget(result)
@@ -642,9 +674,13 @@ class Stage2GlobalMapFusion:
             else self.map.get_scaling.detach()
         )
         map_rotation = (
-            self.map._base_rotation().detach()
-            if self.lazy_owner_transforms
-            else self.map.get_rotation.detach()
+            self.map.rotation.detach()
+            if self.map.gaussian_parameterization == "traditional_3dgs"
+            else (
+                self.map._base_rotation().detach()
+                if self.lazy_owner_transforms
+                else self.map.get_rotation.detach()
+            )
         )
         map_sh = (
             self.map._base_sh_coefficients().detach()
@@ -669,6 +705,7 @@ class Stage2GlobalMapFusion:
             scale=map_scale.clone(),
             rotation=map_rotation.clone(),
             opacity=self.map.get_opacity.detach().clone(),
+            opacity_parameter=self.map.opacity_logit.detach().clone(),
             sh_coefficients=map_sh.clone(),
             quality=metadata("_anchor_quality", torch.ones(count)).to(dtype=dtype),
             owner_window_id=metadata("_anchor_owner_window_id", torch.full((count,), -1)).long(),
@@ -681,6 +718,8 @@ class Stage2GlobalMapFusion:
             last_seen_frame=metadata("_anchor_last_seen_kf", torch.zeros(count)).long(),
             visibility_count=metadata("_anchor_visibility_count", torch.zeros(count)).long(),
             render_error_ema=metadata("_anchor_render_error_ema", torch.zeros(count)).to(dtype=dtype),
+            replacement_hits=metadata("_anchor_inlier_obs", torch.zeros(count)).long(),
+            inconsistency_hits=metadata("_anchor_outlier_obs", torch.zeros(count)).long(),
         )
 
     def _write_map(self, batch: GlobalExplicitGaussianBatch) -> None:
@@ -690,11 +729,20 @@ class Stage2GlobalMapFusion:
         opacity = batch.opacity.to(device=device, dtype=dtype)
         sh = batch.sh_coefficients.to(device=device, dtype=dtype)
         self.map.xyz = nn.Parameter(xyz)
-        self.map.rotation = nn.Parameter(normalize_quaternion(batch.rotation.to(device=device, dtype=dtype)))
-        self.map.scaling = nn.Parameter(self.map._inverse_softplus_scale(scale))
-        self.map.opacity_logit = nn.Parameter(self.map._inv_sigmoid(opacity))
-        dc_rgb = (0.5 + SH_C0 * sh[:, 0]).clamp(0.0, 1.0)
-        self.map.features = nn.Parameter(self.map._inv_sigmoid(dc_rgb))
+        self.map.rotation = nn.Parameter(
+            batch.rotation.to(device=device, dtype=dtype)
+            if self.map.gaussian_parameterization == "traditional_3dgs"
+            else normalize_quaternion(batch.rotation.to(device=device, dtype=dtype))
+        )
+        self.map.scaling = nn.Parameter(self.map._scale_parameter_from_actual(scale))
+        self.map.opacity_logit = nn.Parameter(
+            batch.opacity_parameter.to(device=device, dtype=dtype)
+            if self.map.gaussian_parameterization == "traditional_3dgs"
+            else self.map._inv_sigmoid(opacity)
+        )
+        self.map.features = nn.Parameter(
+            self.map._feature_parameter_from_sh_dc(sh[:, 0])
+        )
         rest_count = int(self.map.sh_rest.shape[1])
         self.map.sh_rest = nn.Parameter(
             sh[:, 1 : 1 + rest_count].contiguous()
@@ -712,8 +760,8 @@ class Stage2GlobalMapFusion:
         self.map._anchor_source_window_id = batch.owner_window_id.detach().cpu().to(torch.int32)
         self.map._anchor_source_frame_start = batch.birth_frame.detach().cpu().to(torch.int32)
         self.map._anchor_source_frame_end = batch.last_seen_frame.detach().cpu().to(torch.int32)
-        self.map._anchor_inlier_obs = torch.zeros(len(batch), dtype=torch.int32)
-        self.map._anchor_outlier_obs = torch.zeros(len(batch), dtype=torch.int32)
+        self.map._anchor_inlier_obs = batch.replacement_hits.detach().cpu().to(torch.int32)
+        self.map._anchor_outlier_obs = batch.inconsistency_hits.detach().cpu().to(torch.int32)
         self.map._anchor_owner_window_id = batch.owner_window_id.detach().cpu().to(torch.int32)
         self.map._anchor_quality = batch.quality.detach().cpu().float()
         self.map._anchor_visibility_count = batch.visibility_count.detach().cpu().to(torch.int32)
@@ -788,6 +836,9 @@ class Stage2GlobalMapFusion:
                 scale=scale.index_select(0, selected),
                 rotation=rotation.index_select(0, selected),
                 opacity=opacity.index_select(0, selected),
+                opacity_parameter=self.map._inv_sigmoid(
+                    opacity.index_select(0, selected)
+                ),
                 sh_coefficients=coefficients.index_select(0, selected),
                 quality=quality,
                 owner_window_id=torch.full((size,), int(packet.window_id), device=device, dtype=torch.long),
@@ -800,6 +851,8 @@ class Stage2GlobalMapFusion:
                 last_seen_frame=torch.full((size,), int(packet.frame_ids[-1]), device=device, dtype=torch.long),
                 visibility_count=torch.ones(size, device=device, dtype=torch.long),
                 render_error_ema=torch.zeros(size, device=device, dtype=dtype),
+                replacement_hits=torch.zeros(size, device=device, dtype=torch.long),
+                inconsistency_hits=torch.zeros(size, device=device, dtype=torch.long),
             ),
             selected,
         )
@@ -1529,58 +1582,3 @@ class Stage2GlobalMapFusion:
         prune = torch.zeros(self.map.anchor_count(), device=device, dtype=torch.bool)
         prune[duplicate_rows] = True
         return int(self.map.prune_anchors(prune))
-
-    def prune_lifecycle(
-        self,
-        *,
-        current_frame: int,
-        max_stale_frames: int = 0,
-        max_render_error: float = float("inf"),
-    ) -> int:
-        batch = self._batch_from_map()
-        if len(batch) == 0:
-            return 0
-        mean_confidence = batch.confidence_accum / batch.observation_count.clamp_min(1).to(
-            batch.confidence_accum
-        )
-        prune = (batch.opacity[:, 0] < self.min_opacity) | (mean_confidence < self.min_confidence)
-        if int(max_stale_frames) > 0:
-            prune |= (
-                (int(current_frame) - batch.last_seen_frame) > int(max_stale_frames)
-            ) & (batch.visibility_count <= 0)
-        if math.isfinite(float(max_render_error)):
-            prune |= batch.render_error_ema > float(max_render_error)
-        removed = int(prune.sum())
-        if removed:
-            self._write_map(batch.index(~prune))
-        return removed
-
-    def update_lifecycle_observations(
-        self,
-        visible_indices: torch.Tensor,
-        *,
-        current_frame: int,
-        render_error: torch.Tensor | None = None,
-        ema_decay: float = 0.9,
-    ) -> None:
-        """Update visibility/error metadata from an external render pass."""
-
-        batch = self._batch_from_map()
-        indices = visible_indices.detach().to(device=batch.xyz.device, dtype=torch.long).view(-1)
-        if len(batch) == 0 or indices.numel() == 0:
-            return
-        indices = indices[(indices >= 0) & (indices < len(batch))].unique()
-        if indices.numel() == 0:
-            return
-        batch.visibility_count[indices] += 1
-        batch.last_seen_frame[indices] = int(current_frame)
-        if render_error is not None:
-            error = render_error.detach().to(batch.render_error_ema).view(-1)
-            if int(error.numel()) != int(indices.numel()):
-                raise ValueError("render_error must contain one value per visible Gaussian")
-            decay = min(max(float(ema_decay), 0.0), 1.0)
-            batch.render_error_ema[indices] = (
-                decay * batch.render_error_ema[indices]
-                + (1.0 - decay) * error.clamp_min(0.0)
-            )
-        self._write_map(batch)

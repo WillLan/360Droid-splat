@@ -67,7 +67,12 @@ def _identity_quats(n: int, *, device, dtype) -> torch.Tensor:
     return quat
 
 
-def _blank_package(camera: PanoRenderCamera, gaussians, background: torch.Tensor) -> RenderPackage:
+def _blank_package(
+    camera: PanoRenderCamera,
+    gaussians,
+    background: torch.Tensor,
+    query_values: torch.Tensor | None = None,
+) -> RenderPackage:
     H = int(camera.image_height)
     W = int(camera.image_width)
     total = int(gaussians.get_xyz.shape[0])
@@ -75,6 +80,7 @@ def _blank_package(camera: PanoRenderCamera, gaussians, background: torch.Tensor
     render = bg.view(3, 1, 1).expand(3, H, W).clone()
     depth = torch.zeros((1, H, W), device=render.device, dtype=render.dtype)
     alpha = torch.zeros((1, H, W), device=render.device, dtype=render.dtype)
+    query_channels = 0 if query_values is None else int(query_values.shape[-1])
     return {
         "render": render,
         "gs_only": render,
@@ -86,6 +92,12 @@ def _blank_package(camera: PanoRenderCamera, gaussians, background: torch.Tensor
         "render_distort": None,
         "radii": torch.zeros(total, device=render.device, dtype=torch.int32),
         "n_touched": torch.zeros(total, device=render.device, dtype=torch.int32),
+        "accum_visible": torch.zeros(total, device=render.device, dtype=render.dtype),
+        "query_answers": (
+            None
+            if query_values is None
+            else torch.zeros(total, query_channels, device=render.device, dtype=render.dtype)
+        ),
         "accum_metric_counts": None,
         "viewspace_points": torch.zeros(total, 2, device=render.device, dtype=render.dtype),
         "visibility_filter": torch.zeros(total, device=render.device, dtype=torch.bool),
@@ -166,6 +178,7 @@ class PFGS360Renderer:
         gaussians,
         *,
         background: torch.Tensor | None = None,
+        query_values: torch.Tensor | None = None,
     ) -> RenderPackage:
         total_start = time.perf_counter()
         profile: dict[str, float] = {
@@ -189,7 +202,7 @@ class PFGS360Renderer:
             background = torch.zeros(3, device=gaussians.get_xyz.device, dtype=gaussians.get_xyz.dtype)
         if int(gaussians.get_xyz.shape[0]) == 0:
             section_start = time.perf_counter()
-            pkg = _blank_package(camera, gaussians, background)
+            pkg = _blank_package(camera, gaussians, background, query_values)
             profile["profile_renderer_rasterize_sec"] = float(time.perf_counter() - section_start)
             section_start = time.perf_counter()
             pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
@@ -202,6 +215,10 @@ class PFGS360Renderer:
 
         rasterization = _optional_gsplat360(self.extra_gsplat360_roots)
         if rasterization is None:
+            if query_values is not None:
+                raise RuntimeError(
+                    "Gaussian query attribution requires the gsplat360 CUDA renderer"
+                )
             if not self.allow_fallback:
                 raise ImportError(
                     "gsplat360 is unavailable. Install/build the PFGS360 gsplat360 package "
@@ -222,7 +239,13 @@ class PFGS360Renderer:
             return self._attach_profile(pkg, profile)
 
         section_start = time.perf_counter()
-        pkg = self._render_gsplat360(rasterization, camera, gaussians, background)
+        pkg = self._render_gsplat360(
+            rasterization,
+            camera,
+            gaussians,
+            background,
+            query_values=query_values,
+        )
         self._sync_for_profile(gaussians.get_xyz.device)
         profile["profile_renderer_rasterize_sec"] = float(time.perf_counter() - section_start)
         section_start = time.perf_counter()
@@ -338,6 +361,8 @@ class PFGS360Renderer:
         camera: PanoRenderCamera,
         gaussians,
         background: torch.Tensor,
+        *,
+        query_values: torch.Tensor | None = None,
     ) -> RenderPackage:
         H = int(camera.image_height)
         W = int(camera.image_width)
@@ -362,6 +387,18 @@ class PFGS360Renderer:
             if hasattr(gaussians, "get_sh_coefficients")
             else ((gaussians.get_features - 0.5) / SH_C0).unsqueeze(1)
         )
+        if query_values is not None:
+            query_values = query_values.to(device=device, dtype=torch.float32)
+            if query_values.ndim == 3:
+                query_values = query_values.unsqueeze(0)
+            if (
+                query_values.ndim != 4
+                or int(query_values.shape[0]) != 1
+                or tuple(query_values.shape[1:3]) != (H, W)
+            ):
+                raise ValueError(
+                    "query_values must have shape HxWxK or 1xHxWxK for a single camera"
+                )
         render, alpha, render_distort, info = rasterization(
             means=xyz,
             quats=gaussians.get_rotation,
@@ -385,6 +422,7 @@ class PFGS360Renderer:
             rasterize_mode=str(training_cfg.get("pfgs360_rasterize_mode", "antialiased")),
             camera_model="equirectangular",
             ret_visible=True,
+            query_values=query_values,
         )
         rgb = render[0, ..., :3].permute(2, 0, 1).contiguous()
         depth = render[0, ..., 3:4].permute(2, 0, 1).contiguous()
@@ -395,7 +433,19 @@ class PFGS360Renderer:
         if means2d.requires_grad:
             means2d.retain_grad()
         radii = info["radii"][0]
-        visibility_filter = radii > 0
+        accumulated_visibility = info.get("accum_visible")
+        if torch.is_tensor(accumulated_visibility):
+            accumulated_visibility = accumulated_visibility[0]
+            if tuple(accumulated_visibility.shape) != tuple(radii.shape):
+                raise RuntimeError("gsplat360 accum_visible must have shape N.")
+            visibility_filter = accumulated_visibility > 0
+        else:
+            visibility_filter = radii > 0
+        query_answers = info.get("query_answers")
+        if torch.is_tensor(query_answers):
+            query_answers = query_answers[0]
+            if int(query_answers.shape[0]) != int(xyz.shape[0]):
+                raise RuntimeError("gsplat360 query_answers must have shape NxK.")
         n_touched = info.get("accum_times")
         if n_touched is not None:
             n_touched = n_touched[0].to(device=device, dtype=torch.int32)
@@ -412,6 +462,8 @@ class PFGS360Renderer:
             "render_distort": render_distort[0] if render_distort is not None else None,
             "radii": radii,
             "n_touched": n_touched,
+            "accum_visible": accumulated_visibility,
+            "query_answers": query_answers,
             "accum_metric_counts": None,
             "viewspace_points": means2d,
             "visibility_filter": visibility_filter,
@@ -456,12 +508,19 @@ class PFGS360Renderer:
         # Autocast may produce BF16 target-conditioned RGB even though Stage 3
         # materializes geometry in FP32. gsplat360's SH kernel requires colors
         # and view directions to share a scalar type.
-        features = gaussians.get_features.to(device=device, dtype=dtype)
-        if features.ndim == 2:
-            features = features.unsqueeze(0).expand(camera_count, -1, -1)
-        if tuple(features.shape[:2]) != (camera_count, int(xyz.shape[0])):
-            raise ValueError("Batched Gaussian RGB must have shape CxNx3.")
-        colors_sh = ((features - 0.5) / SH_C0).unsqueeze(-2)
+        colors_sh = (
+            gaussians.get_sh_coefficients
+            if hasattr(gaussians, "get_sh_coefficients")
+            else ((gaussians.get_features - 0.5) / SH_C0).unsqueeze(-2)
+        ).to(device=device, dtype=dtype)
+        if colors_sh.ndim == 3:
+            if int(colors_sh.shape[0]) != int(xyz.shape[0]):
+                raise ValueError("Shared Gaussian SH coefficients must have shape NxKx3.")
+        elif colors_sh.ndim == 4:
+            if tuple(colors_sh.shape[:2]) != (camera_count, int(xyz.shape[0])):
+                raise ValueError("Batched Gaussian SH coefficients must have shape CxNxKx3.")
+        else:
+            raise ValueError("Gaussian SH coefficients must have shape NxKx3 or CxNxKx3.")
         backgrounds = background.to(device=device, dtype=dtype)
         if backgrounds.ndim == 1:
             backgrounds = backgrounds.view(1, 3).expand(camera_count, -1)
@@ -484,7 +543,7 @@ class PFGS360Renderer:
             far_plane=float(training_cfg.get("pfgs360_far_plane", 1.0e5)),
             radius_clip=float(training_cfg.get("pfgs360_radius_clip", 0.0)),
             render_mode=render_mode,
-            sh_degree=0,
+            sh_degree=int(getattr(gaussians, "active_sh_degree", 0)),
             sparse_grad=False,
             absgrad=bool(training_cfg.get("pfgs360_absgrad", True)),
             distloss=bool(training_cfg.get("pfgs360_distloss", False)),

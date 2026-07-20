@@ -319,6 +319,9 @@ class SphericalSelfiGlobalBackend:
         insertion_depth_gate_cfg = dict(
             self.config.get("insertion_depth_gate", {}) or {}
         )
+        error_prune_cfg = dict(
+            self.config.get("error_gaussian_prune", {}) or {}
+        )
         self.enabled = bool(self.config.get("enabled", False))
         self.voxel_anchor_refiner_enabled = bool(
             self.config.get("_voxel_anchor_refiner_enabled", False)
@@ -694,6 +697,52 @@ class SphericalSelfiGlobalBackend:
                 raise ValueError(
                     "insertion_depth_gate.alpha_threshold must be in [0, 1]"
                 )
+        self.error_gaussian_prune_enabled = bool(
+            error_prune_cfg.get("enabled", False)
+        )
+        self.error_gaussian_prune_relative_threshold = float(
+            error_prune_cfg.get("relative_depth_threshold", 0.15)
+        )
+        self.error_gaussian_prune_alpha_threshold = float(
+            error_prune_cfg.get("alpha_threshold", 0.05)
+        )
+        self.error_gaussian_prune_min_depth_confidence = float(
+            error_prune_cfg.get("min_depth_confidence", 0.05)
+        )
+        self.error_gaussian_prune_responsibility_threshold = float(
+            error_prune_cfg.get("responsibility_threshold", 0.8)
+        )
+        self.error_gaussian_prune_min_replacement_hits = max(
+            1, int(error_prune_cfg.get("min_replacement_hits", 2))
+        )
+        self.error_gaussian_prune_require_query = bool(
+            error_prune_cfg.get("require_query_attribution", True)
+        )
+        if self.error_gaussian_prune_enabled:
+            if not self.insertion_depth_gate_enabled:
+                raise ValueError(
+                    "error_gaussian_prune requires insertion_depth_gate.enabled=true"
+                )
+            if self.renderer is None:
+                raise ValueError("error_gaussian_prune requires a renderer")
+            if not self.error_gaussian_prune_require_query:
+                raise ValueError(
+                    "error_gaussian_prune requires query attribution; center-projection fallback is unsupported"
+                )
+            for name, value in (
+                ("relative_depth_threshold", self.error_gaussian_prune_relative_threshold),
+                ("alpha_threshold", self.error_gaussian_prune_alpha_threshold),
+                ("min_depth_confidence", self.error_gaussian_prune_min_depth_confidence),
+                ("responsibility_threshold", self.error_gaussian_prune_responsibility_threshold),
+            ):
+                if not math.isfinite(value) or value < 0.0 or (
+                    name != "relative_depth_threshold" and value > 1.0
+                ):
+                    raise ValueError(f"error_gaussian_prune.{name} is invalid")
+            if self.error_gaussian_prune_relative_threshold <= 0.0:
+                raise ValueError(
+                    "error_gaussian_prune.relative_depth_threshold must be positive"
+                )
         if self.insertion_dedup_max_new_gaussians_per_chunk > 0 and (
             not math.isfinite(self.insertion_dedup_coverage_coarse_cell_size)
             or self.insertion_dedup_coverage_coarse_cell_size <= 0.0
@@ -904,10 +953,20 @@ class SphericalSelfiGlobalBackend:
         if self.map_optimization_strategy not in {
             "legacy",
             "gaussian_only_staged",
+            "gaussian_only_joint_3dgs",
         }:
             raise ValueError(
-                "map_optimization.strategy must be 'legacy' or "
-                "'gaussian_only_staged'"
+                "map_optimization.strategy must be 'legacy', "
+                "'gaussian_only_staged', or 'gaussian_only_joint_3dgs'"
+            )
+        if (
+            self.map_optimization_strategy == "gaussian_only_joint_3dgs"
+            and getattr(self.map, "gaussian_parameterization", "legacy")
+            != "traditional_3dgs"
+        ):
+            raise ValueError(
+                "gaussian_only_joint_3dgs requires "
+                "MapRepresentation.gaussian_parameterization=traditional_3dgs"
             )
         self.map_steps_on_loop = max(
             0,
@@ -986,14 +1045,6 @@ class SphericalSelfiGlobalBackend:
         )
         self.insert_loop_pose_factor = bool(
             loop_cfg.get("insert_pose_factor", False)
-        )
-        self.lifecycle_prune_interval = max(
-            0, int(fusion_cfg.get("lifecycle_prune_interval_windows", 0))
-        )
-        self.lifecycle_max_stale_frames = max(0, int(fusion_cfg.get("max_stale_frames", 0)))
-        max_render_error = fusion_cfg.get("max_render_error")
-        self.lifecycle_max_render_error = (
-            float("inf") if max_render_error is None else float(max_render_error)
         )
         self.graph = GlobalSim3FactorGraph(
             damping=float(graph_cfg.get("damping", 1.0e-4)),
@@ -2172,6 +2223,266 @@ class SphericalSelfiGlobalBackend:
             render_seconds=elapsed,
         )
 
+    def _render_two_new_frame_global_views(
+        self,
+        packet: LocalGaussianWindowPacket,
+        window_transform: torch.Tensor,
+        *,
+        new_frame_indices: tuple[int, int],
+    ) -> tuple[torch.Tensor, dict[int, RenderedSharedFrame], float]:
+        if packet.anchor_observation is None:
+            raise RuntimeError("Two-frame global rendering requires anchor geometry")
+        if len(new_frame_indices) != 2:
+            raise RuntimeError("Exactly two non-overlap frames are required")
+        global_poses = packet.global_poses(window_transform)
+        rendered: dict[int, RenderedSharedFrame] = {}
+        seconds = 0.0
+        for frame_index in new_frame_indices:
+            frame = self._render_global_pose_frame(
+                global_poses[int(frame_index)],
+                image_size=packet.anchor_observation.image_size,
+            )
+            rendered[int(frame_index)] = frame
+            seconds += float(frame.render_seconds)
+        return global_poses, rendered, seconds
+
+    def _query_global_pose_frame(
+        self,
+        pose_c2w: torch.Tensor,
+        query_values: torch.Tensor,
+        *,
+        image_size: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        if self.renderer is None:
+            raise RuntimeError("Gaussian query attribution requires a renderer")
+        height, width = (int(value) for value in image_size)
+        device, dtype = self.map.xyz.device, self.map.xyz.dtype
+        camera = PanoRenderCamera(
+            height,
+            width,
+            pose_c2w.to(device=device, dtype=dtype),
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        with torch.inference_mode():
+            package = self.renderer.render(
+                camera,
+                self.map,
+                query_values=query_values.to(device=device, dtype=torch.float32),
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = float(time.perf_counter() - start)
+        answers = package.get("query_answers")
+        accumulated = package.get("accum_visible")
+        if not torch.is_tensor(answers) or not torch.is_tensor(accumulated):
+            raise RuntimeError(
+                "error_gaussian_prune requires gsplat360 query_answers and accum_visible"
+            )
+        if answers.ndim == 3 and int(answers.shape[0]) == 1:
+            answers = answers[0]
+        if accumulated.ndim == 2 and int(accumulated.shape[0]) == 1:
+            accumulated = accumulated[0]
+        answers = answers.to(device=device, dtype=dtype)
+        accumulated = accumulated.to(device=device, dtype=dtype).reshape(-1)
+        expected = self.map.anchor_count()
+        if tuple(answers.shape) != (expected, int(query_values.shape[-1])):
+            raise RuntimeError(
+                "query_answers must have shape NxK matching the current map"
+            )
+        if int(accumulated.numel()) != expected:
+            raise RuntimeError("accum_visible must have one value per Gaussian")
+        if not bool(torch.isfinite(answers).all()) or not bool(
+            torch.isfinite(accumulated).all()
+        ):
+            raise RuntimeError("Gaussian query attribution returned non-finite values")
+        visible = self._single_camera_visibility(
+            package,
+            expected_count=expected,
+            require_accumulated=True,
+        ).to(device=device)
+        return answers, accumulated, visible, elapsed
+
+    @torch.no_grad()
+    def _accumulate_and_prune_error_gaussians(
+        self,
+        packet: LocalGaussianWindowPacket,
+        window_transform: torch.Tensor,
+        *,
+        new_frame_indices: tuple[int, int],
+        global_poses: torch.Tensor,
+        rendered_views: dict[int, RenderedSharedFrame],
+    ) -> tuple[dict[str, int | float], int, float]:
+        """Delete old foreground Gaussians supported by two query-attributed hits."""
+
+        if len(new_frame_indices) != 2:
+            raise RuntimeError("Error-Gaussian pruning requires exactly two new frames")
+        count_before = self.map.anchor_count()
+        if count_before <= 0:
+            return {"error_prune_applied": 0, "error_pruned": 0}, 0, 0.0
+        if int(self.map._anchor_inlier_obs.numel()) != count_before or int(
+            self.map._anchor_outlier_obs.numel()
+        ) != count_before:
+            raise RuntimeError("Error-prune evidence does not match the Gaussian map")
+
+        scale = sim3_components(
+            window_transform.to(device=self.map.xyz.device, dtype=self.map.xyz.dtype)
+        )[0]
+        threshold = float(self.error_gaussian_prune_relative_threshold)
+        stats: dict[str, int | float] = {
+            "error_prune_enabled": 1,
+            "error_prune_applied": 1,
+            "error_prune_query_views": 0,
+            "error_prune_rerender_views": 0,
+            "error_prune_evidence_carryover": int(
+                (self.map._anchor_inlier_obs > 0).sum().item()
+            ),
+        }
+        query_seconds = 0.0
+        query_visible_total = 0
+        new_replacement_hits = 0
+        new_inconsistency_hits = 0
+        replacement_increment = torch.zeros(count_before, dtype=torch.int32)
+        inconsistency_increment = torch.zeros(count_before, dtype=torch.int32)
+        for frame_index in new_frame_indices:
+            frame_index = int(frame_index)
+            frame_id = int(packet.frame_ids[frame_index])
+            rendered = rendered_views.get(frame_index)
+            if rendered is None:
+                raise RuntimeError(f"Missing global render for frame index {frame_index}")
+            new_depth = (
+                packet.observation.refined_depth[0, frame_index]
+                .to(device=self.map.xyz.device, dtype=self.map.xyz.dtype)
+                * scale
+            )
+            confidence = packet.observation.confidence[0, frame_index].to(
+                device=new_depth.device, dtype=new_depth.dtype
+            )
+            trusted = (
+                packet.finite_gaussian_mask[0, frame_index].to(new_depth.device)
+                & packet.static_mask[0, frame_index].to(new_depth.device)
+                & packet.geometry_consistency[0, frame_index].to(new_depth.device)
+                & ~packet.sky_mask[0, frame_index].to(new_depth.device)
+                & torch.isfinite(new_depth)
+                & (new_depth > 0.0)
+                & torch.isfinite(confidence)
+                & (confidence >= self.error_gaussian_prune_min_depth_confidence)
+            )
+            global_depth = rendered.depth.to(new_depth)
+            global_alpha = rendered.alpha.to(new_depth)
+            global_valid = (
+                torch.isfinite(global_depth)
+                & (global_depth > 0.0)
+                & torch.isfinite(global_alpha)
+                & (global_alpha >= self.error_gaussian_prune_alpha_threshold)
+            )
+            comparable = trusted & global_valid
+            old_front = comparable & (
+                global_depth < (1.0 - threshold) * new_depth
+            )
+            new_front = comparable & (
+                new_depth < (1.0 - threshold) * global_depth
+            )
+            consistent = comparable & ~(old_front | new_front)
+            inconsistency = old_front | new_front
+            query_values = torch.stack(
+                [inconsistency[0].float(), old_front[0].float()], dim=-1
+            )
+            answers, accumulated, visible, elapsed = self._query_global_pose_frame(
+                global_poses[frame_index],
+                query_values,
+                image_size=packet.anchor_observation.image_size,
+            )
+            query_seconds += elapsed
+            stats["error_prune_query_views"] = int(
+                stats["error_prune_query_views"]
+            ) + 1
+            valid_responsibility = visible & (accumulated > 0.0)
+            responsibility = torch.zeros_like(answers)
+            responsibility[valid_responsibility] = (
+                answers[valid_responsibility]
+                / accumulated[valid_responsibility, None].clamp_min(1.0e-12)
+            )
+            inconsistency_hit = valid_responsibility & (
+                responsibility[:, 0]
+                >= self.error_gaussian_prune_responsibility_threshold
+            )
+            replacement_hit = valid_responsibility & (
+                responsibility[:, 1]
+                >= self.error_gaussian_prune_responsibility_threshold
+            )
+            inconsistency_rows = torch.nonzero(
+                inconsistency_hit, as_tuple=False
+            ).flatten().cpu()
+            replacement_rows = torch.nonzero(
+                replacement_hit, as_tuple=False
+            ).flatten().cpu()
+            inconsistency_increment[inconsistency_rows] += 1
+            replacement_increment[replacement_rows] += 1
+            view_visible = int(valid_responsibility.sum().detach().cpu())
+            view_inconsistency_hits = int(inconsistency_rows.numel())
+            view_replacement_hits = int(replacement_rows.numel())
+            query_visible_total += view_visible
+            new_inconsistency_hits += view_inconsistency_hits
+            new_replacement_hits += view_replacement_hits
+            stats.update(
+                {
+                    f"error_prune_view_{frame_id}_reliable_pixels": int(
+                        trusted.sum().detach().cpu()
+                    ),
+                    f"error_prune_view_{frame_id}_old_front_pixels": int(
+                        old_front.sum().detach().cpu()
+                    ),
+                    f"error_prune_view_{frame_id}_new_front_pixels": int(
+                        new_front.sum().detach().cpu()
+                    ),
+                    f"error_prune_view_{frame_id}_consistent_pixels": int(
+                        consistent.sum().detach().cpu()
+                    ),
+                    f"error_prune_view_{frame_id}_no_valid_pixels": int(
+                        (~comparable).sum().detach().cpu()
+                    ),
+                    f"error_prune_view_{frame_id}_query_visible": view_visible,
+                    f"error_prune_view_{frame_id}_inconsistency_hits": view_inconsistency_hits,
+                    f"error_prune_view_{frame_id}_replacement_hits": view_replacement_hits,
+                    f"error_prune_view_{frame_id}_mean_replacement_responsibility": float(
+                        responsibility[valid_responsibility, 1].mean().detach().cpu()
+                    )
+                    if bool(valid_responsibility.any())
+                    else 0.0,
+                }
+            )
+
+        self.map._anchor_outlier_obs += inconsistency_increment
+        self.map._anchor_inlier_obs += replacement_increment
+        eligible_cpu = (
+            self.map._anchor_inlier_obs
+            >= int(self.error_gaussian_prune_min_replacement_hits)
+        )
+        eligible = int(eligible_cpu.sum().item())
+        deleted = 0
+        if eligible > 0:
+            deleted = int(
+                self.map.prune_anchors(
+                    eligible_cpu.to(device=self.map.xyz.device, dtype=torch.bool)
+                )
+            )
+        stats.update(
+            {
+                "error_prune_query_visible": query_visible_total,
+                "error_prune_new_inconsistency_hits": new_inconsistency_hits,
+                "error_prune_new_replacement_hits": new_replacement_hits,
+                "error_prune_eligible": eligible,
+                "error_pruned": deleted,
+                "error_prune_anchor_count_before": count_before,
+                "error_prune_anchor_count_after": self.map.anchor_count(),
+                "error_prune_deleted_fraction": float(deleted / max(1, count_before)),
+                "error_prune_query_seconds": query_seconds,
+            }
+        )
+        return stats, deleted, query_seconds
+
     @staticmethod
     def _classify_incoming_anchor_depths(
         incoming_depth: torch.Tensor,
@@ -2298,6 +2609,8 @@ class SphericalSelfiGlobalBackend:
         window_transform: torch.Tensor,
         *,
         new_frame_indices: tuple[int, int],
+        rendered_views: dict[int, RenderedSharedFrame] | None = None,
+        global_poses: torch.Tensor | None = None,
     ) -> tuple[
         Any,
         torch.Tensor,
@@ -2320,7 +2633,20 @@ class SphericalSelfiGlobalBackend:
         if not torch.is_tensor(source_view_mask):
             raise RuntimeError("Insertion depth gate requires source-view support")
 
-        global_poses = packet.global_poses(window_transform)
+        if (rendered_views is None) != (global_poses is None):
+            raise ValueError(
+                "rendered_views and global_poses must be provided together"
+            )
+        if rendered_views is None or global_poses is None:
+            global_poses, rendered_views, render_seconds = (
+                self._render_two_new_frame_global_views(
+                    packet,
+                    window_transform,
+                    new_frame_indices=new_frame_indices,
+                )
+            )
+        else:
+            render_seconds = 0.0
         xyz = prepared.batch.xyz
         source_rows = prepared.source_anchor_indices.to(
             device=source_view_mask.device, dtype=torch.long
@@ -2340,17 +2666,16 @@ class SphericalSelfiGlobalBackend:
             "depth_gate_incoming_render_views": 0,
             "depth_gate_global_render_views": 2,
         }
-        render_seconds = 0.0
         height, width = (
             int(value) for value in packet.anchor_observation.image_size
         )
         for frame_index in new_frame_indices:
             frame_id = int(packet.frame_ids[int(frame_index)])
-            rendered = self._render_global_pose_frame(
-                global_poses[int(frame_index)],
-                image_size=(height, width),
-            )
-            render_seconds += float(rendered.render_seconds)
+            rendered = rendered_views.get(int(frame_index))
+            if rendered is None:
+                raise RuntimeError(
+                    f"Missing pre-rendered global view for frame index {frame_index}"
+                )
             existing_visibility |= rendered.anchor_visibility.to(
                 existing_visibility.device
             )
@@ -7507,6 +7832,62 @@ class SphericalSelfiGlobalBackend:
                 metrics["pose_refine_enabled"] = 0.0
                 metrics["photometric_only"] = 0.0
                 return metrics
+            if self.map_optimization_strategy == "gaussian_only_joint_3dgs":
+                recent_frame_ids = self._map_optimization_frame_ids(
+                    int(window_id)
+                )
+                metrics = self.mapper.optimize_spherical_selfi_joint_3dgs(
+                    window_id=int(window_id),
+                    frame_ids=list(recent_frame_ids),
+                    active_owner_window_ids=list(active_owner_window_ids),
+                    settings={
+                        "steps": int(steps),
+                        "sample_observations_per_step": int(
+                            self.map_optimize_config.get(
+                                "sample_observations_per_step", 2
+                            )
+                        ),
+                        "seed": int(self.map_optimize_config.get("seed", 123)),
+                        "rgb_l1_weight": float(
+                            self.map_optimize_config.get("rgb_l1_weight", 0.8)
+                        ),
+                        "dssim_weight": float(
+                            self.map_optimize_config.get("dssim_weight", 0.2)
+                        ),
+                        "max_rgb_worsening": float(
+                            self.map_optimize_config.get(
+                                "max_rgb_worsening", 0.005
+                            )
+                        ),
+                        "xyz_lr": float(
+                            self.map_optimize_config.get("xyz_lr", 5.0e-4)
+                        ),
+                        "feature_lr": float(
+                            self.map_optimize_config.get("feature_lr", 2.0e-3)
+                        ),
+                        "sh_rest_lr": float(
+                            self.map_optimize_config.get("sh_rest_lr", 1.0e-4)
+                        ),
+                        "opacity_lr": float(
+                            self.map_optimize_config.get("opacity_lr", 1.0e-3)
+                        ),
+                        "scaling_lr": float(
+                            self.map_optimize_config.get("scaling_lr", 1.0e-4)
+                        ),
+                        "rotation_lr": float(
+                            self.map_optimize_config.get("rotation_lr", 1.0e-4)
+                        ),
+                    },
+                )
+                metrics["optimized_frame_count"] = float(
+                    len(recent_frame_ids)
+                )
+                metrics["active_owner_window_count"] = float(
+                    len(active_owner_window_ids)
+                )
+                metrics["pose_refine_enabled"] = 0.0
+                metrics["photometric_only"] = 1.0
+                return metrics
             fixed_frame_ids: list[int] = []
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
@@ -10719,12 +11100,58 @@ class SphericalSelfiGlobalBackend:
                             "non-overlap frames after the first window"
                         )
                     gate_start = time.perf_counter()
+                    precomputed_views = None
+                    precomputed_global_poses = None
+                    if self.error_gaussian_prune_enabled:
+                        (
+                            precomputed_global_poses,
+                            precomputed_views,
+                            initial_depth_seconds,
+                        ) = self._render_two_new_frame_global_views(
+                            packet,
+                            window_transform,
+                            new_frame_indices=(
+                                int(new_indices[0]), int(new_indices[1])
+                            ),
+                        )
+                        prune_stats, deleted, query_seconds = (
+                            self._accumulate_and_prune_error_gaussians(
+                                packet,
+                                window_transform,
+                                new_frame_indices=(
+                                    int(new_indices[0]), int(new_indices[1])
+                                ),
+                                global_poses=precomputed_global_poses,
+                                rendered_views=precomputed_views,
+                            )
+                        )
+                        insertion_render_seconds += (
+                            initial_depth_seconds + query_seconds
+                        )
+                        if deleted > 0:
+                            (
+                                precomputed_global_poses,
+                                precomputed_views,
+                                rerender_seconds,
+                            ) = self._render_two_new_frame_global_views(
+                                packet,
+                                window_transform,
+                                new_frame_indices=(
+                                    int(new_indices[0]), int(new_indices[1])
+                                ),
+                            )
+                            insertion_render_seconds += rerender_seconds
+                            prune_stats["error_prune_rerender_views"] = 2
+                            prune_stats["error_prune_rerender_seconds"] = float(
+                                rerender_seconds
+                            )
+                        hash_stats.update(prune_stats)
                     (
                         prepared,
                         incoming_visibility,
                         existing_visibility,
                         depth_gate_stats,
-                        insertion_render_seconds,
+                        gate_render_seconds,
                         global_poses,
                     ) = self._apply_two_new_frame_depth_gate(
                         packet,
@@ -10733,7 +11160,10 @@ class SphericalSelfiGlobalBackend:
                         new_frame_indices=(
                             int(new_indices[0]), int(new_indices[1])
                         ),
+                        rendered_views=precomputed_views,
+                        global_poses=precomputed_global_poses,
                     )
+                    insertion_render_seconds += gate_render_seconds
                     hash_stats.update(depth_gate_stats)
                     hash_visibility_views = 2
                     if self.insertion_dedup_log_posthash_coverage:
@@ -11337,14 +11767,6 @@ class SphericalSelfiGlobalBackend:
             self.frame_owner_window.setdefault(frame, window_id)
             self.frame_depth_owner_window.setdefault(frame, window_id)
 
-        if self.lifecycle_prune_interval > 0 and (
-            len(self.window_order) % self.lifecycle_prune_interval == 0
-        ):
-            fusion_stats["lifecycle_pruned"] = self.fusion.prune_lifecycle(
-                current_frame=end_frame,
-                max_stale_frames=self.lifecycle_max_stale_frames,
-                max_render_error=self.lifecycle_max_render_error,
-            )
         self.loop_detector.add(compact_packet)
         if self.chunk_first_stride_graph:
             graph_changed_history = bool(
@@ -11375,7 +11797,10 @@ class SphericalSelfiGlobalBackend:
         else:
             self._refresh_geometry_updates()
 
-        if self.map_optimization_strategy == "gaussian_only_staged":
+        if self.map_optimization_strategy in {
+            "gaussian_only_staged",
+            "gaussian_only_joint_3dgs",
+        }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(
                     window_id, packet.frame_ids, self.map_steps_per_window
@@ -11669,17 +12094,12 @@ class SphericalSelfiGlobalBackend:
             self.frame_windows.setdefault(int(frame_id), set()).add(int(window_id))
             self.frame_depth_owner_window.setdefault(int(frame_id), int(window_id))
         fusion_stats = self.fusion.fuse_packet(packet, self.graph.transform(window_id))
-        if self.lifecycle_prune_interval > 0 and (
-            len(self.window_order) % self.lifecycle_prune_interval == 0
-        ):
-            fusion_stats["lifecycle_pruned"] = self.fusion.prune_lifecycle(
-                current_frame=int(packet.frame_ids[-1]),
-                max_stale_frames=self.lifecycle_max_stale_frames,
-                max_render_error=self.lifecycle_max_render_error,
-            )
         self.loop_detector.add(compact_packet)
         self._refresh_pose_updates()
-        if self.map_optimization_strategy == "gaussian_only_staged":
+        if self.map_optimization_strategy in {
+            "gaussian_only_staged",
+            "gaussian_only_joint_3dgs",
+        }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(
                     window_id, packet.frame_ids, self.map_steps_per_window
