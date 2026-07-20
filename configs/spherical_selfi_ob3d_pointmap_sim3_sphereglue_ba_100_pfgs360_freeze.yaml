@@ -1,0 +1,48 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_pfgs360_freeze.yaml
+
+# Strict matcher ablation on the PointMap-Sim3 mainline. SphereGlue replaces
+# only the local-BA correspondence cache (and therefore the boundary/chunk-
+# stride matches exported from that cache). The dense adapter remains frozen
+# for the Gaussian head, voxel-anchor refiner, sky head, and loop descriptors.
+SphericalSelfiRuntime:
+  local_ba:
+    matching:
+      type: superpoint_sphereglue
+      num_queries: 1024
+      extractor_max_keypoints: 2048
+      min_depth: 0.05
+      max_depth: 20.0
+      min_factor_weight: 0.01
+      nms_radius: 4
+      detection_threshold: 5.0e-4
+      remove_borders: 4
+      chebyshev_k: 2
+      knn: 20
+      sinkhorn_iterations: 20
+      match_threshold: 0.2
+      aggregation: add
+      lightglue_repo: /mnt/disk1/lanboyang/External/LightGlue
+      sphereglue_repo: /mnt/disk1/lanboyang/External/SphereGlue
+      superpoint_checkpoint: /mnt/disk1/lanboyang/External/LightGlue/weights/superpoint_v1.pth
+      sphereglue_checkpoint: /mnt/disk1/lanboyang/External/SphereGlue/model_weights/superpoint/model.safetensors
+
+WeightsAndBiases:
+  group: ob3d-sponza-pointmap-sim3-sphereglue-ba-100
+  run_name: ob3d100_pointmap_sim3_sphereglue_ba_pfgs360_frozen_frontend_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - superpoint
+    - sphereglue-ba
+    - localba8-single-stage
+    - refiner
+    - overlap-pointmap
+    - full-sim3
+    - overlap2
+    - matcher-ablation
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_sphereglue_ba_pfgs360_frozen_frontend_r1

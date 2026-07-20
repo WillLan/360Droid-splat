@@ -512,6 +512,61 @@ def test_ob3d_pointmap_sim3_config_preserves_adapter_ba_refiner_baseline() -> No
     )
 
 
+def test_ob3d_pointmap_sim3_sphereglue_is_a_matcher_only_ablation() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    adapter = load_config(
+        root
+        / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_pfgs360_freeze.yaml"
+    )
+    sphereglue = load_config(
+        root
+        / "spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_freeze.yaml"
+    )
+
+    for section in (
+        "Dataset",
+        "VoxelAnchorRefiner",
+        "SphericalSelfiGlobalBackend",
+        "MapRepresentation",
+        "BackendOptimization",
+        "Mapping",
+        "SkyBox",
+        "Training",
+        "Renderer",
+        "TrajectoryEvaluation",
+    ):
+        assert sphereglue.get(section) == adapter.get(section)
+
+    adapter_runtime = adapter["SphericalSelfiRuntime"]
+    sphereglue_runtime = sphereglue["SphericalSelfiRuntime"]
+    assert sphereglue_runtime.keys() == adapter_runtime.keys()
+    for key in sphereglue_runtime:
+        if key != "local_ba":
+            assert sphereglue_runtime[key] == adapter_runtime[key]
+    assert {
+        key: value
+        for key, value in sphereglue_runtime["local_ba"].items()
+        if key != "matching"
+    } == {
+        key: value
+        for key, value in adapter_runtime["local_ba"].items()
+        if key != "matching"
+    }
+
+    matching = sphereglue_runtime["local_ba"]["matching"]
+    assert matching["type"] == "superpoint_sphereglue"
+    assert matching["num_queries"] == 1024
+    assert matching["extractor_max_keypoints"] == 2048
+    assert matching["knn"] == 20
+    assert matching["sinkhorn_iterations"] == 20
+    assert matching["lightglue_repo"].endswith("/External/LightGlue")
+    assert matching["sphereglue_repo"].endswith("/External/SphereGlue")
+    assert sphereglue["WeightsAndBiases"]["runtime_log_preset"] == (
+        "slam_core_visuals"
+    )
+    assert sphereglue["Results"]["render_final_all_frames"] is True
+
+
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):
     cfg = {
         "Dataset": {"synthetic": True, "synthetic_length": 4, "height": 16, "width": 32},
