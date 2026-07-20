@@ -66,11 +66,74 @@ def _align_rotations(
     return u @ correction @ vh
 
 
+def pfgs360_normalized_trajectory_alignment(
+    predicted_centers: torch.Tensor,
+    target_centers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Reproduce the official PFGS360 normalized trajectory ATE protocol.
+
+    PFGS360 independently centers and Frobenius-normalizes the predicted and
+    target camera centers, applies the scalar returned by orthogonal
+    Procrustes, and then performs a full Sim(3) Umeyama alignment.  Its ATE is
+    therefore dimensionless rather than expressed in the target coordinate
+    units.
+    """
+
+    if (
+        predicted_centers.shape != target_centers.shape
+        or predicted_centers.ndim != 2
+        or predicted_centers.shape[-1] != 3
+    ):
+        raise ValueError("PFGS360 trajectory alignment expects matching Nx3 centers")
+    if int(predicted_centers.shape[0]) < 2:
+        raise ValueError("PFGS360 trajectory alignment requires at least two centers")
+    predicted = predicted_centers.detach().double()
+    target = target_centers.detach().double()
+    if not bool(torch.isfinite(predicted).all() and torch.isfinite(target).all()):
+        raise ValueError("PFGS360 trajectory centers must be finite")
+
+    predicted_centered = predicted - predicted.mean(dim=0, keepdim=True)
+    target_centered = target - target.mean(dim=0, keepdim=True)
+    predicted_norm = torch.linalg.norm(predicted_centered)
+    target_norm = torch.linalg.norm(target_centered)
+    if float(predicted_norm) <= 0.0 or float(target_norm) <= 0.0:
+        raise ValueError("PFGS360 trajectory normalization requires non-zero motion")
+
+    predicted_normalized = predicted_centered / predicted_norm
+    target_normalized = target_centered / target_norm
+
+    # scipy.linalg.orthogonal_procrustes(A, B) returns the sum of singular
+    # values of A.T @ B as its scalar.  The official code discards the returned
+    # rotation and multiplies only the predicted centers by this scalar before
+    # running its second, full Sim(3) alignment.
+    procrustes_cross = target_normalized.transpose(0, 1) @ predicted_normalized
+    procrustes_scale = torch.linalg.svdvals(procrustes_cross).sum()
+    predicted_pre_scaled = predicted_normalized * procrustes_scale
+    aligned, sim3_scale, _, _ = _align_centers(
+        predicted_pre_scaled,
+        target_normalized,
+        allow_scale=True,
+    )
+    error = (aligned - target_normalized).norm(dim=-1)
+    metrics = {
+        "pfgs360_ate": float(error.square().mean().sqrt().cpu()),
+        "pfgs360_ate_mean": float(error.mean().cpu()),
+        "pfgs360_ate_median": float(error.median().cpu()),
+        "pfgs360_ate_max": float(error.max().cpu()),
+        "pfgs360_gt_center_norm": float(target_norm.cpu()),
+        "pfgs360_pred_center_norm": float(predicted_norm.cpu()),
+        "pfgs360_procrustes_scale": float(procrustes_scale.cpu()),
+        "pfgs360_sim3_scale_after_normalization": float(sim3_scale.cpu()),
+    }
+    return aligned, target_normalized, error, metrics
+
+
 def c2w_trajectory_metrics(
     predicted_c2w: torch.Tensor,
     target_c2w: torch.Tensor,
     *,
     deltas: tuple[int, ...] = (1, 3, 10),
+    include_pfgs360: bool = False,
 ) -> dict[str, float]:
     """Compute ATE, RPE, and scale drift for matching c2w trajectories.
 
@@ -133,6 +196,12 @@ def c2w_trajectory_metrics(
             so3_rotation_ape.median().cpu()
         ),
     }
+    if include_pfgs360:
+        _, _, _, pfgs360_metrics = pfgs360_normalized_trajectory_alignment(
+            pred_center,
+            target_center,
+        )
+        metrics.update(pfgs360_metrics)
 
     for delta in sorted({int(value) for value in deltas if 0 < int(value) < count}):
         pred_relative = torch.linalg.inv(predicted[:-delta]) @ predicted[delta:]

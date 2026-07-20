@@ -600,6 +600,17 @@ def test_pointmap_sim3_config_is_explicit_opt_in() -> None:
     assert graph["skip_edge"]["enabled"] is False
 
 
+def test_ob3d_pointmap_sim3_100_config_logs_both_ate_protocols() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert config["TrajectoryEvaluation"] == {"ate_mode": "both"}
+
+
 def test_hash_radius20_configs_only_sweep_the_radius_algorithmically() -> None:
     root = Path(__file__).parents[1] / "configs"
     expected = {
@@ -6238,6 +6249,29 @@ def test_pointmap_chunk_graph_delays_node_and_uses_current_first_depth() -> None
         ),
     )
     assert float(following.observation.refined_depth[0, 0].mean()) == 4.0
+
+
+def test_pointmap_sim3_frontend_pose_snapshot_keeps_first_overlap_owner() -> None:
+    previous_poses = torch.eye(4).repeat(4, 1, 1)
+    previous_poses[:, 0, 3] = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    current_poses = torch.eye(4).repeat(4, 1, 1)
+    current_poses[:, 0, 3] = torch.tensor([20.0, 21.0, 22.0, 23.0])
+    previous = _packet(0, previous_poses, (0, 1, 2, 3))
+    current = _packet(1, current_poses, (2, 3, 4, 5))
+    backend = _pointmap_chunk_backend()
+
+    backend._record_pointmap_sim3_alignment(previous, torch.eye(4))
+    backend._record_pointmap_sim3_alignment(current, torch.eye(4))
+
+    snapshot = backend.pointmap_sim3_aligned_pose_snapshot()
+    assert set(snapshot) == {0, 1, 2, 3, 4, 5}
+    # Conflicting current-chunk estimates for the overlap frames do not
+    # replace the canonical poses already emitted by the previous chunk.
+    assert float(snapshot[2][0, 3]) == pytest.approx(2.0)
+    assert float(snapshot[3][0, 3]) == pytest.approx(3.0)
+    # Only genuinely new frames are appended from the current chunk.
+    assert float(snapshot[4][0, 3]) == pytest.approx(2.0)
+    assert float(snapshot[5][0, 3]) == pytest.approx(3.0)
 
 
 def test_pointmap_alignment_finalizes_refiner_once_before_sampling(

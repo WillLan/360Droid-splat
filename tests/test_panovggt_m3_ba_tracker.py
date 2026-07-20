@@ -1967,6 +1967,61 @@ def test_slam_core_visuals_separate_pose_streams_and_filter_wandb(tmp_path):
     assert all(step is None for _, step in logger.run.logged)
 
 
+def test_slam_logger_both_ate_mode_keeps_standard_primary_metric(tmp_path):
+    class _Run:
+        def __init__(self):
+            self.logged = []
+
+        def log(self, payload, step=None):
+            self.logged.append((payload, step))
+
+    class _Wandb:
+        @staticmethod
+        def Image(value):
+            return ("image", value)
+
+    logger = SlamRuntimeLogger(
+        {
+            "TrajectoryEvaluation": {"ate_mode": "both"},
+            "WeightsAndBiases": {
+                "mode": "disabled",
+                "runtime_log_preset": "slam_core_visuals",
+            },
+            "Visualization": {"save_local": True},
+        },
+        tmp_path,
+    )
+    logger.run = _Run()
+    logger._wandb = _Wandb()
+    poses = []
+    for frame_id in range(3):
+        pose = torch.eye(4)
+        pose[0, 3] = float(frame_id)
+        poses.append((frame_id, pose))
+
+    logger.log_final_slam_trajectory(
+        poses,
+        trajectory_metrics={
+            "sim3_ate_rmse": 0.12,
+            "se3_ate_rmse": 0.34,
+            "pfgs360_ate": 0.045,
+        },
+        fallback_ate_rmse=None,
+        step=8,
+    )
+
+    scalar_payload = {
+        key: value
+        for payload, _ in logger.run.logged
+        for key, value in payload.items()
+        if not isinstance(value, tuple)
+    }
+    assert scalar_payload["slam/final_ate_rmse"] == pytest.approx(0.12)
+    assert scalar_payload["slam/final_sim3_ate_rmse"] == pytest.approx(0.12)
+    assert scalar_payload["slam/final_pfgs360_ate"] == pytest.approx(0.045)
+    assert scalar_payload["slam/final_se3_ate_rmse"] == pytest.approx(0.34)
+
+
 def test_slam_logger_saves_depth_insertion_diagnostic_visualization(tmp_path):
     logger = SlamRuntimeLogger(
         {

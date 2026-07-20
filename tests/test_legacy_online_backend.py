@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from backend.legacy_360gs.config import build_legacy_config
@@ -14,6 +15,7 @@ from system.pano_droid_gs_slam import (
     PanoDroidGSSlamSystem,
     SlamRuntimeLogger,
     _compute_ape_translation,
+    _compute_pfgs360_ape_translation,
 )
 
 
@@ -213,6 +215,31 @@ def test_trajectory_ape_translation_uses_sim3_umeyama_alignment():
     assert np.allclose(aligned, gt, atol=1e-5)
     assert float(np.nanmax(ape)) < 1e-5
     assert metrics["rmse"] < 1e-5
+
+
+def test_pfgs360_ape_translation_returns_normalized_dimensionless_metric():
+    pred = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.5],
+        ],
+        dtype=np.float64,
+    )
+    gt = pred.copy()
+    gt[2, 1] += 0.2
+
+    aligned, normalized_gt, ape, metrics, accepted = (
+        _compute_pfgs360_ape_translation(pred, gt)
+    )
+
+    assert accepted
+    assert np.isfinite(aligned).all()
+    assert np.linalg.norm(normalized_gt) == pytest.approx(1.0)
+    assert metrics["pfgs360_ate"] == pytest.approx(
+        float(np.sqrt(np.mean(np.square(ape))))
+    )
 
 
 def test_panovggt_backend_pose_feedback_updates_pose_cache():

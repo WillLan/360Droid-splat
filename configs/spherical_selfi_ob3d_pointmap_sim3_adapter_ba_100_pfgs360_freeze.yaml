@@ -1,0 +1,9 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100.yaml
+
+# OB3D 100-frame validation of the frozen online frontend Sim(3) trajectory
+# and the additional official PFGS360 normalized ATE diagnostic.
+WeightsAndBiases:
+  run_name: ob3d100_pointmap_sim3_pfgs360_ate_frozen_frontend_r4
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_pfgs360_ate_frozen_frontend_r4

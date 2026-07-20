@@ -25,6 +25,11 @@ SphericalSelfiGlobalBackend:
     skip_edge:
       enabled: false
 
+TrajectoryEvaluation:
+  # Keep the standard Sim(3) ATE and additionally reproduce the normalized,
+  # dimensionless ATE protocol used by the official PFGS360 implementation.
+  ate_mode: both
+
 WeightsAndBiases:
   enabled: true
   mode: online

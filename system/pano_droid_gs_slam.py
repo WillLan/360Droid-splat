@@ -25,7 +25,10 @@ from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_gri
 from frontend.pano_droid.spherical_ba import se3_exp, skew
 from frontend.pano_vggt.grid_utils import feature_uv_to_image_uv
 from geometry.pose import relative_c2w
-from geometry.trajectory_metrics import c2w_trajectory_metrics
+from geometry.trajectory_metrics import (
+    c2w_trajectory_metrics,
+    pfgs360_normalized_trajectory_alignment,
+)
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
 
@@ -362,6 +365,35 @@ def _compute_ape_translation(
     return aligned, ape, metrics, sim3_aligned
 
 
+def _compute_pfgs360_ape_translation(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float], bool]:
+    """Return the official PFGS360 normalized alignment and APE per frame."""
+
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+    valid = np.isfinite(pred).all(axis=1) & np.isfinite(gt).all(axis=1)
+    aligned = np.full_like(pred, np.nan, dtype=np.float64)
+    normalized_gt = np.full_like(gt, np.nan, dtype=np.float64)
+    ape = np.full((len(pred),), np.nan, dtype=np.float64)
+    if int(valid.sum()) < 2:
+        return aligned, normalized_gt, ape, {}, False
+    try:
+        aligned_valid, normalized_gt_valid, error_valid, metrics = (
+            pfgs360_normalized_trajectory_alignment(
+                torch.from_numpy(pred[valid]),
+                torch.from_numpy(gt[valid]),
+            )
+        )
+    except ValueError:
+        return aligned, normalized_gt, ape, {}, False
+    aligned[valid] = aligned_valid.cpu().numpy()
+    normalized_gt[valid] = normalized_gt_valid.cpu().numpy()
+    ape[valid] = error_valid.cpu().numpy()
+    return aligned, normalized_gt, ape, metrics, True
+
+
 def _align_xyz_for_plot(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     aligned, _ = _align_xyz_umeyama_sim3(pred, gt)
     return aligned
@@ -514,6 +546,10 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "slam/final_ate_rmse",
         "slam/final_sim3_ate_rmse",
         "slam/final_se3_ate_rmse",
+        "slam/final_pfgs360_ate",
+        "frontend/pfgs360_ate",
+        "backend/pfgs360_ate",
+        "slam/pfgs360_ate",
         "backend/render_vs_gt_panorama",
         "backend/new_gaussians_per_chunk",
     }
@@ -526,6 +562,19 @@ class SlamRuntimeLogger:
     def __init__(self, config: dict, output_dir: Path) -> None:
         wb_cfg = config.get("WeightsAndBiases", {})
         vis_cfg = config.get("Visualization", {})
+        trajectory_eval_cfg = dict(config.get("TrajectoryEvaluation", {}) or {})
+        self.trajectory_ate_mode = str(
+            trajectory_eval_cfg.get("ate_mode", "standard")
+        ).strip().lower()
+        if self.trajectory_ate_mode not in {
+            "standard",
+            "pfgs360_official",
+            "both",
+        }:
+            raise ValueError(
+                "TrajectoryEvaluation.ate_mode must be 'standard', "
+                "'pfgs360_official', or 'both'"
+            )
         self.output_dir = output_dir
         self.log_every = max(1, int(wb_cfg.get("log_every", vis_cfg.get("log_every", 10))))
         self.m3_log_every = max(1, int(vis_cfg.get("m3_log_every", self.log_every)))
@@ -871,6 +920,28 @@ class SlamRuntimeLogger:
                 pose_cpu[:3, 3].numpy(),
             )
 
+    def _pfgs360_metrics_for_history(
+        self,
+        history: list[tuple[int, np.ndarray]],
+    ) -> dict[str, float]:
+        if self.trajectory_ate_mode not in {"pfgs360_official", "both"}:
+            return {}
+        gt_by_id = {int(frame_id): xyz for frame_id, xyz in self._gt_pose_history}
+        paired = [
+            (np.asarray(position), np.asarray(gt_by_id[int(frame_id)]))
+            for frame_id, position in history
+            if int(frame_id) in gt_by_id
+        ]
+        if len(paired) < 2:
+            return {}
+        predicted = np.asarray([value[0] for value in paired], dtype=np.float64)
+        target = np.asarray([value[1] for value in paired], dtype=np.float64)
+        _, _, _, metrics, accepted = _compute_pfgs360_ape_translation(
+            predicted,
+            target,
+        )
+        return metrics if accepted else {}
+
     def _trajectory_comparison_payload(
         self,
         output: FrontendOutput,
@@ -900,7 +971,7 @@ class SlamRuntimeLogger:
         )
         if self.run is None or self._wandb is None:
             return {}
-        return {
+        payload: dict[str, object] = {
             "frontend/trajectory_vs_gt": self._wandb.Image(
                 str(frontend_traj_path)
             ),
@@ -913,6 +984,27 @@ class SlamRuntimeLogger:
             "frontend/trajectory_png": str(frontend_traj_path),
             "backend/trajectory_png": str(backend_traj_path),
         }
+        for prefix, history in (
+            (
+                "frontend",
+                self._frontend_sim3_pose_history
+                or self._frontend_raw_pose_history
+                or self._frontend_pose_history,
+            ),
+            (
+                "backend",
+                self._backend_graph_pose_history
+                or self._backend_global_pose_history
+                or self._backend_pose_history,
+            ),
+            ("slam", self._slam_final_pose_history),
+        ):
+            metrics = self._pfgs360_metrics_for_history(history)
+            if "pfgs360_ate" in metrics:
+                payload[f"{prefix}/pfgs360_ate"] = float(
+                    metrics["pfgs360_ate"]
+                )
+        return payload
 
     def _observe_m3_debug(self, m3_debug: dict | None) -> None:
         if not m3_debug:
@@ -1795,14 +1887,32 @@ class SlamRuntimeLogger:
         gt_positions = np.asarray([gt_by_id.get(int(fid), np.full(3, np.nan)) for fid in frame_ids], dtype=np.float32)
         has_gt = bool(np.isfinite(gt_positions).all(axis=1).any())
         positions_plot = positions
+        gt_positions_plot = gt_positions
         ape_errors = None
         ape_metrics: dict[str, float] = {}
+        pfgs360_metrics: dict[str, float] = {}
         sim3_aligned = False
+        pfgs360_aligned = False
         if has_gt:
             positions_plot, ape_errors, ape_metrics, sim3_aligned = _compute_ape_translation(
                 positions,
                 gt_positions,
             )
+            if self.trajectory_ate_mode in {"pfgs360_official", "both"}:
+                (
+                    pfgs360_positions,
+                    pfgs360_gt,
+                    pfgs360_errors,
+                    pfgs360_metrics,
+                    pfgs360_aligned,
+                ) = _compute_pfgs360_ape_translation(positions, gt_positions)
+                if (
+                    self.trajectory_ate_mode == "pfgs360_official"
+                    and pfgs360_aligned
+                ):
+                    positions_plot = pfgs360_positions
+                    gt_positions_plot = pfgs360_gt
+                    ape_errors = pfgs360_errors
         try:
             import matplotlib
 
@@ -1817,8 +1927,8 @@ class SlamRuntimeLogger:
             valid_gt = np.zeros((len(frame_ids),), dtype=bool)
             plot_gt = None
             if has_gt:
-                valid_gt = np.isfinite(gt_positions).all(axis=1)
-                plot_gt_all = _xyz_to_y_up_plot(gt_positions)
+                valid_gt = np.isfinite(gt_positions_plot).all(axis=1)
+                plot_gt_all = _xyz_to_y_up_plot(gt_positions_plot)
                 plot_gt = plot_gt_all[valid_gt]
                 all_for_limits.append(plot_gt)
                 ax.plot(
@@ -1855,7 +1965,11 @@ class SlamRuntimeLogger:
                         ax=ax,
                         shrink=0.75,
                         pad=0.08,
-                        label="APE translation",
+                        label=(
+                            "PFGS360 normalized APE"
+                            if self.trajectory_ate_mode == "pfgs360_official"
+                            else "APE translation"
+                        ),
                     )
                 else:
                     line_collection = Line3DCollection(segments, colors="#1f77b4", linewidth=2.2)
@@ -1883,14 +1997,28 @@ class SlamRuntimeLogger:
             ax.set_zlabel("Y")
             if has_gt:
                 align_text = "Sim(3) Umeyama" if sim3_aligned else "unaligned (<3 GT matches)"
-                metric_text = ""
-                if ape_metrics:
-                    metric_text = (
-                        f"\nATE RMSE ({align_text})="
-                        f"{ape_metrics['rmse']:.3f} m, "
-                        f"mean={ape_metrics['mean']:.3f}, "
-                        f"max={ape_metrics['max']:.3f}"
+                metric_lines: list[str] = []
+                if (
+                    self.trajectory_ate_mode in {"standard", "both"}
+                    and ape_metrics
+                ):
+                    unit = "m" if self.trajectory_ate_mode == "standard" else "GT units"
+                    metric_lines.append(
+                        f"ATE RMSE ({align_text})={ape_metrics['rmse']:.3f} {unit}, "
+                        f"mean={ape_metrics['mean']:.3f}, max={ape_metrics['max']:.3f}"
                     )
+                if (
+                    self.trajectory_ate_mode in {"pfgs360_official", "both"}
+                    and pfgs360_aligned
+                    and pfgs360_metrics
+                ):
+                    metric_lines.append(
+                        "PFGS360 normalized ATE="
+                        f"{pfgs360_metrics['pfgs360_ate']:.6f}, "
+                        f"mean={pfgs360_metrics['pfgs360_ate_mean']:.6f}, "
+                        f"max={pfgs360_metrics['pfgs360_ate_max']:.6f}"
+                    )
+                metric_text = "" if not metric_lines else "\n" + "\n".join(metric_lines)
                 ax.set_title(f"{display_name} trajectory vs GT{metric_text}")
             else:
                 ax.set_title(f"{display_name} trajectory (GT unavailable)")
@@ -1945,12 +2073,27 @@ class SlamRuntimeLogger:
             pred_history=history,
         )
         sim3_ate = trajectory_metrics.get("sim3_ate_rmse", fallback_ate_rmse)
+        pfgs360_ate = trajectory_metrics.get("pfgs360_ate")
+        primary_ate = (
+            pfgs360_ate
+            if self.trajectory_ate_mode == "pfgs360_official"
+            else sim3_ate
+        )
         payload: dict[str, object] = {}
         if self.run is not None and self._wandb is not None:
             payload["slam/final_trajectory_vs_gt"] = self._wandb.Image(str(path))
-        if sim3_ate is not None:
-            payload["slam/final_ate_rmse"] = float(sim3_ate)
+        if primary_ate is not None:
+            payload["slam/final_ate_rmse"] = float(primary_ate)
+        if (
+            self.trajectory_ate_mode in {"standard", "both"}
+            and sim3_ate is not None
+        ):
             payload["slam/final_sim3_ate_rmse"] = float(sim3_ate)
+        if (
+            self.trajectory_ate_mode in {"pfgs360_official", "both"}
+            and pfgs360_ate is not None
+        ):
+            payload["slam/final_pfgs360_ate"] = float(pfgs360_ate)
         se3_ate = trajectory_metrics.get("se3_ate_rmse")
         if se3_ate is not None:
             payload["slam/final_se3_ate_rmse"] = float(se3_ate)
@@ -4666,6 +4809,8 @@ class PanoDroidGSSlamSystem:
                 trajectory_metrics = c2w_trajectory_metrics(
                     torch.stack(predicted_poses, dim=0),
                     torch.stack(target_poses, dim=0),
+                    include_pfgs360=logger.trajectory_ate_mode
+                    in {"pfgs360_official", "both"},
                 )
             trajectory_payload = {
                 "pose_convention": "c2w",
@@ -4683,13 +4828,20 @@ class PanoDroidGSSlamSystem:
                 fallback_ate_rmse=ate_metrics.get("rmse"),
                 step=max(1, int(logger._step) + 1),
             )
+            primary_ate_rmse = (
+                trajectory_metrics.get("pfgs360_ate")
+                if logger.trajectory_ate_mode == "pfgs360_official"
+                else ate_metrics.get("rmse")
+            )
             metrics = {
                 "render_count": int(len(per_frame)),
                 "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
-                "ate_rmse": ate_metrics.get("rmse"),
+                "ate_rmse": primary_ate_rmse,
                 "ate_count": int(len(pred_xyz)),
                 **trajectory_metrics,
             }
+            if logger.trajectory_ate_mode != "standard":
+                metrics["ate_mode"] = logger.trajectory_ate_mode
             payload = {
                 "metrics": metrics,
                 "frames": per_frame,
@@ -5002,6 +5154,10 @@ class PanoDroidGSSlamSystem:
                 "runtime_profile_path": str(profile_path) if profile_path is not None else None,
                 "notes": self.mapper.stats.notes,
             }
+            if logger.trajectory_ate_mode in {"pfgs360_official", "both"}:
+                summary["final_all_frames_pfgs360_ate"] = final_all_metrics.get(
+                    "pfgs360_ate"
+                )
             with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2)
             if profile_file is not None and not profile_file.closed:

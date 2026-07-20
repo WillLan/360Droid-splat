@@ -476,6 +476,10 @@ def test_ob3d_pointmap_sim3_config_preserves_adapter_ba_refiner_baseline() -> No
         root
         / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_stages.yaml"
     )
+    pfgs360_freeze = load_config(
+        root
+        / "spherical_selfi_ob3d_pointmap_sim3_adapter_ba_100_pfgs360_freeze.yaml"
+    )
     algorithm_sections = (
         "Dataset",
         "SphericalSelfiRuntime",
@@ -497,6 +501,15 @@ def test_ob3d_pointmap_sim3_config_preserves_adapter_ba_refiner_baseline() -> No
     )
     assert stages["WeightsAndBiases"]["run_name"].endswith("stages_r3")
     assert stages["Results"]["save_dir"].endswith("stages_r3")
+    for section in algorithm_sections:
+        assert pfgs360_freeze.get(section) == pointmap.get(section)
+    assert pfgs360_freeze["TrajectoryEvaluation"] == {"ate_mode": "both"}
+    assert pfgs360_freeze["WeightsAndBiases"]["run_name"].endswith(
+        "frozen_frontend_r4"
+    )
+    assert pfgs360_freeze["Results"]["save_dir"].endswith(
+        "frozen_frontend_r4"
+    )
 
 
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):

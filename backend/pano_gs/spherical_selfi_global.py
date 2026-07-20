@@ -7107,15 +7107,23 @@ class SphericalSelfiGlobalBackend:
             )
         self._pointmap_sim3_window_transforms[window_id] = value.detach().clone()
         for frame_id, pose in zip(packet.frame_ids, poses):
+            frame_id = int(frame_id)
             canonical = canonicalize_c2w(pose.detach().float())
             if not bool(torch.isfinite(canonical).all()):
                 raise RuntimeError(
                     f"Window {window_id} produced a non-finite Sim(3)-aligned "
-                    f"pose for frame {int(frame_id)}"
+                    f"pose for frame {frame_id}"
                 )
-            self._pointmap_sim3_pose_by_frame[int(frame_id)] = (
-                canonical.detach().cpu().clone()
-            )
+            # The frontend trajectory is an online, causal pose stream.  The
+            # overlap frames already have a canonical global pose from the
+            # preceding chunk; retain that first owner and append only frames
+            # that have not appeared before.  The current chunk's transform
+            # is still stored above and remains available for its geometry and
+            # for converting the genuinely new local poses.
+            if frame_id not in self._pointmap_sim3_pose_by_frame:
+                self._pointmap_sim3_pose_by_frame[frame_id] = (
+                    canonical.detach().cpu().clone()
+                )
 
     def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
