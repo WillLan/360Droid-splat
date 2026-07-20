@@ -7759,6 +7759,9 @@ class SphericalSelfiGlobalBackend:
                 f"{report.reason}; matrix={report.max_matrix_error:.3e}, "
                 f"rotation={report.max_rotation_error_deg:.3e}deg, "
                 f"center={report.max_center_error:.3e}, "
+                f"submap={report.max_submap_matrix_error:.3e}, "
+                f"lazy_owner={report.max_lazy_owner_matrix_error:.3e}, "
+                f"mapper={report.max_mapper_matrix_error:.3e}, "
                 f"revision_mismatches={report.revision_mismatch_count}"
             )
         self._pose_state_revision = int(revision)

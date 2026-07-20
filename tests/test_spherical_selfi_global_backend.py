@@ -1780,6 +1780,9 @@ def test_pose_state_consistency_failure_rolls_back_graph_packets_and_revision(
             report,
             accepted=False,
             reason="synthetic_state_mismatch",
+            max_submap_matrix_error=2.0e-5,
+            max_lazy_owner_matrix_error=3.0e-5,
+            max_mapper_matrix_error=4.0e-5,
         )
 
     monkeypatch.setattr(
@@ -1791,8 +1794,12 @@ def test_pose_state_consistency_failure_rolls_back_graph_packets_and_revision(
     with pytest.raises(
         RuntimeError,
         match="Canonical pose-state consistency failed",
-    ):
+    ) as exc_info:
         backend._synchronize_chunk_stride_optimized_window(1)
+    message = str(exc_info.value)
+    assert "submap=2.000e-05" in message
+    assert "lazy_owner=3.000e-05" in message
+    assert "mapper=4.000e-05" in message
 
     assert backend._geometry_revision == geometry_revision_before
     assert backend._pose_state_revision == pose_revision_before
