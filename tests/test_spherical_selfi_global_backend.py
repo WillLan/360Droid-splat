@@ -30,6 +30,7 @@ from backend.pano_gs.stage2_global_fusion import (
     rotate_sh_coefficients,
 )
 from frontend.pano_droid.spherical_ba import se3_exp
+from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel
 from frontend.pano_droid.interfaces import PanoFrame
 from frontend.spherical_selfi.panorama_loop import (
     PanoramaLoopDetector,
@@ -62,6 +63,7 @@ from geometry.panorama_loop_contracts import (
     LoopPoseMeasurement,
 )
 from geometry.spherical_erp import erp_pixel_to_unit_ray, sample_erp_with_wrap
+from mapping.gaussian_initializer import GaussianSeedBatch
 from models.per_pixel_gaussian_observation import real_sh_basis
 from models.spherical_selfi_gaussian_head import SphericalSelfiGaussianHead
 from models.spherical_selfi_stage3_ba import Stage3MatchCache
@@ -526,6 +528,11 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
         "coverage_coarse_cell_size": 0.64,
         "log_posthash_coverage": False,
     }
+    assert global_backend["insertion_depth_gate"] == {
+        "enabled": True,
+        "relative_threshold": 0.15,
+        "alpha_threshold": 0.05,
+    }
     assert global_backend["post_optimization_seam_check"] == {"enabled": True}
     assert global_backend["voxel_fusion"]["coverage_aware_budget"] is True
     assert global_backend["voxel_fusion"]["max_total_gaussians"] == 3_000_000
@@ -534,19 +541,49 @@ def test_spherical_selfi_global_config_uses_chunk_first_ba8_refiner_mainline() -
     assert map_optimization["loop_seam_deduplication"] is True
     assert map_optimization["extra_steps_on_loop"] == 20
     assert map_optimization["pose_lr"] == 2.0e-4
-    assert map_optimization["pose_refine_enable"] is True
+    assert map_optimization["strategy"] == "gaussian_only_staged"
+    assert map_optimization["pose_refine_enable"] is False
     assert map_optimization["separate_gaussian_lrs"] is True
     assert map_optimization["scale_gaussian_parameter_updates"] is True
-    assert map_optimization["steps_per_window"] == 100
+    assert map_optimization["steps_per_window"] == 40
     assert map_optimization["recent_window_count"] == 3
-    assert map_optimization["sample_observations_per_step"] == 1
+    assert map_optimization["sample_observations_per_step"] == 2
     assert map_optimization["sampler"] == "shuffled_cycle"
-    assert map_optimization["photometric_only"] is True
+    assert map_optimization["photometric_only"] is False
     assert map_optimization["optimize_skybox"] is False
     assert map_optimization["pose_prior_weight"] == 0.0
     assert map_optimization["s2_loss_weight"] == 0.0
     assert map_optimization["match_depth_loss_weight"] == 0.0
     assert map_optimization["visible_neighbor_lr_scale"] == 0.0
+    assert map_optimization["appearance"] == {
+        "steps": 30,
+        "dc_lr": 1.0e-3,
+        "sh_lr": 2.0e-4,
+        "opacity_lr": 2.0e-4,
+        "rgb_l1_weight": 0.8,
+        "dssim_weight": 0.2,
+        "opacity_logit_delta": 1.0,
+    }
+    assert map_optimization["geometry"] == {
+        "steps": 10,
+        "xyz_lr": 1.0e-4,
+        "scaling_lr": 2.0e-5,
+        "rotation_lr": 2.0e-5,
+        "depth_weight": 0.05,
+        "depth_huber_delta": 0.1,
+        "position_weight": 0.01,
+        "log_scale_weight": 0.01,
+        "rotation_weight": 0.001,
+        "xyz_voxels": 0.25,
+        "scale_ratio_min": 0.8,
+        "scale_ratio_max": 1.25,
+        "rotation_degrees": 5.0,
+    }
+    assert map_optimization["acceptance"] == {
+        "appearance_min_improvement": 0.001,
+        "geometry_min_improvement": 0.001,
+        "geometry_max_rgb_worsening": 0.005,
+    }
     assert {
         name: map_optimization[name]
         for name in (
@@ -2168,6 +2205,203 @@ def test_new_frame_support_and_four_view_visibility_jointly_gate_first_fusion() 
     assert result.fusion["hash_visibility_views"] == 4
     assert result.fusion["chunk_anchor_delta"] == 1
     assert backend.map.anchor_count() == 1
+
+
+def test_two_view_depth_gate_classifies_hole_front_surface_behind_and_conflict() -> None:
+    incoming = torch.tensor(
+        [
+            [1.0, 1.0],
+            [0.70, 0.75],
+            [1.00, 1.10],
+            [1.30, 1.40],
+            [0.70, 1.30],
+            [1.0, 1.0],
+        ]
+    )
+    global_depth = torch.ones_like(incoming)
+    global_alpha = torch.ones_like(incoming)
+    global_alpha[0] = 0.0
+    support = torch.ones_like(incoming, dtype=torch.bool)
+    support[5] = False
+
+    keep, class_id, stats = (
+        SphericalSelfiGlobalBackend._classify_incoming_anchor_depths(
+            incoming,
+            global_depth,
+            global_alpha,
+            support,
+            relative_threshold=0.15,
+            alpha_threshold=0.05,
+        )
+    )
+
+    assert class_id.tolist() == [0, 1, 2, 3, 2, 4]
+    assert keep.tolist() == [True, True, False, False, False, True]
+    assert stats["depth_gate_hole"] == 1
+    assert stats["depth_gate_front"] == 1
+    assert stats["depth_gate_consistent"] == 2
+    assert stats["depth_gate_behind"] == 1
+    assert stats["depth_gate_no_valid"] == 1
+    assert stats["depth_gate_two_view_comparable"] == 4
+    assert stats["depth_gate_two_view_agreement"] == 3
+
+
+def test_depth_gate_analytic_erp_projection_wraps_across_panorama_seam() -> None:
+    width, height = 16, 8
+    epsilon = 1.0e-4
+    bearing = torch.tensor(
+        [[-epsilon, 0.0, -1.0], [epsilon, 0.0, -1.0]],
+        dtype=torch.float32,
+    )
+    pixel = bearing_to_erp_pixel(bearing, height, width, wrap=True)
+    longitude = (
+        torch.arange(width, dtype=torch.float32) + 0.5
+    ) / float(width) * (2.0 * math.pi) - math.pi
+    feature = torch.cos(longitude).view(1, 1, width).expand(1, height, width)
+    sampled = sample_erp_with_wrap(feature, pixel).reshape(-1)
+
+    assert pixel[0, 0] < 0.01
+    assert pixel[1, 0] > width - 0.01
+    assert torch.allclose(sampled[0], sampled[1], atol=1.0e-4)
+
+
+def test_depth_gate_first_window_is_passthrough_without_any_render(monkeypatch) -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    packet.metadata["voxel_anchor_source_view_mask"] = torch.ones(
+        packet.anchor_observation.num_anchors, dtype=torch.long
+    )
+    _attach_identity_stride_matches(packet)
+    backend = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config={}, device="cpu"),
+        renderer=_SyntheticSharedDepthRenderer(
+            local_depth=2.0, global_depth=2.0
+        ),
+        config={
+            "enabled": True,
+            "rendered_overlap_alignment": {
+                "enabled": True,
+                "mode": "two_frame_bridge_depth_scale",
+            },
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "require_new_frame_support": True,
+                "radius_voxels": 1.5,
+            },
+            "insertion_depth_gate": {"enabled": True},
+            "global_graph": {
+                "node_mode": "chunk_first_stride",
+                "expected_overlap_frames": 2,
+                "optimization_trigger": "loop_only",
+                "chunk_stride": {"target_index": 2, "holdout_stride": 5},
+                "skip_edge": {"enabled": False},
+            },
+            "loop_closure": {"exclude_recent_windows": 100},
+            "map_optimization": {"steps_per_window": 0, "final_steps": 0},
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_render_global_pose_frame",
+        lambda *args, **kwargs: pytest.fail("first window rendered global map"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_render_refined_anchor_frame",
+        lambda *args, **kwargs: pytest.fail("first window rendered incoming map"),
+    )
+
+    result = backend.process_packet(packet)
+
+    assert result.fusion["depth_gate_first_window_passthrough"] == 1
+    assert result.fusion["depth_gate_global_render_views"] == 0
+    assert result.fusion["depth_gate_incoming_render_views"] == 0
+    assert result.fusion["depth_gate_requested"] == result.fusion["depth_gate_kept"]
+
+
+def test_depth_gate_uses_exactly_two_global_renders_and_no_incoming_render(
+    monkeypatch,
+) -> None:
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    packet.metadata["voxel_anchor_source_view_mask"] = torch.full(
+        (packet.anchor_observation.num_anchors,),
+        (1 << 2) | (1 << 3),
+        dtype=torch.long,
+    )
+    gaussian_map = PanoGaussianMap(config={}, device="cpu")
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[0.0, 0.0, 1.0]]),
+            rgb=torch.zeros(1, 3),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.1),
+            level=torch.zeros(1, dtype=torch.long),
+            frame_id=0,
+        )
+    )
+    backend = SphericalSelfiGlobalBackend(
+        gaussian_map,
+        config={
+            "enabled": True,
+            "insertion_dedup": {
+                "enabled": True,
+                "visible_only": True,
+                "same_level_only": True,
+                "compare_existing_only": True,
+                "permanent_drop": True,
+                "require_new_frame_support": True,
+                "radius_voxels": 1.5,
+            },
+            "insertion_depth_gate": {"enabled": True},
+        },
+    )
+    prepared = backend.fusion.prepare_packet_batch(packet, sim3_identity())
+    calls = 0
+
+    def global_render(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        height, width = packet.anchor_observation.image_size
+        return RenderedSharedFrame(
+            depth=torch.full((1, height, width), 10.0),
+            alpha=torch.ones(1, height, width),
+            anchor_visibility=torch.tensor([calls == 1]),
+            render_seconds=0.01,
+        )
+
+    monkeypatch.setattr(backend, "_render_global_pose_frame", global_render)
+    monkeypatch.setattr(
+        backend,
+        "_render_refined_anchor_frame",
+        lambda *args, **kwargs: pytest.fail("depth gate rendered incoming map"),
+    )
+
+    filtered, _, visible_old, stats, _, _ = (
+        backend._apply_two_new_frame_depth_gate(
+            packet,
+            prepared,
+            sim3_identity(),
+            new_frame_indices=(2, 3),
+        )
+    )
+
+    assert calls == 2
+    assert stats["depth_gate_global_render_views"] == 2
+    assert stats["depth_gate_incoming_render_views"] == 0
+    assert stats["depth_gate_front"] == len(prepared.batch)
+    assert len(filtered.batch) == len(prepared.batch)
+    assert visible_old.tolist() == [True]
 
 
 def test_chunk_first_hash_uses_committed_pose_revision_for_all_four_views(
@@ -5092,6 +5326,66 @@ def test_recent_three_window_photometric_optimization_uses_eight_unique_frames()
     assert metrics["active_owner_window_count"] == 3.0
     assert metrics["photometric_only"] == 1.0
     assert mapper.commits == 1
+
+
+def test_gaussian_only_staged_backend_uses_recent_owners_without_pose_sync() -> None:
+    packets = [
+        _packet(0, torch.eye(4).repeat(4, 1, 1), (0, 1, 2, 3)),
+        _packet(1, torch.eye(4).repeat(4, 1, 1), (2, 3, 4, 5)),
+        _packet(2, torch.eye(4).repeat(4, 1, 1), (4, 5, 6, 7)),
+    ]
+
+    class _Mapper:
+        def __init__(self) -> None:
+            self.optimizer = None
+            self.stats = SimpleNamespace(notes=[], n_anchors=0)
+            self.call = None
+
+        def prepare_spherical_selfi_window(self, frame_ids) -> int:
+            return len(frame_ids)
+
+        def optimize_spherical_selfi_staged(self, **kwargs):
+            self.call = kwargs
+            return {
+                "steps": 40.0,
+                "window_rollback": 0.0,
+                "pose_unchanged": 1.0,
+                "owner_transform_unchanged": 1.0,
+            }
+
+    mapper = _Mapper()
+    backend = _boundary_backend(
+        PanoGaussianMap(config={}, device="cpu"), mapper=mapper
+    )
+    backend.map_optimization_strategy = "gaussian_only_staged"
+    backend.map_optimize_recent_windows = 3
+    backend.map_optimize_config.update(
+        {
+            "sample_observations_per_step": 2,
+            "appearance": {"steps": 30},
+            "geometry": {"steps": 10},
+        }
+    )
+    backend.window_order = [0, 1, 2]
+    backend.packets = {
+        packet.window_id: packet.compact_for_memory() for packet in packets
+    }
+    backend._optimization_packets[2] = packets[2]
+    backend._synchronize_joint_optimized_window = lambda *args, **kwargs: pytest.fail(
+        "Gaussian-only staged optimization synchronized poses"
+    )
+
+    metrics = backend._run_map_optimization(2, packets[2].frame_ids, 40)
+
+    assert mapper.call is not None
+    assert tuple(mapper.call["frame_ids"]) == tuple(range(8))
+    assert tuple(mapper.call["active_owner_window_ids"]) == (0, 1, 2)
+    assert mapper.call["settings"]["sample_observations_per_step"] == 2
+    assert mapper.call["settings"]["appearance"]["steps"] == 30
+    assert mapper.call["settings"]["geometry"]["steps"] == 10
+    assert metrics["pose_refine_enabled"] == 0.0
+    assert metrics["pose_unchanged"] == 1.0
+    assert metrics["owner_transform_unchanged"] == 1.0
 
 
 def test_mapper_rejection_snapshots_after_durable_keyframe_registration() -> None:

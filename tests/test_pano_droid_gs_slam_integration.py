@@ -1,11 +1,16 @@
 import json
+import math
 from pathlib import Path
 
 import pytest
 import torch
 
 from backend.pano_gs import PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper, PanoRenderCamera
-from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
+from backend.pano_gs.losses import (
+    BackendLossWeights,
+    backend_render_loss,
+    pano_depth_loss,
+)
 from frontend.pano_droid.interfaces import FrontendOutput
 from mapping.gaussian_initializer import GaussianSeedBatch
 from models.per_pixel_gaussian_observation import BatchedExplicitPerPixelGaussianSet
@@ -28,6 +33,45 @@ class _CountingRenderer:
             color = gaussian_map.get_features.mean(dim=0).to(device=camera.c2w.device, dtype=camera.c2w.dtype)
         render = color.view(3, 1, 1).expand(3, H, W)
         return {"render": render, "depth": render.new_ones(1, H, W)}
+
+
+class _AllGaussianParameterRenderer:
+    def render(self, camera: PanoRenderCamera, gaussian_map: PanoGaussianMap) -> dict:
+        height, width = int(camera.image_height), int(camera.image_width)
+        feature_signal = gaussian_map.features.mean(dim=0)
+        sh_signal = (
+            gaussian_map.sh_rest.mean(dim=(0, 1))
+            if gaussian_map.sh_rest.numel() > 0
+            else torch.zeros_like(feature_signal)
+        )
+        opacity_signal = gaussian_map.opacity_logit.mean()
+        geometry_signal = (
+            gaussian_map.xyz.mean()
+            + gaussian_map.scaling.mean()
+            + gaussian_map.rotation.mean()
+        )
+        color = torch.sigmoid(
+            feature_signal
+            + 0.25 * sh_signal
+            + 0.10 * opacity_signal
+            + 0.05 * geometry_signal
+        )
+        render = color.view(3, 1, 1).expand(3, height, width)
+        depth_value = 1.0 + torch.nn.functional.softplus(
+            gaussian_map.xyz.mean()
+            + 0.25 * gaussian_map.scaling.mean()
+            + 0.10 * gaussian_map.rotation.mean()
+        )
+        depth = depth_value.view(1, 1, 1).expand(1, height, width)
+        alpha = torch.sigmoid(gaussian_map.opacity_logit.mean()).view(1, 1, 1)
+        alpha = alpha.expand(1, height, width)
+        return {
+            "render": render,
+            "depth": depth,
+            "alpha": alpha,
+            "opacity": alpha,
+            "render_distort": None,
+        }
 
 
 class _DepthGateRenderer:
@@ -769,6 +813,30 @@ def test_backend_render_loss_masks_sky_pixels_for_rgb_and_depth():
     assert float(render_depth.grad[:, :, 4:].abs().max()) == 0.0
 
 
+def test_log_depth_huber_is_confidence_weighted_and_ignores_invalid_depth() -> None:
+    render_depth = torch.tensor(
+        [[[1.0, 2.0, 4.0, float("nan")]]], requires_grad=True
+    )
+    target_depth = torch.tensor([[[1.0, 1.0, 0.0, 2.0]]])
+    confidence = torch.tensor([[[1.0, 0.5, 1.0, 1.0]]])
+
+    loss = pano_depth_loss(
+        render_depth,
+        target_depth,
+        confidence=confidence,
+        mode="log_huber",
+        huber_delta=0.1,
+    )
+    loss.backward()
+
+    expected = 0.1 * (math.log(2.0) - 0.05)
+    assert float(loss.detach()) == pytest.approx(expected / 3.0, rel=1.0e-5)
+    assert torch.isfinite(render_depth.grad).all()
+    assert float(render_depth.grad[0, 0, 0]) == 0.0
+    assert float(render_depth.grad[0, 0, 2]) == 0.0
+    assert float(render_depth.grad[0, 0, 3]) == 0.0
+
+
 def test_mapper_observation_depth_confidence_excludes_sky_mask():
     config = {
         "Training": {"panorama_render_mode": "pfgs360_gsplat"},
@@ -960,6 +1028,199 @@ def test_spherical_selfi_window_runs_twenty_balanced_steps_and_reuses_overlap_po
         )
     assert mapper.prepare_spherical_selfi_window((3, 4, 5, 6)) == 4
     assert mapper.pose_deltas[3] is overlap_pose_delta
+
+
+def test_gaussian_only_staged_updates_all_gaussian_groups_but_keeps_pose_and_owner() -> None:
+    config = {
+        "Training": {"panorama_render_mode": "pfgs360_gsplat"},
+        "BackendOptimization": {
+            "enabled": True,
+            "sh_degree": 2,
+            "gaussian_refine_enable": True,
+            "pose_refine_enable": True,
+            "optimize_skybox": False,
+            "FeedForwardWindow": {"enabled": True},
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(
+        gaussian_map, renderer=_AllGaussianParameterRenderer()
+    )
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.85),
+    )
+    gaussian_map._anchor_owner_window_id[:] = 0
+    gaussian_map.configure_lazy_owner_transforms(True)
+    gaussian_map.set_lazy_owner_transform(0, torch.eye(4), set_reference=True)
+    gaussian_map.set_lazy_owner_transform(0, torch.eye(4))
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    parameter_before = {
+        name: value.detach().clone()
+        for name, value in gaussian_map.named_parameters()
+    }
+    pose_before = mapper.pose_deltas[0].delta.detach().clone()
+    owner_before = gaussian_map._lazy_owner_current_transforms[0].clone()
+
+    metrics = mapper.optimize_spherical_selfi_staged(
+        window_id=0,
+        frame_ids=(0,),
+        active_owner_window_ids=(0,),
+        settings={
+            "sample_observations_per_step": 2,
+            "appearance": {"steps": 2},
+            "geometry": {"steps": 2},
+            "acceptance": {
+                "appearance_min_improvement": -1.0,
+                "geometry_min_improvement": -1.0,
+                "geometry_max_rgb_worsening": 1.0,
+            },
+        },
+    )
+
+    assert metrics["appearance_accepted"] == 1.0, metrics
+    assert metrics["geometry_accepted"] == 1.0
+    assert metrics["pose_unchanged"] == 1.0
+    assert metrics["owner_transform_unchanged"] == 1.0
+    for name in (
+        "features",
+        "sh_rest",
+        "opacity_logit",
+        "xyz",
+        "scaling",
+        "rotation",
+    ):
+        assert not torch.equal(
+            dict(gaussian_map.named_parameters())[name], parameter_before[name]
+        ), name
+    assert torch.equal(mapper.pose_deltas[0].delta, pose_before)
+    assert torch.equal(
+        gaussian_map._lazy_owner_current_transforms[0], owner_before
+    )
+
+
+def test_staged_geometry_rejection_keeps_accepted_appearance(monkeypatch) -> None:
+    config = {
+        "BackendOptimization": {
+            "enabled": True,
+            "sh_degree": 2,
+            "gaussian_refine_enable": True,
+            "FeedForwardWindow": {"enabled": True},
+        }
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_CountingRenderer())
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.5),
+    )
+    gaussian_map._anchor_owner_window_id[:] = 0
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    feature_before = gaussian_map.features.detach().clone()
+    xyz_before = gaussian_map.xyz.detach().clone()
+    evaluations = iter(
+        (
+            {"loss": 1.0, "photometric": 1.0, "finite": 1.0},
+            {"loss": 0.5, "photometric": 0.5, "finite": 1.0},
+            {"loss": 0.5, "photometric": 0.5, "finite": 1.0},
+            {"loss": 0.7, "photometric": 0.7, "finite": 1.0},
+        )
+    )
+    calls = 0
+
+    def fake_evaluate(*args, **kwargs):
+        return next(evaluations)
+
+    def fake_optimize(**kwargs):
+        nonlocal calls
+        mapper._spherical_selfi_rollback_state = (
+            {
+                name: value.detach().clone()
+                for name, value in gaussian_map.named_parameters()
+            },
+            {
+                frame_id: pose.delta.detach().clone()
+                for frame_id, pose in mapper.pose_deltas.items()
+            },
+        )
+        with torch.no_grad():
+            if calls == 0:
+                gaussian_map.features.add_(0.1)
+            else:
+                gaussian_map.xyz.add_(1.0)
+        calls += 1
+        return {"steps": 1.0, "non_finite_window": 0.0}
+
+    monkeypatch.setattr(mapper, "evaluate_spherical_selfi_window", fake_evaluate)
+    monkeypatch.setattr(mapper, "optimize_spherical_selfi_window", fake_optimize)
+
+    metrics = mapper.optimize_spherical_selfi_staged(
+        window_id=0,
+        frame_ids=(0,),
+        active_owner_window_ids=(0,),
+    )
+
+    assert metrics["appearance_accepted"] == 1.0
+    assert metrics["geometry_accepted"] == 0.0
+    assert metrics["geometry_rollback"] == 1.0
+    assert not torch.equal(gaussian_map.features, feature_before)
+    assert torch.equal(gaussian_map.xyz, xyz_before)
+
+
+def test_staged_appearance_rejection_restores_the_full_window(monkeypatch) -> None:
+    config = {
+        "BackendOptimization": {
+            "enabled": True,
+            "gaussian_refine_enable": True,
+            "FeedForwardWindow": {"enabled": True},
+        }
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map, renderer=_CountingRenderer())
+    mapper.insert_keyframe(
+        _small_seed_batch(0),
+        _small_frontend_output(0),
+        image=torch.full((3, 4, 8), 0.5),
+    )
+    gaussian_map._anchor_owner_window_id[:] = 0
+    assert mapper.prepare_spherical_selfi_window((0,)) == 1
+    parameter_before = {
+        name: value.detach().clone()
+        for name, value in gaussian_map.named_parameters()
+    }
+    evaluations = iter(
+        (
+            {"loss": 1.0, "photometric": 1.0, "finite": 1.0},
+            {"loss": 1.0, "photometric": 1.0, "finite": 1.0},
+        )
+    )
+
+    monkeypatch.setattr(
+        mapper,
+        "evaluate_spherical_selfi_window",
+        lambda *args, **kwargs: next(evaluations),
+    )
+
+    def fake_optimize(**kwargs):
+        with torch.no_grad():
+            gaussian_map.features.add_(0.2)
+            gaussian_map.xyz.add_(0.2)
+        return {"steps": 1.0, "non_finite_window": 0.0}
+
+    monkeypatch.setattr(mapper, "optimize_spherical_selfi_window", fake_optimize)
+
+    metrics = mapper.optimize_spherical_selfi_staged(
+        window_id=0,
+        frame_ids=(0,),
+        active_owner_window_ids=(0,),
+    )
+
+    assert metrics["appearance_accepted"] == 0.0
+    assert metrics["window_rollback"] == 1.0
+    for name, value in gaussian_map.named_parameters():
+        assert torch.equal(value, parameter_before[name])
 
 
 def test_spherical_selfi_window_initializes_cubemap_from_head_sky_mask():

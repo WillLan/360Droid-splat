@@ -25,6 +25,7 @@ class BackendLossWeights:
     dssim_weight: float = 0.2
     depth_loss_mode: str = "charbonnier"
     depth_residual_clamp: float = 0.20
+    depth_huber_delta: float = 0.10
 
 
 def _dssim_loss(
@@ -99,6 +100,7 @@ def pano_depth_loss(
     eps: float = 1e-3,
     mode: str = "charbonnier",
     residual_clamp: float = 0.20,
+    huber_delta: float = 0.10,
 ) -> torch.Tensor:
     if render_depth.shape != target_depth.shape:
         raise ValueError(
@@ -111,7 +113,36 @@ def pano_depth_loss(
         weight = weight * confidence.to(device=render_depth.device, dtype=render_depth.dtype)
     if mask is not None:
         weight = weight * mask.to(device=render_depth.device, dtype=render_depth.dtype)
-    if str(mode or "charbonnier").lower() in {"relative", "relative_clamped", "robust_relative"}:
+    mode_name = str(mode or "charbonnier").lower()
+    if mode_name in {"log_huber", "huber_log", "log-depth-huber"}:
+        valid = (
+            torch.isfinite(render_depth)
+            & torch.isfinite(target_depth)
+            & (render_depth > 0.0)
+            & (target_depth > 0.0)
+        )
+        safe_render = torch.where(
+            valid, render_depth, torch.ones_like(render_depth)
+        )
+        safe_target = torch.where(
+            valid, target_depth, torch.ones_like(target_depth)
+        )
+        residual = safe_render.clamp_min(1.0e-8).log() - safe_target.clamp_min(
+            1.0e-8
+        ).log()
+        delta = max(float(huber_delta), 1.0e-8)
+        absolute = residual.abs()
+        loss = torch.where(
+            absolute <= delta,
+            0.5 * residual.square(),
+            delta * (absolute - 0.5 * delta),
+        )
+        weight = torch.where(
+            valid & torch.isfinite(weight) & (weight > 0.0),
+            weight,
+            torch.zeros_like(weight),
+        )
+    elif mode_name in {"relative", "relative_clamped", "robust_relative"}:
         residual = (render_depth - target_depth) / torch.maximum(render_depth.abs(), target_depth.abs()).clamp_min(1.0e-6)
         if float(residual_clamp) > 0.0:
             residual = residual.clamp(min=-float(residual_clamp), max=float(residual_clamp))
@@ -153,6 +184,7 @@ def backend_render_loss(
             mask=depth_mask,
             mode=weights.depth_loss_mode,
             residual_clamp=weights.depth_residual_clamp,
+            huber_delta=weights.depth_huber_delta,
         )
         total = total + weights.depth * depth
 

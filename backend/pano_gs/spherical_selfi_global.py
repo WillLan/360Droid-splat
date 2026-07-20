@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import torch
 
+from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel
 from frontend.pano_vggt.alignment import SubmapAligner
 from frontend.spherical_selfi.panorama_loop import PanoramaLoopDetector
 from frontend.spherical_selfi.window_packet import (
@@ -315,6 +316,9 @@ class SphericalSelfiGlobalBackend:
             self.config.get("rendered_overlap_alignment", {}) or {}
         )
         insertion_dedup_cfg = dict(self.config.get("insertion_dedup", {}) or {})
+        insertion_depth_gate_cfg = dict(
+            self.config.get("insertion_depth_gate", {}) or {}
+        )
         self.enabled = bool(self.config.get("enabled", False))
         self.voxel_anchor_refiner_enabled = bool(
             self.config.get("_voxel_anchor_refiner_enabled", False)
@@ -657,6 +661,39 @@ class SphericalSelfiGlobalBackend:
         self.insertion_dedup_log_posthash_coverage = bool(
             insertion_dedup_cfg.get("log_posthash_coverage", False)
         )
+        self.insertion_depth_gate_enabled = bool(
+            insertion_depth_gate_cfg.get("enabled", False)
+        )
+        self.insertion_depth_gate_relative_threshold = float(
+            insertion_depth_gate_cfg.get("relative_threshold", 0.15)
+        )
+        self.insertion_depth_gate_alpha_threshold = float(
+            insertion_depth_gate_cfg.get("alpha_threshold", 0.05)
+        )
+        if self.insertion_depth_gate_enabled:
+            if not self.insertion_dedup_enabled:
+                raise ValueError(
+                    "insertion_depth_gate requires insertion_dedup.enabled=true"
+                )
+            if not self.insertion_dedup_require_new_frame_support:
+                raise ValueError(
+                    "insertion_depth_gate requires "
+                    "insertion_dedup.require_new_frame_support=true"
+                )
+            if (
+                not math.isfinite(self.insertion_depth_gate_relative_threshold)
+                or self.insertion_depth_gate_relative_threshold <= 0.0
+            ):
+                raise ValueError(
+                    "insertion_depth_gate.relative_threshold must be positive"
+                )
+            if (
+                not math.isfinite(self.insertion_depth_gate_alpha_threshold)
+                or not 0.0 <= self.insertion_depth_gate_alpha_threshold <= 1.0
+            ):
+                raise ValueError(
+                    "insertion_depth_gate.alpha_threshold must be in [0, 1]"
+                )
         if self.insertion_dedup_max_new_gaussians_per_chunk > 0 and (
             not math.isfinite(self.insertion_dedup_coverage_coarse_cell_size)
             or self.insertion_dedup_coverage_coarse_cell_size <= 0.0
@@ -861,6 +898,17 @@ class SphericalSelfiGlobalBackend:
         self.map_optimize_skybox = bool(
             optimize_cfg.get("optimize_skybox", True)
         )
+        self.map_optimization_strategy = str(
+            optimize_cfg.get("strategy", "legacy")
+        ).strip().lower()
+        if self.map_optimization_strategy not in {
+            "legacy",
+            "gaussian_only_staged",
+        }:
+            raise ValueError(
+                "map_optimization.strategy must be 'legacy' or "
+                "'gaussian_only_staged'"
+            )
         self.map_steps_on_loop = max(
             0,
             int(optimize_cfg.get("extra_steps_on_loop", optimize_cfg.get("steps_on_loop", 0))),
@@ -2122,6 +2170,258 @@ class SphericalSelfiGlobalBackend:
                 require_accumulated=isinstance(self.renderer, PFGS360Renderer),
             ),
             render_seconds=elapsed,
+        )
+
+    @staticmethod
+    def _classify_incoming_anchor_depths(
+        incoming_depth: torch.Tensor,
+        global_depth: torch.Tensor,
+        global_alpha: torch.Tensor,
+        source_support: torch.Tensor,
+        *,
+        relative_threshold: float = 0.15,
+        alpha_threshold: float = 0.05,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | float]]:
+        """Classify analytically projected anchors against rendered global depth.
+
+        Class ids are exclusive: 0=hole, 1=front, 2=consistent, 3=behind,
+        and 4=no-valid projection.  Hole/front/no-valid anchors are retained;
+        consistent/behind anchors are suppressed before spatial hashing.
+        """
+
+        if not (
+            incoming_depth.shape
+            == global_depth.shape
+            == global_alpha.shape
+            == source_support.shape
+        ):
+            raise ValueError("Depth-gate tensors must have matching NxV shapes")
+        if incoming_depth.ndim != 2:
+            raise ValueError("Depth-gate tensors must have shape NxV")
+        threshold = float(relative_threshold)
+        alpha_min = float(alpha_threshold)
+        projected = (
+            source_support.bool()
+            & torch.isfinite(incoming_depth)
+            & (incoming_depth > 0.0)
+        )
+        valid_global = (
+            projected
+            & torch.isfinite(global_depth)
+            & (global_depth > 0.0)
+            & torch.isfinite(global_alpha)
+            & (global_alpha >= alpha_min)
+        )
+        ratio = incoming_depth / global_depth.clamp_min(1.0e-8)
+        ratio = torch.where(
+            valid_global,
+            ratio,
+            torch.full_like(ratio, torch.inf),
+        )
+        valid_count = valid_global.sum(dim=1)
+        projected_count = projected.sum(dim=1)
+        sorted_ratio = ratio.sort(dim=1).values
+        rows = torch.arange(
+            int(ratio.shape[0]), device=ratio.device, dtype=torch.long
+        )
+        lower_index = ((valid_count - 1).clamp_min(0) // 2).long()
+        upper_index = (valid_count.clamp_min(1) // 2).long()
+        lower = sorted_ratio[rows, lower_index]
+        upper = sorted_ratio[rows, upper_index]
+        median_ratio = 0.5 * (lower + upper)
+
+        class_id = torch.full(
+            (int(ratio.shape[0]),), 4, device=ratio.device, dtype=torch.long
+        )
+        hole = (projected_count > 0) & (valid_count == 0)
+        class_id[hole] = 0
+        has_global = valid_count > 0
+        front = has_global & (median_ratio < 1.0 - threshold)
+        consistent = has_global & (median_ratio >= 1.0 - threshold) & (
+            median_ratio <= 1.0 + threshold
+        )
+        behind = has_global & (median_ratio > 1.0 + threshold)
+        class_id[front] = 1
+        class_id[consistent] = 2
+        class_id[behind] = 3
+        keep = (class_id == 0) | (class_id == 1) | (class_id == 4)
+
+        per_view_class = torch.full_like(ratio, -1, dtype=torch.long)
+        per_view_class[valid_global & (ratio < 1.0 - threshold)] = 1
+        per_view_class[
+            valid_global
+            & (ratio >= 1.0 - threshold)
+            & (ratio <= 1.0 + threshold)
+        ] = 2
+        per_view_class[valid_global & (ratio > 1.0 + threshold)] = 3
+        two_view = valid_count == 2
+        if int(ratio.shape[1]) == 2:
+            agreement = two_view & (
+                per_view_class[:, 0] == per_view_class[:, 1]
+            )
+        else:
+            comparable = torch.where(
+                valid_global,
+                per_view_class,
+                torch.full_like(per_view_class, 4),
+            )
+            agreement = two_view & (
+                comparable.min(dim=1).values == comparable.max(dim=1).values
+            )
+        comparable_count = int(two_view.sum().detach().cpu())
+        agreement_count = int(agreement.sum().detach().cpu())
+        count = int(class_id.numel())
+        kept = int(keep.sum().detach().cpu())
+        stats: dict[str, int | float] = {
+            "depth_gate_requested": count,
+            "depth_gate_kept": kept,
+            "depth_gate_dropped": count - kept,
+            "depth_gate_keep_rate": float(kept / max(1, count)),
+            "depth_gate_hole": int((class_id == 0).sum().detach().cpu()),
+            "depth_gate_front": int((class_id == 1).sum().detach().cpu()),
+            "depth_gate_consistent": int((class_id == 2).sum().detach().cpu()),
+            "depth_gate_behind": int((class_id == 3).sum().detach().cpu()),
+            "depth_gate_no_valid": int((class_id == 4).sum().detach().cpu()),
+            "depth_gate_two_view_comparable": comparable_count,
+            "depth_gate_two_view_agreement": agreement_count,
+            "depth_gate_two_view_agreement_rate": float(
+                agreement_count / max(1, comparable_count)
+            ),
+        }
+        return keep, class_id, stats
+
+    @torch.no_grad()
+    def _apply_two_new_frame_depth_gate(
+        self,
+        packet: LocalGaussianWindowPacket,
+        prepared,
+        window_transform: torch.Tensor,
+        *,
+        new_frame_indices: tuple[int, int],
+    ) -> tuple[
+        Any,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, int | float],
+        float,
+        torch.Tensor,
+    ]:
+        """Use two global renders and zero incoming renders to gate new anchors."""
+
+        if packet.anchor_observation is None:
+            raise RuntimeError("Insertion depth gate requires an anchor observation")
+        if prepared.source_anchor_indices is None:
+            raise RuntimeError("Insertion depth gate requires source anchor indices")
+        if len(new_frame_indices) != 2:
+            raise RuntimeError(
+                "Insertion depth gate requires exactly two non-overlap frames"
+            )
+        source_view_mask = packet.metadata.get("voxel_anchor_source_view_mask")
+        if not torch.is_tensor(source_view_mask):
+            raise RuntimeError("Insertion depth gate requires source-view support")
+
+        global_poses = packet.global_poses(window_transform)
+        xyz = prepared.batch.xyz
+        source_rows = prepared.source_anchor_indices.to(
+            device=source_view_mask.device, dtype=torch.long
+        )
+        anchor_support = source_view_mask.to(dtype=torch.long).index_select(
+            0, source_rows
+        )
+        existing_visibility = torch.zeros(
+            self.map.anchor_count(), device=self.map.xyz.device, dtype=torch.bool
+        )
+        incoming_depths: list[torch.Tensor] = []
+        global_depths: list[torch.Tensor] = []
+        global_alphas: list[torch.Tensor] = []
+        source_supports: list[torch.Tensor] = []
+        stats: dict[str, int | float] = {
+            "depth_gate_views": 2,
+            "depth_gate_incoming_render_views": 0,
+            "depth_gate_global_render_views": 2,
+        }
+        render_seconds = 0.0
+        height, width = (
+            int(value) for value in packet.anchor_observation.image_size
+        )
+        for frame_index in new_frame_indices:
+            frame_id = int(packet.frame_ids[int(frame_index)])
+            rendered = self._render_global_pose_frame(
+                global_poses[int(frame_index)],
+                image_size=(height, width),
+            )
+            render_seconds += float(rendered.render_seconds)
+            existing_visibility |= rendered.anchor_visibility.to(
+                existing_visibility.device
+            )
+            pose = global_poses[int(frame_index)].to(device=xyz.device, dtype=xyz.dtype)
+            camera_xyz = (xyz - pose[:3, 3]) @ pose[:3, :3]
+            ray_depth = torch.linalg.norm(camera_xyz, dim=-1)
+            bearing = camera_xyz / ray_depth.unsqueeze(-1).clamp_min(1.0e-8)
+            if int(xyz.shape[0]) == 0:
+                sampled_depth = ray_depth.clone()
+                sampled_alpha = ray_depth.clone()
+            else:
+                pixel = bearing_to_erp_pixel(
+                    bearing, height, width, wrap=True
+                )
+                sampled_depth = sample_erp_with_wrap(
+                    rendered.depth.to(device=xyz.device, dtype=xyz.dtype), pixel
+                ).reshape(-1)
+                sampled_alpha = sample_erp_with_wrap(
+                    rendered.alpha.to(device=xyz.device, dtype=xyz.dtype), pixel
+                ).reshape(-1)
+            source_supported = (
+                anchor_support.to(device=xyz.device) & (1 << int(frame_index))
+            ) != 0
+            incoming_depths.append(ray_depth)
+            global_depths.append(sampled_depth)
+            global_alphas.append(sampled_alpha)
+            source_supports.append(source_supported)
+            depth_valid = torch.isfinite(rendered.depth) & (rendered.depth > 0.0)
+            alpha_valid = torch.isfinite(rendered.alpha) & (
+                rendered.alpha >= self.insertion_depth_gate_alpha_threshold
+            )
+            stats[f"depth_gate_view_{frame_id}_global_depth_coverage"] = float(
+                depth_valid.float().mean().detach().cpu()
+            )
+            stats[f"depth_gate_view_{frame_id}_global_alpha_coverage"] = float(
+                alpha_valid.float().mean().detach().cpu()
+            )
+            stats[f"prehash_view_{frame_id}_existing_valid_coverage"] = float(
+                (depth_valid & alpha_valid).float().mean().detach().cpu()
+            )
+
+        keep, _, classification_stats = self._classify_incoming_anchor_depths(
+            torch.stack(incoming_depths, dim=1),
+            torch.stack(global_depths, dim=1),
+            torch.stack(global_alphas, dim=1),
+            torch.stack(source_supports, dim=1),
+            relative_threshold=self.insertion_depth_gate_relative_threshold,
+            alpha_threshold=self.insertion_depth_gate_alpha_threshold,
+        )
+        selected = torch.nonzero(keep, as_tuple=False).flatten().to(
+            prepared.batch.xyz.device
+        )
+        prepared = prepared.index(selected)
+        incoming_visibility = torch.ones(
+            packet.anchor_observation.num_anchors,
+            device=packet.anchor_observation.xyz.device,
+            dtype=torch.bool,
+        )
+        stats.update(classification_stats)
+        stats["hash_candidates"] = len(prepared.batch)
+        stats["hash_visible_incoming"] = len(prepared.batch)
+        stats["hash_visible_existing"] = int(
+            existing_visibility.sum().detach().cpu()
+        )
+        return (
+            prepared,
+            incoming_visibility,
+            existing_visibility,
+            stats,
+            render_seconds,
+            global_poses,
         )
 
     def _render_global_shared_frame(
@@ -7172,6 +7472,41 @@ class SphericalSelfiGlobalBackend:
             active_owner_window_ids = self._map_optimization_window_ids(
                 int(window_id)
             )
+            if self.map_optimization_strategy == "gaussian_only_staged":
+                recent_frame_ids = self._map_optimization_frame_ids(
+                    int(window_id)
+                )
+                metrics = self.mapper.optimize_spherical_selfi_staged(
+                    window_id=int(window_id),
+                    frame_ids=list(recent_frame_ids),
+                    active_owner_window_ids=list(active_owner_window_ids),
+                    settings={
+                        "sample_observations_per_step": int(
+                            self.map_optimize_config.get(
+                                "sample_observations_per_step", 2
+                            )
+                        ),
+                        "seed": int(self.map_optimize_config.get("seed", 123)),
+                        "appearance": dict(
+                            self.map_optimize_config.get("appearance", {}) or {}
+                        ),
+                        "geometry": dict(
+                            self.map_optimize_config.get("geometry", {}) or {}
+                        ),
+                        "acceptance": dict(
+                            self.map_optimize_config.get("acceptance", {}) or {}
+                        ),
+                    },
+                )
+                metrics["optimized_frame_count"] = float(
+                    len(recent_frame_ids)
+                )
+                metrics["active_owner_window_count"] = float(
+                    len(active_owner_window_ids)
+                )
+                metrics["pose_refine_enabled"] = 0.0
+                metrics["photometric_only"] = 0.0
+                return metrics
             fixed_frame_ids: list[int] = []
             settings = {
                 "gaussian_lr": float(self.map_optimize_config.get("gaussian_lr", self.map_optimize_config.get("lr", 2.0e-3))),
@@ -10344,21 +10679,121 @@ class SphericalSelfiGlobalBackend:
                 tuple[int, int],
             ] | None = None
             has_existing_map = self.map.anchor_count() > 0
-            require_four_view_admission = bool(
-                self.insertion_dedup_require_new_frame_support
+            if self.insertion_depth_gate_enabled:
+                hash_stats.update(
+                    {
+                        "depth_gate_enabled": 1,
+                        "depth_gate_applied": int(has_existing_map),
+                        "depth_gate_first_window_passthrough": int(
+                            not has_existing_map
+                        ),
+                        "depth_gate_incoming_render_views": 0,
+                        "depth_gate_global_render_views": (
+                            2 if has_existing_map else 0
+                        ),
+                    }
+                )
+                if not has_existing_map:
+                    passthrough_count = len(prepared.batch)
+                    hash_stats.update(
+                        {
+                            "depth_gate_requested": passthrough_count,
+                            "depth_gate_kept": passthrough_count,
+                            "depth_gate_dropped": 0,
+                            "depth_gate_keep_rate": 1.0,
+                            "depth_gate_hole": 0,
+                            "depth_gate_front": 0,
+                            "depth_gate_consistent": 0,
+                            "depth_gate_behind": 0,
+                            "depth_gate_no_valid": 0,
+                            "depth_gate_two_view_comparable": 0,
+                            "depth_gate_two_view_agreement": 0,
+                            "depth_gate_two_view_agreement_rate": 0.0,
+                            "hash_hit_rate": 0.0,
+                        }
+                    )
+                if has_existing_map:
+                    if len(new_indices) != 2:
+                        raise RuntimeError(
+                            "Insertion depth gate requires exactly two "
+                            "non-overlap frames after the first window"
+                        )
+                    gate_start = time.perf_counter()
+                    (
+                        prepared,
+                        incoming_visibility,
+                        existing_visibility,
+                        depth_gate_stats,
+                        insertion_render_seconds,
+                        global_poses,
+                    ) = self._apply_two_new_frame_depth_gate(
+                        packet,
+                        prepared,
+                        window_transform,
+                        new_frame_indices=(
+                            int(new_indices[0]), int(new_indices[1])
+                        ),
+                    )
+                    hash_stats.update(depth_gate_stats)
+                    hash_visibility_views = 2
+                    if self.insertion_dedup_log_posthash_coverage:
+                        posthash_coverage_context = (
+                            tuple(
+                                int(packet.frame_ids[index])
+                                for index in new_indices
+                            ),
+                            global_poses.detach().clone(),
+                            set(),
+                            tuple(
+                                int(value)
+                                for value in packet.anchor_observation.image_size
+                            ),
+                        )
+                    hash_start = time.perf_counter()
+                    prehash_diagnostics = dict(hash_stats)
+                    prepared, filtered_hash_stats, evidence_update = (
+                        self.fusion.filter_against_visible_map(
+                            prepared,
+                            incoming_anchor_visibility=incoming_visibility,
+                            existing_anchor_visibility=existing_visibility,
+                            radius_voxels=self.insertion_dedup_radius_voxels,
+                            update_existing_statistics=(
+                                self.insertion_dedup_update_existing_statistics
+                            ),
+                        )
+                    )
+                    hash_stats = {
+                        **prehash_diagnostics,
+                        **filtered_hash_stats,
+                    }
+                    hash_stats["hash_visibility_views"] = 2
+                    hash_stats["hash_hit_rate"] = float(
+                        int(hash_stats.get("hash_hits", 0))
+                        / max(1, int(hash_stats.get("hash_candidates", 0)))
+                    )
+                    hash_seconds = float(time.perf_counter() - hash_start)
+                    hash_stats["depth_gate_and_hash_seconds"] = float(
+                        time.perf_counter() - gate_start
+                    )
+            legacy_four_view_admission = bool(
+                not self.insertion_depth_gate_enabled
+                and self.insertion_dedup_require_new_frame_support
                 and len(packet.frame_ids) == 4
             )
             render_insertion_visibility = bool(
-                require_four_view_admission
-                or (self.insertion_dedup_enabled and has_existing_map)
+                not self.insertion_depth_gate_enabled
+                and (
+                    legacy_four_view_admission
+                    or (self.insertion_dedup_enabled and has_existing_map)
+                )
             )
             if render_insertion_visibility:
                 assert packet.anchor_observation is not None
                 use_all_packet_views = bool(
-                    require_four_view_admission
+                    legacy_four_view_admission
                     or self.chunk_first_stride_graph
                 )
-                if require_four_view_admission or self.two_frame_overlap_enabled:
+                if legacy_four_view_admission or self.two_frame_overlap_enabled:
                     if use_all_packet_views:
                         visibility_frame_ids = tuple(
                             int(value) for value in packet.frame_ids
@@ -10670,7 +11105,7 @@ class SphericalSelfiGlobalBackend:
                             hash_stats[
                                 f"prehash_{group}_{name}_coverage"
                             ] = sum(row[index] for row in rows) / len(rows)
-                    if require_four_view_admission:
+                    if legacy_four_view_admission:
                         if prepared.source_anchor_indices is None:
                             raise RuntimeError(
                                 "Four-view incoming admission requires source anchor indices"
@@ -10940,7 +11375,13 @@ class SphericalSelfiGlobalBackend:
         else:
             self._refresh_geometry_updates()
 
-        if self.loop_neighborhood_refinement_enabled and accepted_loops:
+        if self.map_optimization_strategy == "gaussian_only_staged":
+            if self.map_steps_per_window > 0:
+                self._enqueue_map_optimization(
+                    window_id, packet.frame_ids, self.map_steps_per_window
+                )
+                self._optimization_packets[window_id] = packet
+        elif self.loop_neighborhood_refinement_enabled and accepted_loops:
             self._enqueue_map_optimization(
                 window_id, packet.frame_ids, self.map_steps_per_window
             )
@@ -11238,7 +11679,13 @@ class SphericalSelfiGlobalBackend:
             )
         self.loop_detector.add(compact_packet)
         self._refresh_pose_updates()
-        if self.loop_neighborhood_refinement_enabled and accepted_loops:
+        if self.map_optimization_strategy == "gaussian_only_staged":
+            if self.map_steps_per_window > 0:
+                self._enqueue_map_optimization(
+                    window_id, packet.frame_ids, self.map_steps_per_window
+                )
+                self._optimization_packets[window_id] = packet
+        elif self.loop_neighborhood_refinement_enabled and accepted_loops:
             self._enqueue_map_optimization(
                 window_id, packet.frame_ids, self.map_steps_per_window
             )

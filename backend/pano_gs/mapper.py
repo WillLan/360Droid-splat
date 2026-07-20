@@ -1592,6 +1592,15 @@ class PanoGaussianMapper:
         ff_cfg["sampler"] = str(effective_cfg.get("sampler", "random"))
         ff_cfg["sampler_seed"] = int(effective_cfg.get("sampler_seed", 123))
         ff_cfg["skip_prune"] = bool(effective_cfg.get("skip_prune", False))
+        for key in (
+            "loss_weights_override",
+            "photometric_mask_non_sky",
+            "gaussian_trust",
+            "parameter_bounds",
+            "frozen_gaussian_parameters",
+        ):
+            if key in effective_cfg:
+                ff_cfg[key] = effective_cfg[key]
         self.optim_cfg["enabled"] = True
         self.optim_cfg["pose_refine_enable"] = bool(effective_cfg.get("pose_refine_enable", False))
         for key in overridden_root:
@@ -1660,7 +1669,9 @@ class PanoGaussianMapper:
                 "active_owner_window_id": int(window_id),
                 "pose_refine_enable": bool(cfg.get("pose_refine_enable", True)),
                 "random_observation_per_iter": True,
-                "sample_observations_per_step": 1,
+                "sample_observations_per_step": max(
+                    1, int(cfg.get("sample_observations_per_step", 1))
+                ),
                 "sampler": "shuffled_cycle",
                 "skip_prune": True,
             }
@@ -1712,6 +1723,492 @@ class PanoGaussianMapper:
         lr = float(self.optimizer.param_groups[0].get("lr", 2.0e-3)) if self.optimizer.param_groups else 2.0e-3
         self.optimizer = self.map.make_optimizer(lr=lr)
         return True
+
+    @torch.no_grad()
+    def evaluate_spherical_selfi_window(
+        self,
+        frame_ids: list[int] | tuple[int, ...],
+        *,
+        loss_weights_override: dict | None = None,
+        photometric_mask_non_sky: bool = True,
+    ) -> dict[str, float]:
+        """Evaluate every requested recent view with fixed camera poses."""
+
+        override = loss_weights_override if isinstance(loss_weights_override, dict) else {}
+        values = {
+            "photometric": float(self.loss_weights.photometric),
+            "depth": float(self.loss_weights.depth),
+            "opacity": float(self.loss_weights.opacity),
+            "distortion": float(self.loss_weights.distortion),
+            "sky_alpha": float(self.loss_weights.sky_alpha),
+            "photometric_mode": str(self.loss_weights.photometric_mode),
+            "rgb_l1_weight": float(self.loss_weights.rgb_l1_weight),
+            "dssim_weight": float(self.loss_weights.dssim_weight),
+            "depth_loss_mode": str(self.loss_weights.depth_loss_mode),
+            "depth_residual_clamp": float(
+                self.loss_weights.depth_residual_clamp
+            ),
+            "depth_huber_delta": float(self.loss_weights.depth_huber_delta),
+        }
+        for key in tuple(values):
+            if key in override:
+                values[key] = override[key]
+        weights = BackendLossWeights(**values)
+        device, dtype = self.map.get_xyz.device, self.map.get_xyz.dtype
+        totals: dict[str, list[torch.Tensor]] = {}
+        evaluated = 0
+        for frame_id in dict.fromkeys(int(value) for value in frame_ids):
+            obs = self.observations.get(frame_id)
+            if obs is None:
+                continue
+            target = obs.image.to(device=device, dtype=dtype)
+            height, width = int(target.shape[-2]), int(target.shape[-1])
+            pose_delta = self.pose_deltas.get(frame_id)
+            c2w = (
+                obs.pose_c2w.detach()
+                if pose_delta is None
+                else pose_delta().detach()
+            ).to(device=device, dtype=dtype)
+            pkg = self.renderer.render(
+                PanoRenderCamera(height, width, c2w), self.map
+            )
+            sky_mask = self._skybox_mask_for_target(target, obs.sky_mask)
+            pkg = self._apply_skybox_optimization_mask(pkg, sky_mask)
+            non_sky_mask = (
+                None
+                if sky_mask is None
+                else ~sky_mask.to(device=device, dtype=torch.bool)
+            )
+            target_depth = (
+                None
+                if obs.target_depth is None or float(weights.depth) <= 0.0
+                else obs.target_depth.to(device=device, dtype=dtype)
+            )
+            depth_confidence = (
+                None
+                if obs.depth_confidence is None or target_depth is None
+                else obs.depth_confidence.to(device=device, dtype=dtype)
+            )
+            _, metrics = backend_render_loss(
+                pkg,
+                target,
+                target_depth=target_depth,
+                depth_confidence=depth_confidence,
+                photometric_mask=(
+                    non_sky_mask if photometric_mask_non_sky else None
+                ),
+                depth_mask=non_sky_mask,
+                weights=weights,
+            )
+            for key, value in metrics.items():
+                totals.setdefault(key, []).append(value.detach())
+            evaluated += 1
+        result = {
+            key: float(torch.stack(items).mean().detach().cpu())
+            for key, items in totals.items()
+            if items
+        }
+        result["views"] = float(evaluated)
+        result["finite"] = float(
+            evaluated > 0
+            and all(math.isfinite(float(value)) for value in result.values())
+        )
+        return result
+
+    def _capture_fixed_optimization_state(self) -> dict[str, object]:
+        return {
+            "parameters": {
+                name: value.detach().cpu().clone()
+                for name, value in self.map.named_parameters()
+            },
+            "poses": {
+                int(frame_id): pose.delta.detach().cpu().clone()
+                for frame_id, pose in self.pose_deltas.items()
+            },
+            "owner_reference": {
+                int(owner): value.detach().cpu().clone()
+                for owner, value in getattr(
+                    self.map, "_lazy_owner_reference_transforms", {}
+                ).items()
+            },
+            "owner_current": {
+                int(owner): value.detach().cpu().clone()
+                for owner, value in getattr(
+                    self.map, "_lazy_owner_current_transforms", {}
+                ).items()
+            },
+        }
+
+    @torch.no_grad()
+    def _restore_fixed_optimization_state(self, state: dict[str, object]) -> None:
+        parameters = state.get("parameters", {})
+        if isinstance(parameters, dict):
+            for name, value in self.map.named_parameters():
+                saved = parameters.get(name)
+                if torch.is_tensor(saved) and tuple(saved.shape) == tuple(value.shape):
+                    value.copy_(saved.to(value))
+        poses = state.get("poses", {})
+        if isinstance(poses, dict):
+            for frame_id, saved in poses.items():
+                if int(frame_id) in self.pose_deltas and torch.is_tensor(saved):
+                    self.pose_deltas[int(frame_id)].delta.copy_(
+                        saved.to(self.pose_deltas[int(frame_id)].delta)
+                    )
+        for attribute, state_key in (
+            ("_lazy_owner_reference_transforms", "owner_reference"),
+            ("_lazy_owner_current_transforms", "owner_current"),
+        ):
+            saved_values = state.get(state_key, {})
+            if isinstance(saved_values, dict):
+                setattr(
+                    self.map,
+                    attribute,
+                    {
+                        int(owner): value.detach().clone()
+                        for owner, value in saved_values.items()
+                    },
+                )
+        self.map._lazy_sh_rotation_cache.clear()
+        self._spherical_selfi_rollback_state = None
+        lr = (
+            float(self.optimizer.param_groups[0].get("lr", 2.0e-3))
+            if self.optimizer.param_groups
+            else 2.0e-3
+        )
+        self.optimizer = self.map.make_optimizer(lr=lr)
+
+    @torch.no_grad()
+    def _fixed_optimization_state_unchanged(
+        self, state: dict[str, object]
+    ) -> tuple[bool, bool]:
+        poses = state.get("poses", {})
+        pose_unchanged = isinstance(poses, dict) and all(
+            int(frame_id) in self.pose_deltas
+            and torch.equal(
+                self.pose_deltas[int(frame_id)].delta.detach().cpu(),
+                saved.detach().cpu(),
+            )
+            for frame_id, saved in poses.items()
+            if torch.is_tensor(saved)
+        )
+        owner_unchanged = True
+        for attribute, state_key in (
+            ("_lazy_owner_reference_transforms", "owner_reference"),
+            ("_lazy_owner_current_transforms", "owner_current"),
+        ):
+            current = getattr(self.map, attribute, {})
+            saved = state.get(state_key, {})
+            if not isinstance(saved, dict) or set(current) != set(saved):
+                owner_unchanged = False
+                continue
+            owner_unchanged = owner_unchanged and all(
+                torch.equal(current[key].detach().cpu(), saved[key].detach().cpu())
+                for key in saved
+            )
+        return bool(pose_unchanged), bool(owner_unchanged)
+
+    def optimize_spherical_selfi_staged(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        active_owner_window_ids: list[int] | tuple[int, ...],
+        settings: dict | None = None,
+    ) -> dict[str, float]:
+        """Run staged refinement with a full-window exception rollback."""
+
+        full_state = self._capture_fixed_optimization_state()
+        try:
+            return self._optimize_spherical_selfi_staged_impl(
+                window_id=window_id,
+                frame_ids=frame_ids,
+                active_owner_window_ids=active_owner_window_ids,
+                settings=settings,
+                full_state=full_state,
+            )
+        except Exception:
+            self._restore_fixed_optimization_state(full_state)
+            raise
+
+    def _optimize_spherical_selfi_staged_impl(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        active_owner_window_ids: list[int] | tuple[int, ...],
+        settings: dict | None,
+        full_state: dict[str, object],
+    ) -> dict[str, float]:
+        """Run independent appearance and geometry Gaussian-only transactions."""
+
+        cfg = dict(settings or {})
+        appearance_cfg = dict(cfg.get("appearance", {}) or {})
+        geometry_cfg = dict(cfg.get("geometry", {}) or {})
+        acceptance_cfg = dict(cfg.get("acceptance", {}) or {})
+        frame_ids = tuple(dict.fromkeys(int(value) for value in frame_ids))
+        owner_ids = tuple(
+            dict.fromkeys(int(value) for value in active_owner_window_ids)
+        )
+        common = {
+            "active_owner_window_ids": owner_ids,
+            "pose_refine_enable": False,
+            "fixed_pose_frame_ids": list(self.pose_deltas),
+            "optimize_skybox": False,
+            "separate_gaussian_lrs": True,
+            "scale_gaussian_parameter_updates": True,
+            "sample_observations_per_step": max(
+                1, int(cfg.get("sample_observations_per_step", 2))
+            ),
+            "photometric_mask_non_sky": False,
+            "visible_neighbor_lr_scale": 0.0,
+            "sampler_seed": int(cfg.get("seed", 123)) + int(window_id),
+        }
+        appearance_weights = {
+            "photometric": 1.0,
+            "depth": 0.0,
+            "opacity": 0.0,
+            "distortion": 0.0,
+            "sky_alpha": 0.0,
+            "photometric_mode": "l1_dssim",
+            "rgb_l1_weight": float(appearance_cfg.get("rgb_l1_weight", 0.8)),
+            "dssim_weight": float(appearance_cfg.get("dssim_weight", 0.2)),
+        }
+        appearance_settings = {
+            **common,
+            "photometric_only": True,
+            "feature_lr": float(appearance_cfg.get("dc_lr", 1.0e-3)),
+            "sh_rest_lr": float(appearance_cfg.get("sh_lr", 2.0e-4)),
+            "opacity_lr": float(appearance_cfg.get("opacity_lr", 2.0e-4)),
+            "xyz_lr": 0.0,
+            "scaling_lr": 0.0,
+            "rotation_lr": 0.0,
+            "loss_weights_override": appearance_weights,
+            "parameter_bounds": {
+                "opacity_logit_delta": float(
+                    appearance_cfg.get("opacity_logit_delta", 1.0)
+                )
+            },
+            "frozen_gaussian_parameters": (
+                "xyz",
+                "scaling",
+                "rotation",
+            ),
+        }
+        metrics: dict[str, float] = {
+            "strategy_gaussian_only_staged": 1.0,
+            "pose_refine_enabled": 0.0,
+            "active_owner_window_count": float(len(owner_ids)),
+            "optimized_frame_count": float(len(frame_ids)),
+            "appearance_accepted": 0.0,
+            "geometry_accepted": 0.0,
+            "geometry_rollback": 0.0,
+            "window_rollback": 0.0,
+            "full_rollback": 0.0,
+            "pose_unchanged": 1.0,
+            "owner_transform_unchanged": 1.0,
+        }
+        appearance_pre = self.evaluate_spherical_selfi_window(
+            frame_ids,
+            loss_weights_override=appearance_weights,
+            photometric_mask_non_sky=False,
+        )
+        appearance_metrics = self.optimize_spherical_selfi_window(
+            window_id=int(window_id),
+            frame_ids=list(frame_ids),
+            iters=max(0, int(appearance_cfg.get("steps", 30))),
+            settings=appearance_settings,
+            extra_loss_fn=None,
+        )
+        appearance_post = self.evaluate_spherical_selfi_window(
+            frame_ids,
+            loss_weights_override=appearance_weights,
+            photometric_mask_non_sky=False,
+        )
+        pre_rgb = float(appearance_pre.get("photometric", float("inf")))
+        post_rgb = float(appearance_post.get("photometric", float("inf")))
+        appearance_improvement = (pre_rgb - post_rgb) / max(
+            abs(pre_rgb), 1.0e-8
+        )
+        appearance_finite = bool(
+            appearance_pre.get("finite", 0.0) > 0.0
+            and appearance_post.get("finite", 0.0) > 0.0
+            and float(appearance_metrics.get("non_finite_window", 0.0)) == 0.0
+            and math.isfinite(appearance_improvement)
+        )
+        appearance_accepted = bool(
+            appearance_finite
+            and appearance_improvement
+            >= float(acceptance_cfg.get("appearance_min_improvement", 0.001))
+        )
+        metrics.update(
+            {
+                "appearance_pre_rgb": pre_rgb,
+                "appearance_post_rgb": post_rgb,
+                "appearance_relative_improvement": appearance_improvement,
+                "appearance_steps": float(appearance_metrics.get("steps", 0.0)),
+                "appearance_accepted": float(appearance_accepted),
+            }
+        )
+        if not appearance_accepted:
+            self._restore_fixed_optimization_state(full_state)
+            metrics["window_rollback"] = 1.0
+            metrics["full_rollback"] = 1.0
+            metrics["loss"] = pre_rgb if math.isfinite(pre_rgb) else 0.0
+            metrics["steps"] = 0.0
+            return metrics
+        self.commit_spherical_selfi_window()
+
+        geometry_weights = {
+            **appearance_weights,
+            "depth": float(geometry_cfg.get("depth_weight", 0.05)),
+            "depth_loss_mode": "log_huber",
+            "depth_huber_delta": float(geometry_cfg.get("depth_huber_delta", 0.1)),
+        }
+        trust_cfg = {
+            "position_weight": float(geometry_cfg.get("position_weight", 0.01)),
+            "log_scale_weight": float(geometry_cfg.get("log_scale_weight", 0.01)),
+            "rotation_weight": float(geometry_cfg.get("rotation_weight", 0.001)),
+        }
+        geometry_bounds = {
+            "xyz_voxels": float(geometry_cfg.get("xyz_voxels", 0.25)),
+            "scale_ratio_min": float(geometry_cfg.get("scale_ratio_min", 0.8)),
+            "scale_ratio_max": float(geometry_cfg.get("scale_ratio_max", 1.25)),
+            "rotation_degrees": float(geometry_cfg.get("rotation_degrees", 5.0)),
+        }
+        geometry_settings = {
+            **common,
+            "photometric_only": False,
+            "xyz_lr": float(geometry_cfg.get("xyz_lr", 1.0e-4)),
+            "feature_lr": 0.0,
+            "sh_rest_lr": 0.0,
+            "opacity_lr": 0.0,
+            "scaling_lr": float(geometry_cfg.get("scaling_lr", 2.0e-5)),
+            "rotation_lr": float(geometry_cfg.get("rotation_lr", 2.0e-5)),
+            "loss_weights_override": geometry_weights,
+            "gaussian_trust": trust_cfg,
+            "parameter_bounds": geometry_bounds,
+            "frozen_gaussian_parameters": (
+                "features",
+                "sh_rest",
+                "opacity_logit",
+            ),
+        }
+        geometry_reference = self._capture_gaussian_stage_reference()
+        geometry_pre = self.evaluate_spherical_selfi_window(
+            frame_ids,
+            loss_weights_override=geometry_weights,
+            photometric_mask_non_sky=False,
+        )
+        geometry_metrics = self.optimize_spherical_selfi_window(
+            window_id=int(window_id),
+            frame_ids=list(frame_ids),
+            iters=max(0, int(geometry_cfg.get("steps", 10))),
+            settings=geometry_settings,
+            extra_loss_fn=None,
+        )
+        geometry_post = self.evaluate_spherical_selfi_window(
+            frame_ids,
+            loss_weights_override=geometry_weights,
+            photometric_mask_non_sky=False,
+        )
+        owner = getattr(self.map, "_anchor_owner_window_id", None)
+        active_mask = torch.zeros(
+            self.map.anchor_count(),
+            device=self.map.xyz.device,
+            dtype=torch.bool,
+        )
+        if torch.is_tensor(owner) and int(owner.numel()) == self.map.anchor_count():
+            owner_rows = owner.to(device=active_mask.device, dtype=torch.long)
+            for owner_id in owner_ids:
+                active_mask |= owner_rows == int(owner_id)
+        with torch.no_grad():
+            trust_post, _ = self._gaussian_stage_trust_loss(
+                geometry_reference, active_mask, trust_cfg
+            )
+        pre_objective = float(geometry_pre.get("loss", float("inf")))
+        post_objective = float(geometry_post.get("loss", float("inf"))) + float(
+            trust_post.detach().cpu()
+        )
+        geometry_improvement = (pre_objective - post_objective) / max(
+            abs(pre_objective), 1.0e-8
+        )
+        geometry_pre_rgb = float(
+            geometry_pre.get("photometric", float("inf"))
+        )
+        geometry_post_rgb = float(
+            geometry_post.get("photometric", float("inf"))
+        )
+        rgb_worsening = (geometry_post_rgb - geometry_pre_rgb) / max(
+            abs(geometry_pre_rgb), 1.0e-8
+        )
+        geometry_finite = bool(
+            geometry_pre.get("finite", 0.0) > 0.0
+            and geometry_post.get("finite", 0.0) > 0.0
+            and float(geometry_metrics.get("non_finite_window", 0.0)) == 0.0
+            and all(
+                math.isfinite(value)
+                for value in (
+                    pre_objective,
+                    post_objective,
+                    geometry_improvement,
+                    rgb_worsening,
+                )
+            )
+        )
+        geometry_accepted = bool(
+            geometry_finite
+            and geometry_improvement
+            >= float(acceptance_cfg.get("geometry_min_improvement", 0.001))
+            and rgb_worsening
+            <= float(acceptance_cfg.get("geometry_max_rgb_worsening", 0.005))
+        )
+        metrics.update(
+            {
+                "geometry_pre_objective": pre_objective,
+                "geometry_post_objective": post_objective,
+                "geometry_relative_improvement": geometry_improvement,
+                "geometry_pre_rgb": geometry_pre_rgb,
+                "geometry_post_rgb": geometry_post_rgb,
+                "geometry_rgb_worsening": rgb_worsening,
+                "geometry_steps": float(geometry_metrics.get("steps", 0.0)),
+                "geometry_accepted": float(geometry_accepted),
+            }
+        )
+        if not geometry_finite:
+            self._restore_fixed_optimization_state(full_state)
+            metrics["window_rollback"] = 1.0
+            metrics["full_rollback"] = 1.0
+            metrics["geometry_rollback"] = 1.0
+            metrics["steps"] = 0.0
+            metrics["loss"] = pre_rgb
+            return metrics
+        if geometry_accepted:
+            self.commit_spherical_selfi_window()
+        else:
+            self.rollback_spherical_selfi_window()
+            metrics["geometry_rollback"] = 1.0
+
+        pose_unchanged, owner_unchanged = self._fixed_optimization_state_unchanged(
+            full_state
+        )
+        metrics["pose_unchanged"] = float(pose_unchanged)
+        metrics["owner_transform_unchanged"] = float(owner_unchanged)
+        if not (pose_unchanged and owner_unchanged):
+            self._restore_fixed_optimization_state(full_state)
+            metrics["window_rollback"] = 1.0
+            metrics["full_rollback"] = 1.0
+            metrics["steps"] = 0.0
+            metrics["loss"] = pre_rgb
+            return metrics
+        metrics["steps"] = float(appearance_metrics.get("steps", 0.0)) + (
+            float(geometry_metrics.get("steps", 0.0))
+            if geometry_accepted
+            else 0.0
+        )
+        metrics["loss"] = (
+            geometry_post_rgb if geometry_accepted else geometry_pre_rgb
+        )
+        return metrics
 
     def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
         """Promote registered RGB/depth observations without inserting legacy seeds."""
@@ -3867,6 +4364,15 @@ class PanoGaussianMapper:
             and self.map.anchor_count() > 0
             and bool((gaussian_scales > 0).any().detach().cpu())
         )
+        gaussian_stage_reference = (
+            self._capture_gaussian_stage_reference()
+            if gaussian_enabled
+            and (
+                isinstance(cfg.get("gaussian_trust"), dict)
+                or isinstance(cfg.get("parameter_bounds"), dict)
+            )
+            else None
+        )
         pose_enabled = bool(self.optim_cfg.get("pose_refine_enable", False))
         trainable_pose_ids = self._feedforward_trainable_pose_ids(current_keyframe_ids, pose_enabled=pose_enabled)
         pose_params = [
@@ -3950,22 +4456,32 @@ class PanoGaussianMapper:
         if str(cfg.get("sampler", "")).lower() == "shuffled_cycle":
             rng = random.Random(int(cfg.get("sampler_seed", 123)) + sum(int(obs.frame_id) for obs in observations))
             sampling_schedule = []
-            while len(sampling_schedule) < max(0, steps):
+            schedule_size = max(0, steps) * min(
+                len(observations),
+                max(1, int(cfg.get("sample_observations_per_step", 1))),
+            )
+            while len(sampling_schedule) < schedule_size:
                 cycle = list(observations)
                 rng.shuffle(cycle)
                 sampling_schedule.extend(cycle)
-            sampling_schedule = sampling_schedule[: max(0, steps)]
+            sampling_schedule = sampling_schedule[:schedule_size]
         non_finite_window = False
         for step_idx in range(max(0, steps)):
             optimizer.zero_grad(set_to_none=True)
             render_losses = []
             metric_accum: dict[str, list[torch.Tensor]] = {}
             section_start = time.perf_counter()
-            sampled = (
-                [sampling_schedule[step_idx]]
-                if sampling_schedule is not None
-                else self._sample_observations_for_step(observations)
-            )
+            if sampling_schedule is not None:
+                sample_n = min(
+                    len(observations),
+                    max(1, int(cfg.get("sample_observations_per_step", 1))),
+                )
+                sample_start = step_idx * sample_n
+                sampled = sampling_schedule[
+                    sample_start : sample_start + sample_n
+                ]
+            else:
+                sampled = self._sample_observations_for_step(observations)
             sample_sec += time.perf_counter() - section_start
             last_sampled_ids = [int(obs.frame_id) for obs in sampled]
             for frame_id in last_sampled_ids:
@@ -4005,6 +4521,11 @@ class PanoGaussianMapper:
                     target,
                     target_depth=target_depth,
                     depth_confidence=depth_confidence,
+                    photometric_mask=(
+                        non_sky_mask
+                        if bool(cfg.get("photometric_mask_non_sky", False))
+                        else None
+                    ),
                     depth_mask=non_sky_mask,
                     weights=loss_weights,
                 )
@@ -4032,6 +4553,28 @@ class PanoGaussianMapper:
                 if torch.is_tensor(extra_loss):
                     loss = loss + extra_loss.to(loss)
                     metric_accum.setdefault("graph_factor_loss", []).append(extra_loss.detach())
+            trust_config = cfg.get("gaussian_trust", {})
+            trust_enabled = isinstance(trust_config, dict) and any(
+                float(trust_config.get(key, 0.0)) > 0.0
+                for key in (
+                    "position_weight",
+                    "log_scale_weight",
+                    "rotation_weight",
+                )
+            )
+            if (
+                gaussian_stage_reference is not None
+                and gaussian_scales is not None
+                and trust_enabled
+            ):
+                trust_loss, trust_metrics = self._gaussian_stage_trust_loss(
+                    gaussian_stage_reference,
+                    gaussian_scales > 0.0,
+                    trust_config,
+                )
+                loss = loss + trust_loss.to(loss)
+                for key, value in trust_metrics.items():
+                    metric_accum.setdefault(key, []).append(value.detach())
             if not bool(torch.isfinite(loss).detach().cpu()):
                 non_finite_window = True
                 break
@@ -4064,6 +4607,18 @@ class PanoGaussianMapper:
                 with torch.no_grad():
                     if gaussian_enabled and gaussian_scales is not None:
                         self._sanitize_active_gaussian_rows(gaussian_scales)
+                        if gaussian_stage_reference is not None:
+                            self._clamp_gaussian_stage_parameters(
+                                gaussian_stage_reference,
+                                gaussian_scales > 0.0,
+                                cfg.get("parameter_bounds", {}),
+                            )
+                            self._sanitize_active_gaussian_rows(gaussian_scales)
+                            self._restore_frozen_gaussian_parameters(
+                                gaussian_stage_reference,
+                                gaussian_scales > 0.0,
+                                cfg.get("frozen_gaussian_parameters", ()),
+                            )
                 parameters_finite = all(
                     bool(torch.isfinite(value).all().detach().cpu())
                     for group in param_groups
@@ -4355,20 +4910,37 @@ class PanoGaussianMapper:
         *,
         photometric_only: bool,
     ) -> BackendLossWeights:
-        if not photometric_only:
-            return self.loss_weights
-        return BackendLossWeights(
-            photometric=float(self.loss_weights.photometric),
-            depth=0.0,
-            opacity=0.0,
-            distortion=0.0,
-            sky_alpha=0.0,
-            photometric_mode=str(self.loss_weights.photometric_mode),
-            rgb_l1_weight=float(self.loss_weights.rgb_l1_weight),
-            dssim_weight=float(self.loss_weights.dssim_weight),
-            depth_loss_mode=str(self.loss_weights.depth_loss_mode),
-            depth_residual_clamp=float(self.loss_weights.depth_residual_clamp),
+        values = {
+            "photometric": float(self.loss_weights.photometric),
+            "depth": (
+                0.0 if photometric_only else float(self.loss_weights.depth)
+            ),
+            "opacity": (
+                0.0 if photometric_only else float(self.loss_weights.opacity)
+            ),
+            "distortion": (
+                0.0 if photometric_only else float(self.loss_weights.distortion)
+            ),
+            "sky_alpha": (
+                0.0 if photometric_only else float(self.loss_weights.sky_alpha)
+            ),
+            "photometric_mode": str(self.loss_weights.photometric_mode),
+            "rgb_l1_weight": float(self.loss_weights.rgb_l1_weight),
+            "dssim_weight": float(self.loss_weights.dssim_weight),
+            "depth_loss_mode": str(self.loss_weights.depth_loss_mode),
+            "depth_residual_clamp": float(
+                self.loss_weights.depth_residual_clamp
+            ),
+            "depth_huber_delta": float(self.loss_weights.depth_huber_delta),
+        }
+        override = self._feedforward_window_cfg().get(
+            "loss_weights_override", {}
         )
+        if isinstance(override, dict):
+            for key in tuple(values):
+                if key in override:
+                    values[key] = override[key]
+        return BackendLossWeights(**values)
 
     def _sample_observations_for_step(self, observations: list[MapperObservation]) -> list[MapperObservation]:
         cfg = self._feedforward_window_cfg()
@@ -5279,6 +5851,188 @@ class PanoGaussianMapper:
         if hasattr(self.map, "opacity_logit") and torch.is_tensor(self.map.opacity_logit):
             self.map.opacity_logit[active] = self.map.opacity_logit[active].clamp(
                 -12.0, 12.0
+            )
+
+    @torch.no_grad()
+    def _capture_gaussian_stage_reference(self) -> dict[str, torch.Tensor]:
+        n = self.map.anchor_count()
+        voxel = getattr(self.map, "_anchor_voxel_size", None)
+        if not torch.is_tensor(voxel) or int(voxel.numel()) != n:
+            voxel_value = torch.ones(
+                n, device=self.map.xyz.device, dtype=self.map.xyz.dtype
+            )
+        else:
+            voxel_value = voxel.to(
+                device=self.map.xyz.device, dtype=self.map.xyz.dtype
+            ).reshape(-1)
+        return {
+            "xyz": self.map.xyz.detach().clone(),
+            "scaling": self.map._base_scaling().detach().clone(),
+            "scaling_parameter": self.map.scaling.detach().clone(),
+            "rotation": F.normalize(
+                self.map.rotation.detach(), dim=-1, eps=1.0e-8
+            ).clone(),
+            "rotation_parameter": self.map.rotation.detach().clone(),
+            "opacity_logit": self.map.opacity_logit.detach().clone(),
+            "features": self.map.features.detach().clone(),
+            "sh_rest": self.map.sh_rest.detach().clone(),
+            "voxel_size": voxel_value.clamp_min(1.0e-8).detach().clone(),
+        }
+
+    @torch.no_grad()
+    def _restore_frozen_gaussian_parameters(
+        self,
+        reference: dict[str, torch.Tensor],
+        active_mask: torch.Tensor,
+        names,
+    ) -> None:
+        frozen = {str(value).strip().lower() for value in (names or ())}
+        if not frozen:
+            return
+        active = active_mask.to(device=self.map.xyz.device, dtype=torch.bool)
+        if int(active.numel()) != self.map.anchor_count() or not bool(active.any()):
+            return
+        parameter_keys = {
+            "xyz": (self.map.xyz, "xyz"),
+            "scaling": (self.map.scaling, "scaling_parameter"),
+            "rotation": (self.map.rotation, "rotation_parameter"),
+            "opacity": (self.map.opacity_logit, "opacity_logit"),
+            "opacity_logit": (self.map.opacity_logit, "opacity_logit"),
+            "features": (self.map.features, "features"),
+            "dc": (self.map.features, "features"),
+            "sh_rest": (self.map.sh_rest, "sh_rest"),
+            "sh": (self.map.sh_rest, "sh_rest"),
+        }
+        restored: set[int] = set()
+        for name in frozen:
+            value = parameter_keys.get(name)
+            if value is None:
+                raise ValueError(f"Unknown frozen Gaussian parameter {name!r}")
+            parameter, reference_key = value
+            if id(parameter) in restored:
+                continue
+            parameter[active] = reference[reference_key].to(parameter)[active]
+            restored.add(id(parameter))
+
+    def _gaussian_stage_trust_loss(
+        self,
+        reference: dict[str, torch.Tensor],
+        active_mask: torch.Tensor,
+        config: dict | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        cfg = config if isinstance(config, dict) else {}
+        zero = self.map.xyz.new_zeros(())
+        active = active_mask.to(device=self.map.xyz.device, dtype=torch.bool)
+        if int(active.numel()) != self.map.anchor_count() or not bool(active.any()):
+            return zero, {
+                "trust_position": zero,
+                "trust_log_scale": zero,
+                "trust_rotation": zero,
+                "trust_total": zero,
+            }
+        voxel = reference["voxel_size"].to(self.map.xyz)[active].unsqueeze(-1)
+        position = (
+            (self.map.xyz[active] - reference["xyz"].to(self.map.xyz)[active])
+            / voxel
+        ).square().mean()
+        scale = self.map._base_scaling()[active].clamp_min(1.0e-8)
+        scale_ref = reference["scaling"].to(scale)[active].clamp_min(1.0e-8)
+        log_scale = (scale.log() - scale_ref.log()).square().mean()
+        rotation = F.normalize(self.map.rotation[active], dim=-1, eps=1.0e-8)
+        rotation_ref = F.normalize(
+            reference["rotation"].to(rotation)[active], dim=-1, eps=1.0e-8
+        )
+        dot = (rotation * rotation_ref).sum(dim=-1).abs().clamp(0.0, 1.0)
+        # For unit quaternions, 8(1-|q.q0|) is the small-angle equivalent of
+        # squared geodesic rotation while retaining a finite derivative at the
+        # zero-update snapshot.
+        rotation_loss = (8.0 * (1.0 - dot)).mean()
+        total = (
+            float(cfg.get("position_weight", 0.0)) * position
+            + float(cfg.get("log_scale_weight", 0.0)) * log_scale
+            + float(cfg.get("rotation_weight", 0.0)) * rotation_loss
+        )
+        return total, {
+            "trust_position": position,
+            "trust_log_scale": log_scale,
+            "trust_rotation": rotation_loss,
+            "trust_total": total,
+        }
+
+    @torch.no_grad()
+    def _clamp_gaussian_stage_parameters(
+        self,
+        reference: dict[str, torch.Tensor],
+        active_mask: torch.Tensor,
+        config: dict | None,
+    ) -> None:
+        cfg = config if isinstance(config, dict) else {}
+        active = active_mask.to(device=self.map.xyz.device, dtype=torch.bool)
+        if int(active.numel()) != self.map.anchor_count() or not bool(active.any()):
+            return
+        opacity_delta = float(cfg.get("opacity_logit_delta", 0.0))
+        if opacity_delta > 0.0:
+            opacity_ref = reference["opacity_logit"].to(self.map.opacity_logit)
+            self.map.opacity_logit[active] = torch.maximum(
+                torch.minimum(
+                    self.map.opacity_logit[active],
+                    opacity_ref[active] + opacity_delta,
+                ),
+                opacity_ref[active] - opacity_delta,
+            )
+
+        xyz_voxels = float(cfg.get("xyz_voxels", 0.0))
+        if xyz_voxels > 0.0:
+            xyz_ref = reference["xyz"].to(self.map.xyz)
+            delta = self.map.xyz[active] - xyz_ref[active]
+            max_norm = (
+                xyz_voxels
+                * reference["voxel_size"].to(self.map.xyz)[active]
+            ).clamp_min(1.0e-8)
+            norm = torch.linalg.norm(delta, dim=-1).clamp_min(1.0e-12)
+            factor = torch.minimum(torch.ones_like(norm), max_norm / norm)
+            self.map.xyz[active] = xyz_ref[active] + delta * factor.unsqueeze(-1)
+
+        scale_ratio_min = float(cfg.get("scale_ratio_min", 0.0))
+        scale_ratio_max = float(cfg.get("scale_ratio_max", 0.0))
+        if scale_ratio_min > 0.0 and scale_ratio_max >= scale_ratio_min:
+            scale_ref = reference["scaling"].to(self.map.scaling)
+            scale = self.map._base_scaling()
+            bounded = torch.maximum(
+                torch.minimum(
+                    scale[active], scale_ref[active] * scale_ratio_max
+                ),
+                scale_ref[active] * scale_ratio_min,
+            )
+            self.map.scaling[active] = self.map._inverse_softplus_scale(bounded)
+
+        max_rotation_deg = float(cfg.get("rotation_degrees", 0.0))
+        if max_rotation_deg > 0.0:
+            q0 = F.normalize(
+                reference["rotation"].to(self.map.rotation)[active],
+                dim=-1,
+                eps=1.0e-8,
+            )
+            q1 = F.normalize(
+                self.map.rotation[active], dim=-1, eps=1.0e-8
+            )
+            signed_dot = (q0 * q1).sum(dim=-1, keepdim=True)
+            q1 = torch.where(signed_dot < 0.0, -q1, q1)
+            dot = (q0 * q1).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+            theta = torch.acos(dot)
+            max_theta = math.radians(max_rotation_deg) * 0.5
+            interpolation = torch.minimum(
+                torch.ones_like(theta),
+                torch.full_like(theta, max_theta) / theta.clamp_min(1.0e-8),
+            )
+            sine = torch.sin(theta).clamp_min(1.0e-8)
+            slerp = (
+                torch.sin((1.0 - interpolation) * theta) / sine * q0
+                + torch.sin(interpolation * theta) / sine * q1
+            )
+            slerp = torch.where(theta <= 1.0e-7, q1, slerp)
+            self.map.rotation[active] = F.normalize(
+                slerp, dim=-1, eps=1.0e-8
             )
 
     @torch.no_grad()

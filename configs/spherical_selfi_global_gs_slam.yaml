@@ -208,8 +208,8 @@ SphericalSelfiGlobalBackend:
     enabled: true
     visible_only: true
     same_level_only: true
-    # The four-view visible Hash uses the confirmed relaxed same-level radius.
-    # The 1.0 / 1.25 / 1.5 short-run configs remain available for ablations.
+    # Depth-gated candidates are compared only with old anchors visible in the
+    # two non-overlap global renders.
     radius_voxels: 1.5
     compare_existing_only: true
     permanent_drop: true
@@ -219,9 +219,13 @@ SphericalSelfiGlobalBackend:
     # radius=1.5 still misses the per-chunk growth target.
     max_new_gaussians_per_chunk: 0
     coverage_coarse_cell_size: 0.64
-    # Four additional global-map renders per chunk. Keep disabled for normal
-    # runs; the radius20 sweep enables it to measure post-Hash coverage.
+    # Two additional global-map renders after insertion. Keep disabled for
+    # normal runs; enable only when post-Hash coverage diagnostics are needed.
     log_posthash_coverage: false
+  insertion_depth_gate:
+    enabled: true
+    relative_threshold: 0.15
+    alpha_threshold: 0.05
   post_optimization_seam_check:
     enabled: true
   geometry_validation:
@@ -373,16 +377,19 @@ SphericalSelfiGlobalBackend:
     max_stale_frames: 0
     max_render_error: null
   map_optimization:
+    strategy: gaussian_only_staged
     renderer: gsplat360
-    steps_per_window: 100
+    # The staged strategy uses its own 30+10 step schedule. This value keeps
+    # the existing backend queue enabled.
+    steps_per_window: 40
     # Optimize the current chunk and its two immediate predecessors. With the
     # 4-frame/stride-2 schedule this is at most eight unique physical frames.
     recent_window_count: 3
-    sample_observations_per_step: 1
+    sample_observations_per_step: 2
     sampler: shuffled_cycle
-    # This Mapper pass is a pure RGB joint pose/Gaussian refinement. Depth,
-    # graph-factor, opacity, pose-prior, and skybox objectives stay disabled.
-    photometric_only: true
+    # All poses and lazy owner transforms remain fixed. Appearance and geometry
+    # are accepted independently against all recent observations.
+    photometric_only: false
     optimize_skybox: false
     gaussian_lr: 0.002
     separate_gaussian_lrs: true
@@ -393,7 +400,7 @@ SphericalSelfiGlobalBackend:
     scaling_lr: 1.0e-4
     rotation_lr: 1.0e-4
     scale_gaussian_parameter_updates: true
-    pose_refine_enable: true
+    pose_refine_enable: false
     pose_lr: 2.0e-4
     pose_prior_weight: 0.0
     lazy_submap_transforms:
@@ -401,6 +408,32 @@ SphericalSelfiGlobalBackend:
     pose_grad_clip: 0.001
     s2_loss_weight: 0.0
     match_depth_loss_weight: 0.0
+    appearance:
+      steps: 30
+      dc_lr: 1.0e-3
+      sh_lr: 2.0e-4
+      opacity_lr: 2.0e-4
+      rgb_l1_weight: 0.8
+      dssim_weight: 0.2
+      opacity_logit_delta: 1.0
+    geometry:
+      steps: 10
+      xyz_lr: 1.0e-4
+      scaling_lr: 2.0e-5
+      rotation_lr: 2.0e-5
+      depth_weight: 0.05
+      depth_huber_delta: 0.1
+      position_weight: 0.01
+      log_scale_weight: 0.01
+      rotation_weight: 0.001
+      xyz_voxels: 0.25
+      scale_ratio_min: 0.8
+      scale_ratio_max: 1.25
+      rotation_degrees: 5.0
+    acceptance:
+      appearance_min_improvement: 0.001
+      geometry_min_improvement: 0.001
+      geometry_max_rgb_worsening: 0.005
     # Older owners are rendered for occlusion/context but remain bitwise
     # frozen. This legacy knob remains zero as an additional safety guard.
     visible_neighbor_lr_scale: 0.0

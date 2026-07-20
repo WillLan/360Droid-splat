@@ -613,6 +613,19 @@ def test_visible_same_level_hash_only_drops_matches_against_existing_map() -> No
         vectorized_evidence.observation_count_delta,
         evidence.observation_count_delta,
     )
+    invisible_filtered, invisible_stats, invisible_evidence = (
+        fusion.filter_against_visible_map(
+            prepared,
+            incoming_anchor_visibility=torch.ones(count, dtype=torch.bool),
+            existing_anchor_visibility=torch.tensor([False]),
+            radius_voxels=1.0,
+            update_existing_statistics=True,
+        )
+    )
+    assert invisible_stats["hash_visible_existing"] == 0
+    assert invisible_stats["hash_hits"] == 0
+    assert len(invisible_filtered.batch) == len(prepared.batch)
+    assert invisible_evidence is None
     torch.testing.assert_close(
         vectorized_evidence.confidence_accum_delta,
         evidence.confidence_accum_delta,
