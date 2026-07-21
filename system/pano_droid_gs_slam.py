@@ -55,6 +55,15 @@ def load_config(path: str | Path) -> dict:
     return _deep_merge_config(load_config(resolved_base), config)
 
 
+def _requires_refiner_insertion_dedup(spherical_global_cfg: dict) -> bool:
+    strategy = str(
+        (spherical_global_cfg.get("map_optimization", {}) or {}).get(
+            "strategy", "legacy"
+        )
+    ).strip().lower()
+    return strategy != "pfgs360_full_50_50"
+
+
 def _se3_log(T: torch.Tensor) -> torch.Tensor:
     """SE(3) logarithm matching ``se3_exp``'s ``[tx, ty, tz, rx, ry, rz]`` convention."""
 
@@ -2431,7 +2440,10 @@ class PanoDroidGSSlamSystem:
                         "VoxelAnchorRefiner requires "
                         "SphericalSelfiGlobalBackend.rendered_overlap_alignment.enabled=true"
                     )
-                if not bool(dedup_cfg.get("enabled", False)):
+                if (
+                    _requires_refiner_insertion_dedup(spherical_global_cfg)
+                    and not bool(dedup_cfg.get("enabled", False))
+                ):
                     raise ValueError(
                         "VoxelAnchorRefiner requires "
                         "SphericalSelfiGlobalBackend.insertion_dedup.enabled=true"

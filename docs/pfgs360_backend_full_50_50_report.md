@@ -168,6 +168,8 @@ loss 与 gradient 是否 finite。skybox 不参与 50+50 更新。
 - PFGS topology 变化会同步重映射 Gaussian Adam moments 和全部 row-aligned metadata；
 - query 缺失、形状错误、非 finite loss/gradient/parameter 或 owner 变化时，整窗
   回滚 Gaussian、metadata、pose、Adam state 与 JOINT 计数。
+- 系统入口只在 legacy Refiner fusion 路径要求 insertion dedup；严格 PFGS360
+  即使保留前端 Refiner，也不会被旧 dedup 配置契约阻断。
 
 全局 3M Gaussian 上限继续作为结构容量保护；它不属于质量 prune。
 

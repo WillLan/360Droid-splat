@@ -11,7 +11,10 @@ from backend.pano_gs.pfgs360_full import (
     sample_erp_with_wrap,
 )
 from backend.pano_gs.pose_param import PoseDelta
-from system.pano_droid_gs_slam import load_config
+from system.pano_droid_gs_slam import (
+    _requires_refiner_insertion_dedup,
+    load_config,
+)
 
 
 def _config() -> dict:
@@ -483,7 +486,11 @@ def test_formal_config_is_sphereglue_pointmap_sim3_and_strict_pfgs360() -> None:
     assert not backend["insertion_dedup"]["enabled"]
     assert not backend["insertion_depth_gate"]["enabled"]
     assert not backend["error_gaussian_prune"]["enabled"]
+    assert config["VoxelAnchorRefiner"]["enabled"] is True
     assert config["SphericalSelfiRuntime"]["local_ba"]["matching"]["type"] == "superpoint_sphereglue"
     assert config["WeightsAndBiases"]["runtime_log_preset"] == "slam_core_visuals"
     assert config["Training"]["pfgs360_distloss"] is True
     assert config["BackendFeedback"]["enabled"] is False
+    assert not _requires_refiner_insertion_dedup(backend)
+    legacy_backend = {**backend, "map_optimization": {"strategy": "legacy"}}
+    assert _requires_refiner_insertion_dedup(legacy_backend)
