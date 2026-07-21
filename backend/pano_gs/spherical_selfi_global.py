@@ -2053,7 +2053,10 @@ class SphericalSelfiGlobalBackend:
             raise RuntimeError(
                 "Refined packets require rendered_overlap_alignment.enabled=true"
             )
-        if not self.insertion_dedup_enabled:
+        if (
+            self.map_optimization_strategy != "pfgs360_full_50_50"
+            and not self.insertion_dedup_enabled
+        ):
             raise RuntimeError(
                 "Refined packets require insertion_dedup.enabled=true"
             )
@@ -10128,32 +10131,10 @@ class SphericalSelfiGlobalBackend:
         refiner_pending = bool(
             packet.metadata.get("voxel_anchor_refiner_pending", False)
         )
-        if self.map_optimization_strategy == "pfgs360_full_50_50":
-            # Strict PFGS360 owns map initialization, DIA removal/reset and
-            # voxel growth.  Refiner anchors remain available to frontend and
-            # PointMap-Sim3, but never enter Stage2 fusion on this path.
-            if hasattr(self.map, "set_lazy_owner_transform"):
-                self.map.set_lazy_owner_transform(
-                    int(window_id),
-                    window_transform,
-                    set_reference=(
-                        int(window_id)
-                        not in getattr(
-                            self.map,
-                            "_lazy_owner_reference_transforms",
-                            {},
-                        )
-                    ),
-                )
-            fusion_stats = {
-                "pfgs360_strict_fusion_bypass": 1,
-                "legacy_prepare_calls": 0,
-                "legacy_depth_gate_calls": 0,
-                "legacy_hash_calls": 0,
-                "legacy_commit_calls": 0,
-                "chunk_anchor_delta": 0,
-            }
-        elif refined_packet:
+        if (
+            refined_packet
+            and self.map_optimization_strategy != "pfgs360_full_50_50"
+        ):
             # Keep the frontend-owned packet immutable even for the first
             # chunk or for failures after alignment has succeeded.
             packet = self._rescaled_packet_copy(packet, 1.0)

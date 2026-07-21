@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -15,6 +16,7 @@ from system.pano_droid_gs_slam import (
     _requires_refiner_insertion_dedup,
     load_config,
 )
+from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
 
 
 def _config() -> dict:
@@ -494,3 +496,23 @@ def test_formal_config_is_sphereglue_pointmap_sim3_and_strict_pfgs360() -> None:
     assert not _requires_refiner_insertion_dedup(backend)
     legacy_backend = {**backend, "map_optimization": {"strategy": "legacy"}}
     assert _requires_refiner_insertion_dedup(legacy_backend)
+
+
+def test_strict_pfgs360_refined_packet_does_not_require_legacy_dedup() -> None:
+    backend = SphericalSelfiGlobalBackend.__new__(SphericalSelfiGlobalBackend)
+    backend.voxel_anchor_refiner_enabled = True
+    backend.pose_canonicalized_packet_refiner = object()
+    backend.two_frame_known_pose_bridge_enabled = False
+    backend.two_frame_chunk_full_sim3_enabled = True
+    backend.rendered_overlap_alignment_enabled = True
+    backend.insertion_dedup_enabled = False
+    backend.map_optimization_strategy = "pfgs360_full_50_50"
+    backend.renderer = object()
+    packet = SimpleNamespace(
+        metadata={
+            "voxel_anchor_refiner_requested": True,
+            "voxel_anchor_refiner_pending": True,
+        },
+        anchor_observation=object(),
+    )
+    assert backend._validate_refined_packet(packet) is True
