@@ -8407,6 +8407,20 @@ class SphericalSelfiGlobalBackend:
             "anchors_after": int(commit_stats.get("anchors_after", 0)),
         }
 
+    def _pfgs360_chunk_new_frame_ids(
+        self,
+        packet: LocalGaussianWindowPacket,
+    ) -> tuple[int, int]:
+        frame_ids = tuple(
+            int(frame_id)
+            for frame_id in packet.frame_ids[self.expected_overlap_frames :]
+        )
+        if len(frame_ids) != 2:
+            raise RuntimeError(
+                "PFGS360 refined growth requires exactly the two new chunk frames"
+            )
+        return frame_ids
+
     def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
             return {}
@@ -8458,12 +8472,11 @@ class SphericalSelfiGlobalBackend:
             )
             if self.map_optimization_strategy == "pfgs360_full_50_50":
                 visited_frame_ids = tuple(sorted(int(value) for value in self.mapper.observations))
-                new_frame_ids = tuple(
-                    int(frame_id)
-                    for frame_id in live_packet.frame_ids
-                    if int(self.frame_owner_window.get(int(frame_id), window_id))
-                    == int(window_id)
-                ) if live_packet is not None else tuple(frame_ids)
+                if live_packet is None:
+                    raise RuntimeError(
+                        "PFGS360 refined growth requires the live chunk packet"
+                    )
+                new_frame_ids = self._pfgs360_chunk_new_frame_ids(live_packet)
                 refined_anchor_update = None
                 pfgs_settings = dict(
                     self.map_optimize_config.get("pfgs360", {}) or {}

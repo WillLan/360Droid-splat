@@ -687,6 +687,24 @@ def test_refined_anchor_insertion_failure_rolls_back_dia_and_optimizer_state() -
             assert torch.equal(actual, value) if torch.is_tensor(value) else actual == value
 
 
+def test_pose_gradient_clipping_skips_parameters_without_gradients() -> None:
+    without_gradient = torch.nn.Parameter(torch.tensor([1.0]))
+    with_gradient = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
+    with_gradient.grad = torch.tensor([2.0, -3.0])
+
+    PFGS360FullBackend._clip_pose_gradients(
+        [without_gradient, with_gradient],
+        0.5,
+    )
+    torch.testing.assert_close(with_gradient.grad, torch.tensor([0.5, -0.5]))
+
+    with_gradient.grad = None
+    PFGS360FullBackend._clip_pose_gradients(
+        [without_gradient, with_gradient],
+        0.5,
+    )
+
+
 def test_formal_config_is_sphereglue_pointmap_sim3_and_strict_pfgs360() -> None:
     path = (
         Path(__file__).parents[1]

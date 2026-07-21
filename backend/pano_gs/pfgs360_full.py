@@ -460,6 +460,20 @@ class PFGS360FullBackend:
             "refined_anchor"
         )
 
+    @staticmethod
+    def _clip_pose_gradients(
+        pose_parameters: list[torch.Tensor],
+        clip_value: float,
+    ) -> None:
+        parameters_with_grad = [
+            parameter for parameter in pose_parameters if parameter.grad is not None
+        ]
+        if parameters_with_grad:
+            torch.nn.utils.clip_grad_value_(
+                parameters_with_grad,
+                float(clip_value),
+            )
+
     def _state_storage_device(self) -> torch.device:
         mode = str(self.settings.get("state_storage_device", "cpu")).strip().lower()
         if mode == "cpu":
@@ -832,7 +846,7 @@ class PFGS360FullBackend:
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError("Non-finite PFGS360 CAMERA loss")
                 loss.backward()
-                torch.nn.utils.clip_grad_value_(
+                self._clip_pose_gradients(
                     pose_params,
                     float(self.settings.get("pose_grad_clip_value", 1.0e-2)),
                 )
@@ -1154,7 +1168,7 @@ class PFGS360FullBackend:
                     raise FloatingPointError("Non-finite PFGS360 JOINT loss")
                 loss.backward()
                 if pose_params:
-                    torch.nn.utils.clip_grad_value_(
+                    self._clip_pose_gradients(
                         pose_params,
                         float(self.settings.get("pose_grad_clip_value", 1.0e-2)),
                     )

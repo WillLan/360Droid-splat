@@ -7344,6 +7344,17 @@ def test_boundary_strict_pfgs_bypasses_legacy_refined_anchor_fusion() -> None:
     assert backend.window_order == [0]
 
 
+def test_strict_pfgs_growth_uses_only_the_two_nonoverlap_frames() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _refined_packet(1, poses, (2, 3, 4, 5))
+    backend = _pointmap_chunk_backend(
+        renderer=_SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=2.0)
+    )
+    backend.frame_owner_window.update({2: 1, 3: 1, 4: 0, 5: 0})
+
+    assert backend._pfgs360_chunk_new_frame_ids(packet) == (4, 5)
+
+
 def test_global_map_overlap_falls_back_to_unchanged_pointmap_path() -> None:
     height, width = 16, 32
     poses = torch.eye(4).repeat(4, 1, 1)
