@@ -261,7 +261,7 @@ class PaGeRDepthProvider:
     def reset(self) -> None:
         self._cache.clear()
 
-    def _dtype(self, *, weights: bool = False) -> torch.dtype:
+    def _dtype(self) -> torch.dtype:
         if self.device.type != "cuda":
             return torch.float32
         mapping = {
@@ -269,8 +269,7 @@ class PaGeRDepthProvider:
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        dtype = mapping[self.config.amp_dtype]
-        return dtype if not weights or dtype != torch.bfloat16 else torch.bfloat16
+        return mapping[self.config.amp_dtype]
 
     def _load_runtime(self) -> None:
         if self._pager is not None:
@@ -332,7 +331,13 @@ class PaGeRDepthProvider:
             )
         self._face_size = int(getattr(model_cfg, "face_size", 504))
         self._cube_fov = float(getattr(model_cfg, "cube_fov", 90.0))
-        weight_dtype = self._dtype(weights=True)
+        # PaGeR explicitly disables autocast around its camera encoder.  Keep
+        # parameters in the official FP32 storage dtype so that the FP32
+        # extrinsic/intrinsic pose encoding and that encoder's linear layers
+        # remain dtype-compatible.  ``amp_dtype`` controls the surrounding
+        # image backbone/head autocast and therefore still provides mixed-
+        # precision inference without mutating the released weights.
+        weight_dtype = torch.float32
         try:
             pager = pager_module.Pager(
                 model_checkpoint,
