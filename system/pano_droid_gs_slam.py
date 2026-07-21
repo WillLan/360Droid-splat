@@ -554,6 +554,10 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "slam/pfgs360_ate",
         "backend/render_vs_gt_panorama",
         "backend/new_gaussians_per_chunk",
+        "backend/selfi_global_map_anchor_scale",
+        "backend/selfi_global_map_root_relative_scale",
+        "backend/selfi_global_map_anchor_fallback",
+        "backend/selfi_global_map_anchor_fallback_rate",
     }
 )
 
@@ -3769,6 +3773,15 @@ class PanoDroidGSSlamSystem:
                         ("overlap_inlier_ratio", "overlap_inlier_ratio"),
                         ("shared_scale", "shared_scale"),
                         ("absolute_scale", "absolute_scale"),
+                        ("global_map_anchor_scale", "map_anchor_scale"),
+                        (
+                            "global_map_root_relative_scale",
+                            "root_relative_scale",
+                        ),
+                        (
+                            "global_map_packet_log_scale_difference",
+                            "map_packet_log_scale_difference",
+                        ),
                         ("s_shared", "s_shared"),
                         ("s_absolute", "s_absolute"),
                         ("scale_c", "c"),
@@ -3897,6 +3910,25 @@ class PanoDroidGSSlamSystem:
                     wandb_payload["backend/selfi_fallback_accepted"] = int(
                         bool(alignment_diag.get("fallback_accepted", False))
                     )
+                    if alignment_diag.get("mode") == "two_frame_global_map_full_sim3":
+                        global_map_results = [
+                            dict(item.diagnostics.get("alignment", {}) or {})
+                            for item in self.spherical_selfi_global_backend.results
+                            if dict(item.diagnostics.get("alignment", {}) or {}).get("mode")
+                            == "two_frame_global_map_full_sim3"
+                            and dict(item.diagnostics.get("alignment", {}) or {}).get("reason")
+                            != "first_window"
+                        ]
+                        fallback_count = sum(
+                            int(bool(item.get("fallback_used", False)))
+                            for item in global_map_results
+                        )
+                        wandb_payload["backend/selfi_global_map_anchor_fallback"] = int(
+                            bool(alignment_diag.get("fallback_used", False))
+                        )
+                        wandb_payload[
+                            "backend/selfi_global_map_anchor_fallback_rate"
+                        ] = float(fallback_count) / float(max(1, len(global_map_results)))
                     wandb_payload[
                         "backend/selfi_bridge_depth_consensus_fallback_used"
                     ] = int(

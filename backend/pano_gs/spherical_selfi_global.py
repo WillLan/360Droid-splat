@@ -340,6 +340,7 @@ class SphericalSelfiGlobalBackend:
                 "two_frame_scale_pose",
                 "two_frame_full_sim3",
                 "two_frame_pointmap_full_sim3",
+                "two_frame_global_map_full_sim3",
                 "two_frame_bridge_depth_scale",
                 "two_frame_bridge_pose_scale",
             }
@@ -348,6 +349,7 @@ class SphericalSelfiGlobalBackend:
                 "rendered_overlap_alignment.mode must be "
                 "'shared_frame_scale_only', 'two_frame_scale_pose', "
                 "'two_frame_full_sim3', 'two_frame_pointmap_full_sim3', "
+                "'two_frame_global_map_full_sim3', "
                 "'two_frame_bridge_depth_scale', or 'two_frame_bridge_pose_scale'"
             )
         self.two_frame_known_pose_bridge_enabled = (
@@ -373,6 +375,7 @@ class SphericalSelfiGlobalBackend:
                 "two_frame_scale_pose",
                 "two_frame_full_sim3",
                 "two_frame_pointmap_full_sim3",
+                "two_frame_global_map_full_sim3",
                 "two_frame_bridge_depth_scale",
                 "two_frame_bridge_pose_scale",
             }
@@ -386,6 +389,15 @@ class SphericalSelfiGlobalBackend:
             and self.rendered_overlap_alignment_mode
             == "two_frame_pointmap_full_sim3"
         )
+        self.two_frame_global_map_full_sim3_enabled = (
+            self.two_frame_overlap_enabled
+            and self.rendered_overlap_alignment_mode
+            == "two_frame_global_map_full_sim3"
+        )
+        self.two_frame_chunk_full_sim3_enabled = (
+            self.two_frame_pointmap_full_sim3_enabled
+            or self.two_frame_global_map_full_sim3_enabled
+        )
         self.two_frame_scale_pose_enabled = (
             self.two_frame_overlap_enabled
             and self.rendered_overlap_alignment_mode == "two_frame_scale_pose"
@@ -395,7 +407,7 @@ class SphericalSelfiGlobalBackend:
         ).strip().lower()
         allowed_acceptance_policies = (
             {"strict", "diagnostics_only"}
-            if self.two_frame_pointmap_full_sim3_enabled
+            if self.two_frame_chunk_full_sim3_enabled
             else {"strict"}
         )
         if (
@@ -489,7 +501,7 @@ class SphericalSelfiGlobalBackend:
         self.post_refiner_scale_max_relative_change = float(
             rendered_alignment_cfg.get("post_refiner_scale_max_relative_change", 0.10)
         )
-        if self.two_frame_pointmap_full_sim3_enabled:
+        if self.two_frame_chunk_full_sim3_enabled:
             per_frame_capacity = min(
                 self.rendered_alignment_max_points_per_frame,
                 self.rendered_alignment_max_points // 2,
@@ -610,7 +622,7 @@ class SphericalSelfiGlobalBackend:
         ).strip().lower()
         allowed_failure_policies = (
             {"error"}
-            if self.two_frame_pointmap_full_sim3_enabled
+            if self.two_frame_chunk_full_sim3_enabled
             else (
                 {"error", "scale_pose_then_error"}
                 if self.two_frame_overlap_enabled
@@ -780,6 +792,7 @@ class SphericalSelfiGlobalBackend:
             not in {
                 "two_frame_bridge_depth_scale",
                 "two_frame_pointmap_full_sim3",
+                "two_frame_global_map_full_sim3",
             }
         ):
             raise ValueError(
@@ -788,9 +801,9 @@ class SphericalSelfiGlobalBackend:
                 "or two_frame_pointmap_full_sim3; "
                 "pose-baseline bridge ablations must use node_mode=boundary_frame"
             )
-        if self.two_frame_pointmap_full_sim3_enabled and not self.chunk_first_stride_graph:
+        if self.two_frame_chunk_full_sim3_enabled and not self.chunk_first_stride_graph:
             raise ValueError(
-                "two_frame_pointmap_full_sim3 requires "
+                "two_frame_*_full_sim3 requires "
                 "global_graph.node_mode=chunk_first_stride"
             )
         self.boundary_frame_graph = self.node_mode in {
@@ -820,11 +833,11 @@ class SphericalSelfiGlobalBackend:
             )
         self.allow_unaligned_fallback = bool(graph_cfg.get("allow_unaligned_fallback", False))
         if (
-            self.two_frame_pointmap_full_sim3_enabled
+            self.two_frame_chunk_full_sim3_enabled
             and self.allow_unaligned_fallback
         ):
             raise ValueError(
-                "two_frame_pointmap_full_sim3 forbids "
+                "two_frame_*_full_sim3 forbids "
                 "global_graph.allow_unaligned_fallback=true"
             )
         self.allow_boundary_matching_fallback = bool(
@@ -844,9 +857,9 @@ class SphericalSelfiGlobalBackend:
         )
         skip_cfg = dict(graph_cfg.get("skip_edge", {}) or {})
         self.chunk_skip_enabled = bool(skip_cfg.get("enabled", False))
-        if self.two_frame_pointmap_full_sim3_enabled and self.chunk_skip_enabled:
+        if self.two_frame_chunk_full_sim3_enabled and self.chunk_skip_enabled:
             raise ValueError(
-                "two_frame_pointmap_full_sim3 supports only adjacent chunk-first "
+                "two_frame_*_full_sim3 supports only adjacent chunk-first "
                 "factors; global_graph.skip_edge.enabled must be false"
             )
         self.chunk_skip_num_queries = max(
@@ -2013,7 +2026,7 @@ class SphericalSelfiGlobalBackend:
             )
         if pending and not (
             self.two_frame_known_pose_bridge_enabled
-            or self.two_frame_pointmap_full_sim3_enabled
+            or self.two_frame_chunk_full_sim3_enabled
         ):
             raise RuntimeError(
                 "Deferred Refiner packets require a two_frame_bridge_* or "
@@ -4983,6 +4996,299 @@ class SphericalSelfiGlobalBackend:
             }
         )
         return measurement, diagnostics
+
+    def _collect_global_map_overlap_frame_geometry(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        previous_transform: torch.Tensor,
+        frame_id: int,
+    ) -> OverlapFrameGeometry:
+        """Pair global rendered geometry with the incoming local point map."""
+
+        previous_index = previous.frame_index(frame_id)
+        current_index = current.frame_index(frame_id)
+        current_depth = current.observation.refined_depth[0, current_index].detach()
+        global_pose = previous.global_poses(previous_transform)[previous_index]
+        rendered = self._render_global_pose_frame(
+            global_pose,
+            image_size=current.observation.image_size,
+        )
+        global_depth = rendered.depth.to(current_depth)
+        global_alpha = rendered.alpha.to(current_depth)
+        confidence = current.observation.confidence[0, current_index].to(current_depth)
+        while confidence.ndim > current_depth.ndim:
+            confidence = confidence.squeeze(0)
+        current_valid = (
+            current.finite_gaussian_mask[0, current_index].to(current_depth.device)
+            & current.static_mask[0, current_index].to(current_depth.device)
+            & current.geometry_consistency[0, current_index].to(current_depth.device)
+            & ~current.sky_mask[0, current_index].to(current_depth.device)
+            & torch.isfinite(current_depth)
+            & (current_depth >= self.fibonacci_min_depth)
+            & (current_depth <= self.fibonacci_max_depth)
+            & torch.isfinite(confidence)
+            & (confidence >= self.rendered_alignment_min_confidence)
+        )
+        global_valid = (
+            torch.isfinite(global_depth)
+            & (global_depth >= self.fibonacci_min_depth)
+            & (global_depth <= self.fibonacci_max_depth)
+            & torch.isfinite(global_alpha)
+            & (global_alpha >= self.rendered_alignment_alpha_threshold)
+        )
+        point_limit = min(
+            int(self.rendered_alignment_max_points_per_frame),
+            max(1, int(self.rendered_alignment_max_points) // 2),
+        )
+        seed = (
+            self.fibonacci_seed
+            + 1_000_003 * int(previous.window_id)
+            + 10_007 * int(current.window_id)
+            + 101 * int(frame_id)
+        ) & 0x7FFFFFFF
+        samples = sample_joint_valid_fibonacci_uv(
+            global_depth,
+            current_depth,
+            count=point_limit,
+            oversample_factor=self.fibonacci_oversample_factor,
+            min_depth=self.fibonacci_min_depth,
+            max_depth=self.fibonacci_max_depth,
+            source_valid=global_valid,
+            target_valid=current_valid,
+            target_sky_probability=current.sky_prob[0, current_index]
+            .detach()
+            .to(current_depth),
+            source_points=None,
+            target_points=current.observation.centers_world()[
+                0, current_index
+            ]
+            .detach()
+            .to(current_depth)
+            .permute(2, 0, 1),
+            sky_threshold=self.sky_threshold,
+            seed=seed,
+        )
+        count = int(samples.uv.shape[0])
+        if count < self.rendered_alignment_min_points_per_frame:
+            raise RuntimeError(
+                f"Frame {frame_id} has only {count} valid global-map samples; "
+                f"{self.rendered_alignment_min_points_per_frame} required"
+            )
+        current_map = current.observation.centers_world()[0, current_index].detach().to(current_depth)
+        current_points = sample_erp_with_wrap(current_map.permute(2, 0, 1), samples.uv)
+        camera_points = samples.bearing * samples.source_depth[:, None]
+        global_points = (
+            camera_points @ global_pose[:3, :3].to(camera_points).transpose(0, 1)
+            + global_pose[:3, 3].to(camera_points)
+        )
+        finite = torch.isfinite(global_points).all(dim=-1) & torch.isfinite(
+            current_points
+        ).all(dim=-1)
+        global_points = global_points[finite]
+        current_points = current_points[finite]
+        if int(finite.sum().item()) < self.rendered_alignment_min_points_per_frame:
+            raise RuntimeError(
+                f"Frame {frame_id} has insufficient finite global-map samples"
+            )
+        return OverlapFrameGeometry(
+            frame_id=int(frame_id),
+            previous_index=previous_index,
+            current_index=current_index,
+            bearing=samples.bearing[finite].detach(),
+            uv=samples.uv[finite].detach(),
+            previous_depth=samples.source_depth[finite].detach(),
+            current_depth=samples.target_depth[finite].detach(),
+            previous_points=global_points.detach(),
+            current_points=current_points.detach(),
+            previous_pose=global_pose.detach(),
+            current_pose=current.local_poses_c2w[current_index].detach(),
+            holdout_mask=torch.zeros(
+                int(finite.sum().item()), device=finite.device, dtype=torch.bool
+            ),
+            previous_render=rendered,
+            previous_valid_image=global_valid.detach(),
+            current_valid_image=current_valid.detach(),
+            sky_union_image=current.sky_mask[0, current_index].detach().to(current_depth.device),
+        )
+
+    def _global_map_overlap_alignment(
+        self,
+        previous: LocalGaussianWindowPacket,
+        current: LocalGaussianWindowPacket,
+        previous_transform: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, bool, dict[str, Any]]:
+        """Estimate an absolute incoming Sim(3), falling back to point-map alignment."""
+
+        started = time.perf_counter()
+        overlap = self._overlap_frame_ids(previous, current)
+        diagnostics: dict[str, Any] = {
+            "mode": "two_frame_global_map_full_sim3",
+            "alignment_method": "global_render_to_incoming_pointmap_uniform_irls_sim3",
+            "source_window_id": int(previous.window_id),
+            "target_window_id": int(current.window_id),
+            "overlap_frame_ids": list(overlap),
+            "incoming_render_count": 0,
+        }
+        map_transform: torch.Tensor | None = None
+        frames: list[OverlapFrameGeometry] = []
+        map_error: str | None = None
+        if len(overlap) != 2:
+            map_error = "two_overlap_frames_required"
+        else:
+            try:
+                frames = [
+                    self._collect_global_map_overlap_frame_geometry(
+                        previous, current, previous_transform, frame_id
+                    )
+                    for frame_id in overlap
+                ]
+                per_frame = [int(frame.current_points.shape[0]) for frame in frames]
+                diagnostics.update(
+                    {
+                        "per_frame_valid_points": per_frame,
+                        "valid_points": sum(per_frame),
+                        "per_frame_valid_coverage": [
+                            float(
+                                (
+                                    frame.previous_valid_image
+                                    & frame.current_valid_image
+                                )
+                                .float()
+                                .mean()
+                                .detach()
+                                .cpu()
+                            )
+                            for frame in frames
+                        ],
+                        "render_count": len(frames),
+                        "render_seconds": sum(
+                            float(frame.previous_render.render_seconds) for frame in frames
+                            if frame.previous_render is not None
+                        ),
+                    }
+                )
+                if sum(per_frame) < self.rendered_alignment_min_points:
+                    raise RuntimeError("insufficient_total_global_map_support")
+                masks = [torch.ones_like(frame.holdout_mask) for frame in frames]
+                current_points = torch.cat([frame.current_points for frame in frames], dim=0)
+                global_points = torch.cat([frame.previous_points for frame in frames], dim=0)
+                base_weights = self._balanced_frame_weights(frames, masks)
+                robust_weights = base_weights.clone()
+                candidate = weighted_umeyama(
+                    current_points,
+                    global_points,
+                    robust_weights,
+                    allow_scale=True,
+                )
+                for _ in range(self.rendered_alignment_irls_iterations):
+                    irls_residual = torch.linalg.norm(
+                        apply_sim3(candidate, current_points) - global_points,
+                        dim=-1,
+                    )
+                    centered = irls_residual - self._weighted_median_1d(
+                        irls_residual, base_weights
+                    )
+                    sigma = (
+                        1.4826
+                        * self._weighted_median_1d(centered.abs(), base_weights)
+                    ).clamp_min(1.0e-5)
+                    delta = (1.345 * sigma).clamp_min(1.0e-4)
+                    huber = torch.minimum(
+                        torch.ones_like(irls_residual),
+                        delta / irls_residual.clamp_min(1.0e-8),
+                    )
+                    robust_weights = base_weights * huber
+                    candidate = weighted_umeyama(
+                        current_points,
+                        global_points,
+                        robust_weights,
+                        allow_scale=True,
+                    )
+                if not bool(torch.isfinite(candidate).all()):
+                    raise RuntimeError("non_finite_transform")
+                map_transform = candidate.detach()
+                residual = torch.linalg.norm(
+                    apply_sim3(map_transform, current_points) - global_points,
+                    dim=-1,
+                )
+                scale = float(sim3_components(map_transform)[0].detach().cpu())
+                root_scale = 1.0
+                if self.graph.fixed_node_id is not None:
+                    root_scale = float(
+                        sim3_components(
+                            self.graph.transform(self.graph.fixed_node_id)
+                        )[0]
+                        .detach()
+                        .cpu()
+                    )
+                diagnostics.update(
+                    {
+                        "accepted": True,
+                        "reason": "accepted_finite_with_sufficient_support",
+                        "fallback_used": False,
+                        "absolute_scale": scale,
+                        "s_absolute": scale,
+                        "map_anchor_scale": scale,
+                        "root_relative_scale": scale / max(root_scale, 1.0e-12),
+                        "irls_residual": float(
+                            (
+                                robust_weights * residual
+                            ).sum().detach().cpu()
+                            / robust_weights.sum().clamp_min(1.0e-8).detach().cpu()
+                        ),
+                        "median_residual": float(residual.median().detach().cpu()),
+                        "quality_gating_enabled": False,
+                    }
+                )
+            except (RuntimeError, ValueError) as exc:
+                map_error = str(exc)
+
+        pointmap_measurement, pointmap_diagnostics = self._pointmap_overlap_alignment(
+            previous, current
+        )
+        diagnostics["pointmap_comparison"] = pointmap_diagnostics
+        if pointmap_measurement is not None:
+            packet_absolute = previous_transform @ pointmap_measurement.to(previous_transform)
+            packet_scale = float(sim3_components(packet_absolute)[0].detach().cpu())
+            diagnostics["pointmap_comparison_absolute_scale"] = packet_scale
+            if map_transform is not None:
+                map_scale = float(sim3_components(map_transform)[0].detach().cpu())
+                diagnostics["map_packet_log_scale_difference"] = abs(
+                    math.log(max(map_scale, 1.0e-12) / max(packet_scale, 1.0e-12))
+                )
+        if map_transform is not None:
+            relative_reference = sim3_inverse(previous_transform) @ map_transform.to(previous_transform)
+            diagnostics["alignment_seconds"] = float(time.perf_counter() - started)
+            return map_transform, relative_reference.detach(), True, diagnostics
+        diagnostics.update(
+            {
+                "map_anchor_accepted": False,
+                "map_anchor_failure_reason": map_error or "unknown",
+                "fallback_used": True,
+            }
+        )
+        if pointmap_measurement is None:
+            diagnostics.update(
+                {
+                    "accepted": False,
+                    "reason": "global_map_and_pointmap_alignment_failed",
+                    "alignment_seconds": float(time.perf_counter() - started),
+                }
+            )
+            return None, None, False, diagnostics
+        fallback_transform = previous_transform @ pointmap_measurement.to(previous_transform)
+        fallback_scale = float(sim3_components(fallback_transform)[0].detach().cpu())
+        diagnostics.update(
+            {
+                "accepted": True,
+                "reason": "fallback_pointmap_full_sim3",
+                "absolute_scale": fallback_scale,
+                "s_absolute": fallback_scale,
+                "alignment_seconds": float(time.perf_counter() - started),
+            }
+        )
+        return fallback_transform.detach(), pointmap_measurement.detach(), False, diagnostics
 
     def _fit_two_frame_full_sim3(
         self,
@@ -9711,7 +10017,7 @@ class SphericalSelfiGlobalBackend:
             # Keep the frontend-owned packet immutable even for the first
             # chunk or for failures after alignment has succeeded.
             packet = self._rescaled_packet_copy(packet, 1.0)
-        if self.two_frame_pointmap_full_sim3_enabled and refiner_pending:
+        if self.two_frame_chunk_full_sim3_enabled and refiner_pending:
             # This mode aligns final point maps, so the existing Refiner callback
             # must finish before any cross-chunk geometry is sampled.
             packet = self._finalize_pose_canonicalized_refiner_packet(packet)
@@ -9725,14 +10031,15 @@ class SphericalSelfiGlobalBackend:
         sequential_overlap_pose: tuple[CoincidentPanoramaFactor, ...] = ()
         pointmap_overlap_measurement: torch.Tensor | None = None
         pointmap_sim3_start_transform: torch.Tensor | None = None
+        global_map_anchor_succeeded = False
         if not self.window_order:
             aligned = True
             start_transform = sim3_identity(device=packet.local_poses_c2w.device)
-            if self.two_frame_pointmap_full_sim3_enabled:
+            if self.two_frame_chunk_full_sim3_enabled:
                 pointmap_sim3_start_transform = start_transform.detach().clone()
                 alignment_diagnostics = {
                     "reason": "first_window",
-                    "mode": "two_frame_pointmap_full_sim3",
+                    "mode": self.rendered_overlap_alignment_mode,
                     "alignment_method": "identity_global_anchor",
                     "absolute_scale": 1.0,
                     "s_absolute": 1.0,
@@ -9770,7 +10077,7 @@ class SphericalSelfiGlobalBackend:
                 raise RuntimeError("The previous full-resolution window packet is unavailable")
             if (
                 self.chunk_first_stride_graph
-                and self.two_frame_pointmap_full_sim3_enabled
+                and self.two_frame_chunk_full_sim3_enabled
             ):
                 if start_frame in self.graph.nodes:
                     raise RuntimeError(
@@ -9779,45 +10086,75 @@ class SphericalSelfiGlobalBackend:
                 previous_transform = self._window_anchor_transforms()[
                     previous_id
                 ].to(packet.local_poses_c2w)
-                (
-                    pointmap_overlap_measurement,
-                    alignment_diagnostics,
-                ) = self._pointmap_overlap_alignment(
-                    previous_packet,
-                    packet,
-                )
-                if pointmap_overlap_measurement is None:
+                if self.two_frame_global_map_full_sim3_enabled:
+                    (
+                        start_transform,
+                        pointmap_overlap_measurement,
+                        global_map_anchor_succeeded,
+                        alignment_diagnostics,
+                    ) = self._global_map_overlap_alignment(
+                        previous_packet,
+                        packet,
+                        previous_transform,
+                    )
+                else:
+                    (
+                        pointmap_overlap_measurement,
+                        alignment_diagnostics,
+                    ) = self._pointmap_overlap_alignment(
+                        previous_packet,
+                        packet,
+                    )
+                    start_transform = (
+                        None
+                        if pointmap_overlap_measurement is None
+                        else previous_transform
+                        @ pointmap_overlap_measurement.to(previous_transform)
+                    )
+                if pointmap_overlap_measurement is None or start_transform is None:
                     self._last_overlap_alignment_failure = copy.deepcopy(
                         alignment_diagnostics
                     )
+                    alignment_label = (
+                        "global-map/point-map Sim(3)"
+                        if self.two_frame_global_map_full_sim3_enabled
+                        else "point-map Sim(3)"
+                    )
                     raise RuntimeError(
-                        f"Window {window_id} point-map Sim(3) alignment failed: "
+                        f"Window {window_id} {alignment_label} alignment failed: "
                         f"{alignment_diagnostics.get('reason', 'unknown')}; "
                         f"diagnostics={alignment_diagnostics!r}"
                     )
-                start_transform = (
-                    previous_transform
-                    @ pointmap_overlap_measurement.to(previous_transform)
-                )
-                previous_sim3_transform = (
-                    self._pointmap_sim3_window_transforms.get(previous_id)
-                )
-                if previous_sim3_transform is None:
-                    raise RuntimeError(
-                        f"Previous window {previous_id} has no point-map Sim(3) "
-                        "diagnostic transform"
+                if self.two_frame_global_map_full_sim3_enabled:
+                    pointmap_sim3_start_transform = start_transform.detach().clone()
+                else:
+                    previous_sim3_transform = (
+                        self._pointmap_sim3_window_transforms.get(previous_id)
                     )
-                pointmap_sim3_start_transform = (
-                    previous_sim3_transform
-                    @ pointmap_overlap_measurement.to(previous_sim3_transform)
-                )
+                    if previous_sim3_transform is None:
+                        raise RuntimeError(
+                            f"Previous window {previous_id} has no point-map Sim(3) "
+                            "diagnostic transform"
+                        )
+                    pointmap_sim3_start_transform = (
+                        previous_sim3_transform
+                        @ pointmap_overlap_measurement.to(previous_sim3_transform)
+                    )
                 absolute_scale = float(
                     sim3_components(start_transform)[0].detach().cpu()
                 )
                 alignment_diagnostics.update(
                     {
-                        "graph_role": "chunk_node_initialization_only",
-                        "node_initialization_source": "overlap_pointmap_full_sim3",
+                        "graph_role": (
+                            "absolute_map_scale_anchor"
+                            if global_map_anchor_succeeded
+                            else "chunk_node_initialization_only"
+                        ),
+                        "node_initialization_source": (
+                            "global_map_render_full_sim3"
+                            if global_map_anchor_succeeded
+                            else "overlap_pointmap_full_sim3"
+                        ),
                         "absolute_scale": absolute_scale,
                         "s_absolute": absolute_scale,
                         "chunk_scale_normalization": 1.0,
@@ -10245,7 +10582,7 @@ class SphericalSelfiGlobalBackend:
 
         if (
             self.chunk_first_stride_graph
-            and self.two_frame_pointmap_full_sim3_enabled
+            and self.two_frame_chunk_full_sim3_enabled
         ):
             if start_frame in self.graph.nodes:
                 raise RuntimeError(
@@ -10287,6 +10624,54 @@ class SphericalSelfiGlobalBackend:
                         "chunk-first factor: "
                         f"{stride_diagnostics.get('reason', 'unknown')}"
                     )
+                if global_map_anchor_succeeded:
+                    if not isinstance(stride_factor, DenseSphericalFactorBlock):
+                        raise RuntimeError(
+                            "Global-map alignment requires a dense SphereGlue stride factor"
+                        )
+                    stride_factor.use_depth = False
+                    stride_factor.optimize_scale = False
+                    stride_factor.metadata["map_controls_scale"] = True
+                    stride_factor.metadata["depth_residual_disabled"] = True
+                    stride_factor.metadata["scale_jacobian_disabled"] = True
+                    stride_diagnostics.update(
+                        {
+                            "factor_representation": "dense_spherical_bearing",
+                            "map_controls_scale": True,
+                            "depth_residual_disabled": True,
+                            "scale_jacobian_disabled": True,
+                        }
+                    )
+                    root_node = self.graph.fixed_node_id
+                    if root_node is None:
+                        raise RuntimeError("Global-map scale anchor requires a fixed root node")
+                    root_transform = self.graph.transform(root_node)
+                    support = int(alignment_diagnostics.get("valid_points", 0))
+                    confidence = min(8.0, max(1.0, math.sqrt(float(support) / 64.0)))
+                    root_edge = Sim3GraphEdge(
+                        source=int(root_node),
+                        target=int(start_frame),
+                        measurement_target_to_source=(
+                            sim3_inverse(root_transform)
+                            @ start_transform.to(root_transform)
+                        ).detach(),
+                        information_diag=start_transform.new_tensor(
+                            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.75 * confidence]
+                        ),
+                        edge_type="global_map_anchor_sim3",
+                        metadata={
+                            "valid_points": support,
+                            "information_confidence": confidence,
+                            "scale_only_information": True,
+                        },
+                    )
+                    self.graph.add_edge(root_edge)
+                    boundary_diagnostics["global_map_anchor_edge"] = {
+                        "inserted": True,
+                        "source": int(root_node),
+                        "target": int(start_frame),
+                        "information_confidence": confidence,
+                    }
                 self.graph.add_edge(stride_factor)
                 if stride_holdout is not None:
                     self._chunk_stride_holdouts[
@@ -11774,7 +12159,7 @@ class SphericalSelfiGlobalBackend:
             )
             if graph_changed_history:
                 geometry_nodes = set(self.graph.nodes)
-            elif self.two_frame_pointmap_full_sim3_enabled:
+            elif self.two_frame_chunk_full_sim3_enabled:
                 # Point-map alignment admits exactly the current chunk-first
                 # node.  Unlike the legacy stride path there is no eagerly
                 # created node for the next chunk.

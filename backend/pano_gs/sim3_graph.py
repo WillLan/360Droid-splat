@@ -66,6 +66,7 @@ class DenseSphericalFactorBlock:
     depth_factor_weight: float = 0.1
     s2_huber_delta_deg: float = 1.0
     use_depth: bool = True
+    optimize_scale: bool = True
     robust_delta: float = float("inf")
     edge_type: str = "dense_spherical"
     dcs_phi: float | None = None
@@ -478,7 +479,10 @@ class GlobalSim3FactorGraph:
         # the singular derivative of an identity-angle ``acos`` and caused an
         # entire graph update to terminate with ``non_finite_gradient``.
         jacobian = torch.func.jacfwd(residual_from_delta)(zero).to(weighted_residual)
-        if isinstance(factor, CoincidentPanoramaFactor):
+        if isinstance(factor, CoincidentPanoramaFactor) or (
+            isinstance(factor, DenseSphericalFactorBlock)
+            and not factor.optimize_scale
+        ):
             # A same-center panorama observation contains no scale evidence.
             # Under left-multiplicative Sim(3) perturbations the scale column
             # can otherwise spuriously reduce a non-zero center residual by
@@ -606,6 +610,9 @@ class GlobalSim3FactorGraph:
             source_camera_jacobian = torch.cat(
                 [translation_jacobian, rotation_jacobian, scale_jacobian], dim=-1
             )
+            if not factor.optimize_scale:
+                source_camera_jacobian = source_camera_jacobian.clone()
+                source_camera_jacobian[..., 6] = 0.0
             target_camera_jacobian = -source_camera_jacobian
             camera_jacobians = {
                 source_id: source_camera_jacobian,

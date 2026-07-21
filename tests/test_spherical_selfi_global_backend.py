@@ -190,6 +190,7 @@ def _pointmap_chunk_backend(
     renderer=None,
     packet_refiner=None,
     hierarchical: bool = False,
+    alignment_mode: str = "two_frame_pointmap_full_sim3",
 ) -> SphericalSelfiGlobalBackend:
     return SphericalSelfiGlobalBackend(
         PanoGaussianMap(config={}, device="cpu"),
@@ -199,7 +200,7 @@ def _pointmap_chunk_backend(
             "enabled": True,
             "rendered_overlap_alignment": {
                 "enabled": True,
-                "mode": "two_frame_pointmap_full_sim3",
+                "mode": str(alignment_mode),
                 "min_points": int(min_points),
                 "max_points": int(max_points_per_frame) * 2,
                 "min_points_per_frame": int(min_points_per_frame),
@@ -6310,6 +6311,110 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
     assert frontend.consume_local_ba_diagnostics() == []
 
 
+def test_synthetic_window_runtime_replaces_head_depth_with_aligned_pager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import frontend.spherical_selfi.runtime as runtime_module
+
+    providers = []
+
+    class FakePaGeRDepthProvider:
+        def __init__(self, config, *, device) -> None:
+            self.config = config
+            self.device = torch.device(device)
+            self.last_raw = None
+            providers.append(self)
+
+        def reset(self) -> None:
+            pass
+
+        def predict(self, images, frame_ids):
+            batch, views, _, height, width = images.shape
+            rows = torch.arange(height, dtype=torch.float32).view(height, 1)
+            cols = torch.arange(width, dtype=torch.float32).view(1, width)
+            raw = 0.5 + rows / max(1, height) + cols / max(1, width)
+            raw = raw.view(1, 1, 1, height, width).repeat(batch, views, 1, 1, 1)
+            self.last_raw = raw.to(self.device)
+            return self.last_raw, {
+                "inference_sec": 0.01,
+                "cache_hits": 0,
+                "cache_misses": int(frame_ids.numel()),
+                "cache_hit_ratio": 0.0,
+                "cache_entries": int(frame_ids.numel()),
+            }
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PaGeRDepthProvider",
+        FakePaGeRDepthProvider,
+    )
+    config = stage2_default_config()
+    config["image"] = {
+        "height": 8,
+        "width": 16,
+        "head_height": 8,
+        "head_width": 16,
+    }
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_pager.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
+        "pager_depth": {
+            "enabled": True,
+            "repo_path": "/unused/pager",
+            "min_valid_pixels": 8,
+            "min_valid_ratio": 0.1,
+        },
+        "local_ba": {"enabled": False},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    for frame_id in range(3):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+    outputs = frontend.pop_ready_outputs() + frontend.flush()
+    packets = frontend.consume_local_gaussian_windows()
+    diagnostics = frontend.consume_local_ba_diagnostics()
+
+    assert len(providers) == 1
+    assert len(packets) == 1
+    observation = packets[0].observation
+    scales = torch.tensor(diagnostics[0]["pager_depth"]["scales"]).view(
+        1, 3, 1, 1, 1
+    )
+    expected = providers[0].last_raw * scales
+    torch.testing.assert_close(observation.initial_depth, expected)
+    torch.testing.assert_close(observation.refined_depth, expected)
+    torch.testing.assert_close(
+        observation.depth_residual,
+        torch.zeros_like(observation.depth_residual),
+    )
+    assert packets[0].metadata["pager_depth_enabled"] is True
+    assert diagnostics[0]["pager_depth"]["cache_misses"] == 3
+    by_frame = {int(output.frame_id): output for output in outputs}
+    for index in range(3):
+        torch.testing.assert_close(
+            by_frame[index].inverse_depth,
+            expected[0, index].reciprocal(),
+        )
+
+
 def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) -> None:
     config = stage2_default_config()
     config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
@@ -7018,3 +7123,154 @@ def test_pointmap_alignment_failure_rolls_back_node_and_owner_transfer() -> None
         torch.testing.assert_close(sim3_after[frame_id], sim3_before[frame_id])
     assert backend._last_overlap_alignment_failure is not None
     assert backend._last_overlap_alignment_failure["accepted"] is False
+
+
+def test_global_map_overlap_initializes_absolute_sim3_and_anchors_only_scale() -> None:
+    height, width = 24, 48
+    angle = 0.19
+    rotation = torch.tensor(
+        [
+            [math.cos(angle), 0.0, math.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(angle), 0.0, math.cos(angle)],
+        ],
+        dtype=torch.float32,
+    )
+    expected = sim3_from_components(
+        1.4, rotation, torch.tensor([0.25, -0.06, 0.12])
+    )
+    current_poses = torch.eye(4).repeat(4, 1, 1)
+    current_poses[1, :3, 3] = torch.tensor([0.2, 0.03, -0.04])
+    previous_poses = torch.eye(4).repeat(4, 1, 1)
+    previous_poses[2] = apply_sim3_to_c2w(expected, current_poses[0])
+    previous_poses[3] = apply_sim3_to_c2w(expected, current_poses[1])
+    previous = _packet(0, previous_poses, (0, 1, 2, 3), height=height, width=width)
+    current = _packet(1, current_poses, (2, 3, 4, 5), height=height, width=width)
+    _replace_packet_depth(previous, torch.full((4, 1, height, width), 2.8))
+    _replace_packet_depth(current, torch.full((4, 1, height, width), 2.0))
+    _attach_identity_stride_matches(previous)
+    renderer = _SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=2.8)
+    backend = _pointmap_chunk_backend(
+        min_points=64,
+        min_points_per_frame=24,
+        max_points_per_frame=64,
+        acceptance_policy="diagnostics_only",
+        renderer=renderer,
+        alignment_mode="two_frame_global_map_full_sim3",
+    )
+
+    candidate, _, map_success, candidate_diagnostics = (
+        backend._global_map_overlap_alignment(
+            previous, current, torch.eye(4)
+        )
+    )
+    assert map_success is True, candidate_diagnostics
+    assert candidate is not None
+    candidate_scale, candidate_rotation, candidate_translation = sim3_components(candidate)
+    expected_scale, expected_rotation, expected_translation = sim3_components(expected)
+    assert float(candidate_scale) == pytest.approx(float(expected_scale), rel=5.0e-3)
+    assert torch.allclose(candidate_rotation, expected_rotation, atol=5.0e-3)
+    assert torch.allclose(candidate_translation, expected_translation, atol=1.0e-2)
+    renderer.calls = 0
+
+    first = backend.process_packet(previous)
+    assert first.diagnostics["alignment"]["reason"] == "first_window"
+    assert renderer.calls == 0
+    result = backend.process_packet(current)
+
+    assert renderer.calls == 2
+    diagnostics = result.diagnostics["alignment"]
+    assert diagnostics["accepted"] is True
+    assert diagnostics["fallback_used"] is False
+    assert diagnostics["incoming_render_count"] == 0
+    recovered = backend.graph.transform(2)
+    scale, _, _ = sim3_components(recovered)
+    assert float(scale) == pytest.approx(float(expected_scale), rel=5.0e-3)
+    dense = [
+        factor for factor in backend.graph.edges
+        if isinstance(factor, DenseSphericalFactorBlock)
+    ]
+    anchors = [
+        factor for factor in backend.graph.edges
+        if isinstance(factor, Sim3GraphEdge)
+        and factor.edge_type == "global_map_anchor_sim3"
+    ]
+    assert len(dense) == 1
+    assert dense[0].use_depth is False
+    assert dense[0].optimize_scale is False
+    assert len(anchors) == 1
+    assert (anchors[0].source, anchors[0].target) == (0, 2)
+    assert torch.equal(
+        anchors[0].information_diag[:6],
+        torch.zeros_like(anchors[0].information_diag[:6]),
+    )
+    assert float(anchors[0].information_diag[6]) > 0.0
+
+
+def test_global_map_overlap_falls_back_to_unchanged_pointmap_path() -> None:
+    height, width = 16, 32
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(0, poses, (0, 1, 2, 3), height=height, width=width)
+    current = _packet(1, poses, (2, 3, 4, 5), height=height, width=width)
+    _replace_packet_depth(previous, torch.full((4, 1, height, width), 3.0))
+    _replace_packet_depth(current, torch.full((4, 1, height, width), 2.0))
+    _attach_identity_stride_matches(previous)
+    renderer = _SyntheticSharedDepthRenderer(
+        local_depth=2.0, global_depth=2.0, alpha=0.0
+    )
+    backend = _pointmap_chunk_backend(
+        renderer=renderer,
+        acceptance_policy="diagnostics_only",
+        alignment_mode="two_frame_global_map_full_sim3",
+    )
+    backend.process_packet(previous)
+    result = backend.process_packet(current)
+
+    assert result.diagnostics["alignment"]["fallback_used"] is True
+    assert result.diagnostics["alignment"]["reason"] == "fallback_pointmap_full_sim3"
+    assert float(sim3_components(backend.graph.transform(2))[0]) == pytest.approx(
+        1.5, rel=2.0e-3
+    )
+    dense = next(
+        factor for factor in backend.graph.edges
+        if isinstance(factor, DenseSphericalFactorBlock)
+    )
+    assert dense.use_depth is True
+    assert dense.optimize_scale is True
+    assert not any(
+        isinstance(factor, Sim3GraphEdge)
+        and factor.edge_type == "global_map_anchor_sim3"
+        for factor in backend.graph.edges
+    )
+
+
+def test_dense_spherical_factor_can_strictly_disable_scale_jacobians() -> None:
+    graph = GlobalSim3FactorGraph()
+    graph.add_node(0, torch.eye(4))
+    target = sim3_from_components(
+        1.3, torch.eye(3), torch.tensor([0.2, 0.0, 0.0])
+    )
+    graph.add_node(1, target)
+    identity = torch.eye(4)
+    bearing = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]]
+    )
+    factor = DenseSphericalFactorBlock(
+        source=0,
+        target=1,
+        source_local_pose=identity,
+        target_local_pose=identity,
+        source_bearing=bearing,
+        target_bearing=bearing.roll(1, dims=0),
+        source_depth=torch.ones(3),
+        target_depth=torch.ones(3),
+        factor_weight=torch.ones(3),
+        use_depth=False,
+        optimize_scale=False,
+    )
+    graph.add_edge(factor)
+
+    endpoint_ids, blocks, _ = graph._linearize_factor(factor, {1: 0})
+
+    assert endpoint_ids == [1]
+    assert torch.equal(blocks[0][:, 6], torch.zeros_like(blocks[0][:, 6]))

@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 import json
 
 from PIL import Image
@@ -565,6 +566,37 @@ def test_ob3d_pointmap_sim3_sphereglue_is_a_matcher_only_ablation() -> None:
         "slam_core_visuals"
     )
     assert sphereglue["Results"]["render_final_all_frames"] is True
+
+
+def test_ob3d_global_map_sim3_sphereglue_only_changes_alignment_and_run_identity() -> None:
+    root = Path(__file__).parents[1]
+    baseline = load_config(
+        root
+        / "configs"
+        / "spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_freeze.yaml"
+    )
+    experiment = load_config(
+        root
+        / "configs"
+        / "spherical_selfi_ob3d_global_map_sim3_sphereglue_ba_100_pfgs360_freeze.yaml"
+    )
+    assert baseline["SphericalSelfiGlobalBackend"]["rendered_overlap_alignment"][
+        "mode"
+    ] == "two_frame_pointmap_full_sim3"
+    assert experiment["SphericalSelfiGlobalBackend"]["rendered_overlap_alignment"][
+        "mode"
+    ] == "two_frame_global_map_full_sim3"
+
+    baseline_normalized = copy.deepcopy(baseline)
+    experiment_normalized = copy.deepcopy(experiment)
+    baseline_normalized["SphericalSelfiGlobalBackend"]["rendered_overlap_alignment"][
+        "mode"
+    ] = "two_frame_global_map_full_sim3"
+    for config in (baseline_normalized, experiment_normalized):
+        for key in ("group", "run_name", "tags"):
+            config["WeightsAndBiases"].pop(key, None)
+        config["Results"].pop("save_dir", None)
+    assert experiment_normalized == baseline_normalized
 
 
 def test_system_runs_panovggt_long_fake_smoke(tmp_path: Path):

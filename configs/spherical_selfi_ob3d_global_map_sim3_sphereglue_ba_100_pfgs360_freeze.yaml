@@ -1,0 +1,28 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_freeze.yaml
+
+# Absolute scale is initialized from the already reconstructed Gaussian map.
+# If map rendering or finite-support fitting fails, the inherited PointMap-Sim3
+# alignment is used transactionally as the fallback.
+SphericalSelfiGlobalBackend:
+  rendered_overlap_alignment:
+    mode: two_frame_global_map_full_sim3
+
+WeightsAndBiases:
+  group: ob3d-sponza-global-map-sim3-sphereglue-ba-100
+  run_name: ob3d100_global_map_sim3_sphereglue_ba_pfgs360_frozen_frontend_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - superpoint
+    - sphereglue-ba
+    - localba8-single-stage
+    - refiner
+    - global-map-anchor
+    - full-sim3
+    - overlap2
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_global_map_sim3_sphereglue_ba_pfgs360_frozen_frontend_r1
