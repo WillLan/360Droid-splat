@@ -1,0 +1,41 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_pager_ba_100_pfgs360_refined_anchor_50_50.yaml
+
+SphericalSelfiGlobalBackend:
+  map_optimization:
+    steps_per_window: 250
+    recent_window_count: 3
+    camera_steps: 50
+    joint_steps: 200
+    sample_observations_per_step: 1
+    optimize_all_gaussians: false
+    pose_lr: 1.0e-4
+    joint_pose_lr: 2.0e-5
+    pfgs360:
+      frame_scope: recent_chunks
+      sampling_policy: uniform
+      gaussian_update_scope: sampled_view_visible
+      visibility_threshold: 0.0
+
+WeightsAndBiases:
+  group: ob3d-sponza-pointmap-sim3-sphereglue-pager-pfgs360-refined-anchor-50-200
+  run_name: ob3d100_pointmap_sim3_sphereglue_pager_pfgs360_refined_anchor_50_200_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - sphereglue-ba
+    - pager-si-depth
+    - fixed-depth-ba
+    - overlap-pointmap
+    - full-sim3
+    - pfgs360-dia
+    - refined-anchor-growth
+    - recent3-chunks
+    - visible-gaussian-update
+    - camera50
+    - joint200
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_sphereglue_pager_pfgs360_refined_anchor_50_200_r1

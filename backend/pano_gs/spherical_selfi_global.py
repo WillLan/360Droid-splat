@@ -8471,16 +8471,39 @@ class SphericalSelfiGlobalBackend:
                 int(window_id)
             )
             if self.map_optimization_strategy == "pfgs360_full_50_50":
-                visited_frame_ids = tuple(sorted(int(value) for value in self.mapper.observations))
+                pfgs_settings = dict(
+                    self.map_optimize_config.get("pfgs360", {}) or {}
+                )
+                frame_scope = str(
+                    pfgs_settings.get("frame_scope", "all_visited")
+                ).strip().lower()
+                if frame_scope == "recent_chunks":
+                    # The queue has already expanded ``frame_ids`` to the
+                    # unique physical frames owned by the configured recent
+                    # chunk window; do not silently widen it back to the full
+                    # trajectory here.
+                    visited_frame_ids = tuple(
+                        dict.fromkeys(int(value) for value in optimized_frame_ids)
+                    )
+                elif frame_scope == "all_visited":
+                    visited_frame_ids = tuple(
+                        sorted(int(value) for value in self.mapper.observations)
+                    )
+                else:
+                    raise ValueError(
+                        "PFGS360 frame_scope must be 'all_visited' or "
+                        "'recent_chunks'"
+                    )
+                if not visited_frame_ids:
+                    raise RuntimeError(
+                        "PFGS360 recent-chunk optimization has no registered frames"
+                    )
                 if live_packet is None:
                     raise RuntimeError(
                         "PFGS360 refined growth requires the live chunk packet"
                     )
                 new_frame_ids = self._pfgs360_chunk_new_frame_ids(live_packet)
                 refined_anchor_update = None
-                pfgs_settings = dict(
-                    self.map_optimize_config.get("pfgs360", {}) or {}
-                )
                 if str(pfgs_settings.get("growth_source", "raw_depth")).strip().lower() == "refined_anchor":
                     if live_packet is None or live_packet.anchor_observation is None:
                         raise RuntimeError(
@@ -8536,6 +8559,7 @@ class SphericalSelfiGlobalBackend:
                 )
                 metrics["optimized_frame_count"] = float(len(visited_frame_ids))
                 metrics["new_frame_count"] = float(len(new_frame_ids))
+                metrics["active_chunk_count"] = float(len(active_owner_window_ids))
                 metrics["pose_to_graph_sync_disabled"] = 1.0
                 return metrics
             if self.map_optimization_strategy == "gaussian_only_staged":

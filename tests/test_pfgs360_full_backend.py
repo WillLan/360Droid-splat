@@ -208,6 +208,17 @@ class _AttributedFakeRenderer(_DifferentiableFakeRenderer):
         return output
 
 
+class _PartiallyVisibleFakeRenderer(_DifferentiableFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        output = super().render(camera, gaussians, query_values=query_values)
+        count = gaussians.anchor_count()
+        visible = torch.zeros(count, device=gaussians.xyz.device)
+        visible[: count // 2] = 1.0
+        output["accum_visible"] = visible
+        output["radii"] = torch.ones_like(visible)
+        return output
+
+
 def _registered_mapper(renderer) -> PanoGaussianMapper:
     gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
     gaussian_map.configure_lazy_owner_transforms(True)
@@ -336,6 +347,67 @@ def test_joint_stage_updates_all_six_gaussian_groups_and_keeps_first_pose_fixed(
         float(mapper.pose_deltas[index].delta.detach().norm()) > 0.0
         for index in (1, 2, 3)
     )
+
+
+def test_joint_stage_updates_only_sampled_view_visible_gaussian_rows() -> None:
+    mapper = _registered_mapper(_PartiallyVisibleFakeRenderer())
+    grid_x, grid_y = torch.meshgrid(torch.arange(12), torch.arange(12), indexing="ij")
+    xyz = torch.stack([grid_x.flatten(), grid_y.flatten(), torch.ones(144)], dim=-1).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(144, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    before = {
+        name: getattr(mapper.map, name).detach().clone()
+        for name in mapper.map._gaussian_parameter_names()
+    }
+    mapper._pfgs360_gaussian_moments = {}
+    for name in mapper.map._gaussian_parameter_names():
+        parameter = getattr(mapper.map, name)
+        mapper._pfgs360_gaussian_moments[name] = {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.ones_like(parameter),
+            "exp_avg_sq": torch.ones_like(parameter),
+        }
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "refine_every_joint_steps": 0,
+            "gaussian_update_scope": "sampled_view_visible",
+            "visibility_threshold": 0.0,
+            "sampling_policy": "uniform",
+        },
+    )
+    metrics = engine._joint_stage(engine._observations((0, 1, 2, 3)), 2, 124)
+
+    assert metrics["joint_gaussian_scope_sampled_view_visible"] == 1.0
+    assert metrics["joint_visible_gaussians_min"] == 72.0
+    assert metrics["joint_visible_gaussians_max"] == 72.0
+    for name, expected in before.items():
+        actual = getattr(mapper.map, name).detach()
+        assert not torch.equal(actual[:72], expected[:72]), name
+        assert torch.equal(actual[72:], expected[72:]), name
+        state = mapper._pfgs360_gaussian_moments[name]
+        assert bool((state["exp_avg"][72:] == 0).all()), name
+        assert bool((state["exp_avg_sq"][72:] == 0).all()), name
+
+
+def test_sampled_view_visible_scope_requires_accumulated_visibility() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    engine = PFGS360FullBackend(
+        mapper,
+        {"gaussian_update_scope": "sampled_view_visible"},
+    )
+    try:
+        engine._gaussian_visibility_mask({})
+    except RuntimeError as error:
+        assert "accum_visible" in str(error)
+    else:
+        raise AssertionError("Visible-only updates must require rasterizer visibility")
 
 
 def test_refined_anchor_joint_path_never_runs_conventional_topology(monkeypatch) -> None:
@@ -776,6 +848,43 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
         config=runtime_backend,
     )
     assert validated.insertion_dedup_radius_voxels == 1.0
+
+
+def test_recent_visible_50_200_config_has_confirmed_scope_and_learning_rates() -> None:
+    config_root = Path(__file__).parents[1] / "configs"
+    pointmap = load_config(
+        config_root
+        / "spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_refined_anchor_50_200.yaml"
+    )
+    pager = load_config(
+        config_root
+        / "spherical_selfi_ob3d_pointmap_sim3_sphereglue_pager_ba_100_pfgs360_refined_anchor_50_200.yaml"
+    )
+
+    for config in (pointmap, pager):
+        backend = config["SphericalSelfiGlobalBackend"]
+        optimize = backend["map_optimization"]
+        pfgs = optimize["pfgs360"]
+        assert backend["rendered_overlap_alignment"]["mode"] == (
+            "two_frame_pointmap_full_sim3"
+        )
+        assert optimize["steps_per_window"] == 250
+        assert optimize["recent_window_count"] == 3
+        assert optimize["camera_steps"] == 50
+        assert optimize["joint_steps"] == 200
+        assert optimize["sample_observations_per_step"] == 1
+        assert optimize["pose_lr"] == 1.0e-4
+        assert optimize["joint_pose_lr"] == 2.0e-5
+        assert optimize["optimize_all_gaussians"] is False
+        assert pfgs["frame_scope"] == "recent_chunks"
+        assert pfgs["sampling_policy"] == "uniform"
+        assert pfgs["gaussian_update_scope"] == "sampled_view_visible"
+        assert pfgs["visibility_threshold"] == 0.0
+        assert pfgs["topology_refine_enabled"] is False
+        assert config["WeightsAndBiases"]["runtime_log_preset"] == (
+            "slam_core_visuals"
+        )
+    assert pager["SphericalSelfiRuntime"]["pager_depth"]["enabled"] is True
 
 
 def test_refined_anchor_global_map_config_is_a_strict_alignment_ablation() -> None:

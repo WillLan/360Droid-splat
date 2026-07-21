@@ -453,6 +453,19 @@ class PFGS360FullBackend:
         self.device = self.map.xyz.device
         self.dtype = self.map.xyz.dtype
         self.refined_anchor_update = refined_anchor_update
+        self.gaussian_update_scope = str(
+            self.settings.get("gaussian_update_scope", "all")
+        ).strip().lower()
+        if self.gaussian_update_scope not in {"all", "sampled_view_visible"}:
+            raise ValueError(
+                "PFGS360 gaussian_update_scope must be 'all' or "
+                "'sampled_view_visible'"
+            )
+        self.visibility_threshold = float(
+            self.settings.get("visibility_threshold", 0.0)
+        )
+        if not math.isfinite(self.visibility_threshold) or self.visibility_threshold < 0.0:
+            raise ValueError("PFGS360 visibility_threshold must be finite and non-negative")
 
     @property
     def uses_refined_anchor_growth(self) -> bool:
@@ -772,12 +785,70 @@ class PFGS360FullBackend:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(seed))
         schedule = []
+        sampling_policy = str(
+            self.settings.get("sampling_policy", "latter_half_biased")
+        ).strip().lower()
+        if sampling_policy == "uniform":
+            for _ in range(int(steps)):
+                index = int(torch.randint(len(observations), (), generator=generator))
+                schedule.append(observations[index])
+            return schedule
+        if sampling_policy != "latter_half_biased":
+            raise ValueError(
+                "PFGS360 sampling_policy must be 'uniform' or "
+                "'latter_half_biased'"
+            )
         probability = float(self.settings.get("latter_half_sample_probability", 0.7))
         for _ in range(int(steps)):
             pool = recent if float(torch.rand((), generator=generator)) < probability else history
             index = int(torch.randint(len(pool), (), generator=generator))
             schedule.append(pool[index])
         return schedule
+
+    def _gaussian_visibility_mask(self, package: dict[str, Any]) -> torch.Tensor:
+        count = self.map.anchor_count()
+        if self.gaussian_update_scope == "all":
+            return torch.ones(count, device=self.device, dtype=torch.bool)
+        accumulated = package.get("accum_visible")
+        if not torch.is_tensor(accumulated) or int(accumulated.numel()) != count:
+            raise RuntimeError(
+                "sampled_view_visible Gaussian updates require per-Gaussian "
+                "accum_visible from gsplat360"
+            )
+        accumulated = accumulated.detach().to(
+            device=self.device, dtype=torch.float32
+        ).reshape(-1)
+        return torch.isfinite(accumulated) & (
+            accumulated > float(self.visibility_threshold)
+        )
+
+    @staticmethod
+    def _mask_gaussian_gradients_and_moments(
+        optimizer: torch.optim.Optimizer,
+        visible: torch.Tensor,
+    ) -> None:
+        """Guarantee that invisible Gaussian rows receive no Adam update."""
+
+        for group in optimizer.param_groups:
+            if str(group.get("name", "")) == "poses":
+                continue
+            if len(group["params"]) != 1:
+                raise RuntimeError("PFGS360 Gaussian groups must contain one tensor")
+            parameter = group["params"][0]
+            if int(parameter.shape[0]) != int(visible.numel()):
+                raise RuntimeError("PFGS360 visibility mask does not match Gaussian rows")
+            mask = visible.to(device=parameter.device, dtype=torch.bool)
+            if parameter.grad is not None:
+                parameter.grad[~mask] = 0
+            state = optimizer.state.get(parameter, {})
+            for field in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                value = state.get(field)
+                if torch.is_tensor(value) and value.ndim > 0:
+                    if int(value.shape[0]) != int(mask.numel()):
+                        raise RuntimeError(
+                            f"PFGS360 Adam {field} does not match Gaussian rows"
+                        )
+                    value[~mask.to(value.device)] = 0
 
     def _render_consistency_masks(self, observations) -> dict[int, torch.Tensor]:
         with torch.no_grad():
@@ -1124,6 +1195,7 @@ class PFGS360FullBackend:
         grad_count = None if grad_sum is None else torch.zeros_like(grad_sum)
         max_radii = None if grad_sum is None else torch.zeros_like(grad_sum)
         last_loss = 0.0
+        visible_counts: list[int] = []
         sky_parameters = self.map.skybox_parameters()
         sky_requires_grad = [parameter.requires_grad for parameter in sky_parameters]
         try:
@@ -1132,13 +1204,20 @@ class PFGS360FullBackend:
             for step_index, observation in enumerate(schedule):
                 optimizer.zero_grad(set_to_none=True)
                 package = self._render(observation)
+                visible_gaussians = self._gaussian_visibility_mask(package)
+                visible_counts.append(int(visible_gaussians.sum().item()))
                 target = observation.image.to(device=self.device, dtype=self.dtype)
                 mask = None
                 if observation.sky_mask is not None:
                     mask = ~observation.sky_mask.to(device=self.device, dtype=torch.bool)
                 loss, _ = pfgs360_photometric_loss(package["render"], target, mask=mask)
-                if (step_index + 1) % int(self.settings.get("phys_ratio_every", 10)) == 0:
-                    scale = self.map.get_scaling
+                if (
+                    bool(visible_gaussians.any())
+                    and (step_index + 1)
+                    % int(self.settings.get("phys_ratio_every", 10))
+                    == 0
+                ):
+                    scale = self.map.get_scaling[visible_gaussians]
                     ratio = scale.amax(dim=-1) / scale.amin(dim=-1).clamp_min(1.0e-8)
                     excessive = ratio - float(
                         self.settings.get("scale_ratio_threshold", 10.0)
@@ -1162,8 +1241,13 @@ class PFGS360FullBackend:
                     loss = loss + float(
                         self.settings.get("distortion_weight", 0.01)
                     ) * (balance * distortion / depth).mean().nan_to_num()
-                loss = loss + float(self.settings.get("opacity_regularizer_weight", 0.01)) * self.map.get_opacity.mean()
-                loss = loss + float(self.settings.get("scale_regularizer_weight", 0.01)) * self.map.get_scaling.mean()
+                if bool(visible_gaussians.any()):
+                    loss = loss + float(
+                        self.settings.get("opacity_regularizer_weight", 0.01)
+                    ) * self.map.get_opacity[visible_gaussians].mean()
+                    loss = loss + float(
+                        self.settings.get("scale_regularizer_weight", 0.01)
+                    ) * self.map.get_scaling[visible_gaussians].mean()
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError("Non-finite PFGS360 JOINT loss")
                 loss.backward()
@@ -1172,6 +1256,10 @@ class PFGS360FullBackend:
                         pose_params,
                         float(self.settings.get("pose_grad_clip_value", 1.0e-2)),
                     )
+                self._mask_gaussian_gradients_and_moments(
+                    optimizer,
+                    visible_gaussians,
+                )
                 all_parameters = [parameter for group in parameter_groups for parameter in group["params"]]
                 if not all(
                     parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
@@ -1233,6 +1321,18 @@ class PFGS360FullBackend:
             "joint_steps": float(len(schedule)),
             "joint_loss": last_loss,
             "joint_trainable_poses": float(len(pose_params)),
+            "joint_gaussian_scope_sampled_view_visible": float(
+                self.gaussian_update_scope == "sampled_view_visible"
+            ),
+            "joint_visible_gaussians_mean": float(
+                sum(visible_counts) / max(1, len(visible_counts))
+            ),
+            "joint_visible_gaussians_min": float(
+                min(visible_counts) if visible_counts else 0
+            ),
+            "joint_visible_gaussians_max": float(
+                max(visible_counts) if visible_counts else 0
+            ),
         }
         if topology_refine_enabled:
             metrics.update(
