@@ -2011,6 +2011,8 @@ def test_slam_logger_both_ate_mode_keeps_standard_primary_metric(tmp_path):
             "sim3_ate_rmse": 0.12,
             "se3_ate_rmse": 0.34,
             "pfgs360_ate": 0.045,
+            "scale_drift_percent": 7.5,
+            "path_length_scale_ratio": 1.075,
         },
         fallback_ate_rmse=None,
         step=8,
@@ -2021,6 +2023,10 @@ def test_slam_logger_both_ate_mode_keeps_standard_primary_metric(tmp_path):
     assert scalar_payload["slam/final_sim3_ate_rmse"] == pytest.approx(0.12)
     assert scalar_payload["slam/final_pfgs360_ate"] == pytest.approx(0.045)
     assert scalar_payload["slam/final_se3_ate_rmse"] == pytest.approx(0.34)
+    assert scalar_payload["slam/final_scale_drift_percent"] == pytest.approx(7.5)
+    assert scalar_payload["slam/final_path_length_scale_ratio"] == pytest.approx(
+        1.075
+    )
 
 
 def test_slam_core_visuals_commit_one_step_per_frame_and_clip_future_poses(tmp_path):

@@ -5075,12 +5075,17 @@ class SphericalSelfiGlobalBackend:
                 f"Frame {frame_id} has only {count} valid global-map samples; "
                 f"{self.rendered_alignment_min_points_per_frame} required"
             )
-        current_map = current.observation.centers_world()[0, current_index].detach().to(current_depth)
-        current_points = sample_erp_with_wrap(current_map.permute(2, 0, 1), samples.uv)
-        camera_points = samples.bearing * samples.source_depth[:, None]
+        global_camera_points = samples.bearing * samples.source_depth[:, None]
         global_points = (
-            camera_points @ global_pose[:3, :3].to(camera_points).transpose(0, 1)
-            + global_pose[:3, 3].to(camera_points)
+            global_camera_points
+            @ global_pose[:3, :3].to(global_camera_points).transpose(0, 1)
+            + global_pose[:3, 3].to(global_camera_points)
+        )
+        current_pose = current.local_poses_c2w[current_index].to(samples.bearing)
+        current_camera_points = samples.bearing * samples.target_depth[:, None]
+        current_points = (
+            current_camera_points @ current_pose[:3, :3].transpose(0, 1)
+            + current_pose[:3, 3]
         )
         finite = torch.isfinite(global_points).all(dim=-1) & torch.isfinite(
             current_points
@@ -5102,7 +5107,7 @@ class SphericalSelfiGlobalBackend:
             previous_points=global_points.detach(),
             current_points=current_points.detach(),
             previous_pose=global_pose.detach(),
-            current_pose=current.local_poses_c2w[current_index].detach(),
+            current_pose=current_pose.detach(),
             holdout_mask=torch.zeros(
                 int(finite.sum().item()), device=finite.device, dtype=torch.bool
             ),
@@ -5198,7 +5203,17 @@ class SphericalSelfiGlobalBackend:
                         torch.ones_like(irls_residual),
                         delta / irls_residual.clamp_min(1.0e-8),
                     )
-                    robust_weights = base_weights * huber
+                    huber_by_frame: list[torch.Tensor] = []
+                    cursor = 0
+                    for frame in frames:
+                        frame_count = int(frame.current_points.shape[0])
+                        huber_by_frame.append(huber[cursor : cursor + frame_count])
+                        cursor += frame_count
+                    robust_weights = self._balanced_frame_weights(
+                        frames,
+                        masks,
+                        point_weights=huber_by_frame,
+                    )
                     candidate = weighted_umeyama(
                         current_points,
                         global_points,
@@ -5212,6 +5227,19 @@ class SphericalSelfiGlobalBackend:
                     apply_sim3(map_transform, current_points) - global_points,
                     dim=-1,
                 )
+                per_frame_weight_sums: list[float] = []
+                cursor = 0
+                for frame in frames:
+                    frame_count = int(frame.current_points.shape[0])
+                    per_frame_weight_sums.append(
+                        float(
+                            robust_weights[cursor : cursor + frame_count]
+                            .sum()
+                            .detach()
+                            .cpu()
+                        )
+                    )
+                    cursor += frame_count
                 scale = float(sim3_components(map_transform)[0].detach().cpu())
                 root_scale = 1.0
                 if self.graph.fixed_node_id is not None:
@@ -5238,6 +5266,7 @@ class SphericalSelfiGlobalBackend:
                             / robust_weights.sum().clamp_min(1.0e-8).detach().cpu()
                         ),
                         "median_residual": float(residual.median().detach().cpu()),
+                        "per_frame_final_weight_sum": per_frame_weight_sums,
                         "quality_gating_enabled": False,
                     }
                 )

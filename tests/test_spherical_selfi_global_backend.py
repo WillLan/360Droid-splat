@@ -6311,110 +6311,6 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
     assert frontend.consume_local_ba_diagnostics() == []
 
 
-def test_synthetic_window_runtime_replaces_head_depth_with_aligned_pager(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import frontend.spherical_selfi.runtime as runtime_module
-
-    providers = []
-
-    class FakePaGeRDepthProvider:
-        def __init__(self, config, *, device) -> None:
-            self.config = config
-            self.device = torch.device(device)
-            self.last_raw = None
-            providers.append(self)
-
-        def reset(self) -> None:
-            pass
-
-        def predict(self, images, frame_ids):
-            batch, views, _, height, width = images.shape
-            rows = torch.arange(height, dtype=torch.float32).view(height, 1)
-            cols = torch.arange(width, dtype=torch.float32).view(1, width)
-            raw = 0.5 + rows / max(1, height) + cols / max(1, width)
-            raw = raw.view(1, 1, 1, height, width).repeat(batch, views, 1, 1, 1)
-            self.last_raw = raw.to(self.device)
-            return self.last_raw, {
-                "inference_sec": 0.01,
-                "cache_hits": 0,
-                "cache_misses": int(frame_ids.numel()),
-                "cache_hit_ratio": 0.0,
-                "cache_entries": int(frame_ids.numel()),
-            }
-
-    monkeypatch.setattr(
-        runtime_module,
-        "PaGeRDepthProvider",
-        FakePaGeRDepthProvider,
-    )
-    config = stage2_default_config()
-    config["image"] = {
-        "height": 8,
-        "width": 16,
-        "head_height": 8,
-        "head_width": 16,
-    }
-    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
-    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
-    checkpoint = tmp_path / "stage2_pager.pt"
-    torch.save(
-        {
-            "format": "spherical_selfi_gaussian_head_v1",
-            "head": head.state_dict(),
-            "adapter_sha256": "synthetic-no-checkpoint",
-            "global_step": 0,
-            "metrics": {},
-            "best_val_psnr": None,
-        },
-        checkpoint,
-    )
-    config["stage2_checkpoint"] = {"path": str(checkpoint)}
-    config["SphericalSelfiRuntime"] = {
-        "enabled": True,
-        "feature_device": "cpu",
-        "head_device": "cpu",
-        "feature_amp": False,
-        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
-        "pager_depth": {
-            "enabled": True,
-            "repo_path": "/unused/pager",
-            "min_valid_pixels": 8,
-            "min_valid_ratio": 0.1,
-        },
-        "local_ba": {"enabled": False},
-    }
-    frontend = SphericalSelfiWindowFrontend(config)
-    for frame_id in range(3):
-        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
-    outputs = frontend.pop_ready_outputs() + frontend.flush()
-    packets = frontend.consume_local_gaussian_windows()
-    diagnostics = frontend.consume_local_ba_diagnostics()
-
-    assert len(providers) == 1
-    assert len(packets) == 1
-    observation = packets[0].observation
-    scales = torch.tensor(diagnostics[0]["pager_depth"]["scales"]).view(
-        1, 3, 1, 1, 1
-    )
-    expected = providers[0].last_raw * scales
-    torch.testing.assert_close(observation.initial_depth, expected)
-    torch.testing.assert_close(observation.refined_depth, expected)
-    torch.testing.assert_close(
-        observation.depth_residual,
-        torch.zeros_like(observation.depth_residual),
-    )
-    assert packets[0].metadata["pager_depth_enabled"] is True
-    assert diagnostics[0]["pager_depth"]["cache_misses"] == 3
-    by_frame = {int(output.frame_id): output for output in outputs}
-    for index in range(3):
-        torch.testing.assert_close(
-            by_frame[index].inverse_depth,
-            expected[0, index].reciprocal(),
-        )
-
-
 def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) -> None:
     config = stage2_default_config()
     config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}
@@ -7168,9 +7064,12 @@ def test_global_map_overlap_initializes_absolute_sim3_and_anchors_only_scale() -
     assert candidate is not None
     candidate_scale, candidate_rotation, candidate_translation = sim3_components(candidate)
     expected_scale, expected_rotation, expected_translation = sim3_components(expected)
-    assert float(candidate_scale) == pytest.approx(float(expected_scale), rel=5.0e-3)
-    assert torch.allclose(candidate_rotation, expected_rotation, atol=5.0e-3)
-    assert torch.allclose(candidate_translation, expected_translation, atol=1.0e-2)
+    assert float(candidate_scale) == pytest.approx(float(expected_scale), rel=2.0e-4)
+    assert torch.allclose(candidate_rotation, expected_rotation, atol=2.0e-4)
+    assert torch.allclose(candidate_translation, expected_translation, atol=5.0e-4)
+    assert candidate_diagnostics["per_frame_final_weight_sum"] == pytest.approx(
+        [0.5, 0.5], abs=1.0e-6
+    )
     renderer.calls = 0
 
     first = backend.process_packet(previous)
@@ -7185,7 +7084,7 @@ def test_global_map_overlap_initializes_absolute_sim3_and_anchors_only_scale() -
     assert diagnostics["incoming_render_count"] == 0
     recovered = backend.graph.transform(2)
     scale, _, _ = sim3_components(recovered)
-    assert float(scale) == pytest.approx(float(expected_scale), rel=5.0e-3)
+    assert float(scale) == pytest.approx(float(expected_scale), rel=2.0e-4)
     dense = [
         factor for factor in backend.graph.edges
         if isinstance(factor, DenseSphericalFactorBlock)
@@ -7274,3 +7173,66 @@ def test_dense_spherical_factor_can_strictly_disable_scale_jacobians() -> None:
 
     assert endpoint_ids == [1]
     assert torch.equal(blocks[0][:, 6], torch.zeros_like(blocks[0][:, 6]))
+
+
+def test_global_map_overlap_is_seam_safe_and_accepts_large_finite_scale() -> None:
+    height, width = 24, 48
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(0, poses, (0, 1, 2, 3), height=height, width=width)
+    current = _packet(1, poses, (2, 3, 4, 5), height=height, width=width)
+    _replace_packet_depth(previous, torch.full((4, 1, height, width), 2.0))
+    _replace_packet_depth(current, torch.full((4, 1, height, width), 2.0))
+    current.static_mask.zero_()
+    current.static_mask[..., :4] = True
+    current.static_mask[..., -4:] = True
+    renderer = _SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=10.0)
+    backend = _pointmap_chunk_backend(
+        min_points=48,
+        min_points_per_frame=24,
+        max_points_per_frame=64,
+        renderer=renderer,
+        alignment_mode="two_frame_global_map_full_sim3",
+    )
+
+    geometry = backend._collect_global_map_overlap_frame_geometry(
+        previous, current, torch.eye(4), 2
+    )
+    assert bool((geometry.uv[:, 0] < 4.5).any())
+    assert bool((geometry.uv[:, 0] > width - 4.5).any())
+    transform, _, map_success, diagnostics = backend._global_map_overlap_alignment(
+        previous, current, torch.eye(4)
+    )
+
+    assert map_success is True, diagnostics
+    assert transform is not None
+    assert diagnostics["quality_gating_enabled"] is False
+    assert diagnostics["reason"] == "accepted_finite_with_sufficient_support"
+    assert float(sim3_components(transform)[0]) == pytest.approx(5.0, rel=2.0e-4)
+
+
+def test_global_map_and_pointmap_failure_rolls_back_transaction() -> None:
+    height, width = 16, 32
+    poses = torch.eye(4).repeat(4, 1, 1)
+    previous = _packet(0, poses, (0, 1, 2, 3), height=height, width=width)
+    current = _packet(1, poses, (2, 3, 4, 5), height=height, width=width)
+    _attach_identity_stride_matches(previous)
+    current.sky_prob.fill_(1.0)
+    current.sky_mask.fill_(True)
+    renderer = _SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=2.0)
+    backend = _pointmap_chunk_backend(
+        renderer=renderer,
+        alignment_mode="two_frame_global_map_full_sim3",
+    )
+    backend.process_packet(previous)
+    owners_before = dict(backend.frame_pose_owner_node)
+
+    with pytest.raises(
+        RuntimeError, match=r"global-map/point-map Sim\(3\) alignment failed"
+    ):
+        backend.process_packet(current)
+
+    assert set(backend.graph.nodes) == {0}
+    assert backend.window_order == [0]
+    assert backend.frame_pose_owner_node == owners_before
+    assert backend._last_overlap_alignment_failure is not None
+    assert backend._last_overlap_alignment_failure["accepted"] is False

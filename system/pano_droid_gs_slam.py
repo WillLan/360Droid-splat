@@ -549,6 +549,8 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "slam/final_sim3_ate_rmse",
         "slam/final_se3_ate_rmse",
         "slam/final_pfgs360_ate",
+        "slam/final_scale_drift_percent",
+        "slam/final_path_length_scale_ratio",
         "frontend/pfgs360_ate",
         "backend/pfgs360_ate",
         "slam/pfgs360_ate",
@@ -2141,6 +2143,14 @@ class SlamRuntimeLogger:
         se3_ate = trajectory_metrics.get("se3_ate_rmse")
         if se3_ate is not None:
             payload["slam/final_se3_ate_rmse"] = float(se3_ate)
+        scale_drift = trajectory_metrics.get("scale_drift_percent")
+        if scale_drift is not None:
+            payload["slam/final_scale_drift_percent"] = float(scale_drift)
+        path_length_ratio = trajectory_metrics.get("path_length_scale_ratio")
+        if path_length_ratio is not None:
+            payload["slam/final_path_length_scale_ratio"] = float(
+                path_length_ratio
+            )
         if self.slam_core_visual_wandb and self.run is not None:
             # The final all-frame result is a run summary, not an extra
             # timeline event.  A 100-frame run therefore remains Step 1..100.
