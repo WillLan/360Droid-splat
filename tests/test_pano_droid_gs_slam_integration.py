@@ -1832,7 +1832,10 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
             "radii": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
             "accum_times": torch.ones(1, colors.shape[0], device=device, dtype=torch.int32),
         }
-        return render, alpha, None, info
+        render_distort = torch.arange(
+            height * width, device=device, dtype=dtype
+        ).view(1, height, width, 1)
+        return render, alpha, render_distort, info
 
     renderer = PFGS360Renderer(config=config, allow_fallback=True)
     camera = PanoRenderCamera(image_height=4, image_width=8, c2w=torch.eye(4))
@@ -1843,6 +1846,10 @@ def test_pfgs360_renderer_converts_rgb_to_sh_dc_for_rasterizer():
     assert torch.allclose(seen["colors"], expected_sh)
     assert seen["sh_degree"] == gaussian_map.active_sh_degree
     assert torch.allclose(pkg["render"], gaussian_map.get_features.mean(dim=0).view(3, 1, 1).expand(3, 4, 8))
+    assert pkg["render_distort"].shape == (1, 4, 8)
+    torch.testing.assert_close(
+        pkg["render_distort"], torch.arange(32, dtype=pkg["render_distort"].dtype).view(1, 4, 8)
+    )
 
 
 def test_pfgs360_renderer_forwards_query_attribution_outputs():
@@ -1928,6 +1935,9 @@ def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
         height, width = int(kwargs["height"]), int(kwargs["width"])
         render = torch.zeros(camera_count, height, width, 4)
         alpha = torch.ones(camera_count, height, width, 1)
+        render_distort = torch.arange(
+            camera_count * height * width, dtype=render.dtype
+        ).view(camera_count, height, width, 1)
         info = {
             "means2d": torch.zeros(camera_count, gaussian_count, 2),
             "radii": torch.ones(camera_count, gaussian_count, dtype=torch.int32),
@@ -1937,7 +1947,7 @@ def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
                 dtype=torch.float32,
             ),
         }
-        return render, alpha, None, info
+        return render, alpha, render_distort, info
 
     renderer = PFGS360Renderer(config=config, allow_fallback=True)
     package = renderer._render_gsplat360_cameras(
@@ -1955,6 +1965,7 @@ def test_pfgs360_renderer_batches_four_cameras_in_one_unpacked_call():
     assert call["colors"].dtype == torch.float32
     assert call["opacities"].shape == (gaussian_count,)
     assert package["render"].shape == (camera_count, 3, 4, 8)
+    assert package["render_distort"].shape == (camera_count, 1, 4, 8)
     assert package["visibility_filter"].shape == (camera_count, gaussian_count)
     assert torch.equal(
         package["visibility_filter"],

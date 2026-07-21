@@ -459,7 +459,11 @@ class PFGS360Renderer:
             "depth": depth,
             "opacity": opacity,
             "alpha": opacity,
-            "render_distort": render_distort[0] if render_distort is not None else None,
+            "render_distort": (
+                render_distort[0].permute(2, 0, 1).contiguous()
+                if render_distort is not None
+                else None
+            ),
             "radii": radii,
             "n_touched": n_touched,
             "accum_visible": accumulated_visibility,
@@ -584,7 +588,11 @@ class PFGS360Renderer:
             "depth": depth,
             "opacity": opacity,
             "alpha": opacity,
-            "render_distort": render_distort,
+            "render_distort": (
+                render_distort.permute(0, 3, 1, 2).contiguous()
+                if render_distort is not None
+                else None
+            ),
             "radii": radii,
             "n_touched": n_touched,
             "accum_visible": accumulated_visibility,
