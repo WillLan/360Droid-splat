@@ -995,6 +995,39 @@ class SphericalSelfiGlobalBackend:
                 raise ValueError(
                     "pfgs360_full_50_50 must bypass the legacy depth gate and persistent prune"
                 )
+            pfgs_cfg = dict(optimize_cfg.get("pfgs360", {}) or {})
+            refined_growth = str(
+                pfgs_cfg.get("growth_source", "raw_depth")
+            ).strip().lower() == "refined_anchor"
+            if refined_growth:
+                if not self.voxel_anchor_refiner_enabled:
+                    raise ValueError(
+                        "Refined-anchor PFGS360 growth requires VoxelAnchorRefiner"
+                    )
+                if not self.insertion_dedup_enabled:
+                    raise ValueError(
+                        "Refined-anchor PFGS360 growth requires insertion_dedup"
+                    )
+                if abs(self.insertion_dedup_radius_voxels - 1.0) > 1.0e-8:
+                    raise ValueError(
+                        "Refined-anchor PFGS360 Hash radius must be exactly 1.0 voxel"
+                    )
+                if str(pfgs_cfg.get("bootstrap_source", "")).strip().lower() != "refined_anchor_all_views":
+                    raise ValueError(
+                        "Refined-anchor PFGS360 bootstrap_source must be refined_anchor_all_views"
+                    )
+                if str(pfgs_cfg.get("growth_frame_policy", "")).strip().lower() != "chunk_new_frames":
+                    raise ValueError(
+                        "Refined-anchor PFGS360 growth_frame_policy must be chunk_new_frames"
+                    )
+                if str(pfgs_cfg.get("validity_gate", "")).strip().lower() != "pfgs360_official_sky_only":
+                    raise ValueError(
+                        "Refined-anchor PFGS360 validity_gate must be pfgs360_official_sky_only"
+                    )
+                if bool(pfgs_cfg.get("topology_refine_enabled", True)):
+                    raise ValueError(
+                        "Refined-anchor PFGS360 must disable conventional topology refinement"
+                    )
         self.map_steps_on_loop = max(
             0,
             int(optimize_cfg.get("extra_steps_on_loop", optimize_cfg.get("steps_on_loop", 0))),
@@ -8105,6 +8138,271 @@ class SphericalSelfiGlobalBackend:
                     canonical.detach().cpu().clone()
                 )
 
+    @staticmethod
+    def _pfgs360_anchor_pixels(
+        xyz_world: torch.Tensor,
+        pose_c2w: torch.Tensor,
+        *,
+        image_size: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project world-space anchor centers to seam-wrapped panoramic pixels."""
+
+        height, width = (int(value) for value in image_size)
+        pose = pose_c2w.to(device=xyz_world.device, dtype=xyz_world.dtype)
+        camera_xyz = (xyz_world - pose[:3, 3]) @ pose[:3, :3]
+        ray_depth = torch.linalg.norm(camera_xyz, dim=-1)
+        valid = (
+            torch.isfinite(camera_xyz).all(dim=-1)
+            & torch.isfinite(ray_depth)
+            & (ray_depth > 1.0e-8)
+        )
+        bearing = camera_xyz / ray_depth[:, None].clamp_min(1.0e-8)
+        pixel = bearing_to_erp_pixel(bearing, height, width, wrap=True)
+        valid &= (
+            torch.isfinite(pixel).all(dim=-1)
+            & (pixel[:, 1] >= 0.0)
+            & (pixel[:, 1] <= float(height - 1))
+        )
+        return pixel, valid
+
+    @staticmethod
+    def _pfgs360_pixel_indices(
+        pixel: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor:
+        height, width = (int(value) for value in image_size)
+        if int(pixel.shape[0]) == 0:
+            return torch.zeros(0, dtype=torch.long)
+        u = torch.remainder(torch.round(pixel[:, 0]).long(), width)
+        v = torch.round(pixel[:, 1]).long().clamp(0, height - 1)
+        return (v * width + u)[valid].detach().cpu()
+
+    @torch.no_grad()
+    def _update_pfgs360_refined_anchors(
+        self,
+        packet: LocalGaussianWindowPacket,
+        window_transform: torch.Tensor,
+        *,
+        event: str,
+        owner_window_id: int,
+        observations,
+        new_frame_ids: tuple[int, ...],
+        mono_inlier_masks: dict[int, torch.Tensor],
+        optimized_poses: dict[int, torch.Tensor],
+        existing_anchor_visibility: dict[int, torch.Tensor],
+    ) -> dict[str, Any]:
+        """Insert Refiner anchors selected by PFGS360 DIA masks.
+
+        The Refiner packet is deliberately consumed only after the DIA query
+        has classified and modified the old map.  Consequently the old-point
+        delete/reset set is independent of whether refined-anchor growth is
+        enabled.
+        """
+
+        if packet.anchor_observation is None:
+            raise RuntimeError("PFGS360 refined growth requires anchor_observation")
+        if int(owner_window_id) != int(packet.window_id):
+            raise RuntimeError("PFGS360 refined growth owner does not match packet")
+        source_view_mask = packet.metadata.get("voxel_anchor_source_view_mask")
+        if not torch.is_tensor(source_view_mask):
+            raise RuntimeError("PFGS360 refined growth requires source-view bits")
+        prepared = self.fusion.prepare_packet_batch(
+            packet,
+            window_transform,
+            apply_semantic_gates=False,
+        )
+        if prepared.source_anchor_indices is None:
+            raise RuntimeError("PFGS360 refined growth requires source indices")
+        source_rows = prepared.source_anchor_indices.to(
+            device=source_view_mask.device,
+            dtype=torch.long,
+        )
+        support = source_view_mask.to(dtype=torch.long).index_select(0, source_rows)
+        candidate_count = len(prepared.batch)
+        event_name = str(event).strip().lower()
+
+        if event_name == "bootstrap":
+            selected_prepared = prepared
+            stats = self.fusion.commit_prepared_packet(
+                packet,
+                window_transform,
+                selected_prepared,
+                extra_stats={
+                    "pfgs360_refined_bootstrap": 1,
+                    "pfgs360_anchor_candidates": candidate_count,
+                    "pfgs360_anchor_selected": len(selected_prepared.batch),
+                    "pfgs360_hash_radius_voxels": 1.0,
+                },
+            )
+            self.mapper._pending_pfgs360_anchor_admission = None
+            return {
+                "candidate": candidate_count,
+                "selected": len(selected_prepared.batch),
+                "inserted": int(stats.get("inserted", 0)),
+                "source_view_rejected": 0,
+                "hash_rejected": 0,
+            }
+        if event_name != "growth":
+            raise ValueError(f"Unsupported PFGS360 anchor event {event!r}")
+
+        frame_ids = tuple(int(value) for value in new_frame_ids)
+        if len(frame_ids) != 2:
+            raise RuntimeError(
+                "PFGS360 refined growth requires exactly the two new chunk frames"
+            )
+        frame_to_index = {
+            int(frame_id): index for index, frame_id in enumerate(packet.frame_ids)
+        }
+        if any(frame_id not in frame_to_index for frame_id in frame_ids):
+            raise RuntimeError("PFGS360 new frames are not contained in the live packet")
+
+        image_size = tuple(int(value) for value in packet.anchor_observation.image_size)
+        selected_union = torch.zeros(
+            candidate_count,
+            device=prepared.batch.xyz.device,
+            dtype=torch.bool,
+        )
+        supported_union = torch.zeros_like(selected_union)
+        existing_visible = torch.zeros(
+            self.map.anchor_count(),
+            device=self.map.xyz.device,
+            dtype=torch.bool,
+        )
+        view_diagnostics: list[dict[str, Any]] = []
+        projected_by_frame: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        observation_by_frame = {
+            int(value.frame_id): value for value in observations
+        }
+        for frame_id in frame_ids:
+            frame_index = int(frame_to_index[frame_id])
+            pose = optimized_poses.get(frame_id)
+            mask = mono_inlier_masks.get(frame_id)
+            visible = existing_anchor_visibility.get(frame_id)
+            if pose is None or mask is None or visible is None:
+                raise RuntimeError(
+                    f"Incomplete PFGS360 refined growth inputs for frame {frame_id}"
+                )
+            if int(visible.numel()) != self.map.anchor_count():
+                raise RuntimeError("PFGS360 Hash visibility is stale after DIA deletion")
+            existing_visible |= visible.to(existing_visible)
+            pixel, projected = self._pfgs360_anchor_pixels(
+                prepared.batch.xyz,
+                pose,
+                image_size=image_size,
+            )
+            source_supported = (
+                support.to(device=pixel.device) & (1 << frame_index)
+            ) != 0
+            supported = projected & source_supported
+            sampled = sample_erp_with_wrap(
+                mask.to(device=pixel.device, dtype=torch.float32),
+                pixel,
+                mode="nearest",
+            ).reshape(-1)
+            selected = supported & torch.isfinite(sampled) & (sampled >= 0.5)
+            supported_union |= supported
+            selected_union |= selected
+            projected_by_frame[frame_id] = (pixel, supported, selected)
+            view_diagnostics.append(
+                {
+                    "frame_id": frame_id,
+                    "image": observation_by_frame[frame_id].image.detach().cpu(),
+                    "mono_inlier_mask": mask.detach().cpu().bool(),
+                    "candidate_pixels": self._pfgs360_pixel_indices(
+                        pixel,
+                        supported,
+                        image_size=image_size,
+                    ),
+                    "dia_selected_pixels": self._pfgs360_pixel_indices(
+                        pixel,
+                        selected,
+                        image_size=image_size,
+                    ),
+                }
+            )
+
+        selected_rows = torch.nonzero(selected_union, as_tuple=False).flatten()
+        selected_prepared = prepared.index(selected_rows)
+        incoming_visibility = torch.zeros(
+            packet.anchor_observation.num_anchors,
+            device=source_view_mask.device,
+            dtype=torch.bool,
+        )
+        if int(selected_rows.numel()) > 0:
+            selected_sources = prepared.source_anchor_indices.index_select(
+                0, selected_rows.to(prepared.source_anchor_indices.device)
+            )
+            incoming_visibility[selected_sources.to(incoming_visibility.device)] = True
+        filtered, hash_stats, evidence_update = self.fusion.filter_against_visible_map(
+            selected_prepared,
+            incoming_anchor_visibility=incoming_visibility,
+            existing_anchor_visibility=existing_visible,
+            radius_voxels=1.0,
+            update_existing_statistics=True,
+        )
+        selected_sources = selected_prepared.source_anchor_indices
+        kept_sources = filtered.source_anchor_indices
+        if selected_sources is None or kept_sources is None:
+            raise RuntimeError("PFGS360 refined Hash lost source-anchor identity")
+        hash_rejected_sources = selected_sources[
+            ~torch.isin(selected_sources, kept_sources)
+        ]
+        kept_source_set = kept_sources.to(source_rows.device)
+        rejected_source_set = hash_rejected_sources.to(source_rows.device)
+        for diagnostic, frame_id in zip(view_diagnostics, frame_ids):
+            pixel, supported, selected = projected_by_frame[frame_id]
+            row_sources = prepared.source_anchor_indices.to(source_rows.device)
+            rejected = selected & torch.isin(row_sources, rejected_source_set)
+            inserted = selected & torch.isin(row_sources, kept_source_set)
+            diagnostic["hash_rejected_pixels"] = self._pfgs360_pixel_indices(
+                pixel,
+                rejected.to(pixel.device),
+                image_size=image_size,
+            )
+            diagnostic["inserted_pixels"] = self._pfgs360_pixel_indices(
+                pixel,
+                inserted.to(pixel.device),
+                image_size=image_size,
+            )
+
+        commit_stats = self.fusion.commit_prepared_packet(
+            packet,
+            window_transform,
+            filtered,
+            evidence_update=evidence_update,
+            extra_stats={
+                **hash_stats,
+                "pfgs360_refined_bootstrap": 0,
+                "pfgs360_anchor_candidates": candidate_count,
+                "pfgs360_anchor_source_supported": int(supported_union.sum().item()),
+                "pfgs360_anchor_dia_selected": int(selected_union.sum().item()),
+                "pfgs360_anchor_hash_rejected": int(hash_rejected_sources.numel()),
+            },
+        )
+        self.mapper._pending_pfgs360_anchor_admission = {
+            "window_id": int(packet.window_id),
+            "image_size": image_size,
+            "views": view_diagnostics,
+            "candidate": candidate_count,
+            "source_view_rejected": candidate_count
+            - int(supported_union.sum().item()),
+            "dia_selected": int(selected_union.sum().item()),
+            "hash_rejected": int(hash_rejected_sources.numel()),
+            "inserted": int(commit_stats.get("inserted", 0)),
+        }
+        return {
+            "candidate": candidate_count,
+            "source_view_rejected": candidate_count
+            - int(supported_union.sum().item()),
+            "selected": int(selected_union.sum().item()),
+            "hash_rejected": int(hash_rejected_sources.numel()),
+            "inserted": int(commit_stats.get("inserted", 0)),
+            "anchors_before": int(commit_stats.get("anchors_before", 0)),
+            "anchors_after": int(commit_stats.get("anchors_after", 0)),
+        }
+
     def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
             return {}
@@ -8162,12 +8460,30 @@ class SphericalSelfiGlobalBackend:
                     if int(self.frame_owner_window.get(int(frame_id), window_id))
                     == int(window_id)
                 ) if live_packet is not None else tuple(frame_ids)
+                refined_anchor_update = None
+                pfgs_settings = dict(
+                    self.map_optimize_config.get("pfgs360", {}) or {}
+                )
+                if str(pfgs_settings.get("growth_source", "raw_depth")).strip().lower() == "refined_anchor":
+                    if live_packet is None or live_packet.anchor_observation is None:
+                        raise RuntimeError(
+                            "Refined-anchor PFGS360 growth requires the live Refiner packet"
+                        )
+                    window_transform = self._window_anchor_transforms()[int(window_id)]
+
+                    def refined_anchor_update(**kwargs):
+                        return self._update_pfgs360_refined_anchors(
+                            live_packet,
+                            window_transform,
+                            **kwargs,
+                        )
+
                 metrics = self.mapper.optimize_pfgs360_full_50_50(
                     window_id=int(window_id),
                     frame_ids=visited_frame_ids,
                     new_frame_ids=new_frame_ids,
                     settings={
-                        **dict(self.map_optimize_config.get("pfgs360", {}) or {}),
+                        **pfgs_settings,
                         "camera_steps": int(
                             self.map_optimize_config.get("camera_steps", 50)
                         ),
@@ -8199,6 +8515,7 @@ class SphericalSelfiGlobalBackend:
                             )
                         ),
                     },
+                    refined_anchor_update=refined_anchor_update,
                 )
                 metrics["optimized_frame_count"] = float(len(visited_frame_ids))
                 metrics["new_frame_count"] = float(len(new_frame_ids))

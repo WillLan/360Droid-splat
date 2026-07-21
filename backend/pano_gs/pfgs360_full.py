@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import time
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -429,7 +430,13 @@ class PFGS360FullBackend:
         "rotation": 1.0e-3,
     }
 
-    def __init__(self, mapper, settings: dict | None = None) -> None:
+    def __init__(
+        self,
+        mapper,
+        settings: dict | None = None,
+        *,
+        refined_anchor_update: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         self.mapper = mapper
         self.map = mapper.map
         self.settings = dict(settings or {})
@@ -445,6 +452,13 @@ class PFGS360FullBackend:
         )
         self.device = self.map.xyz.device
         self.dtype = self.map.xyz.dtype
+        self.refined_anchor_update = refined_anchor_update
+
+    @property
+    def uses_refined_anchor_growth(self) -> bool:
+        return str(self.settings.get("growth_source", "raw_depth")).strip().lower() == (
+            "refined_anchor"
+        )
 
     def _snapshot(self) -> dict[str, object]:
         return {
@@ -482,6 +496,7 @@ class PFGS360FullBackend:
                 pose.delta.copy_(pose_state["delta"].to(pose.delta))
         self.mapper._pfgs360_gaussian_moments = dict(state["moments"])
         self.mapper._pfgs360_joint_steps = int(state["joint_steps"])
+        self.mapper._pending_pfgs360_anchor_admission = None
         self.mapper.optimizer = self.map.make_optimizer(
             lr=float(self.settings.get("fallback_lr", 2.0e-3))
         )
@@ -615,9 +630,68 @@ class PFGS360FullBackend:
         )
         return candidates[:2]
 
+    def _dia_valid_mask(
+        self,
+        observation,
+        aligned_depth: torch.Tensor,
+        alpha: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return the DIA computation domain for the selected compatibility mode."""
+
+        valid = (
+            torch.isfinite(aligned_depth)
+            & (aligned_depth >= self.cfg.min_depth)
+            & (aligned_depth <= self.cfg.max_depth)
+        )
+        official_sky_only = str(
+            self.settings.get("validity_gate", "legacy")
+        ).strip().lower() == "pfgs360_official_sky_only"
+        sky_mask = observation.sky_mask
+        if official_sky_only and sky_mask is None:
+            raise RuntimeError(
+                "pfgs360_official_sky_only requires a panoramic sky mask"
+            )
+        if sky_mask is not None:
+            valid &= ~sky_mask.to(device=self.device, dtype=torch.bool)
+        if official_sky_only:
+            return valid
+        if observation.depth_confidence is not None:
+            valid &= observation.depth_confidence.to(self.device) >= float(
+                self.settings.get("min_depth_confidence", 0.05)
+            )
+        if torch.is_tensor(alpha):
+            valid &= torch.isfinite(alpha) & (
+                alpha >= float(self.settings.get("alpha_threshold", 0.05))
+            )
+        return valid
+
     def _bootstrap(self, observations, owner_window_id: int) -> dict[str, int]:
         if self.map.anchor_count() > 0 or not observations:
             return {"raw": 0, "unique": 0, "occupied": 0, "inserted": 0}
+        if self.uses_refined_anchor_growth:
+            if self.refined_anchor_update is None:
+                raise RuntimeError(
+                    "Refined-anchor PFGS360 bootstrap requires an anchor update handler"
+                )
+            output = self.refined_anchor_update(
+                event="bootstrap",
+                owner_window_id=int(owner_window_id),
+                observations=tuple(observations),
+                new_frame_ids=tuple(int(value.frame_id) for value in observations),
+                mono_inlier_masks={},
+                optimized_poses={
+                    int(value.frame_id): self._pose(value).detach()
+                    for value in observations
+                },
+                existing_anchor_visibility={},
+            )
+            self.mapper._pfgs360_gaussian_moments = {}
+            return {
+                "raw": int(output.get("candidate", 0)),
+                "unique": int(output.get("selected", output.get("candidate", 0))),
+                "occupied": 0,
+                "inserted": int(output.get("inserted", 0)),
+            }
         first = observations[0]
         if first.target_depth is None:
             raise RuntimeError("PFGS360 bootstrap requires refined panoramic ray depth")
@@ -803,6 +877,7 @@ class PFGS360FullBackend:
 
         inconsistent_hits = torch.zeros(self.map.anchor_count(), device=self.device, dtype=torch.int32)
         inlier_hits = torch.zeros_like(inconsistent_hits)
+        mono_inlier_masks: dict[int, torch.Tensor] = {}
         growth_xyz: list[torch.Tensor] = []
         growth_rgb: list[torch.Tensor] = []
         mono_inlier_pixels = 0
@@ -821,20 +896,8 @@ class PFGS360FullBackend:
                 config=self.cfg,
             )
             render_inconsistent = ~render_consistency[frame_id]
-            valid = torch.isfinite(aligned) & (aligned >= self.cfg.min_depth) & (
-                aligned <= self.cfg.max_depth
-            )
-            if observation.depth_confidence is not None:
-                valid &= observation.depth_confidence.to(self.device) >= float(
-                    self.settings.get("min_depth_confidence", 0.05)
-                )
-            if observation.sky_mask is not None:
-                valid &= ~observation.sky_mask.to(device=self.device, dtype=torch.bool)
             alpha = packages[frame_id].get("alpha")
-            if torch.is_tensor(alpha):
-                valid &= torch.isfinite(alpha) & (
-                    alpha >= float(self.settings.get("alpha_threshold", 0.05))
-                )
+            valid = self._dia_valid_mask(observation, aligned, alpha)
             render_inconsistent &= valid
             patch_better = panoramic_patch_better_mask(
                 observation.image.to(self.device),
@@ -866,7 +929,13 @@ class PFGS360FullBackend:
             inconsistent_hits += (finite & (responsibility[:, 0] >= threshold)).int()
             inlier_hits += (finite & (responsibility[:, 1] >= threshold)).int()
             query_views += 1
-            if frame_id in new_set and bool(mono_inlier.any()):
+            if frame_id in new_set:
+                mono_inlier_masks[frame_id] = mono_inlier.detach()
+            if (
+                not self.uses_refined_anchor_growth
+                and frame_id in new_set
+                and bool(mono_inlier.any())
+            ):
                 xyz, rgb = backproject_panorama_depth(
                     aligned,
                     observation.image.to(self.device),
@@ -896,7 +965,49 @@ class PFGS360FullBackend:
             deleted = self.map.prune_anchors(cull)
             self._remap_moments()
         growth = {"raw": 0, "unique": 0, "occupied": 0, "inserted": 0}
-        if growth_xyz:
+        refined_stats: dict[str, Any] = {}
+        if self.uses_refined_anchor_growth:
+            if self.refined_anchor_update is None:
+                raise RuntimeError(
+                    "Refined-anchor PFGS360 growth requires an anchor update handler"
+                )
+            visibility: dict[int, torch.Tensor] = {}
+            optimized_poses: dict[int, torch.Tensor] = {}
+            with torch.no_grad():
+                for observation in observations:
+                    frame_id = int(observation.frame_id)
+                    if frame_id not in new_set:
+                        continue
+                    package = self._render(observation)
+                    accum = package.get("accum_visible")
+                    radii = package.get("radii")
+                    if torch.is_tensor(accum) and int(accum.numel()) == self.map.anchor_count():
+                        visible = torch.isfinite(accum) & (accum > 0.0)
+                    elif torch.is_tensor(radii) and int(radii.numel()) == self.map.anchor_count():
+                        visible = torch.isfinite(radii) & (radii.reshape(-1) > 0.0)
+                    else:
+                        raise RuntimeError(
+                            "Refined-anchor Hash requires per-Gaussian visibility"
+                        )
+                    visibility[frame_id] = visible.detach()
+                    optimized_poses[frame_id] = self._pose(observation).detach()
+            refined_stats = self.refined_anchor_update(
+                event="growth",
+                owner_window_id=int(owner_window_id),
+                observations=tuple(observations),
+                new_frame_ids=tuple(sorted(new_set)),
+                mono_inlier_masks=mono_inlier_masks,
+                optimized_poses=optimized_poses,
+                existing_anchor_visibility=visibility,
+            )
+            self.mapper._pfgs360_gaussian_moments = {}
+            growth = {
+                "raw": int(refined_stats.get("candidate", 0)),
+                "unique": int(refined_stats.get("selected", 0)),
+                "occupied": 0,
+                "inserted": int(refined_stats.get("inserted", 0)),
+            }
+        elif growth_xyz:
             growth = self.map.append_pfgs360_points(
                 torch.cat(growth_xyz, dim=0),
                 torch.cat(growth_rgb, dim=0),
@@ -908,7 +1019,7 @@ class PFGS360FullBackend:
                 min_unique_voxels=int(self.settings.get("min_unique_growth_voxels", 100)),
             )
             self._remap_moments()
-        return {
+        metrics = {
             "dia_render_views": float(len(observations)),
             "dia_query_views": float(query_views),
             "dia_mono_inlier_pixels": float(mono_inlier_pixels),
@@ -922,6 +1033,14 @@ class PFGS360FullBackend:
             "dia_growth_inserted": float(growth["inserted"]),
             "dia_alignment_scale_mean": float(sum(alignment_scales) / max(1, len(alignment_scales))),
         }
+        metrics.update(
+            {
+                f"dia_anchor_{key}": float(value)
+                for key, value in refined_stats.items()
+                if isinstance(value, (int, float))
+            }
+        )
+        return metrics
 
     def _joint_stage(self, observations, steps: int, seed: int) -> dict[str, float]:
         fixed_frame = min(int(value.frame_id) for value in observations)
@@ -955,9 +1074,16 @@ class PFGS360FullBackend:
         )
         self._load_moments(optimizer)
         schedule = self._sampling_schedule(observations, steps, seed)
-        grad_sum = torch.zeros(self.map.anchor_count(), device=self.device)
-        grad_count = torch.zeros_like(grad_sum)
-        max_radii = torch.zeros_like(grad_sum)
+        topology_refine_enabled = bool(
+            self.settings.get("topology_refine_enabled", True)
+        )
+        grad_sum = (
+            torch.zeros(self.map.anchor_count(), device=self.device)
+            if topology_refine_enabled
+            else None
+        )
+        grad_count = None if grad_sum is None else torch.zeros_like(grad_sum)
+        max_radii = None if grad_sum is None else torch.zeros_like(grad_sum)
         last_loss = 0.0
         sky_parameters = self.map.skybox_parameters()
         sky_requires_grad = [parameter.requires_grad for parameter in sky_parameters]
@@ -1015,7 +1141,7 @@ class PFGS360FullBackend:
                     raise FloatingPointError("Non-finite PFGS360 JOINT gradient")
                 viewspace = package.get("viewspace_points")
                 radii = package.get("radii")
-                if torch.is_tensor(viewspace):
+                if topology_refine_enabled and torch.is_tensor(viewspace):
                     gradient = getattr(viewspace, "absgrad", None)
                     if gradient is None and (
                         bool(viewspace.is_leaf) or bool(viewspace.retains_grad)
@@ -1024,9 +1150,15 @@ class PFGS360FullBackend:
                     if torch.is_tensor(gradient) and int(gradient.shape[0]) == self.map.anchor_count():
                         magnitude = torch.linalg.norm(gradient.detach(), dim=-1)
                         visible = magnitude > 0.0
+                        assert grad_sum is not None and grad_count is not None
                         grad_sum[visible] += magnitude[visible]
                         grad_count[visible] += 1.0
-                if torch.is_tensor(radii) and int(radii.numel()) == self.map.anchor_count():
+                if (
+                    topology_refine_enabled
+                    and torch.is_tensor(radii)
+                    and int(radii.numel()) == self.map.anchor_count()
+                ):
+                    assert max_radii is not None
                     max_radii = torch.maximum(max_radii, radii.detach().reshape(-1).to(max_radii))
                 optimizer.step()
                 if not all(bool(torch.isfinite(value).all()) for value in self.map.gaussian_parameters()):
@@ -1038,10 +1170,15 @@ class PFGS360FullBackend:
         self.mapper._pfgs360_joint_steps = int(
             getattr(self.mapper, "_pfgs360_joint_steps", 0)
         ) + len(schedule)
-        refine_every = int(self.settings.get("refine_every_joint_steps", 100))
+        refine_every = (
+            int(self.settings.get("refine_every_joint_steps", 100))
+            if topology_refine_enabled
+            else 0
+        )
         refine = {"split": 0, "duplicate": 0, "culled": 0, "after": self.map.anchor_count()}
         self._store_moments(optimizer)
         if refine_every > 0 and self.mapper._pfgs360_joint_steps % refine_every == 0:
+            assert grad_sum is not None and grad_count is not None and max_radii is not None
             mean_grad = grad_sum / grad_count.clamp_min(1.0)
             refine = self.map.pfgs360_refine_topology(
                 mean_grad,
@@ -1053,15 +1190,21 @@ class PFGS360FullBackend:
                 ood_distance=float(self.settings.get("ood_distance", 1.0e5)),
             )
             self._remap_moments()
-        return {
+        metrics = {
             "joint_steps": float(len(schedule)),
             "joint_loss": last_loss,
             "joint_trainable_poses": float(len(pose_params)),
-            "refine_split": float(refine.get("split", 0)),
-            "refine_split_children": float(refine.get("split_children", 0)),
-            "refine_duplicate": float(refine.get("duplicate", 0)),
-            "refine_culled": float(refine.get("culled", 0)),
         }
+        if topology_refine_enabled:
+            metrics.update(
+                {
+                    "refine_split": float(refine.get("split", 0)),
+                    "refine_split_children": float(refine.get("split_children", 0)),
+                    "refine_duplicate": float(refine.get("duplicate", 0)),
+                    "refine_culled": float(refine.get("culled", 0)),
+                }
+            )
+        return metrics
 
     def run(
         self,
@@ -1085,17 +1228,31 @@ class PFGS360FullBackend:
             }
             bootstrap = self._bootstrap(observations, int(owner_window_id))
             metrics.update({f"bootstrap_{key}": float(value) for key, value in bootstrap.items()})
+            refined_bootstrap = self.uses_refined_anchor_growth and int(
+                bootstrap.get("inserted", 0)
+            ) > 0
+            if self.uses_refined_anchor_growth and self.map.anchor_count() == 0:
+                raise RuntimeError("Refined-anchor bootstrap produced an empty map")
             started = time.perf_counter()
             metrics.update(self._camera_stage(observations, int(camera_steps), int(seed)))
             metrics["camera_seconds"] = float(time.perf_counter() - started)
             started = time.perf_counter()
-            metrics.update(
-                self._dia(
-                    observations,
-                    tuple(int(value) for value in new_frame_ids),
-                    int(owner_window_id),
+            if refined_bootstrap:
+                metrics.update(
+                    {
+                        "dia_render_views": 0.0,
+                        "dia_query_views": 0.0,
+                        "dia_first_window_passthrough": 1.0,
+                    }
                 )
-            )
+            else:
+                metrics.update(
+                    self._dia(
+                        observations,
+                        tuple(int(value) for value in new_frame_ids),
+                        int(owner_window_id),
+                    )
+                )
             metrics["dia_seconds"] = float(time.perf_counter() - started)
             started = time.perf_counter()
             metrics.update(

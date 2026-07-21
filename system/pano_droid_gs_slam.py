@@ -565,6 +565,7 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "slam/pfgs360_ate",
         "backend/render_vs_gt_panorama",
         "backend/new_gaussians_per_chunk",
+        "backend/pfgs360_new_anchor_admission",
         "backend/selfi_global_map_anchor_scale",
         "backend/selfi_global_map_root_relative_scale",
         "backend/selfi_global_map_anchor_fallback",
@@ -1369,6 +1370,117 @@ class SlamRuntimeLogger:
                     payload["mapping/new_gaussians_png"] = str(path)
             self._log_wandb_payload(payload, step=step)
         return path
+
+    def observe_pfgs360_new_anchor_admission(
+        self,
+        diagnostic: dict,
+        *,
+        step: int | None = None,
+    ) -> Path | None:
+        """Save per-view DIA/anchor overlays and log one fixed W&B panel."""
+
+        views = list(diagnostic.get("views", ()) or ())
+        if not views:
+            return None
+        image_size = tuple(int(value) for value in diagnostic.get("image_size", (0, 0)))
+        if len(image_size) != 2 or min(image_size) <= 0:
+            return None
+        height, width = image_size
+
+        def point_mask(indices) -> np.ndarray:
+            mask = np.zeros(height * width, dtype=bool)
+            if torch.is_tensor(indices):
+                values = indices.detach().cpu().long().numpy()
+            else:
+                values = np.asarray(indices if indices is not None else [], dtype=np.int64)
+            values = values[(values >= 0) & (values < mask.size)]
+            mask[values] = True
+            return mask.reshape(height, width)
+
+        rows: list[Image.Image] = []
+        local_paths: list[Path] = []
+        for view in views:
+            frame_id = int(view["frame_id"])
+            rgb = _image_tensor_to_pil(view["image"])
+            if rgb.size != (width, height):
+                rgb = rgb.resize((width, height), Image.BILINEAR)
+            rgb_array = np.asarray(rgb).astype(np.float32)
+            mono = torch.as_tensor(view["mono_inlier_mask"]).detach().cpu().bool()
+            while mono.ndim > 2:
+                mono = mono[0]
+            mono_np = mono.numpy()
+            candidate = point_mask(view.get("candidate_pixels"))
+            rejected = point_mask(view.get("hash_rejected_pixels"))
+            inserted = point_mask(view.get("inserted_pixels"))
+
+            overlay = rgb_array.copy()
+            overlay[mono_np] = 0.55 * overlay[mono_np] + 0.45 * np.array(
+                [40.0, 120.0, 255.0]
+            )
+            overlay[candidate] = 0.45 * overlay[candidate] + 0.55 * np.array(
+                [255.0, 210.0, 30.0]
+            )
+            overlay[rejected] = 0.30 * overlay[rejected] + 0.70 * np.array(
+                [255.0, 40.0, 40.0]
+            )
+            overlay[inserted] = 0.25 * overlay[inserted] + 0.75 * np.array(
+                [30.0, 255.0, 80.0]
+            )
+            masks = []
+            for mask, color in (
+                (mono_np, (40, 120, 255)),
+                (candidate, (255, 210, 30)),
+                (rejected, (255, 40, 40)),
+                (inserted, (30, 255, 80)),
+            ):
+                panel = np.zeros((height, width, 3), dtype=np.uint8)
+                panel[mask] = np.asarray(color, dtype=np.uint8)
+                masks.append(Image.fromarray(panel, mode="RGB"))
+            panels = [rgb, *masks, Image.fromarray(overlay.clip(0, 255).astype(np.uint8), mode="RGB")]
+            title_h = 28
+            row = Image.new("RGB", (len(panels) * width, height + title_h), "white")
+            labels = ("rgb", "DIA mono-inlier", "anchor candidate", "Hash rejected", "inserted", "overlay")
+            draw = ImageDraw.Draw(row)
+            for index, (panel, label) in enumerate(zip(panels, labels)):
+                row.paste(panel, (index * width, title_h))
+                draw.text((index * width + 6, 7), label, fill=(0, 0, 0))
+            rows.append(row)
+            if self.save_local:
+                directory = self.visualization_dir / "pfgs360_new_anchor_admission"
+                directory.mkdir(parents=True, exist_ok=True)
+                path = directory / (
+                    f"window_{int(diagnostic.get('window_id', -1)):06d}_"
+                    f"frame_{frame_id:06d}.png"
+                )
+                _resize_to_max_width(row, self.kf_opt_max_width).save(path)
+                local_paths.append(path)
+
+        panel_width = max(value.width for value in rows)
+        panel_height = sum(value.height for value in rows)
+        combined = Image.new("RGB", (panel_width, panel_height), "white")
+        offset = 0
+        for row in rows:
+            combined.paste(row, (0, offset))
+            offset += row.height
+        combined = _resize_to_max_width(combined, self.kf_opt_max_width)
+        combined_path = None
+        if self.save_local:
+            directory = self.visualization_dir / "pfgs360_new_anchor_admission"
+            directory.mkdir(parents=True, exist_ok=True)
+            combined_path = directory / (
+                f"window_{int(diagnostic.get('window_id', -1)):06d}.png"
+            )
+            combined.save(combined_path)
+        if self.run is not None and self._wandb is not None:
+            self._log_wandb_payload(
+                {
+                    "backend/pfgs360_new_anchor_admission": self._wandb.Image(
+                        str(combined_path) if combined_path is not None else combined
+                    )
+                },
+                step=step,
+            )
+        return combined_path
 
     def observe_depth_insertion_diagnostic(
         self,
@@ -4338,6 +4450,12 @@ class PanoDroidGSSlamSystem:
             metrics = self.spherical_selfi_global_backend.run_pending_map_optimization()
             if not metrics:
                 return
+            anchor_admission = self.mapper.consume_pfgs360_anchor_admission()
+            if anchor_admission is not None:
+                logger.observe_pfgs360_new_anchor_admission(
+                    anchor_admission,
+                    step=max(1, int(logger._step) + 1),
+                )
             consume_spherical_selfi_geometry_updates(outputs)
             last_feedforward_metrics = dict(metrics)
             successful_steps = float(metrics.get("steps", 0.0))

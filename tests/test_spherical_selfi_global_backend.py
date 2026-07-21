@@ -2283,6 +2283,120 @@ def test_depth_gate_analytic_erp_projection_wraps_across_panorama_seam() -> None
     assert torch.allclose(sampled[0], sampled[1], atol=1.0e-4)
 
 
+def test_pfgs360_refined_anchor_projection_wraps_panorama_seam() -> None:
+    width, height = 16, 8
+    epsilon = 1.0e-4
+    xyz = torch.tensor(
+        [[-epsilon, 0.0, -1.0], [epsilon, 0.0, -1.0]],
+        dtype=torch.float32,
+    )
+    pixel, valid = SphericalSelfiGlobalBackend._pfgs360_anchor_pixels(
+        xyz,
+        torch.eye(4),
+        image_size=(height, width),
+    )
+
+    assert bool(valid.all())
+    assert pixel[0, 0] < 0.01
+    assert pixel[1, 0] > width - 0.01
+
+
+def test_refined_anchor_prepare_can_bypass_semantic_quality_gates() -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    anchor = packet.anchor_observation
+    assert anchor is not None
+    packet.anchor_observation = replace(
+        anchor,
+        quality=torch.zeros_like(anchor.quality),
+        opacity_logit=torch.full_like(anchor.opacity_logit, -12.0),
+    )
+    fusion = Stage2GlobalMapFusion(
+        PanoGaussianMap(config={}, device="cpu"),
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.05,
+        min_opacity=0.02,
+    )
+
+    legacy = fusion.prepare_packet_batch(
+        packet,
+        sim3_identity(),
+        apply_semantic_gates=True,
+    )
+    official = fusion.prepare_packet_batch(
+        packet,
+        sim3_identity(),
+        apply_semantic_gates=False,
+    )
+
+    assert len(legacy.batch) == 0
+    assert len(official.batch) == anchor.num_anchors
+    assert torch.equal(official.batch.xyz, anchor.xyz)
+    assert torch.equal(official.batch.scale, anchor.scaling)
+    assert torch.equal(official.batch.rotation, anchor.rotation)
+    assert torch.equal(official.batch.opacity, packet.anchor_observation.opacity)
+
+
+def test_pfgs360_first_chunk_commits_refiner_attributes_without_reinitialization() -> None:
+    packet = _refined_packet(
+        0,
+        torch.eye(4).repeat(4, 1, 1),
+        (0, 1, 2, 3),
+    )
+    packet.metadata["voxel_anchor_source_view_mask"] = torch.full(
+        (packet.anchor_observation.num_anchors,),
+        (1 << 4) - 1,
+        dtype=torch.long,
+    )
+    gaussian_map = PanoGaussianMap(
+        config={"MapRepresentation": {"gaussian_parameterization": "traditional_3dgs"}},
+        device="cpu",
+    )
+    backend = SphericalSelfiGlobalBackend.__new__(SphericalSelfiGlobalBackend)
+    backend.map = gaussian_map
+    backend.mapper = SimpleNamespace(
+        _pending_pfgs360_anchor_admission=None,
+        _pfgs360_gaussian_moments={},
+    )
+    backend.fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.05,
+        min_opacity=0.02,
+    )
+    expected = backend.fusion.prepare_packet_batch(
+        packet,
+        sim3_identity(),
+        apply_semantic_gates=False,
+    )
+
+    stats = backend._update_pfgs360_refined_anchors(
+        packet,
+        sim3_identity(),
+        event="bootstrap",
+        owner_window_id=0,
+        observations=(),
+        new_frame_ids=packet.frame_ids,
+        mono_inlier_masks={},
+        optimized_poses={},
+        existing_anchor_visibility={},
+    )
+
+    assert stats["candidate"] == len(expected.batch)
+    assert gaussian_map.anchor_count() == stats["inserted"]
+    assert torch.allclose(gaussian_map.get_xyz, expected.batch.xyz)
+    assert torch.allclose(gaussian_map.get_scaling, expected.batch.scale)
+    assert torch.allclose(gaussian_map.get_rotation, expected.batch.rotation)
+    assert torch.allclose(gaussian_map.get_opacity, expected.batch.opacity)
+    assert torch.allclose(
+        gaussian_map.get_sh_coefficients,
+        expected.batch.sh_coefficients,
+    )
+
+
 def test_depth_gate_first_window_is_passthrough_without_any_render(monkeypatch) -> None:
     packet = _refined_packet(
         0,

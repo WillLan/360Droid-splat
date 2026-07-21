@@ -13,8 +13,10 @@ from backend.pano_gs.pfgs360_full import (
 )
 from backend.pano_gs.pose_param import PoseDelta
 from system.pano_droid_gs_slam import (
+    _SLAM_CORE_VISUAL_WANDB_KEYS,
     _requires_refiner_insertion_dedup,
     load_config,
+    SlamRuntimeLogger,
 )
 from backend.pano_gs.spherical_selfi_global import SphericalSelfiGlobalBackend
 
@@ -63,6 +65,30 @@ def test_affine_depth_alignment_recovers_scale_and_shift() -> None:
     assert abs(scale - 1.5) < 1.0e-5
     assert abs(shift - 0.25) < 1.0e-5
     assert torch.allclose(aligned, rendered, atol=1.0e-5)
+
+
+def test_official_dia_validity_ignores_alpha_and_confidence_but_keeps_sky() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    observation = mapper.observations[0]
+    observation.depth_confidence = torch.zeros(1, 4, 8)
+    observation.sky_mask = torch.zeros(1, 4, 8, dtype=torch.bool)
+    observation.sky_mask[:, 0, 0] = True
+    depth = torch.ones(1, 4, 8)
+    alpha = torch.zeros_like(depth)
+
+    official = PFGS360FullBackend(
+        mapper,
+        {"validity_gate": "pfgs360_official_sky_only"},
+    )._dia_valid_mask(observation, depth, alpha)
+    legacy = PFGS360FullBackend(mapper)._dia_valid_mask(
+        observation,
+        depth,
+        alpha,
+    )
+
+    assert int(official.sum()) == depth.numel() - 1
+    assert not bool(official[0, 0, 0])
+    assert not bool(legacy.any())
 
 
 def test_pfgs360_voxel_growth_uses_traditional_3dgs_initialization() -> None:
@@ -232,6 +258,31 @@ def test_full_backend_runs_camera_dia_joint_and_keeps_owner_transform() -> None:
     assert torch.equal(owner_before["current"][0], owner_after["current"][0])
 
 
+def test_refined_anchor_bootstrap_never_calls_raw_point_growth(monkeypatch) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    monkeypatch.setattr(
+        mapper.map,
+        "append_pfgs360_points",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("refined bootstrap called raw PFGS growth")
+        ),
+    )
+    calls = []
+
+    def update(**kwargs):
+        calls.append(kwargs["event"])
+        return {"candidate": 12, "selected": 12, "inserted": 10}
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {"growth_source": "refined_anchor"},
+        refined_anchor_update=update,
+    )
+    output = engine._bootstrap(engine._observations((0, 1, 2, 3)), 0)
+    assert calls == ["bootstrap"]
+    assert output == {"raw": 12, "unique": 12, "occupied": 0, "inserted": 10}
+
+
 def test_camera_stage_changes_pose_only_and_freezes_every_gaussian_parameter() -> None:
     mapper = _registered_mapper(_DifferentiableFakeRenderer())
     grid_x, grid_y = torch.meshgrid(torch.arange(12), torch.arange(12), indexing="ij")
@@ -284,6 +335,38 @@ def test_joint_stage_updates_all_six_gaussian_groups_and_keeps_first_pose_fixed(
         float(mapper.pose_deltas[index].delta.detach().norm()) > 0.0
         for index in (1, 2, 3)
     )
+
+
+def test_refined_anchor_joint_path_never_runs_conventional_topology(monkeypatch) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    grid_x, grid_y = torch.meshgrid(torch.arange(12), torch.arange(12), indexing="ij")
+    xyz = torch.stack([grid_x.flatten(), grid_y.flatten(), torch.ones(144)], dim=-1).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(144, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    monkeypatch.setattr(
+        mapper.map,
+        "pfgs360_refine_topology",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("refined-anchor path called conventional topology")
+        ),
+    )
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "growth_source": "refined_anchor",
+            "topology_refine_enabled": False,
+            "refine_every_joint_steps": 1,
+        },
+        refined_anchor_update=lambda **kwargs: {},
+    )
+    metrics = engine._joint_stage(engine._observations((0, 1, 2, 3)), 2, 124)
+    assert metrics["joint_steps"] == 2
+    assert not any(key.startswith("refine_") for key in metrics)
 
 
 def test_pfgs360_adam_moments_follow_append_and_prune_row_mapping() -> None:
@@ -445,6 +528,54 @@ def test_dia_applies_official_100_threshold_without_deletion_cap() -> None:
     assert bool((mapper.map.get_opacity <= 0.010001).all())
 
 
+def test_refined_anchor_growth_runs_only_after_dia_old_map_deletion() -> None:
+    mapper = _registered_mapper(_AttributedFakeRenderer())
+    xyz = torch.stack(
+        [torch.arange(240), torch.zeros(240), torch.ones(240)], dim=-1
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(240, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    calls = []
+
+    def update(**kwargs):
+        calls.append(
+            {
+                "event": kwargs["event"],
+                "count": mapper.map.anchor_count(),
+                "visibility": {
+                    key: int(value.numel())
+                    for key, value in kwargs["existing_anchor_visibility"].items()
+                },
+            }
+        )
+        return {"candidate": 0, "selected": 0, "inserted": 0}
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "growth_source": "refined_anchor",
+            "validity_gate": "pfgs360_official_sky_only",
+            "min_reset_gaussians": 100,
+            "min_delete_gaussians": 100,
+        },
+        refined_anchor_update=update,
+    )
+    metrics = engine._dia(engine._observations((0, 1, 2, 3)), (2, 3), 1)
+    assert metrics["dia_deleted"] == 120
+    assert calls == [
+        {
+            "event": "growth",
+            "count": 120,
+            "visibility": {2: 120, 3: 120},
+        }
+    ]
+
+
 def test_query_failure_rolls_back_bootstrap_pose_and_topology() -> None:
     mapper = _registered_mapper(_AttributedFakeRenderer(fail_query=True))
     deltas_before = {
@@ -472,6 +603,68 @@ def test_query_failure_rolls_back_bootstrap_pose_and_topology() -> None:
         assert torch.equal(mapper.pose_deltas[frame_id].delta.detach(), expected)
 
 
+def test_refined_anchor_insertion_failure_rolls_back_dia_and_optimizer_state() -> None:
+    mapper = _registered_mapper(_AttributedFakeRenderer())
+    xyz = torch.stack(
+        [torch.arange(240), torch.zeros(240), torch.ones(240)], dim=-1
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(240, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    before = mapper.map.pfgs360_topology_snapshot()
+    mapper._pfgs360_gaussian_moments = {
+        "xyz": {
+            "step": torch.tensor(2.0),
+            "exp_avg": torch.ones_like(mapper.map.xyz),
+            "exp_avg_sq": torch.full_like(mapper.map.xyz, 2.0),
+        }
+    }
+    moments_before = {
+        key: {
+            field: value.detach().clone() if torch.is_tensor(value) else value
+            for field, value in state.items()
+        }
+        for key, state in mapper._pfgs360_gaussian_moments.items()
+    }
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "growth_source": "refined_anchor",
+            "validity_gate": "pfgs360_official_sky_only",
+            "topology_refine_enabled": False,
+            "min_reset_gaussians": 100,
+            "min_delete_gaussians": 100,
+        },
+        refined_anchor_update=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic refined insertion failure")
+        ),
+    )
+    try:
+        engine.run(
+            frame_ids=(0, 1, 2, 3),
+            new_frame_ids=(2, 3),
+            owner_window_id=1,
+            camera_steps=0,
+            joint_steps=0,
+        )
+    except RuntimeError as error:
+        assert "synthetic refined insertion failure" in str(error)
+    else:
+        raise AssertionError("Refined insertion failure must abort the transaction")
+
+    assert mapper.map.anchor_count() == 240
+    assert torch.equal(mapper.map.xyz.detach().cpu(), before["parameters"]["xyz"])
+    for key, state in moments_before.items():
+        for field, value in state.items():
+            actual = mapper._pfgs360_gaussian_moments[key][field]
+            assert torch.equal(actual, value) if torch.is_tensor(value) else actual == value
+
+
 def test_formal_config_is_sphereglue_pointmap_sim3_and_strict_pfgs360() -> None:
     path = (
         Path(__file__).parents[1]
@@ -496,6 +689,83 @@ def test_formal_config_is_sphereglue_pointmap_sim3_and_strict_pfgs360() -> None:
     assert not _requires_refiner_insertion_dedup(backend)
     legacy_backend = {**backend, "map_optimization": {"strategy": "legacy"}}
     assert _requires_refiner_insertion_dedup(legacy_backend)
+
+
+def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topology() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "configs/spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_refined_anchor_50_50.yaml"
+    )
+    config = load_config(path)
+    backend = config["SphericalSelfiGlobalBackend"]
+    optimize = backend["map_optimization"]
+    pfgs = optimize["pfgs360"]
+    assert backend["rendered_overlap_alignment"]["mode"] == "two_frame_pointmap_full_sim3"
+    assert backend["rendered_overlap_alignment"]["acceptance_policy"] == "diagnostics_only"
+    assert backend["global_graph"]["node_mode"] == "chunk_first_stride"
+    assert optimize["camera_steps"] == optimize["joint_steps"] == 50
+    assert pfgs["growth_source"] == "refined_anchor"
+    assert pfgs["bootstrap_source"] == "refined_anchor_all_views"
+    assert pfgs["growth_frame_policy"] == "chunk_new_frames"
+    assert pfgs["validity_gate"] == "pfgs360_official_sky_only"
+    assert pfgs["topology_refine_enabled"] is False
+    assert "refine_every_joint_steps" not in pfgs
+    assert "split_scale_threshold" not in pfgs
+    assert "cull_opacity" not in pfgs
+    assert backend["insertion_dedup"]["enabled"] is True
+    assert backend["insertion_dedup"]["radius_voxels"] == 1.0
+    assert config["Training"]["pfgs360_absgrad"] is False
+    assert config["WeightsAndBiases"]["runtime_log_preset"] == "slam_core_visuals"
+    assert "backend/pfgs360_new_anchor_admission" in _SLAM_CORE_VISUAL_WANDB_KEYS
+    assert not any(
+        key.startswith("backend/pfgs360_new_anchor_admission_view_")
+        for key in _SLAM_CORE_VISUAL_WANDB_KEYS
+    )
+    runtime_backend = dict(backend)
+    runtime_backend["_voxel_anchor_refiner_enabled"] = True
+    validated = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config=config, device="cpu"),
+        renderer=object(),
+        config=runtime_backend,
+    )
+    assert validated.insertion_dedup_radius_voxels == 1.0
+
+
+def test_refined_anchor_admission_saves_two_local_views_and_one_chunk_panel(
+    tmp_path: Path,
+) -> None:
+    logger = SlamRuntimeLogger(
+        {
+            "WeightsAndBiases": {"enabled": False, "mode": "disabled"},
+            "Visualization": {"save_local": True},
+        },
+        tmp_path,
+    )
+    views = []
+    for frame_id in (4, 5):
+        mask = torch.zeros(1, 4, 8, dtype=torch.bool)
+        mask[:, 1, 0] = True
+        views.append(
+            {
+                "frame_id": frame_id,
+                "image": torch.full((3, 4, 8), 0.5),
+                "mono_inlier_mask": mask,
+                "candidate_pixels": torch.tensor([8]),
+                "dia_selected_pixels": torch.tensor([8]),
+                "hash_rejected_pixels": torch.tensor([9]),
+                "inserted_pixels": torch.tensor([10]),
+            }
+        )
+
+    path = logger.observe_pfgs360_new_anchor_admission(
+        {"window_id": 2, "image_size": (4, 8), "views": views},
+        step=6,
+    )
+
+    assert path is not None and path.exists()
+    directory = path.parent
+    assert (directory / "window_000002_frame_000004.png").exists()
+    assert (directory / "window_000002_frame_000005.png").exists()
 
 
 def test_strict_pfgs360_refined_packet_does_not_require_legacy_dedup() -> None:

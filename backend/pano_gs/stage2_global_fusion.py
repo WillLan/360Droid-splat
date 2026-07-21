@@ -772,6 +772,8 @@ class Stage2GlobalMapFusion:
         self,
         packet: LocalGaussianWindowPacket,
         anchor_to_global: torch.Tensor,
+        *,
+        apply_semantic_gates: bool = True,
     ) -> tuple[GlobalExplicitGaussianBatch, torch.Tensor]:
         """Transform refined voxel anchors without scale-based re-leveling."""
 
@@ -810,16 +812,19 @@ class Stage2GlobalMapFusion:
         keep = (
             torch.isfinite(xyz).all(dim=-1)
             & torch.isfinite(scale).all(dim=-1)
+            & (scale > 0.0).all(dim=-1)
             & torch.isfinite(rotation).all(dim=-1)
             & torch.isfinite(coefficients).all(dim=(-1, -2))
             & torch.isfinite(opacity[:, 0])
             & torch.isfinite(quality)
-            & (quality >= self.min_confidence)
-            & (opacity[:, 0] >= self.min_opacity)
             & (voxel_size[:, 0] > 0.0)
             & (level >= 0)
             & (level < len(self.voxel_sizes))
         )
+        if apply_semantic_gates:
+            keep &= (quality >= self.min_confidence) & (
+                opacity[:, 0] >= self.min_opacity
+            )
         selected = torch.nonzero(keep, as_tuple=False).flatten()
         if int(selected.numel()) == 0:
             return self._empty(device, dtype, target_sh_count), selected
@@ -872,6 +877,8 @@ class Stage2GlobalMapFusion:
         self,
         packet: LocalGaussianWindowPacket,
         anchor_to_global: torch.Tensor,
+        *,
+        apply_semantic_gates: bool = True,
     ) -> PreparedPacketFusion:
         depth_selected = packet.anchor_observation is not None
         if self._depth_selected_mode and not depth_selected and self.map.anchor_count() > 0:
@@ -882,6 +889,7 @@ class Stage2GlobalMapFusion:
             batch, source_indices = self._anchor_packet_to_global_batch_with_indices(
                 packet,
                 anchor_to_global,
+                apply_semantic_gates=apply_semantic_gates,
             )
         else:
             batch = self.packet_to_global_batch(packet, anchor_to_global)

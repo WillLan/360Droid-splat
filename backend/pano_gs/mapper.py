@@ -2733,11 +2733,16 @@ class PanoGaussianMapper:
         frame_ids: list[int] | tuple[int, ...],
         new_frame_ids: list[int] | tuple[int, ...],
         settings: dict | None = None,
+        refined_anchor_update=None,
     ) -> dict[str, float]:
         from backend.pano_gs.pfgs360_full import PFGS360FullBackend
 
         cfg = dict(settings or {})
-        engine = PFGS360FullBackend(self, cfg)
+        engine = PFGS360FullBackend(
+            self,
+            cfg,
+            refined_anchor_update=refined_anchor_update,
+        )
         metrics = engine.run(
             frame_ids=frame_ids,
             new_frame_ids=new_frame_ids,
@@ -2757,6 +2762,13 @@ class PanoGaussianMapper:
             [int(value) for value in frame_ids]
         )
         return metrics
+
+    def consume_pfgs360_anchor_admission(self):
+        """Return and clear the latest fixed-key refined-anchor diagnostic."""
+
+        value = getattr(self, "_pending_pfgs360_anchor_admission", None)
+        self._pending_pfgs360_anchor_admission = None
+        return value
 
     def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
         """Promote registered RGB/depth observations without inserting legacy seeds."""
