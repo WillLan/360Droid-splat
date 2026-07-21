@@ -460,9 +460,24 @@ class PFGS360FullBackend:
             "refined_anchor"
         )
 
+    def _state_storage_device(self) -> torch.device:
+        mode = str(self.settings.get("state_storage_device", "cpu")).strip().lower()
+        if mode == "cpu":
+            return torch.device("cpu")
+        if mode in {"map", "cuda"}:
+            if self.device.type != "cuda":
+                return self.device
+            return self.device
+        raise ValueError(
+            "PFGS360 state_storage_device must be 'cpu', 'map', or 'cuda'"
+        )
+
     def _snapshot(self) -> dict[str, object]:
+        state_device = self._state_storage_device()
         return {
-            "map": self.map.pfgs360_topology_snapshot(),
+            "map": self.map.pfgs360_topology_snapshot(
+                parameter_device=state_device,
+            ),
             "poses": {
                 int(frame_id): {
                     "base": pose.base_c2w.detach().cpu().clone(),
@@ -515,16 +530,19 @@ class PFGS360FullBackend:
         moments = dict(getattr(self.mapper, "_pfgs360_gaussian_moments", {}) or {})
         if not torch.is_tensor(mapping) or not moments:
             return
-        mapping_cpu = mapping.detach().cpu().long()
-        valid = mapping_cpu >= 0
         for name, state in moments.items():
             for field in ("exp_avg", "exp_avg_sq"):
                 value = state.get(field)
                 if not torch.is_tensor(value) or value.ndim == 0:
                     continue
-                output = value.new_zeros((int(mapping_cpu.numel()), *value.shape[1:]))
+                state_mapping = mapping.detach().to(
+                    device=value.device,
+                    dtype=torch.long,
+                )
+                valid = state_mapping >= 0
+                output = value.new_zeros((int(state_mapping.numel()), *value.shape[1:]))
                 if bool(valid.any()):
-                    output[valid] = value.index_select(0, mapping_cpu[valid])
+                    output[valid] = value.index_select(0, state_mapping[valid])
                 state[field] = output
         self.mapper._pfgs360_gaussian_moments = moments
 
@@ -555,6 +573,7 @@ class PFGS360FullBackend:
 
     def _store_moments(self, optimizer: torch.optim.Optimizer) -> None:
         output: dict[str, dict[str, object]] = {}
+        state_device = self._state_storage_device()
         for group in optimizer.param_groups:
             name = str(group.get("name", ""))
             if name == "poses" or len(group["params"]) != 1:
@@ -564,9 +583,13 @@ class PFGS360FullBackend:
             if not state:
                 continue
             output[name] = {
-                field: value.detach().cpu().clone()
-                if torch.is_tensor(value)
-                else value
+                field: (
+                    value.detach().cpu().clone()
+                    if field == "step" and torch.is_tensor(value)
+                    else value.detach().to(state_device).clone()
+                    if torch.is_tensor(value)
+                    else value
+                )
                 for field, value in state.items()
             }
         self.mapper._pfgs360_gaussian_moments = output
@@ -577,10 +600,12 @@ class PFGS360FullBackend:
         ).get("opacity_logit")
         if not state:
             return
-        mask = rows.detach().cpu().bool()
         for field in ("exp_avg", "exp_avg_sq"):
             value = state.get(field)
-            if torch.is_tensor(value) and int(value.shape[0]) == int(mask.numel()):
+            if not torch.is_tensor(value):
+                continue
+            mask = rows.detach().to(device=value.device, dtype=torch.bool)
+            if int(value.shape[0]) == int(mask.numel()):
                 value[mask] = 0
 
     def _pose(self, observation) -> torch.Tensor:
@@ -1216,7 +1241,9 @@ class PFGS360FullBackend:
         joint_steps: int = 50,
         seed: int = 123,
     ) -> dict[str, float]:
+        snapshot_started = time.perf_counter()
         state = self._snapshot()
+        snapshot_seconds = float(time.perf_counter() - snapshot_started)
         owner_before = self.map.lazy_owner_transform_state()
         try:
             observations = self._observations(frame_ids)
@@ -1225,6 +1252,11 @@ class PFGS360FullBackend:
             metrics: dict[str, float] = {
                 "strategy_pfgs360_full_50_50": 1.0,
                 "visited_frames": float(len(observations)),
+                "state_storage_on_map_device": float(
+                    self._state_storage_device().type == self.device.type
+                    and self._state_storage_device() == self.device
+                ),
+                "snapshot_seconds": snapshot_seconds,
             }
             bootstrap = self._bootstrap(observations, int(owner_window_id))
             metrics.update({f"bootstrap_{key}": float(value) for key, value in bootstrap.items()})

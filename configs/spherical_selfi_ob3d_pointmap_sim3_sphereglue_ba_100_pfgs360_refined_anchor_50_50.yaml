@@ -3,6 +3,14 @@ base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_freeze
 # Formal PointMap-Sim3 mainline: PFGS360 CAMERA/DIA/JOINT with Refiner anchors
 # as the only growth source.  DIA owns quality deletion; the Refiner does not
 # participate in old-map responsibility queries.
+Runtime:
+  cpu_threading:
+    enabled: true
+    intraop_threads: 8
+    interop_threads: 2
+    native_threads: 8
+    opencv_threads: 2
+
 SphericalSelfiGlobalBackend:
   insertion_dedup:
     enabled: true
@@ -34,6 +42,9 @@ SphericalSelfiGlobalBackend:
     dssim_weight: 0.2
     latter_half_sample_probability: 0.7
     pfgs360:
+      # Keep transaction snapshots and persistent Adam moments beside the map
+      # instead of cloning the full state through host memory every window.
+      state_storage_device: map
       growth_source: refined_anchor
       bootstrap_source: refined_anchor_all_views
       growth_frame_policy: chunk_new_frames

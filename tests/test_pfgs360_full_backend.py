@@ -14,6 +14,7 @@ from backend.pano_gs.pfgs360_full import (
 from backend.pano_gs.pose_param import PoseDelta
 from system.pano_droid_gs_slam import (
     _SLAM_CORE_VISUAL_WANDB_KEYS,
+    _resolve_cpu_threading_config,
     _requires_refiner_insertion_dedup,
     load_config,
     SlamRuntimeLogger,
@@ -419,6 +420,27 @@ def test_pfgs360_adam_moments_follow_append_and_prune_row_mapping() -> None:
         assert int(state["exp_avg"].shape[0]) == 144
 
 
+def test_pfgs360_state_storage_uses_requested_map_device_and_rejects_unknown_mode() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    engine = PFGS360FullBackend(mapper, {"state_storage_device": "map"})
+    assert engine._state_storage_device() == mapper.map.xyz.device
+    snapshot = mapper.map.pfgs360_topology_snapshot(
+        parameter_device=engine._state_storage_device()
+    )
+    assert all(
+        value.device == mapper.map.xyz.device
+        for value in snapshot["parameters"].values()
+    )
+
+    invalid = PFGS360FullBackend(mapper, {"state_storage_device": "elsewhere"})
+    try:
+        invalid._state_storage_device()
+    except ValueError as error:
+        assert "state_storage_device" in str(error)
+    else:
+        raise AssertionError("Unknown PFGS360 state storage must fail explicitly")
+
+
 def test_conventional_refine_splits_large_and_duplicates_small_gaussians() -> None:
     gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
     grid_x, grid_y = torch.meshgrid(torch.arange(12), torch.arange(12), indexing="ij")
@@ -709,6 +731,7 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
     assert pfgs["growth_frame_policy"] == "chunk_new_frames"
     assert pfgs["validity_gate"] == "pfgs360_official_sky_only"
     assert pfgs["topology_refine_enabled"] is False
+    assert pfgs["state_storage_device"] == "map"
     assert "refine_every_joint_steps" not in pfgs
     assert "split_scale_threshold" not in pfgs
     assert "cull_opacity" not in pfgs
@@ -716,6 +739,12 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
     assert backend["insertion_dedup"]["radius_voxels"] == 1.0
     assert config["Training"]["pfgs360_absgrad"] is False
     assert config["WeightsAndBiases"]["runtime_log_preset"] == "slam_core_visuals"
+    assert _resolve_cpu_threading_config(config) == {
+        "intraop_threads": 8,
+        "interop_threads": 2,
+        "native_threads": 8,
+        "opencv_threads": 2,
+    }
     assert "backend/pfgs360_new_anchor_admission" in _SLAM_CORE_VISUAL_WANDB_KEYS
     assert not any(
         key.startswith("backend/pfgs360_new_anchor_admission_view_")
@@ -752,6 +781,7 @@ def test_refined_anchor_global_map_config_is_a_strict_alignment_ablation() -> No
     for section in (
         "Dataset",
         "SphericalSelfiRuntime",
+        "Runtime",
         "VoxelAnchorRefiner",
         "MapRepresentation",
         "BackendOptimization",

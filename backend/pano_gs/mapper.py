@@ -599,10 +599,15 @@ class PanoGaussianMap(nn.Module):
             "rotation",
         )
 
-    def pfgs360_topology_snapshot(self) -> dict[str, object]:
+    def pfgs360_topology_snapshot(
+        self,
+        *,
+        parameter_device: torch.device | str = "cpu",
+    ) -> dict[str, object]:
+        snapshot_device = torch.device(parameter_device)
         return {
             "parameters": {
-                name: getattr(self, name).detach().cpu().clone()
+                name: getattr(self, name).detach().to(snapshot_device).clone()
                 for name in self._gaussian_parameter_names()
             },
             "metadata": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import time
 from dataclasses import replace
@@ -30,6 +31,72 @@ from geometry.trajectory_metrics import (
     pfgs360_normalized_trajectory_alignment,
 )
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
+
+
+_CPU_THREADPOOL_LIMITER = None
+
+
+def _resolve_cpu_threading_config(config: dict) -> dict[str, int] | None:
+    runtime = dict(config.get("Runtime", {}) or {})
+    threading = dict(runtime.get("cpu_threading", {}) or {})
+    if not bool(threading.get("enabled", False)):
+        return None
+    intraop = max(1, int(threading.get("intraop_threads", 8)))
+    return {
+        "intraop_threads": intraop,
+        "interop_threads": max(1, int(threading.get("interop_threads", 2))),
+        "native_threads": max(
+            1,
+            int(threading.get("native_threads", intraop)),
+        ),
+        "opencv_threads": max(1, int(threading.get("opencv_threads", 2))),
+    }
+
+
+def _configure_cpu_threading(config: dict) -> dict[str, int] | None:
+    global _CPU_THREADPOOL_LIMITER
+
+    resolved = _resolve_cpu_threading_config(config)
+    if resolved is None:
+        return None
+    native_threads = int(resolved["native_threads"])
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = str(native_threads)
+    os.environ["OPENCV_FOR_THREADS_NUM"] = str(resolved["opencv_threads"])
+
+    torch.set_num_threads(int(resolved["intraop_threads"]))
+    requested_interop = int(resolved["interop_threads"])
+    try:
+        torch.set_num_interop_threads(requested_interop)
+    except RuntimeError as error:
+        if int(torch.get_num_interop_threads()) != requested_interop:
+            raise RuntimeError(
+                "CPU inter-op threads must be configured before SLAM work starts"
+            ) from error
+
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _CPU_THREADPOOL_LIMITER = threadpool_limits(limits=native_threads)
+    except ImportError:
+        _CPU_THREADPOOL_LIMITER = None
+
+    try:
+        import cv2
+
+        cv2.setNumThreads(int(resolved["opencv_threads"]))
+    except ImportError:
+        pass
+    return {
+        **resolved,
+        "torch_intraop_applied": int(torch.get_num_threads()),
+        "torch_interop_applied": int(torch.get_num_interop_threads()),
+    }
 
 
 def _deep_merge_config(base: dict, override: dict) -> dict:
@@ -5441,6 +5508,9 @@ def main() -> None:
         cfg.setdefault("WeightsAndBiases", {})["mode"] = args.wandb_mode
     if args.run_name:
         cfg.setdefault("WeightsAndBiases", {})["run_name"] = args.run_name
+    threading = _configure_cpu_threading(cfg)
+    if threading is not None:
+        print("[runtime] cpu_threading=" + json.dumps(threading, sort_keys=True))
     system = PanoDroidGSSlamSystem(cfg)
     print(json.dumps(system.run(max_frames=args.max_frames), indent=2))
 
