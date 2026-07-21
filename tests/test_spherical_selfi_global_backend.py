@@ -7326,6 +7326,24 @@ def test_global_map_overlap_initializes_absolute_sim3_and_anchors_only_scale() -
     assert float(anchors[0].information_diag[6]) > 0.0
 
 
+def test_boundary_strict_pfgs_bypasses_legacy_refined_anchor_fusion() -> None:
+    poses = torch.eye(4).repeat(4, 1, 1)
+    packet = _refined_packet(0, poses, (0, 1, 2, 3))
+    _attach_identity_stride_matches(packet)
+    renderer = _SyntheticSharedDepthRenderer(local_depth=2.0, global_depth=2.0)
+    backend = _pointmap_chunk_backend(renderer=renderer)
+    backend.map_optimization_strategy = "pfgs360_full_50_50"
+    backend.map_steps_per_window = 0
+
+    result = backend.process_packet(packet)
+
+    assert result.fusion["pfgs360_strict_fusion_bypass"] == 1
+    assert result.fusion["legacy_commit_calls"] == 0
+    assert result.fusion["chunk_anchor_delta"] == 0
+    assert backend.map.anchor_count() == 0
+    assert backend.window_order == [0]
+
+
 def test_global_map_overlap_falls_back_to_unchanged_pointmap_path() -> None:
     height, width = 16, 32
     poses = torch.eye(4).repeat(4, 1, 1)

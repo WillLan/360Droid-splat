@@ -11803,7 +11803,22 @@ class SphericalSelfiGlobalBackend:
             )
 
         window_transform = self._window_anchor_transforms()[window_id]
-        if refined_packet:
+        if self.map_optimization_strategy == "pfgs360_full_50_50":
+            # Strict PFGS360 owns both bootstrap and subsequent DIA-gated
+            # refined-anchor growth.  Committing the packet through the
+            # legacy fusion path here would populate the map before CAMERA/DIA,
+            # turning the first four-view packet into an invalid growth event
+            # and allowing later anchors to bypass DIA admission entirely.
+            if hasattr(self.map, "set_lazy_owner_transform"):
+                self.map.set_lazy_owner_transform(
+                    int(window_id), window_transform, set_reference=True
+                )
+            fusion_stats = {
+                "pfgs360_strict_fusion_bypass": 1,
+                "legacy_commit_calls": 0,
+                "chunk_anchor_delta": 0,
+            }
+        elif refined_packet:
             prepare_start = time.perf_counter()
             prepared = self.fusion.prepare_packet_batch(packet, window_transform)
             prepare_seconds = float(time.perf_counter() - prepare_start)
