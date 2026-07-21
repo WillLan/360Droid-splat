@@ -987,9 +987,13 @@ class SphericalSelfiGlobalBackend:
                 "MapRepresentation.gaussian_parameterization=traditional_3dgs"
             )
         if self.map_optimization_strategy == "pfgs360_full_50_50":
-            if not self.two_frame_pointmap_full_sim3_enabled:
+            if not (
+                self.two_frame_pointmap_full_sim3_enabled
+                or self.two_frame_global_map_full_sim3_enabled
+            ):
                 raise ValueError(
-                    "pfgs360_full_50_50 is restricted to the PointMap-Sim3 mainline"
+                    "pfgs360_full_50_50 requires the PointMap-Sim3 or "
+                    "Global-Map-Sim3 mainline"
                 )
             if self.insertion_depth_gate_enabled or self.error_gaussian_prune_enabled:
                 raise ValueError(

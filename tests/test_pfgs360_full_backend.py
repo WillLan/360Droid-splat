@@ -731,6 +731,57 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
     assert validated.insertion_dedup_radius_voxels == 1.0
 
 
+def test_refined_anchor_global_map_config_is_a_strict_alignment_ablation() -> None:
+    config_root = Path(__file__).parents[1] / "configs"
+    pointmap = load_config(
+        config_root
+        / "spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_refined_anchor_50_50.yaml"
+    )
+    global_map = load_config(
+        config_root
+        / "spherical_selfi_ob3d_global_map_sim3_sphereglue_ba_100_pfgs360_refined_anchor_50_50.yaml"
+    )
+
+    assert pointmap["SphericalSelfiGlobalBackend"]["rendered_overlap_alignment"][
+        "mode"
+    ] == "two_frame_pointmap_full_sim3"
+    assert global_map["SphericalSelfiGlobalBackend"]["rendered_overlap_alignment"][
+        "mode"
+    ] == "two_frame_global_map_full_sim3"
+
+    for section in (
+        "Dataset",
+        "SphericalSelfiRuntime",
+        "VoxelAnchorRefiner",
+        "MapRepresentation",
+        "BackendOptimization",
+        "Mapping",
+        "Training",
+        "Renderer",
+        "TrajectoryEvaluation",
+    ):
+        assert global_map.get(section) == pointmap.get(section)
+
+    pointmap_backend = dict(pointmap["SphericalSelfiGlobalBackend"])
+    global_backend = dict(global_map["SphericalSelfiGlobalBackend"])
+    pointmap_alignment = dict(pointmap_backend.pop("rendered_overlap_alignment"))
+    global_alignment = dict(global_backend.pop("rendered_overlap_alignment"))
+    pointmap_alignment.pop("mode")
+    global_alignment.pop("mode")
+    assert global_backend == pointmap_backend
+    assert global_alignment == pointmap_alignment
+    assert global_map["WeightsAndBiases"]["runtime_log_preset"] == "slam_core_visuals"
+    runtime_backend = dict(global_map["SphericalSelfiGlobalBackend"])
+    runtime_backend["_voxel_anchor_refiner_enabled"] = True
+    validated = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config=global_map, device="cpu"),
+        renderer=object(),
+        config=runtime_backend,
+    )
+    assert validated.two_frame_global_map_full_sim3_enabled is True
+    assert validated.map_optimization_strategy == "pfgs360_full_50_50"
+
+
 def test_refined_anchor_admission_saves_two_local_views_and_one_chunk_panel(
     tmp_path: Path,
 ) -> None:
