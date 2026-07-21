@@ -58,6 +58,23 @@ def test_center_geometry_reacts_to_pose_and_depth_updates() -> None:
     torch.testing.assert_close(updated.depth_residual, torch.ones_like(updated.depth_residual))
 
 
+def test_replaced_depth_resets_provenance_and_head_residual() -> None:
+    observation = _observation()
+    replacement = torch.linspace(
+        0.5,
+        3.0,
+        steps=observation.refined_depth.numel(),
+    ).reshape_as(observation.refined_depth)
+    updated = observation.with_replaced_depth(replacement)
+    torch.testing.assert_close(updated.initial_depth, replacement)
+    torch.testing.assert_close(updated.refined_depth, replacement)
+    torch.testing.assert_close(updated.depth_residual, torch.zeros_like(replacement))
+    torch.testing.assert_close(updated.local_quaternion, observation.local_quaternion)
+    torch.testing.assert_close(updated.log_scale_multiplier, observation.log_scale_multiplier)
+    torch.testing.assert_close(updated.rgb_sh, observation.rgb_sh)
+    torch.testing.assert_close(updated.density_sh, observation.density_sh)
+
+
 def test_scale_is_positive_depth_relative_and_latitude_aware() -> None:
     observation = _observation(views=1)
     scale = observation.scales()[0, 0]

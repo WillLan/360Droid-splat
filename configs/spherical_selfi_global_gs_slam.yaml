@@ -84,6 +84,11 @@ SphericalSelfiRuntime:
   feature_device: cuda:0
   head_device: cuda:0
   feature_amp: true
+  # Optional online single-panorama depth replacement. Disabled by default so
+  # existing spherical-Selfi, PointMap-Sim3, and SphereGlue configs retain
+  # their original geometry source and BA behavior.
+  pager_depth:
+    enabled: false
   window:
     size: 4
     stride: 2

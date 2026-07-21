@@ -1,0 +1,30 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_pager_ba_100_pfgs360_refined_anchor_50_50.yaml
+
+# Strict Global-Map-Sim3 counterpart to the PaGeR PointMap treatment. The
+# alignment source is the only algorithmic override; both the incoming chunk
+# and the persistent rendered map originate from aligned PaGeR geometry.
+SphericalSelfiGlobalBackend:
+  rendered_overlap_alignment:
+    mode: two_frame_global_map_full_sim3
+
+WeightsAndBiases:
+  group: ob3d-sponza-global-map-sim3-sphereglue-pager-pfgs360-refined-anchor-50-50
+  run_name: ob3d100_global_map_sim3_sphereglue_pager_pfgs360_refined_anchor_50_50_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - sphereglue-ba
+    - pager-si-depth
+    - fixed-depth-ba
+    - global-map-anchor
+    - full-sim3
+    - pfgs360-dia
+    - refined-anchor-growth
+    - camera50
+    - joint50
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_global_map_sim3_sphereglue_pager_pfgs360_refined_anchor_50_50_r1

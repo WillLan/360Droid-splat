@@ -6425,6 +6425,112 @@ def test_synthetic_window_runtime_emits_unchanged_outputs_and_packet(tmp_path: P
     assert frontend.consume_local_ba_diagnostics() == []
 
 
+def test_synthetic_window_runtime_replaces_head_depth_with_aligned_pager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import frontend.spherical_selfi.runtime as runtime_module
+
+    providers = []
+
+    class FakePaGeRDepthProvider:
+        def __init__(self, config, *, device) -> None:
+            self.config = config
+            self.device = torch.device(device)
+            self.last_raw = None
+            providers.append(self)
+
+        def reset(self) -> None:
+            pass
+
+        def predict(self, images, frame_ids):
+            batch, views, _, height, width = images.shape
+            rows = torch.arange(height, dtype=torch.float32).view(height, 1)
+            cols = torch.arange(width, dtype=torch.float32).view(1, width)
+            raw = 0.5 + rows / max(1, height) + cols / max(1, width)
+            raw = raw.view(1, 1, 1, height, width).repeat(
+                batch, views, 1, 1, 1
+            )
+            self.last_raw = raw.to(self.device)
+            return self.last_raw, {
+                "inference_sec": 0.01,
+                "cache_hits": 0,
+                "cache_misses": int(frame_ids.numel()),
+                "cache_hit_ratio": 0.0,
+                "cache_entries": int(frame_ids.numel()),
+            }
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PaGeRDepthProvider",
+        FakePaGeRDepthProvider,
+    )
+    config = stage2_default_config()
+    config["image"] = {
+        "height": 8,
+        "width": 16,
+        "head_height": 8,
+        "head_width": 16,
+    }
+    config["head"].update({"channels": [8, 12, 16, 24], "mlp_hidden_dim": 12})
+    head = SphericalSelfiGaussianHead(**config["head"], renderer_config=config)
+    checkpoint = tmp_path / "stage2_pager.pt"
+    torch.save(
+        {
+            "format": "spherical_selfi_gaussian_head_v1",
+            "head": head.state_dict(),
+            "adapter_sha256": "synthetic-no-checkpoint",
+            "global_step": 0,
+            "metrics": {},
+            "best_val_psnr": None,
+        },
+        checkpoint,
+    )
+    config["stage2_checkpoint"] = {"path": str(checkpoint)}
+    config["SphericalSelfiRuntime"] = {
+        "enabled": True,
+        "feature_device": "cpu",
+        "head_device": "cpu",
+        "feature_amp": False,
+        "window": {"size": 3, "stride": 2, "verification_size": [4, 8]},
+        "pager_depth": {
+            "enabled": True,
+            "repo_path": "/unused/pager",
+            "min_valid_pixels": 8,
+            "min_valid_ratio": 0.1,
+        },
+        "local_ba": {"enabled": False},
+    }
+    frontend = SphericalSelfiWindowFrontend(config)
+    for frame_id in range(3):
+        frontend.track(PanoFrame(torch.rand(3, 8, 16), float(frame_id), frame_id))
+    outputs = frontend.pop_ready_outputs() + frontend.flush()
+    packets = frontend.consume_local_gaussian_windows()
+    diagnostics = frontend.consume_local_ba_diagnostics()
+
+    assert len(providers) == 1
+    assert len(packets) == 1
+    observation = packets[0].observation
+    scales = torch.tensor(diagnostics[0]["pager_depth"]["scales"]).view(
+        1, 3, 1, 1, 1
+    )
+    expected = providers[0].last_raw * scales
+    torch.testing.assert_close(observation.initial_depth, expected)
+    torch.testing.assert_close(observation.refined_depth, expected)
+    torch.testing.assert_close(
+        observation.depth_residual,
+        torch.zeros_like(observation.depth_residual),
+    )
+    assert packets[0].metadata["pager_depth_enabled"] is True
+    assert diagnostics[0]["pager_depth"]["cache_misses"] == 3
+    by_frame = {int(output.frame_id): output for output in outputs}
+    for index in range(3):
+        torch.testing.assert_close(
+            by_frame[index].inverse_depth,
+            expected[0, index].reciprocal(),
+        )
+
+
 def test_synthetic_window_runtime_adapter_ba_builds_diagnostics(tmp_path: Path) -> None:
     config = stage2_default_config()
     config["image"] = {"height": 8, "width": 16, "head_height": 8, "head_width": 16}

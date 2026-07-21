@@ -1,0 +1,50 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_refined_anchor_50_50.yaml
+
+# Strict depth-source treatment on the current PointMap-Sim3 mainline.
+# PanoVGGT remains the feature, pose, and per-frame scale reference. Its depth
+# is not published after alignment: aligned PaGeR ray depth is the sole dense
+# geometry consumed by the head output, SphereGlue lifting, fixed-depth BA,
+# Refiner, PointMap-Sim3, PFGS360 DIA, and refined-anchor growth.
+SphericalSelfiRuntime:
+  pager_depth:
+    enabled: true
+    repo_path: /mnt/disk1/lanboyang/External/PaGeR
+    checkpoint: /mnt/disk1/lanboyang/External/PaGeR-checkpoints/unified
+    output: scale_invariant
+    micro_batch_size: 1
+    amp_dtype: float16
+    cache_size: 128
+    alignment_mode: per_frame_panovggt_scale
+    min_valid_pixels: 4096
+    min_valid_ratio: 0.05
+    min_scale: 1.0e-3
+    max_scale: 1.0e3
+    apply_head_depth_residual: false
+    failure_policy: error
+  local_ba:
+    depth_parameterization: fixed
+    dense_depth_mode: none
+    defer_dense_depth_affine: false
+    pose_safe_two_stage: false
+
+WeightsAndBiases:
+  group: ob3d-sponza-pointmap-sim3-sphereglue-pager-pfgs360-refined-anchor-50-50
+  run_name: ob3d100_pointmap_sim3_sphereglue_pager_pfgs360_refined_anchor_50_50_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - sphereglue-ba
+    - pager-si-depth
+    - fixed-depth-ba
+    - overlap-pointmap
+    - full-sim3
+    - pfgs360-dia
+    - refined-anchor-growth
+    - camera50
+    - joint50
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_sphereglue_pager_pfgs360_refined_anchor_50_50_r1

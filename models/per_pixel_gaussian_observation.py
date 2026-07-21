@@ -357,6 +357,30 @@ class PerPixelGaussianObservation:
             depth_residual=depth - self.initial_depth.to(device=depth.device, dtype=depth.dtype),
         )
 
+    def with_replaced_depth(self, depth: torch.Tensor) -> "PerPixelGaussianObservation":
+        """Replace the canonical depth source without changing Gaussian attributes.
+
+        This is used by config-gated external depth providers.  Both provenance
+        and refined geometry are reset to the supplied ray depth, so later
+        fixed-depth BA cannot accidentally retain the Gaussian head's learned
+        residual.
+        """
+
+        if tuple(depth.shape) != tuple(self.refined_depth.shape):
+            raise ValueError("Replacement depth must match refined_depth shape.")
+        canonical = depth.to(device=self.refined_depth.device, dtype=self.refined_depth.dtype)
+        finite_valid = torch.isfinite(canonical) & (canonical > 0.0)
+        valid = self.valid_mask & finite_valid
+        confidence = torch.where(valid, self.confidence, torch.zeros_like(self.confidence))
+        return replace(
+            self,
+            initial_depth=canonical,
+            refined_depth=canonical,
+            depth_residual=torch.zeros_like(canonical),
+            confidence=confidence,
+            valid_mask=valid,
+        )
+
     def source_view_confidence(self, density_sh: torch.Tensor | None = None) -> torch.Tensor:
         """Evaluate density SH in each Gaussian's immutable source-ray direction."""
 

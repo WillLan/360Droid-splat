@@ -637,6 +637,18 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "backend/selfi_global_map_root_relative_scale",
         "backend/selfi_global_map_anchor_fallback",
         "backend/selfi_global_map_anchor_fallback_rate",
+        "pager_depth/enabled",
+        "pager_depth/inference_sec",
+        "pager_depth/alignment_sec",
+        "pager_depth/cache_hits",
+        "pager_depth/cache_misses",
+        "pager_depth/cache_hit_ratio",
+        "pager_depth/cache_entries",
+        "pager_depth/scale_mean",
+        "pager_depth/scale_min",
+        "pager_depth/scale_max",
+        "pager_depth/log_mad_mean",
+        "pager_depth/valid_ratio_mean",
     }
 )
 
@@ -4321,6 +4333,12 @@ class PanoDroidGSSlamSystem:
                     )
                     affine_accepted = ba_diagnostic.get("depth_affine_accepted") or []
                     depth_affine_frames = ba_diagnostic.get("depth_affine_frames") or []
+                    pager_diagnostic = diagnostic.get("pager_depth") or {}
+                    pager_scales = finite_sequence(pager_diagnostic.get("scales"))
+                    pager_log_mad = finite_sequence(pager_diagnostic.get("log_mad"))
+                    pager_valid_ratios = finite_sequence(
+                        pager_diagnostic.get("valid_ratios")
+                    )
 
                     record = {
                         "window_id": int(diagnostic["window_id"]),
@@ -4425,6 +4443,33 @@ class PanoDroidGSSlamSystem:
                         "validation_final_median_deg": finite_optional(
                             ba_diagnostic.get("validation_final_median_deg")
                         ),
+                        "pager_depth": {
+                            "enabled": bool(pager_diagnostic.get("enabled", False)),
+                            "scales": pager_scales,
+                            "log_mad": pager_log_mad,
+                            "valid_pixels": [
+                                int(value)
+                                for value in pager_diagnostic.get("valid_pixels", [])
+                                if isinstance(value, (int, float))
+                            ],
+                            "valid_ratios": pager_valid_ratios,
+                            "inference_sec": float(
+                                pager_diagnostic.get("inference_sec", 0.0)
+                            ),
+                            "alignment_sec": float(
+                                pager_diagnostic.get("alignment_sec", 0.0)
+                            ),
+                            "cache_hits": int(pager_diagnostic.get("cache_hits", 0)),
+                            "cache_misses": int(
+                                pager_diagnostic.get("cache_misses", 0)
+                            ),
+                            "cache_hit_ratio": float(
+                                pager_diagnostic.get("cache_hit_ratio", 0.0)
+                            ),
+                            "cache_entries": int(
+                                pager_diagnostic.get("cache_entries", 0)
+                            ),
+                        },
                     }
                     local_ba_window_records.append(record)
                     local_ba_payload = {
@@ -4499,6 +4544,48 @@ class PanoDroidGSSlamSystem:
                         local_ba_payload["local_ba/final_residual_deg"] = float(
                             record["final_median_residual_deg"]
                         )
+                    pager_record = record["pager_depth"]
+                    if pager_record["enabled"]:
+                        scales = pager_record["scales"]
+                        log_mad = pager_record["log_mad"]
+                        valid_ratios = pager_record["valid_ratios"]
+                        local_ba_payload.update(
+                            {
+                                "pager_depth/enabled": 1,
+                                "pager_depth/inference_sec": pager_record[
+                                    "inference_sec"
+                                ],
+                                "pager_depth/alignment_sec": pager_record[
+                                    "alignment_sec"
+                                ],
+                                "pager_depth/cache_hits": pager_record["cache_hits"],
+                                "pager_depth/cache_misses": pager_record[
+                                    "cache_misses"
+                                ],
+                                "pager_depth/cache_hit_ratio": pager_record[
+                                    "cache_hit_ratio"
+                                ],
+                                "pager_depth/cache_entries": pager_record[
+                                    "cache_entries"
+                                ],
+                            }
+                        )
+                        if scales:
+                            local_ba_payload.update(
+                                {
+                                    "pager_depth/scale_mean": float(np.mean(scales)),
+                                    "pager_depth/scale_min": float(np.min(scales)),
+                                    "pager_depth/scale_max": float(np.max(scales)),
+                                }
+                            )
+                        if log_mad:
+                            local_ba_payload["pager_depth/log_mad_mean"] = float(
+                                np.mean(log_mad)
+                            )
+                        if valid_ratios:
+                            local_ba_payload[
+                                "pager_depth/valid_ratio_mean"
+                            ] = float(np.mean(valid_ratios))
                     logger._log_wandb_payload(
                         local_ba_payload,
                         step=max(1, int(logger._step) + 1),

@@ -52,6 +52,11 @@ from .window_packet import (
     LocalGaussianWindowQueue,
     chunk_stride_matches_from_cache,
 )
+from .pager_depth import (
+    PaGeRDepthConfig,
+    PaGeRDepthProvider,
+    align_pager_depth_to_panovggt,
+)
 
 
 def _device(value: str | torch.device) -> torch.device:
@@ -278,6 +283,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             int(image_cfg.get("head_height", image_cfg.get("height", 504))),
             int(image_cfg.get("head_width", image_cfg.get("width", 1008))),
         )
+        self.pager_depth_config = PaGeRDepthConfig.from_mapping(
+            runtime.get("pager_depth")
+        )
+        self.pager_depth_enabled = self.pager_depth_config.enabled
+        self.pager_depth_provider: PaGeRDepthProvider | None = None
         self.wrapper, self.adapter, self.adapter_sha, _ = build_frozen_feature_stack(
             config, device=self.feature_device
         )
@@ -510,6 +520,30 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
             self.local_ba_second.depth_parameterization = "frame_shift"
             self.local_ba_second.dense_depth_mode = "none"
             self.local_ba_second.gauge_mode = "none"
+        if self.pager_depth_enabled and self.local_ba_enabled:
+            if self.local_ba_defer_dense_affine:
+                raise ValueError(
+                    "PaGeR fixed-depth BA requires local_ba.defer_dense_depth_affine=false."
+                )
+            if self.local_ba_requested_dense_depth_mode != "none":
+                raise ValueError(
+                    "PaGeR fixed-depth BA requires local_ba.dense_depth_mode='none'."
+                )
+            if self.local_ba.depth_parameterization != "fixed":
+                raise ValueError(
+                    "PaGeR fixed-depth BA requires "
+                    "local_ba.depth_parameterization='fixed'."
+                )
+            if self.local_ba_pose_safe_two_stage:
+                raise ValueError(
+                    "PaGeR fixed-depth BA is incompatible with pose_safe_two_stage "
+                    "depth-shift publication."
+                )
+        if self.pager_depth_enabled:
+            self.pager_depth_provider = PaGeRDepthProvider(
+                self.pager_depth_config,
+                device=self.head_device,
+            )
         self.frames: list[PanoFrame] = []
         self.frame_buffer_start = 0
         self.next_window_start = 0
@@ -551,6 +585,8 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self._last_keyframe_descriptor = None
         self._last_keyframe_pose = None
         self._last_keyframe_coverage = 0.0
+        if self.pager_depth_provider is not None:
+            self.pager_depth_provider.reset()
 
     def load_checkpoint(self, path: str) -> None:
         load_stage2_checkpoint(
@@ -1099,9 +1135,17 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         if self.head_device.type == "cuda":
             torch.cuda.synchronize(self.head_device)
         ba_sec = float(time.perf_counter() - ba_start)
+        published_depth = result.dense_depth.detach()
+        if self.pager_depth_enabled:
+            if not torch.equal(published_depth, ba_depth):
+                raise RuntimeError(
+                    "PaGeR fixed-depth local BA modified dense depth; refusing to "
+                    "publish a mixed or doubly-scaled geometry state."
+                )
+            published_depth = observation.refined_depth.detach()
         updated = observation.with_geometry(
             poses_c2w=result.poses_c2w.detach(),
-            refined_depth=result.dense_depth.detach(),
+            refined_depth=published_depth,
         )
         return updated, published_cache, result, matching_sec, ba_sec
 
@@ -1385,6 +1429,84 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self._keyframe_decisions[frame] = decision
         return decision
 
+    def _predict_sky_probability(
+        self,
+        captured_feature: torch.Tensor | None,
+        *,
+        views: int,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor | None:
+        if self.sky_adapter is None:
+            return None
+        if captured_feature is None:
+            raise RuntimeError("Sky feature hook did not capture a feature tensor.")
+        sky_output = run_matching_sky_head(
+            self.sky_adapter,
+            captured_feature.to(self.sky_adapter.device),
+        )
+        if "sky_prob" not in sky_output:
+            if self.sky_required:
+                raise RuntimeError("Sky head did not return sky_prob")
+            return None
+        feature_sky = sky_output["sky_prob"]
+        if not torch.is_tensor(feature_sky):
+            raise TypeError("Sky head sky_prob must be a tensor")
+        if int(feature_sky.shape[0]) != int(views):
+            raise ValueError(
+                "Sky head view count does not match the spherical-Selfi window."
+            )
+        return erp_bilinear_resize(
+            feature_sky.to(self.head_device),
+            image_size,
+        ).reshape(1, views, 1, *image_size)
+
+    def _run_pager_depth(
+        self,
+        images: torch.Tensor,
+        frame_ids: torch.Tensor,
+        panovggt_depth: torch.Tensor,
+        sky_prob: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if not self.pager_depth_enabled or self.pager_depth_provider is None:
+            return panovggt_depth, {"enabled": False}
+        raw_depth, provider_diagnostics = self.pager_depth_provider.predict(
+            images,
+            frame_ids,
+        )
+        target_size = tuple(int(value) for value in panovggt_depth.shape[-2:])
+        if tuple(raw_depth.shape[-2:]) != target_size:
+            batch, views = int(raw_depth.shape[0]), int(raw_depth.shape[1])
+            raw_depth = erp_bilinear_resize(
+                raw_depth.reshape(batch * views, 1, *raw_depth.shape[-2:]),
+                target_size,
+            ).reshape(batch, views, 1, *target_size)
+        alignment_start = time.perf_counter()
+        aligned, per_frame = align_pager_depth_to_panovggt(
+            raw_depth.to(self.head_device),
+            panovggt_depth.to(self.head_device),
+            sky_mask=(
+                None
+                if sky_prob is None
+                else sky_prob.to(self.head_device) >= self.sky_threshold
+            ),
+            frame_ids=frame_ids,
+            min_valid_pixels=self.pager_depth_config.min_valid_pixels,
+            min_valid_ratio=self.pager_depth_config.min_valid_ratio,
+            min_scale=self.pager_depth_config.min_scale,
+            max_scale=self.pager_depth_config.max_scale,
+        )
+        alignment_sec = float(time.perf_counter() - alignment_start)
+        return aligned, {
+            "enabled": True,
+            **provider_diagnostics,
+            "alignment_sec": alignment_sec,
+            "scales": [float(value["scale"]) for value in per_frame],
+            "log_mad": [float(value["log_mad"]) for value in per_frame],
+            "valid_pixels": [int(value["valid_pixels"]) for value in per_frame],
+            "valid_ratios": [float(value["valid_ratio"]) for value in per_frame],
+            "per_frame": per_frame,
+        }
+
     def _run_window(self, frames: list[PanoFrame]) -> None:
         images = torch.stack([ensure_chw_image(frame.image).float() for frame in frames], dim=0).unsqueeze(0)
         frame_ids = torch.tensor([[int(frame.frame_id) for frame in frames]], device=self.head_device)
@@ -1415,6 +1537,23 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 dense, rgb, depth, poses = frozen_inputs
             else:
                 dense, rgb, depth, poses = frozen_forward()
+            views = int(depth.shape[1])
+            sky_prob = None
+            pager_depth_diagnostics: dict[str, Any] = {"enabled": False}
+            if self.pager_depth_enabled:
+                # PaGeR alignment excludes the existing learned sky mask, so
+                # only the enabled path moves sky inference ahead of the head.
+                sky_prob = self._predict_sky_probability(
+                    captured_feature,
+                    views=views,
+                    image_size=self.head_size,
+                )
+                depth, pager_depth_diagnostics = self._run_pager_depth(
+                    images,
+                    frame_ids,
+                    depth,
+                    sky_prob,
+                )
             observation = self.head(
                 dense,
                 rgb,
@@ -1423,24 +1562,16 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 frame_ids=frame_ids,
                 flat_batch_chunk_size=(self.head_view_chunk_size or None),
             )
-            sky_prob = None
-            if self.sky_adapter is not None:
-                sky_output = run_matching_sky_head(
-                    self.sky_adapter,
-                    captured_feature.to(self.sky_adapter.device),
+            if self.pager_depth_enabled:
+                observation = observation.with_replaced_depth(depth)
+            else:
+                # Keep the disabled path's original head-before-sky execution
+                # order and data flow.
+                sky_prob = self._predict_sky_probability(
+                    captured_feature,
+                    views=views,
+                    image_size=observation.image_size,
                 )
-                if "sky_prob" not in sky_output:
-                    if self.sky_required:
-                        raise RuntimeError("Sky head did not return sky_prob")
-                else:
-                    feature_sky = sky_output["sky_prob"]
-                    if not torch.is_tensor(feature_sky):
-                        raise TypeError("Sky head sky_prob must be a tensor")
-                    views = int(feature_sky.shape[0])
-                    sky_prob = erp_bilinear_resize(
-                        feature_sky.to(self.head_device),
-                        observation.image_size,
-                    ).reshape(1, views, 1, *observation.image_size)
         initial_poses_c2w = observation.poses_c2w.detach().cpu().float().clone()
         pre_depth_shift_depth = observation.refined_depth.detach().clone()
         ba_valid = None if sky_prob is None else sky_prob < self.sky_threshold
@@ -1507,6 +1638,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "ba_sec": float(ba_sec),
                 "ba_diagnostics": None if ba_result is None else dict(ba_result.diagnostics[0]),
                 "matching_metadata": None if match_cache is None else dict(match_cache.metadata),
+                "pager_depth": pager_depth_diagnostics,
             }
         )
 
@@ -1595,6 +1727,19 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 "dense_depth_shift_applied": depth_shift_applied,
                 "dense_depth_shift_deferred": self.local_ba_defer_dense_affine,
                 "input_anchor_pose_c2w": poses[0, 0].detach().cpu(),
+                "pager_depth_enabled": self.pager_depth_enabled,
+                "pager_depth_scales": tuple(
+                    float(value)
+                    for value in pager_depth_diagnostics.get("scales", ())
+                ),
+                "pager_depth_log_mad": tuple(
+                    float(value)
+                    for value in pager_depth_diagnostics.get("log_mad", ())
+                ),
+                "pager_depth_valid_ratios": tuple(
+                    float(value)
+                    for value in pager_depth_diagnostics.get("valid_ratios", ())
+                ),
                 "fibonacci": dict(self.fibonacci_config),
                 "voxel_anchor_refiner_requested": self.voxel_anchor_enabled,
                 "voxel_anchor_refiner_pending": self.voxel_anchor_enabled,
