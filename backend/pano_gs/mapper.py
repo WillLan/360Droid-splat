@@ -202,6 +202,7 @@ class PanoGaussianMap(nn.Module):
         self._lazy_owner_reference_transforms: dict[int, torch.Tensor] = {}
         self._lazy_owner_current_transforms: dict[int, torch.Tensor] = {}
         self._lazy_sh_rotation_cache: dict[tuple[int, str, str, int], torch.Tensor] = {}
+        self._pfgs360_last_topology_mapping: torch.Tensor | None = None
 
     def _reset_parameters(self) -> None:
         device = self.device_hint
@@ -564,6 +565,319 @@ class PanoGaussianMap(nn.Module):
 
     def anchor_count(self) -> int:
         return int(self.xyz.shape[0])
+
+    @staticmethod
+    def _anchor_metadata_names() -> tuple[str, ...]:
+        return (
+            "_anchor_level",
+            "_anchor_voxel_size",
+            "_anchor_grid_coord",
+            "_anchor_obs_count",
+            "_anchor_conf_accum",
+            "_anchor_birth_frame",
+            "_anchor_last_seen_kf",
+            "_anchor_last_update_kf_ord",
+            "_anchor_source_window_id",
+            "_anchor_source_frame_start",
+            "_anchor_source_frame_end",
+            "_anchor_inlier_obs",
+            "_anchor_outlier_obs",
+            "_anchor_owner_window_id",
+            "_anchor_quality",
+            "_anchor_visibility_count",
+            "_anchor_render_error_ema",
+        )
+
+    @staticmethod
+    def _gaussian_parameter_names() -> tuple[str, ...]:
+        return (
+            "xyz",
+            "features",
+            "sh_rest",
+            "opacity_logit",
+            "scaling",
+            "rotation",
+        )
+
+    def pfgs360_topology_snapshot(self) -> dict[str, object]:
+        return {
+            "parameters": {
+                name: getattr(self, name).detach().cpu().clone()
+                for name in self._gaussian_parameter_names()
+            },
+            "metadata": {
+                name: getattr(self, name).detach().clone()
+                for name in self._anchor_metadata_names()
+            },
+            "lazy": self.lazy_owner_transform_state(),
+        }
+
+    def restore_pfgs360_topology_snapshot(self, state: dict[str, object]) -> None:
+        target_device = self.xyz.device
+        parameters = dict(state["parameters"])
+        for name in self._gaussian_parameter_names():
+            setattr(
+                self,
+                name,
+                nn.Parameter(parameters[name].detach().clone().to(target_device)),
+            )
+        metadata = dict(state["metadata"])
+        for name in self._anchor_metadata_names():
+            setattr(self, name, metadata[name].detach().clone().cpu())
+        lazy = dict(state.get("lazy", {}) or {})
+        self._lazy_owner_transforms_enabled = bool(lazy.get("enabled", False))
+        self._lazy_owner_reference_transforms = {
+            int(owner): value.detach().cpu().float().clone()
+            for owner, value in dict(lazy.get("reference", {}) or {}).items()
+        }
+        self._lazy_owner_current_transforms = {
+            int(owner): value.detach().cpu().float().clone()
+            for owner, value in dict(lazy.get("current", {}) or {}).items()
+        }
+        self._lazy_sh_rotation_cache.clear()
+
+    def _owner_local_from_world(self, xyz: torch.Tensor, owner_window_id: int) -> torch.Tensor:
+        owner = int(owner_window_id)
+        if (
+            not self._lazy_owner_transforms_enabled
+            or owner not in self._lazy_owner_reference_transforms
+            or owner not in self._lazy_owner_current_transforms
+        ):
+            return xyz
+        delta = self._lazy_owner_delta(owner, device=xyz.device, dtype=xyz.dtype)
+        return apply_sim3(sim3_inverse(delta), xyz)
+
+    def _append_anchor_metadata(
+        self,
+        count: int,
+        *,
+        owner_window_id: int,
+        frame_id: int,
+        voxel_size: float,
+        world_grid: torch.Tensor,
+    ) -> None:
+        n = int(count)
+        if n <= 0:
+            return
+        frame = torch.full((n,), int(frame_id), dtype=torch.int32)
+        self._anchor_level = torch.cat([self._anchor_level, torch.zeros(n, dtype=torch.int8)])
+        self._anchor_voxel_size = torch.cat(
+            [self._anchor_voxel_size, torch.full((n,), float(voxel_size), dtype=torch.float32)]
+        )
+        self._anchor_grid_coord = torch.cat(
+            [self._anchor_grid_coord, world_grid.detach().cpu().to(torch.int32)]
+        )
+        self._anchor_obs_count = torch.cat([self._anchor_obs_count, torch.ones(n, dtype=torch.int32)])
+        self._anchor_conf_accum = torch.cat([self._anchor_conf_accum, torch.ones(n)])
+        self._anchor_birth_frame = torch.cat([self._anchor_birth_frame, frame])
+        self._anchor_last_seen_kf = torch.cat([self._anchor_last_seen_kf, frame])
+        self._anchor_last_update_kf_ord = torch.cat([self._anchor_last_update_kf_ord, frame])
+        owner = torch.full((n,), int(owner_window_id), dtype=torch.int32)
+        self._anchor_source_window_id = torch.cat([self._anchor_source_window_id, owner])
+        self._anchor_source_frame_start = torch.cat([self._anchor_source_frame_start, frame])
+        self._anchor_source_frame_end = torch.cat([self._anchor_source_frame_end, frame])
+        self._anchor_inlier_obs = torch.cat([self._anchor_inlier_obs, torch.zeros(n, dtype=torch.int32)])
+        self._anchor_outlier_obs = torch.cat([self._anchor_outlier_obs, torch.zeros(n, dtype=torch.int32)])
+        self._anchor_owner_window_id = torch.cat([self._anchor_owner_window_id, owner])
+        self._anchor_quality = torch.cat([self._anchor_quality, torch.ones(n)])
+        self._anchor_visibility_count = torch.cat([self._anchor_visibility_count, torch.zeros(n, dtype=torch.int32)])
+        self._anchor_render_error_ema = torch.cat([self._anchor_render_error_ema, torch.zeros(n)])
+
+    def append_pfgs360_points(
+        self,
+        world_xyz: torch.Tensor,
+        rgb: torch.Tensor,
+        *,
+        owner_window_id: int,
+        frame_id: int,
+        voxel_size: float = 0.01,
+        initial_opacity: float = 0.01,
+        min_raw_points: int = 10,
+        min_unique_voxels: int = 100,
+    ) -> dict[str, int]:
+        """Official PFGS360 voxel growth with 3DGS parameter initialization."""
+
+        from backend.pano_gs.pfgs360_full import voxel_average_points
+
+        self._pfgs360_last_topology_mapping = None
+
+        xyz = world_xyz.detach().to(device=self.xyz.device, dtype=self.xyz.dtype)
+        color = rgb.detach().to(device=self.xyz.device, dtype=self.xyz.dtype).clamp(0.0, 1.0)
+        valid = torch.isfinite(xyz).all(dim=-1) & torch.isfinite(color).all(dim=-1)
+        xyz, color = xyz[valid], color[valid]
+        raw = int(xyz.shape[0])
+        if raw < int(min_raw_points):
+            return {"raw": raw, "unique": 0, "occupied": 0, "inserted": 0}
+        xyz, color, grid = voxel_average_points(xyz, color, voxel_size=float(voxel_size))
+        unique = int(xyz.shape[0])
+        if unique < int(min_unique_voxels):
+            return {"raw": raw, "unique": unique, "occupied": 0, "inserted": 0}
+
+        occupied_count = 0
+        if self.anchor_count() > 0:
+            old_grid = torch.round(self.get_xyz.detach() / float(voxel_size)).long()
+            old_keys = {tuple(row) for row in old_grid.detach().cpu().tolist()}
+            keep_values = [tuple(row) not in old_keys for row in grid.detach().cpu().tolist()]
+            keep = torch.tensor(keep_values, device=xyz.device, dtype=torch.bool)
+            occupied_count = int((~keep).sum().item())
+            xyz, color, grid = xyz[keep], color[keep], grid[keep]
+        inserted = int(xyz.shape[0])
+        if inserted < int(min_unique_voxels):
+            return {
+                "raw": raw,
+                "unique": unique,
+                "occupied": occupied_count,
+                "inserted": 0,
+            }
+
+        if inserted >= 4:
+            # The official implementation initializes scale from the three
+            # nearest points.  A dense torch.cdist is O(N^2) memory and is not
+            # viable for panoramic growth, so use a single-threaded KD-tree.
+            from scipy.spatial import cKDTree
+
+            points_cpu = xyz.detach().cpu().double().numpy()
+            distances_np, _ = cKDTree(points_cpu).query(points_cpu, k=4, workers=1)
+            scale = torch.from_numpy(distances_np[:, 1:4].mean(axis=1)).to(
+                device=xyz.device, dtype=xyz.dtype
+            ).view(-1, 1)
+        else:
+            scale = torch.full((inserted, 1), float(voxel_size), device=xyz.device, dtype=xyz.dtype)
+        scale = scale.clamp_min(float(voxel_size) * 0.1).expand(-1, 3)
+        quat = torch.randn(inserted, 4, device=xyz.device, dtype=xyz.dtype)
+        quat = F.normalize(quat, dim=-1, eps=1.0e-8)
+        opacity = torch.full(
+            (inserted, 1),
+            float(initial_opacity),
+            device=xyz.device,
+            dtype=xyz.dtype,
+        )
+        owner_local = self._owner_local_from_world(xyz, int(owner_window_id))
+        self.xyz = nn.Parameter(torch.cat([self.xyz.detach(), owner_local], dim=0))
+        self.features = nn.Parameter(
+            torch.cat([self.features.detach(), self._feature_parameter_from_rgb(color)], dim=0)
+        )
+        self.sh_rest = nn.Parameter(
+            torch.cat(
+                [
+                    self.sh_rest.detach(),
+                    torch.zeros(inserted, int(self.sh_rest.shape[1]), 3, device=xyz.device, dtype=xyz.dtype),
+                ],
+                dim=0,
+            )
+        )
+        self.opacity_logit = nn.Parameter(
+            torch.cat([self.opacity_logit.detach(), self._inv_sigmoid(opacity)], dim=0)
+        )
+        self.scaling = nn.Parameter(
+            torch.cat([self.scaling.detach(), self._scale_parameter_from_actual(scale)], dim=0)
+        )
+        self.rotation = nn.Parameter(torch.cat([self.rotation.detach(), quat], dim=0))
+        self._append_anchor_metadata(
+            inserted,
+            owner_window_id=int(owner_window_id),
+            frame_id=int(frame_id),
+            voxel_size=float(voxel_size),
+            world_grid=grid,
+        )
+        old_count = self.anchor_count() - inserted
+        self._pfgs360_last_topology_mapping = torch.cat(
+            [
+                torch.arange(old_count, dtype=torch.long),
+                torch.full((inserted,), -1, dtype=torch.long),
+            ]
+        )
+        return {
+            "raw": raw,
+            "unique": unique,
+            "occupied": occupied_count,
+            "inserted": inserted,
+        }
+
+    def pfgs360_refine_topology(
+        self,
+        mean_absgrad: torch.Tensor,
+        max_radii: torch.Tensor,
+        *,
+        grad_threshold: float = 8.0e-5,
+        split_scale_threshold: float = 0.01,
+        split_samples: int = 2,
+        cull_opacity: float = 0.005,
+        ood_distance: float = 1.0e5,
+    ) -> dict[str, int]:
+        """Conventional PFGS360 split/duplicate/low-opacity refinement."""
+
+        self._pfgs360_last_topology_mapping = None
+        count = self.anchor_count()
+        if count == 0:
+            return {"split": 0, "duplicate": 0, "culled": 0, "after": 0}
+        grad = mean_absgrad.detach().to(self.xyz).view(-1)
+        if int(grad.numel()) != count:
+            raise ValueError("PFGS360 absgrad accumulator is not aligned with map topology")
+        _ = max_radii  # retained for checkpoint/diagnostics parity with official PFGS360
+        actual_scale = self._base_scaling().detach().amax(dim=-1)
+        selected = torch.isfinite(grad) & (grad > float(grad_threshold))
+        split_mask = selected & (actual_scale > float(split_scale_threshold))
+        duplicate_mask = selected & ~split_mask
+        cull_mask = (
+            (self.get_opacity.detach().view(-1) < float(cull_opacity))
+            | ~torch.isfinite(self.xyz.detach()).all(dim=-1)
+            | (torch.linalg.norm(self.get_xyz.detach(), dim=-1) > float(ood_distance))
+        )
+        split_idx = torch.nonzero(split_mask & ~cull_mask, as_tuple=False).flatten()
+        duplicate_idx = torch.nonzero(duplicate_mask & ~cull_mask, as_tuple=False).flatten()
+        keep = ~(cull_mask | split_mask)
+        keep_idx = torch.nonzero(keep, as_tuple=False).flatten()
+        copies: list[torch.Tensor] = []
+        split_parent: torch.Tensor | None = None
+        if int(split_idx.numel()) > 0:
+            split_parent = split_idx.repeat_interleave(max(1, int(split_samples)))
+            copies.append(split_parent)
+        if int(duplicate_idx.numel()) > 0:
+            copies.append(duplicate_idx)
+        copy_idx = (
+            torch.cat(copies, dim=0)
+            if copies
+            else torch.zeros(0, device=self.xyz.device, dtype=torch.long)
+        )
+
+        old_parameters = {
+            name: getattr(self, name).detach() for name in self._gaussian_parameter_names()
+        }
+        for name, old in old_parameters.items():
+            new = old.index_select(0, keep_idx)
+            if int(copy_idx.numel()) > 0:
+                copied = old.index_select(0, copy_idx).clone()
+                if name == "xyz" and split_parent is not None:
+                    split_n = int(split_parent.numel())
+                    parent_scale = self._base_scaling().detach().index_select(0, split_parent)
+                    copied[:split_n] += torch.randn_like(copied[:split_n]) * parent_scale
+                elif name == "scaling" and split_parent is not None:
+                    split_n = int(split_parent.numel())
+                    split_scale = self._base_scaling().detach().index_select(0, split_parent)
+                    split_scale = split_scale / (0.8 * max(1, int(split_samples)))
+                    copied[:split_n] = self._scale_parameter_from_actual(split_scale)
+                new = torch.cat([new, copied], dim=0)
+            setattr(self, name, nn.Parameter(new))
+
+        keep_cpu = keep_idx.detach().cpu()
+        copy_cpu = copy_idx.detach().cpu()
+        for name in self._anchor_metadata_names():
+            old = getattr(self, name)
+            new = old.index_select(0, keep_cpu)
+            if int(copy_cpu.numel()) > 0:
+                new = torch.cat([new, old.index_select(0, copy_cpu).clone()], dim=0)
+            setattr(self, name, new)
+        self._pfgs360_last_topology_mapping = torch.cat(
+            [keep_cpu.long(), copy_cpu.long()], dim=0
+        )
+        return {
+            "split": int(split_idx.numel()),
+            "split_children": int(0 if split_parent is None else split_parent.numel()),
+            "duplicate": int(duplicate_idx.numel()),
+            "culled": int(cull_mask.sum().item()),
+            "after": self.anchor_count(),
+        }
 
     def add_seeds(
         self,
@@ -988,6 +1302,7 @@ class PanoGaussianMap(nn.Module):
         }
 
     def prune_anchors(self, prune_mask: torch.Tensor) -> int:
+        self._pfgs360_last_topology_mapping = None
         if self.anchor_count() == 0:
             return 0
         mask = prune_mask.detach().to(device=self.xyz.device, dtype=torch.bool).view(-1)
@@ -1021,6 +1336,9 @@ class PanoGaussianMap(nn.Module):
         self._anchor_quality = self._anchor_quality[keep_cpu]
         self._anchor_visibility_count = self._anchor_visibility_count[keep_cpu]
         self._anchor_render_error_ema = self._anchor_render_error_ema[keep_cpu]
+        self._pfgs360_last_topology_mapping = torch.nonzero(
+            keep_cpu, as_tuple=False
+        ).flatten().long()
         return n_pruned
 
     def make_optimizer(self, *, lr: float = 2e-3, weight_decay: float = 0.0) -> torch.optim.Optimizer:
@@ -1251,6 +1569,10 @@ class PanoGaussianMap(nn.Module):
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "state_dict": self.state_dict(),
+            "pfgs360_metadata": {
+                name: getattr(self, name).detach().cpu().clone()
+                for name in self._anchor_metadata_names()
+            },
             "anchor_level": self._anchor_level,
             "anchor_voxel_size": self._anchor_voxel_size,
             "anchor_grid_coord": self._anchor_grid_coord,
@@ -1372,6 +1694,8 @@ class PanoGaussianMapper:
         self.observations: dict[int, MapperObservation] = {}
         self.pose_deltas: dict[int, PoseDelta] = {}
         self._spherical_selfi_rollback_state: tuple[dict[str, torch.Tensor], dict[int, torch.Tensor]] | None = None
+        self._pfgs360_joint_steps = 0
+        self._pfgs360_gaussian_moments: dict[str, dict[str, object]] = {}
         self.last_inserted_range: tuple[int, int] = (0, 0)
         self.last_requested_source_flat_idx: torch.Tensor | None = None
         self.last_inserted_source_flat_idx: torch.Tensor | None = None
@@ -2401,6 +2725,38 @@ class PanoGaussianMapper:
         except Exception:
             self._restore_fixed_optimization_state(full_state)
             raise
+
+    def optimize_pfgs360_full_50_50(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        new_frame_ids: list[int] | tuple[int, ...],
+        settings: dict | None = None,
+    ) -> dict[str, float]:
+        from backend.pano_gs.pfgs360_full import PFGS360FullBackend
+
+        cfg = dict(settings or {})
+        engine = PFGS360FullBackend(self, cfg)
+        metrics = engine.run(
+            frame_ids=frame_ids,
+            new_frame_ids=new_frame_ids,
+            owner_window_id=int(window_id),
+            camera_steps=int(cfg.get("camera_steps", 50)),
+            joint_steps=int(cfg.get("joint_steps", 50)),
+            seed=int(cfg.get("seed", 123)) + int(window_id),
+        )
+        self.optimizer = self.map.make_optimizer(
+            lr=float(cfg.get("fallback_lr", 2.0e-3))
+        )
+        self.stats.n_anchors = self.map.anchor_count()
+        self.stats.last_phase = "pfgs360_full_50_50"
+        self.stats.optimization_steps += int(metrics.get("camera_steps", 0.0))
+        self.stats.optimization_steps += int(metrics.get("joint_steps", 0.0))
+        self.stats.last_pose_delta_norm = self._pose_delta_norm(
+            [int(value) for value in frame_ids]
+        )
+        return metrics
 
     def prepare_spherical_selfi_window(self, frame_ids: list[int] | tuple[int, ...]) -> int:
         """Promote registered RGB/depth observations without inserting legacy seeds."""
@@ -3985,6 +4341,19 @@ class PanoGaussianMapper:
                 out.append((int(keyframe.frame_id), pose))
         return out
 
+    def canonical_pose_c2w(self, frame_id: int) -> torch.Tensor | None:
+        pose_delta = self.pose_deltas.get(int(frame_id))
+        return None if pose_delta is None else pose_delta.canonical_pose().cpu()
+
+    def _preserve_pfgs360_pose_residual(self) -> bool:
+        cfg = (
+            self.map.config.get("SphericalSelfiGlobalBackend", {})
+            if isinstance(self.map.config, dict)
+            else {}
+        )
+        optimize = dict(cfg.get("map_optimization", {}) or {})
+        return str(optimize.get("strategy", "")).strip().lower() == "pfgs360_full_50_50"
+
     def apply_frontend_pose_updates(self, updates: dict[int, torch.Tensor]) -> int:
         """Replace registered keyframe pose bases with frontend graph updates."""
 
@@ -4000,7 +4369,10 @@ class PanoGaussianMapper:
             pose_t = pose.detach().to(device=device, dtype=self.map.get_xyz.dtype)
             if tuple(pose_t.shape) != (4, 4) or not torch.isfinite(pose_t).all():
                 continue
-            self.pose_deltas[fid] = PoseDelta(pose_t).to(device=device)
+            if fid in self.pose_deltas and self._preserve_pfgs360_pose_residual():
+                self.pose_deltas[fid].rebase(pose_t, preserve_delta=True)
+            else:
+                self.pose_deltas[fid] = PoseDelta(pose_t).to(device=device)
             observation = self.observations.get(fid)
             if observation is not None:
                 observation.pose_c2w = pose_t.detach().cpu().float()
@@ -4022,6 +4394,7 @@ class PanoGaussianMapper:
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
         staged: dict[int, PoseDelta] = {}
+        staged_rebases: dict[int, torch.Tensor] = {}
         staged_observations: dict[int, torch.Tensor] = {}
         for frame_id, pose in poses_c2w.items():
             fid = int(frame_id)
@@ -4033,7 +4406,10 @@ class PanoGaussianMapper:
                     f"Invalid canonical pose for mapper frame {fid}"
                 )
             if fid in self.pose_deltas or fid in self.observations:
-                staged[fid] = PoseDelta(value).to(device=device)
+                if fid in self.pose_deltas and self._preserve_pfgs360_pose_residual():
+                    staged_rebases[fid] = value
+                else:
+                    staged[fid] = PoseDelta(value).to(device=device)
             if fid in self.observations:
                 staged_observations[fid] = value.detach().cpu().float()
 
@@ -4047,13 +4423,15 @@ class PanoGaussianMapper:
             new_optimizer = self.map.make_optimizer(lr=learning_rate)
         for fid, pose_delta in staged.items():
             self.pose_deltas[fid] = pose_delta
+        for fid, value in staged_rebases.items():
+            self.pose_deltas[fid].rebase(value, preserve_delta=True)
         for fid, pose in staged_observations.items():
             observation = self.observations[fid]
             observation.pose_c2w = pose
             observation.pose_revision = int(revision)
         if new_optimizer is not None:
             self.optimizer = new_optimizer
-        return len(staged)
+        return len(staged) + len(staged_rebases)
 
     def set_spherical_selfi_observation_geometry(
         self,
@@ -4139,6 +4517,7 @@ class PanoGaussianMapper:
         device = self.map.get_xyz.device
         dtype = self.map.get_xyz.dtype
         staged_poses: dict[int, PoseDelta] = {}
+        staged_rebases: dict[int, torch.Tensor] = {}
         staged_observations: dict[
             int, tuple[float, int | None, torch.Tensor | None]
         ] = {}
@@ -4156,7 +4535,10 @@ class PanoGaussianMapper:
                     f"Invalid complete-snapshot pose for frame {fid}"
                 )
             if fid in self.observations or fid in self.pose_deltas:
-                staged_poses[fid] = PoseDelta(pose).to(device=device)
+                if fid in self.pose_deltas and self._preserve_pfgs360_pose_residual():
+                    staged_rebases[fid] = pose
+                else:
+                    staged_poses[fid] = PoseDelta(pose).to(device=device)
 
             observation = self.observations.get(fid)
             if observation is None:
@@ -4217,6 +4599,8 @@ class PanoGaussianMapper:
 
         for fid, pose_delta in staged_poses.items():
             self.pose_deltas[fid] = pose_delta
+        for fid, pose in staged_rebases.items():
+            self.pose_deltas[fid].rebase(pose, preserve_delta=True)
         for fid, (scale, owner, target_depth) in staged_observations.items():
             observation = self.observations[fid]
             observation.pose_c2w = staged_observation_poses[fid]
@@ -4233,7 +4617,7 @@ class PanoGaussianMapper:
                 keyframe.target_depth = staged_keyframe_depths[fid]
         if new_optimizer is not None:
             self.optimizer = new_optimizer
-        return len(staged_poses)
+        return len(staged_poses) + len(staged_rebases)
 
     def snapshot_frontend_geometry_state(self) -> dict[str, object]:
         """Capture mapper-owned trajectory/depth state for a cross-layer transaction."""

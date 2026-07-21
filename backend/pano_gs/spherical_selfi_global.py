@@ -967,20 +967,34 @@ class SphericalSelfiGlobalBackend:
             "legacy",
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
+            "pfgs360_full_50_50",
         }:
             raise ValueError(
                 "map_optimization.strategy must be 'legacy', "
-                "'gaussian_only_staged', or 'gaussian_only_joint_3dgs'"
+                "'gaussian_only_staged', 'gaussian_only_joint_3dgs', "
+                "or 'pfgs360_full_50_50'"
             )
         if (
-            self.map_optimization_strategy == "gaussian_only_joint_3dgs"
+            self.map_optimization_strategy in {
+                "gaussian_only_joint_3dgs",
+                "pfgs360_full_50_50",
+            }
             and getattr(self.map, "gaussian_parameterization", "legacy")
             != "traditional_3dgs"
         ):
             raise ValueError(
-                "gaussian_only_joint_3dgs requires "
+                f"{self.map_optimization_strategy} requires "
                 "MapRepresentation.gaussian_parameterization=traditional_3dgs"
             )
+        if self.map_optimization_strategy == "pfgs360_full_50_50":
+            if not self.two_frame_pointmap_full_sim3_enabled:
+                raise ValueError(
+                    "pfgs360_full_50_50 is restricted to the PointMap-Sim3 mainline"
+                )
+            if self.insertion_depth_gate_enabled or self.error_gaussian_prune_enabled:
+                raise ValueError(
+                    "pfgs360_full_50_50 must bypass the legacy depth gate and persistent prune"
+                )
         self.map_steps_on_loop = max(
             0,
             int(optimize_cfg.get("extra_steps_on_loop", optimize_cfg.get("steps_on_loop", 0))),
@@ -1001,7 +1015,10 @@ class SphericalSelfiGlobalBackend:
             raise ValueError(
                 "map_optimization.lazy_submap_transforms requires hierarchical_submaps.enabled"
             )
-        if self.voxel_anchor_refiner_enabled:
+        if (
+            self.voxel_anchor_refiner_enabled
+            and self.map_optimization_strategy != "pfgs360_full_50_50"
+        ):
             if not self.boundary_frame_graph:
                 raise ValueError(
                     "VoxelAnchorRefiner requires global_graph.node_mode=boundary_frame"
@@ -8116,6 +8133,8 @@ class SphericalSelfiGlobalBackend:
                         depth_confidence=(
                             live_packet.observation.confidence[0, frame_index]
                             * live_packet.finite_gaussian_mask[0, frame_index].float()
+                            * live_packet.static_mask[0, frame_index].float()
+                            * live_packet.geometry_consistency[0, frame_index].float()
                         ),
                         sky_mask=live_packet.sky_mask[0, frame_index],
                     )
@@ -8132,6 +8151,56 @@ class SphericalSelfiGlobalBackend:
             active_owner_window_ids = self._map_optimization_window_ids(
                 int(window_id)
             )
+            if self.map_optimization_strategy == "pfgs360_full_50_50":
+                visited_frame_ids = tuple(sorted(int(value) for value in self.mapper.observations))
+                new_frame_ids = tuple(
+                    int(frame_id)
+                    for frame_id in live_packet.frame_ids
+                    if int(self.frame_owner_window.get(int(frame_id), window_id))
+                    == int(window_id)
+                ) if live_packet is not None else tuple(frame_ids)
+                metrics = self.mapper.optimize_pfgs360_full_50_50(
+                    window_id=int(window_id),
+                    frame_ids=visited_frame_ids,
+                    new_frame_ids=new_frame_ids,
+                    settings={
+                        **dict(self.map_optimize_config.get("pfgs360", {}) or {}),
+                        "camera_steps": int(
+                            self.map_optimize_config.get("camera_steps", 50)
+                        ),
+                        "joint_steps": int(
+                            self.map_optimize_config.get("joint_steps", 50)
+                        ),
+                        "seed": int(self.map_optimize_config.get("seed", 123)),
+                        "pose_lr": float(
+                            self.map_optimize_config.get("pose_lr", 1.0e-3)
+                        ),
+                        "joint_pose_lr": float(
+                            self.map_optimize_config.get("joint_pose_lr", 1.0e-3)
+                        ),
+                        "pose_grad_clip_value": float(
+                            self.map_optimize_config.get("pose_grad_clip_value", 1.0e-2)
+                        ),
+                        "adam_eps": float(
+                            self.map_optimize_config.get("adam_eps", 1.0e-15)
+                        ),
+                        "xyz_lr": float(self.map_optimize_config.get("xyz_lr", 1.6e-4)),
+                        "features_lr": float(self.map_optimize_config.get("feature_lr", 2.5e-3)),
+                        "sh_rest_lr": float(self.map_optimize_config.get("sh_rest_lr", 1.25e-4)),
+                        "opacity_logit_lr": float(self.map_optimize_config.get("opacity_lr", 5.0e-2)),
+                        "scaling_lr": float(self.map_optimize_config.get("scaling_lr", 5.0e-3)),
+                        "rotation_lr": float(self.map_optimize_config.get("rotation_lr", 1.0e-3)),
+                        "latter_half_sample_probability": float(
+                            self.map_optimize_config.get(
+                                "latter_half_sample_probability", 0.7
+                            )
+                        ),
+                    },
+                )
+                metrics["optimized_frame_count"] = float(len(visited_frame_ids))
+                metrics["new_frame_count"] = float(len(new_frame_ids))
+                metrics["pose_to_graph_sync_disabled"] = 1.0
+                return metrics
             if self.map_optimization_strategy == "gaussian_only_staged":
                 recent_frame_ids = self._map_optimization_frame_ids(
                     int(window_id)
@@ -8430,6 +8499,12 @@ class SphericalSelfiGlobalBackend:
                     seam_owners
                 )
                 if deduplicated > 0 and self.mapper is not None:
+                    if self.map_optimization_strategy == "pfgs360_full_50_50":
+                        # External seam compaction does not expose a row
+                        # mapping.  Drop only Adam moments; map parameters and
+                        # PFGS schedule remain intact and the next JOINT stage
+                        # recreates correctly shaped state.
+                        self.mapper._pfgs360_gaussian_moments = {}
                     self.mapper.optimizer = self.map.make_optimizer(
                         lr=float(
                             self.config.get("map_optimization", {}).get(
@@ -9028,6 +9103,7 @@ class SphericalSelfiGlobalBackend:
         ):
             mapper_observations = getattr(self.mapper, "observations", {})
             refined_pose = getattr(self.mapper, "refined_pose_c2w", None)
+            canonical_pose = getattr(self.mapper, "canonical_pose_c2w", None)
             for frame_id, expected in candidate.frame_global_poses.items():
                 observation = mapper_observations.get(int(frame_id))
                 refined = (
@@ -9039,7 +9115,17 @@ class SphericalSelfiGlobalBackend:
                     continue
                 mapper_pose_count += 1
                 if refined is not None:
-                    mapper_errors.append(matrix_error(refined, expected))
+                    if (
+                        self.map_optimization_strategy == "pfgs360_full_50_50"
+                        and callable(canonical_pose)
+                    ):
+                        canonical = canonical_pose(int(frame_id))
+                        if canonical is not None:
+                            mapper_errors.append(matrix_error(canonical, expected))
+                        if not bool(torch.isfinite(refined).all()):
+                            non_finite_count += 1
+                    else:
+                        mapper_errors.append(matrix_error(refined, expected))
                 if observation is not None:
                     mapper_errors.append(
                         matrix_error(observation.pose_c2w, expected)
@@ -10042,7 +10128,32 @@ class SphericalSelfiGlobalBackend:
         refiner_pending = bool(
             packet.metadata.get("voxel_anchor_refiner_pending", False)
         )
-        if refined_packet:
+        if self.map_optimization_strategy == "pfgs360_full_50_50":
+            # Strict PFGS360 owns map initialization, DIA removal/reset and
+            # voxel growth.  Refiner anchors remain available to frontend and
+            # PointMap-Sim3, but never enter Stage2 fusion on this path.
+            if hasattr(self.map, "set_lazy_owner_transform"):
+                self.map.set_lazy_owner_transform(
+                    int(window_id),
+                    window_transform,
+                    set_reference=(
+                        int(window_id)
+                        not in getattr(
+                            self.map,
+                            "_lazy_owner_reference_transforms",
+                            {},
+                        )
+                    ),
+                )
+            fusion_stats = {
+                "pfgs360_strict_fusion_bypass": 1,
+                "legacy_prepare_calls": 0,
+                "legacy_depth_gate_calls": 0,
+                "legacy_hash_calls": 0,
+                "legacy_commit_calls": 0,
+                "chunk_anchor_delta": 0,
+            }
+        elif refined_packet:
             # Keep the frontend-owned packet immutable even for the first
             # chunk or for failures after alignment has succeeded.
             packet = self._rescaled_packet_copy(packet, 1.0)
@@ -12214,6 +12325,7 @@ class SphericalSelfiGlobalBackend:
         if self.map_optimization_strategy in {
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
+            "pfgs360_full_50_50",
         }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(
@@ -12507,12 +12619,27 @@ class SphericalSelfiGlobalBackend:
         for frame_id in packet.frame_ids:
             self.frame_windows.setdefault(int(frame_id), set()).add(int(window_id))
             self.frame_depth_owner_window.setdefault(int(frame_id), int(window_id))
-        fusion_stats = self.fusion.fuse_packet(packet, self.graph.transform(window_id))
+        if self.map_optimization_strategy == "pfgs360_full_50_50":
+            transform = self.graph.transform(window_id)
+            if hasattr(self.map, "set_lazy_owner_transform"):
+                self.map.set_lazy_owner_transform(
+                    int(window_id), transform, set_reference=True
+                )
+            fusion_stats = {
+                "pfgs360_strict_fusion_bypass": 1,
+                "legacy_commit_calls": 0,
+                "chunk_anchor_delta": 0,
+            }
+        else:
+            fusion_stats = self.fusion.fuse_packet(
+                packet, self.graph.transform(window_id)
+            )
         self.loop_detector.add(compact_packet)
         self._refresh_pose_updates()
         if self.map_optimization_strategy in {
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
+            "pfgs360_full_50_50",
         }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(

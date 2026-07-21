@@ -44,6 +44,30 @@ class PoseDelta(nn.Module):
     def forward(self) -> torch.Tensor:
         return se3_exp(self.delta) @ self.base_c2w
 
+    def rebase(
+        self,
+        base_c2w: torch.Tensor,
+        *,
+        preserve_delta: bool = True,
+    ) -> None:
+        """Move the canonical graph base without leaking pose residuals into it.
+
+        PointMap-Sim3 owns the canonical pose while PFGS360 optimizes a local
+        photometric SE(3) residual.  A graph correction therefore updates only
+        ``base_c2w``; the learned residual remains attached to the frame.
+        """
+
+        base = canonicalize_c2w(
+            ensure_homogeneous(base_c2w.detach().clone().to(self.base_c2w))
+        )
+        with torch.no_grad():
+            self.base_c2w.copy_(base)
+            if not preserve_delta:
+                self.delta.zero_()
+
+    def canonical_pose(self) -> torch.Tensor:
+        return self.base_c2w.detach().clone()
+
     def state(self) -> PoseRefinementState:
         refined = self.forward()
         return PoseRefinementState(

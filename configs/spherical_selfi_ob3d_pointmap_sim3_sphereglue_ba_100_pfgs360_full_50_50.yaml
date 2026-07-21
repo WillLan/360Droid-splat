@@ -1,0 +1,93 @@
+base_config: spherical_selfi_ob3d_pointmap_sim3_sphereglue_ba_100_pfgs360_freeze.yaml
+
+# Strict PFGS360 backend ablation.  PointMap-Sim3, SphereGlue local BA,
+# frontend/refiner, global graph and loop closure are inherited unchanged.
+SphericalSelfiGlobalBackend:
+  insertion_dedup:
+    enabled: false
+  insertion_depth_gate:
+    enabled: false
+  error_gaussian_prune:
+    enabled: false
+  map_optimization:
+    strategy: pfgs360_full_50_50
+    steps_per_window: 100
+    camera_steps: 50
+    joint_steps: 50
+    sample_observations_per_step: 1
+    optimize_all_gaussians: true
+    fixed_first_frame: true
+    pose_refine_enable: true
+    pose_lr: 1.0e-3
+    joint_pose_lr: 1.0e-3
+    pose_grad_clip_value: 1.0e-2
+    xyz_lr: 1.6e-4
+    feature_lr: 2.5e-3
+    sh_rest_lr: 1.25e-4
+    opacity_lr: 5.0e-2
+    scaling_lr: 5.0e-3
+    rotation_lr: 1.0e-3
+    adam_eps: 1.0e-15
+    rgb_l1_weight: 0.8
+    dssim_weight: 0.2
+    latter_half_sample_probability: 0.7
+    pfgs360:
+      spherical_balance_sine: 0.8
+      spherical_balance_floor: 0.2
+      tangent_threshold: 0.008
+      depth_relative_threshold: 0.05
+      blur_threshold: 0.5
+      min_depth: 0.1
+      max_depth: 50.0
+      min_depth_confidence: 0.05
+      gncc_radius: 2
+      align_depth: true
+      patch_filter: true
+      filter_sky: true
+      densify_views: 0
+      voxel_size: 0.01
+      initial_opacity: 0.01
+      query_responsibility_threshold: 0.8
+      min_reset_gaussians: 100
+      min_delete_gaussians: 100
+      min_raw_growth_points: 10
+      min_unique_growth_voxels: 100
+      refine_every_joint_steps: 100
+      absgrad_threshold: 8.0e-5
+      split_scale_threshold: 0.01
+      split_samples: 2
+      cull_opacity: 0.005
+      ood_distance: 1.0e5
+      scale_ratio_threshold: 10.0
+      phys_ratio_weight: 0.1
+      phys_ratio_every: 10
+      distortion_weight: 0.01
+      opacity_regularizer_weight: 0.01
+      scale_regularizer_weight: 0.01
+
+Training:
+  pfgs360_absgrad: true
+  pfgs360_distloss: true
+
+BackendFeedback:
+  enabled: false
+
+WeightsAndBiases:
+  group: ob3d-sponza-pointmap-sim3-sphereglue-pfgs360-full-50-50
+  run_name: ob3d100_pointmap_sim3_sphereglue_pfgs360_full_50_50_r1
+  tags:
+    - spherical-selfi
+    - ob3d
+    - sponza
+    - non-egocentric
+    - sphereglue-ba
+    - overlap-pointmap
+    - full-sim3
+    - pfgs360-full
+    - camera50
+    - joint50
+    - formal100
+
+Results:
+  save_dir: outputs/ob3d100_pointmap_sim3_sphereglue_pfgs360_full_50_50_r1
+  save_final_checkpoint: true
