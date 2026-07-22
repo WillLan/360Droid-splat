@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 legacy360gs = ["opencv-python", "scipy", "plyfile", "pandas", "munch"]
+formal-eval = ["torchmetrics", "pytorch-msssim"]
 
 [tool.setuptools.packages.find]
 include = ["frontend*", "mapping*", "backend*", "system*", "geometry*", "models*", "losses*", "data*"]

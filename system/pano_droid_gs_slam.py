@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from geometry.pose import relative_c2w
 from geometry.trajectory_metrics import (
     c2w_trajectory_metrics,
     pfgs360_normalized_trajectory_alignment,
+    sim3_align_c2w_trajectory,
 )
 from mapping.gaussian_initializer import GaussianInitializer, GaussianSeedBatch
 
@@ -2856,6 +2858,8 @@ class PanoDroidGSSlamSystem:
         return len(updates)
 
     def run(self, *, max_frames: int | None = None) -> dict:
+        run_started_unix = time.time()
+        run_started_perf = time.perf_counter()
         if self._delegate is not None:
             return self._delegate.run(max_frames=max_frames)
         self.frontend.initialize({"config": self.config})
@@ -2863,6 +2867,11 @@ class PanoDroidGSSlamSystem:
         output_dir = Path(results_cfg.get("save_dir", "outputs/pano_droid_gs_slam"))
         output_dir.mkdir(parents=True, exist_ok=True)
         logger = SlamRuntimeLogger(self.config, output_dir)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except RuntimeError:
+                pass
         refine_steps = int(self.config.get("Mapping", {}).get("refine_steps_per_keyframe", 0))
         mapping_cfg = self.config.get("Mapping", {})
         novel_cfg = mapping_cfg.get("NovelGaussianInsertion", {}) if isinstance(mapping_cfg, dict) else {}
@@ -5130,16 +5139,61 @@ class PanoDroidGSSlamSystem:
                 return None
             root = output_dir / "final_all_frames"
             panel_dir = root / "render_vs_gt"
+            render_dir = root / "render_rgb"
+            trajectory_dir = root / "trajectory"
             panel_dir.mkdir(parents=True, exist_ok=True)
+            render_dir.mkdir(parents=True, exist_ok=True)
+            trajectory_dir.mkdir(parents=True, exist_ok=True)
+            image_metric_mode = str(
+                results_cfg.get("final_image_metrics", "psnr_only") or "psnr_only"
+            ).strip().lower()
+            if image_metric_mode not in {"psnr_only", "pfgs360_official"}:
+                raise ValueError(
+                    "Results.final_image_metrics must be 'psnr_only' or "
+                    "'pfgs360_official'."
+                )
+            official_image_metrics = image_metric_mode == "pfgs360_official"
+            lpips_metric = None
+            ssim_function = None
+            metric_device = (
+                self.map.get_xyz.device
+                if self.map.anchor_count() > 0
+                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            if official_image_metrics:
+                try:
+                    from pytorch_msssim import ssim as pfgs360_ssim
+                    from torchmetrics.image.lpip import (
+                        LearnedPerceptualImagePatchSimilarity,
+                    )
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "PFGS360 final image metrics require pytorch-msssim and "
+                        "torchmetrics with LPIPS support."
+                    ) from exc
+                ssim_function = pfgs360_ssim
+                lpips_metric = LearnedPerceptualImagePatchSimilarity(
+                    net_type="alex",
+                    normalize=True,
+                ).eval().to(metric_device)
             records = final_frame_records
             if not records:
-                metrics = {"render_count": 0, "mean_psnr": None, "ate_rmse": None, "ate_count": 0}
+                metrics = {
+                    "render_count": 0,
+                    "mean_psnr": None,
+                    "mean_ssim": None,
+                    "mean_lpips": None,
+                    "ate_rmse": None,
+                    "ate_count": 0,
+                }
                 with open(root / "metrics.json", "w", encoding="utf-8") as f:
                     json.dump(metrics, f, indent=2)
                 return {"root": str(root), "metrics": metrics}
 
             per_frame: list[dict] = []
             psnrs: list[float] = []
+            ssims: list[float] = []
+            lpips_values: list[float] = []
             pred_xyz: list[np.ndarray] = []
             gt_xyz: list[np.ndarray] = []
             trajectory_frame_ids: list[int] = []
@@ -5176,32 +5230,80 @@ class PanoDroidGSSlamSystem:
                     continue
                 if pkg is None or not torch.is_tensor(pkg.get("render")):
                     continue
-                render = pkg["render"].detach().cpu().float().clamp(0.0, 1.0)
-                target = image.detach().cpu().float().clamp(0.0, 1.0)
-                if tuple(render.shape[-2:]) != tuple(target.shape[-2:]):
-                    render = F.interpolate(
-                        render.unsqueeze(0),
-                        size=tuple(int(v) for v in target.shape[-2:]),
+                render_metric = pkg["render"].detach().to(
+                    device=metric_device,
+                    dtype=torch.float32,
+                ).clamp(0.0, 1.0)
+                target_metric = image.detach().to(
+                    device=metric_device,
+                    dtype=torch.float32,
+                ).clamp(0.0, 1.0)
+                if tuple(render_metric.shape[-2:]) != tuple(target_metric.shape[-2:]):
+                    render_metric = F.interpolate(
+                        render_metric.unsqueeze(0),
+                        size=tuple(int(v) for v in target_metric.shape[-2:]),
                         mode="bilinear",
                         align_corners=False,
                     )[0]
-                mse = torch.mean((render - target).square()).clamp_min(1.0e-12)
+                mse = torch.mean(
+                    (render_metric - target_metric).square()
+                ).clamp_min(1.0e-12)
                 psnr = float((-10.0 * torch.log10(mse)).item())
                 psnrs.append(psnr)
+                ssim_value = None
+                lpips_value = None
+                if official_image_metrics:
+                    assert ssim_function is not None and lpips_metric is not None
+                    with torch.no_grad():
+                        ssim_value = float(
+                            ssim_function(
+                                render_metric.unsqueeze(0),
+                                target_metric.unsqueeze(0),
+                                data_range=1.0,
+                                size_average=True,
+                            ).item()
+                        )
+                        lpips_value = float(
+                            lpips_metric(
+                                render_metric.unsqueeze(0),
+                                target_metric.unsqueeze(0),
+                            ).item()
+                        )
+                    ssims.append(ssim_value)
+                    lpips_values.append(lpips_value)
+
+                render = render_metric.detach().cpu()
+                target = target_metric.detach().cpu()
 
                 target_img = _image_tensor_to_pil(target)
                 render_img = _image_tensor_to_pil(render)
+                render_path = render_dir / f"frame_{int(frame_id):06d}.png"
+                render_img.save(render_path)
                 w, h = target_img.size
                 canvas = Image.new("RGB", (2 * w, h + 26), "white")
                 canvas.paste(target_img, (0, 26))
                 canvas.paste(render_img, (w, 26))
                 draw = ImageDraw.Draw(canvas)
                 draw.text((8, 6), "target panorama", fill=(0, 0, 0))
-                draw.text((w + 8, 6), f"final render PSNR={psnr:.2f}dB", fill=(0, 0, 0))
+                metric_label = f"PSNR={psnr:.2f}dB"
+                if ssim_value is not None and lpips_value is not None:
+                    metric_label += (
+                        f" SSIM={ssim_value:.4f} LPIPS={lpips_value:.4f}"
+                    )
+                draw.text((w + 8, 6), metric_label, fill=(0, 0, 0))
                 canvas = _resize_to_max_width(canvas, int(results_cfg.get("final_all_frames_max_width", 1600)))
                 panel_path = panel_dir / f"frame_{int(frame_id):06d}.png"
                 canvas.save(panel_path)
-                per_frame.append({"frame_id": int(frame_id), "psnr": psnr, "render_vs_gt": str(panel_path)})
+                per_frame.append(
+                    {
+                        "frame_id": int(frame_id),
+                        "psnr": psnr,
+                        "ssim": ssim_value,
+                        "lpips": lpips_value,
+                        "render_rgb": str(render_path),
+                        "render_vs_gt": str(panel_path),
+                    }
+                )
 
             ate_metrics: dict[str, float] = {}
             if len(pred_xyz) >= 1 and len(pred_xyz) == len(gt_xyz):
@@ -5210,13 +5312,26 @@ class PanoDroidGSSlamSystem:
                     np.asarray(gt_xyz, dtype=np.float32),
                 )
             trajectory_metrics: dict[str, float] = {}
+            aligned_predicted_poses: torch.Tensor | None = None
+            alignment_payload: dict[str, object] | None = None
             if len(predicted_poses) >= 2:
+                predicted_stack = torch.stack(predicted_poses, dim=0)
+                target_stack = torch.stack(target_poses, dim=0)
                 trajectory_metrics = c2w_trajectory_metrics(
-                    torch.stack(predicted_poses, dim=0),
-                    torch.stack(target_poses, dim=0),
+                    predicted_stack,
+                    target_stack,
                     include_pfgs360=logger.trajectory_ate_mode
                     in {"pfgs360_official", "both"},
                 )
+                aligned_predicted_poses, alignment = sim3_align_c2w_trajectory(
+                    predicted_stack,
+                    target_stack,
+                )
+                alignment_payload = {
+                    "scale": float(alignment["scale"].detach().cpu()),
+                    "rotation": alignment["rotation"].detach().cpu().tolist(),
+                    "translation": alignment["translation"].detach().cpu().tolist(),
+                }
             trajectory_payload = {
                 "pose_convention": "c2w",
                 "frame_ids": trajectory_frame_ids,
@@ -5227,12 +5342,53 @@ class PanoDroidGSSlamSystem:
             trajectory_path = root / "trajectory.json"
             with open(trajectory_path, "w", encoding="utf-8") as f:
                 json.dump(trajectory_payload, f, indent=2)
+            pose_exports = (
+                ("predicted_c2w.json", predicted_poses),
+                ("gt_c2w.json", target_poses),
+            )
+            for filename, poses in pose_exports:
+                with open(trajectory_dir / filename, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "pose_convention": "c2w",
+                            "frame_ids": trajectory_frame_ids,
+                            "poses": [pose.tolist() for pose in poses],
+                        },
+                        f,
+                        indent=2,
+                    )
+            if aligned_predicted_poses is not None:
+                with open(
+                    trajectory_dir / "sim3_aligned_predicted_c2w.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(
+                        {
+                            "pose_convention": "c2w",
+                            "frame_ids": trajectory_frame_ids,
+                            "poses": aligned_predicted_poses.detach().cpu().tolist(),
+                            "alignment": alignment_payload,
+                        },
+                        f,
+                        indent=2,
+                    )
+            with open(
+                trajectory_dir / "metrics.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(trajectory_metrics, f, indent=2)
             final_trajectory_png = logger.log_final_slam_trajectory(
                 sorted(pose_by_frame.items()),
                 trajectory_metrics=trajectory_metrics,
                 fallback_ate_rmse=ate_metrics.get("rmse"),
                 step=max(1, int(logger._step) + 1),
             )
+            trajectory_png = None
+            if final_trajectory_png is not None:
+                trajectory_png = trajectory_dir / "trajectory_sim3.png"
+                shutil.copy2(final_trajectory_png, trajectory_png)
             primary_ate_rmse = (
                 trajectory_metrics.get("pfgs360_ate")
                 if logger.trajectory_ate_mode == "pfgs360_official"
@@ -5240,7 +5396,12 @@ class PanoDroidGSSlamSystem:
             )
             metrics = {
                 "render_count": int(len(per_frame)),
+                "image_metric_protocol": image_metric_mode,
                 "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
+                "mean_ssim": float(np.mean(ssims)) if ssims else None,
+                "mean_lpips": (
+                    float(np.mean(lpips_values)) if lpips_values else None
+                ),
                 "ate_rmse": primary_ate_rmse,
                 "ate_count": int(len(pred_xyz)),
                 **trajectory_metrics,
@@ -5251,10 +5412,31 @@ class PanoDroidGSSlamSystem:
                 "metrics": metrics,
                 "frames": per_frame,
                 "trajectory": str(trajectory_path),
-                "trajectory_png": final_trajectory_png,
+                "trajectory_dir": str(trajectory_dir),
+                "trajectory_png": (
+                    str(trajectory_png) if trajectory_png is not None else None
+                ),
             }
             with open(root / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
+            with open(
+                root / "render_metrics.csv",
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=("frame_id", "psnr", "ssim", "lpips"),
+                )
+                writer.writeheader()
+                writer.writerows(
+                    {
+                        key: record.get(key)
+                        for key in writer.fieldnames
+                    }
+                    for record in per_frame
+                )
             logger._log_wandb_payload(
                 {
                     f"final_pose/{key}": value
@@ -5426,7 +5608,43 @@ class PanoDroidGSSlamSystem:
                 self.mapper.refined_keyframe_poses(),
                 step=frame_count,
             )
+            final_evaluation_started = time.perf_counter()
             final_artifacts = save_final_artifacts()
+            final_evaluation_sec = float(
+                time.perf_counter() - final_evaluation_started
+            )
+            runtime_total_wall_sec = float(
+                time.perf_counter() - run_started_perf
+            )
+            runtime_finished_unix = time.time()
+            peak_gpu_memory_bytes = None
+            if torch.cuda.is_available():
+                try:
+                    peak_gpu_memory_bytes = int(torch.cuda.max_memory_allocated())
+                except RuntimeError:
+                    peak_gpu_memory_bytes = None
+            runtime_payload = {
+                "started_unix": float(run_started_unix),
+                "finished_unix": float(runtime_finished_unix),
+                "total_wall_sec": runtime_total_wall_sec,
+                "frames": int(frame_count),
+                "seconds_per_frame": (
+                    runtime_total_wall_sec / frame_count if frame_count > 0 else None
+                ),
+                "fps": (
+                    frame_count / runtime_total_wall_sec
+                    if runtime_total_wall_sec > 0.0
+                    else None
+                ),
+                "final_evaluation_sec": final_evaluation_sec,
+                "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+                "runtime_profile": (
+                    str(profile_path) if profile_path is not None else None
+                ),
+            }
+            runtime_path = output_dir / "runtime.json"
+            with open(runtime_path, "w", encoding="utf-8") as f:
+                json.dump(runtime_payload, f, indent=2)
             final_all_frames = final_artifacts.get("final_all_frames")
             final_all_metrics = (
                 final_all_frames.get("metrics")
@@ -5523,9 +5741,21 @@ class PanoDroidGSSlamSystem:
                 "final_all_frames_trajectory_metrics": {
                     key: value
                     for key, value in final_all_metrics.items()
-                    if key not in {"render_count", "mean_psnr", "ate_count"}
+                    if key
+                    not in {
+                        "render_count",
+                        "image_metric_protocol",
+                        "mean_psnr",
+                        "mean_ssim",
+                        "mean_lpips",
+                        "ate_count",
+                    }
                 },
                 "final_all_frames_mean_psnr": final_all_metrics.get("mean_psnr"),
+                "final_all_frames_mean_ssim": final_all_metrics.get("mean_ssim"),
+                "final_all_frames_mean_lpips": final_all_metrics.get("mean_lpips"),
+                "runtime": runtime_payload,
+                "runtime_path": str(runtime_path),
                 "backend_final_trajectory_png": final_backend_traj,
                 "artifacts": final_artifacts,
                 "dense_ba": dense_ba_summary,

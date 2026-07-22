@@ -1,0 +1,56 @@
+base_config: ../spherical_selfi_ob3d_global_map_sim3_sphereglue_pager_ba_100_pfgs360_refined_anchor_50_200.yaml
+
+# Immutable formal-release weights. The preservation tool creates and hashes
+# this bundle before any historical output is eligible for cleanup.
+panovggt:
+  config_path: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/panovggt/default.yaml
+  checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/panovggt/model.pt
+
+adapter_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/selfi/adapter.pt
+
+stage2_checkpoint:
+  path: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/selfi/gaussian_head.pt
+
+VoxelAnchorRefiner:
+  checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/selfi/voxel_anchor_refiner.pt
+
+SphericalSelfiRuntime:
+  pager_depth:
+    enabled: true
+    repo_path: /mnt/disk1/lanboyang/External/PaGeR
+    checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/pager
+  sky:
+    checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/selfi/sky_head.pt
+  local_ba:
+    matching:
+      type: superpoint_sphereglue
+      lightglue_repo: /mnt/disk1/lanboyang/External/LightGlue
+      sphereglue_repo: /mnt/disk1/lanboyang/External/SphereGlue
+      superpoint_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/sphereglue/superpoint_v1.pth
+      sphereglue_checkpoint: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/sphereglue/model.safetensors
+
+SphericalSelfiGlobalBackend:
+  map_optimization:
+    seed: 123
+
+RuntimeProfiling:
+  enabled: true
+  path: runtime_profile.jsonl
+
+WeightsAndBiases:
+  enabled: true
+  mode: online
+  group: panogsslam-formal-pager-globalmap-refinedanchor-50-200-v1
+  runtime_log_preset: slam_core_visuals
+
+Visualization:
+  enabled: true
+  save_local: true
+
+Results:
+  render_final_all_frames: true
+  final_image_metrics: pfgs360_official
+  save_final_checkpoint: true
+  save_final_ply: false
+  final_all_frames_max_width: 1600

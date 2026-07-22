@@ -11,6 +11,7 @@ from geometry.sim3 import apply_sim3_to_c2w, sim3_from_components
 from geometry.trajectory_metrics import (
     c2w_trajectory_metrics,
     pfgs360_normalized_trajectory_alignment,
+    sim3_align_c2w_trajectory,
 )
 
 
@@ -80,6 +81,26 @@ def test_trajectory_metrics_remove_one_global_sim3_gauge() -> None:
     assert metrics["so3_aligned_rotation_ape_mean_deg"] < 1.0e-3
     assert metrics["scale_drift_percent"] < 1.0e-4
     assert metrics["se3_ate_rmse"] > 0.1
+
+
+def test_sim3_align_c2w_trajectory_exports_aligned_centers_and_rotations() -> None:
+    target = _trajectory()
+    rotation = so3_exp(torch.tensor([0.1, -0.2, 0.05]))
+    transform = sim3_from_components(
+        2.0,
+        rotation,
+        torch.tensor([3.0, -1.0, 0.5]),
+    )
+    predicted = apply_sim3_to_c2w(
+        transform.unsqueeze(0).expand(len(target), -1, -1),
+        target,
+    )
+
+    aligned, alignment = sim3_align_c2w_trajectory(predicted, target)
+
+    torch.testing.assert_close(aligned[:, :3, 3], target[:, :3, 3], atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(aligned[:, :3, :3], target[:, :3, :3], atol=1.0e-5, rtol=1.0e-5)
+    assert float(alignment["scale"]) == pytest.approx(0.5, abs=1.0e-5)
 
 
 def test_trajectory_metrics_detect_local_scale_drift() -> None:

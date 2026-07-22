@@ -128,6 +128,46 @@ def pfgs360_normalized_trajectory_alignment(
     return aligned, target_normalized, error, metrics
 
 
+def sim3_align_c2w_trajectory(
+    predicted_c2w: torch.Tensor,
+    target_c2w: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Align a predicted c2w trajectory to a target with one global Sim(3).
+
+    Camera centers receive the fitted scale, rotation, and translation. Camera
+    orientations receive only the global rotation, preserving the c2w pose
+    convention. The returned poses are suitable for durable trajectory export;
+    optimization and metric computation continue to use the original poses.
+    """
+
+    if (
+        predicted_c2w.shape != target_c2w.shape
+        or predicted_c2w.ndim != 3
+        or predicted_c2w.shape[-2:] != (4, 4)
+    ):
+        raise ValueError("Trajectory alignment expects matching Nx4x4 c2w tensors")
+    if int(predicted_c2w.shape[0]) < 2:
+        raise ValueError("Trajectory alignment requires at least two poses")
+    predicted = predicted_c2w.detach().double()
+    target = target_c2w.detach().double()
+    if not bool(torch.isfinite(predicted).all() and torch.isfinite(target).all()):
+        raise ValueError("Trajectory poses must be finite")
+
+    centers, scale, rotation, translation = _align_centers(
+        predicted[:, :3, 3],
+        target[:, :3, 3],
+        allow_scale=True,
+    )
+    aligned = predicted.clone()
+    aligned[:, :3, :3] = rotation.unsqueeze(0) @ predicted[:, :3, :3]
+    aligned[:, :3, 3] = centers
+    return aligned.to(dtype=predicted_c2w.dtype), {
+        "scale": scale,
+        "rotation": rotation,
+        "translation": translation,
+    }
+
+
 def c2w_trajectory_metrics(
     predicted_c2w: torch.Tensor,
     target_c2w: torch.Tensor,

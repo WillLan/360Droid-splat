@@ -2445,7 +2445,13 @@ def test_system_saves_final_artifacts_and_skybox(tmp_path: Path):
     assert summary["artifacts"]["final_keyframe_render_count"] >= 1
     assert summary["artifacts"]["final_all_frames"]["metrics"]["render_count"] >= 1
     assert summary["final_all_frames_mean_psnr"] is not None
+    assert summary["final_all_frames_mean_ssim"] is None
+    assert summary["final_all_frames_mean_lpips"] is None
+    assert summary["runtime"]["total_wall_sec"] > 0.0
+    assert Path(summary["runtime_path"]).is_file()
     assert (tmp_path / "final_all_frames" / "metrics.json").is_file()
+    assert any((tmp_path / "final_all_frames" / "render_rgb").glob("frame_*.png"))
+    assert (tmp_path / "final_all_frames" / "render_metrics.csv").is_file()
     assert Path(summary["artifacts"]["final_skybox_erp_preview"]).is_file()
     assert Path(summary["artifacts"]["final_skybox_faces"]).is_file()
     assert any((tmp_path / "init_vis").rglob("iter_*_render.png"))
