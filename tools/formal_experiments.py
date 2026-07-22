@@ -51,6 +51,7 @@ class RunSpec:
     scene: str
     split: str
     frames: int
+    config_overrides: dict[str, Any]
     worker: int
 
 
@@ -68,6 +69,20 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected a mapping in {path}")
     return payload
+
+
+def _deep_merge_config(
+    destination: dict[str, Any],
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Recursively apply explicit campaign overrides to a resolved config."""
+
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(destination.get(key), dict):
+            _deep_merge_config(destination[key], value)
+        else:
+            destination[key] = copy.deepcopy(value)
+    return destination
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -122,6 +137,9 @@ def _expand_runs(campaign: dict[str, Any]) -> list[RunSpec]:
                         "scene": scene_name,
                         "split": split_name,
                         "frames": int(dataset["frames"]),
+                        "config_overrides": copy.deepcopy(
+                            dict(dataset.get("config_overrides", {}) or {})
+                        ),
                     }
                 )
     workers = int(campaign.get("max_concurrent_workers", 2))
@@ -180,6 +198,77 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
     failed = [name for name, passed in expected.items() if not passed]
     if failed:
         raise ValueError("Formal mainline invariant failure: " + ", ".join(failed))
+
+
+def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
+    runtime = config["SphericalSelfiRuntime"]
+    backend = config["SphericalSelfiGlobalBackend"]
+    pfgs = backend["map_optimization"]["pfgs360"]
+    refiner_voxels = [float(value) for value in config["VoxelAnchorRefiner"]["voxel_sizes"]]
+    fusion_voxels = [float(value) for value in backend["voxel_fusion"]["voxel_sizes"]]
+    sky = runtime["sky"]
+    mapping = config["Mapping"]
+    skybox = config["SkyBox"]
+    if run.dataset == "ob3d":
+        expected = {
+            "OB3D Sky Head disabled": sky["enabled"] is False,
+            "OB3D sky not required": sky["required"] is False,
+            "OB3D mapping sky mask disabled": mapping["sky_mask_enable"] is False,
+            "OB3D mapping sky source disabled": str(mapping["sky_mask_source"]).lower()
+            == "none",
+            "OB3D skybox disabled": skybox["enabled"] is False,
+            "OB3D DIA has no semantic gate": pfgs["validity_gate"]
+            == "pfgs360_official_no_semantic_gate",
+            "OB3D PFGS sky filtering disabled": pfgs["filter_sky"] is False,
+            "OB3D Refiner voxel sizes": refiner_voxels
+            == [0.02, 0.04, 0.08, 0.16],
+            "OB3D fusion voxel sizes": fusion_voxels
+            == [0.02, 0.04, 0.08, 0.16],
+        }
+    elif run.dataset == "360vo":
+        expected = {
+            "360VO Sky Head enabled": sky["enabled"] is True,
+            "360VO sky required": sky["required"] is True,
+            "360VO sky threshold": abs(float(sky["threshold"]) - 0.6) < 1.0e-12,
+            "360VO mapping sky mask enabled": mapping["sky_mask_enable"] is True,
+            "360VO mapping sky source": str(mapping["sky_mask_source"]).lower()
+            == "panovggt_head",
+            "360VO skybox enabled": skybox["enabled"] is True,
+            "360VO DIA sky-only gate": pfgs["validity_gate"]
+            == "pfgs360_official_sky_only",
+            "360VO PFGS sky filtering": pfgs["filter_sky"] is True,
+            "360VO Refiner voxel sizes": refiner_voxels
+            == [0.04, 0.08, 0.16, 0.32],
+            "360VO fusion voxel sizes": fusion_voxels
+            == [0.04, 0.08, 0.16, 0.32],
+        }
+    else:
+        raise ValueError(f"Unknown formal dataset policy: {run.dataset}")
+    failed = [name for name, passed in expected.items() if not passed]
+    if failed:
+        raise ValueError(
+            f"Formal dataset policy failure for {run.run_id}: " + ", ".join(failed)
+        )
+
+
+def _create_browse_links(root: Path, runs: list[RunSpec]) -> None:
+    """Expose the requested paper-facing directory layout without moving runs."""
+
+    for run in runs:
+        run_root = root / "runs" / run.run_id
+        if run.dataset == "ob3d":
+            link = root / "ob3d" / run.scene / run.split
+        else:
+            link = root / "360vo" / run.scene
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            continue
+        target = Path(os.path.relpath(run_root, start=link.parent))
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            link.mkdir(parents=True, exist_ok=True)
+            (link / "RUN_POINTER.txt").write_text(str(run_root), encoding="utf-8")
 
 
 def _verify_dataset_run(run: RunSpec) -> None:
@@ -265,6 +354,7 @@ def prepare_campaign(
     expanded: list[dict[str, Any]] = []
     for run in runs:
         config = copy.deepcopy(base)
+        _deep_merge_config(config, run.config_overrides)
         config["Dataset"] = {
             **dict(config.get("Dataset", {}) or {}),
             "synthetic": False,
@@ -278,12 +368,14 @@ def prepare_campaign(
             "erp_resize_height": 504,
             "erp_resize_width": 1008,
         }
+        _assert_formal_mainline(config, seed=seed)
+        _assert_dataset_policy(config, run)
         run_name = f"formal_{run.run_id}_seed{seed}"
         config["WeightsAndBiases"] = {
             **dict(config.get("WeightsAndBiases", {}) or {}),
             "run_name": run_name,
             "tags": [
-                "formal-v1",
+                str(campaign["name"]),
                 "pager",
                 "sphereglue",
                 "global-map-sim3",
@@ -328,6 +420,8 @@ def prepare_campaign(
     }
     _write_json(root / "campaign.json", campaign_payload)
     _write_yaml(root / "campaign.yaml", campaign_payload)
+    _write_yaml(root / "manifest.yaml", campaign_payload)
+    _create_browse_links(root, runs)
     return root
 
 

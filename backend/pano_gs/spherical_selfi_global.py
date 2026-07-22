@@ -1024,9 +1024,17 @@ class SphericalSelfiGlobalBackend:
                     raise ValueError(
                         "Refined-anchor PFGS360 growth_frame_policy must be chunk_new_frames"
                     )
-                if str(pfgs_cfg.get("validity_gate", "")).strip().lower() != "pfgs360_official_sky_only":
+                validity_gate = str(
+                    pfgs_cfg.get("validity_gate", "")
+                ).strip().lower()
+                if validity_gate not in {
+                    "pfgs360_official_sky_only",
+                    "pfgs360_official_no_semantic_gate",
+                }:
                     raise ValueError(
-                        "Refined-anchor PFGS360 validity_gate must be pfgs360_official_sky_only"
+                        "Refined-anchor PFGS360 validity_gate must be "
+                        "pfgs360_official_sky_only or "
+                        "pfgs360_official_no_semantic_gate"
                     )
                 if bool(pfgs_cfg.get("topology_refine_enabled", True)):
                     raise ValueError(

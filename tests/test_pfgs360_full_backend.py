@@ -92,6 +92,24 @@ def test_official_dia_validity_ignores_alpha_and_confidence_but_keeps_sky() -> N
     assert not bool(legacy.any())
 
 
+def test_official_no_semantic_dia_validity_keeps_indoor_sky_labels() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    observation = mapper.observations[0]
+    observation.depth_confidence = torch.zeros(1, 4, 8)
+    observation.sky_mask = torch.ones(1, 4, 8, dtype=torch.bool)
+    depth = torch.ones(1, 4, 8)
+    depth[:, 0, 0] = float("nan")
+    alpha = torch.zeros_like(depth)
+
+    valid = PFGS360FullBackend(
+        mapper,
+        {"validity_gate": "pfgs360_official_no_semantic_gate"},
+    )._dia_valid_mask(observation, depth, alpha)
+
+    assert int(valid.sum()) == depth.numel() - 1
+    assert not bool(valid[0, 0, 0])
+
+
 def test_pfgs360_voxel_growth_uses_traditional_3dgs_initialization() -> None:
     gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
     grid_x, grid_y = torch.meshgrid(

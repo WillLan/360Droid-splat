@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -8,13 +9,15 @@ import yaml
 from system.pano_droid_gs_slam import load_config
 from tools.formal_experiments import (
     _assert_formal_mainline,
+    _assert_dataset_policy,
+    _deep_merge_config,
     _expand_runs,
     validate_run,
 )
 
 
 def _campaign() -> dict:
-    path = Path(__file__).parents[1] / "configs/formal/panogsslam_formal_campaign_v1.yaml"
+    path = Path(__file__).parents[1] / "configs/formal/panogsslam_formal_campaign_v2.yaml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
@@ -40,6 +43,43 @@ def test_formal_base_config_locks_the_confirmed_mainline() -> None:
     assert "/outputs/" not in config["adapter_checkpoint"]["path"]
     assert config["Results"]["save_final_checkpoint"] is True
     assert config["Results"]["final_image_metrics"] == "pfgs360_official"
+
+
+def test_formal_v2_applies_dataset_specific_sky_and_voxel_policies() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _campaign()
+    base = load_config(
+        root / "configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v2.yaml"
+    )
+    runs = _expand_runs(campaign)
+
+    for dataset in ("ob3d", "360vo"):
+        run = next(value for value in runs if value.dataset == dataset)
+        resolved = _deep_merge_config(copy.deepcopy(base), run.config_overrides)
+        _assert_formal_mainline(resolved, seed=123)
+        _assert_dataset_policy(resolved, run)
+
+    ob3d = next(value for value in runs if value.dataset == "ob3d")
+    ob3d_config = _deep_merge_config(copy.deepcopy(base), ob3d.config_overrides)
+    assert ob3d_config["SphericalSelfiRuntime"]["sky"]["enabled"] is False
+    assert ob3d_config["SkyBox"]["enabled"] is False
+    assert ob3d_config["VoxelAnchorRefiner"]["voxel_sizes"] == [
+        0.02,
+        0.04,
+        0.08,
+        0.16,
+    ]
+
+    vo = next(value for value in runs if value.dataset == "360vo")
+    vo_config = _deep_merge_config(copy.deepcopy(base), vo.config_overrides)
+    assert vo_config["SphericalSelfiRuntime"]["sky"]["threshold"] == 0.6
+    assert vo_config["SkyBox"]["enabled"] is True
+    assert vo_config["VoxelAnchorRefiner"]["voxel_sizes"] == [
+        0.04,
+        0.08,
+        0.16,
+        0.32,
+    ]
 
 
 def test_formal_run_validator_requires_paper_artifact_contract(tmp_path: Path) -> None:

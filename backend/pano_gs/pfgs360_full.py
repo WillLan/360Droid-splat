@@ -695,18 +695,25 @@ class PFGS360FullBackend:
             & (aligned_depth >= self.cfg.min_depth)
             & (aligned_depth <= self.cfg.max_depth)
         )
-        official_sky_only = str(
+        validity_gate = str(
             self.settings.get("validity_gate", "legacy")
-        ).strip().lower() == "pfgs360_official_sky_only"
+        ).strip().lower()
+        official_sky_only = validity_gate == "pfgs360_official_sky_only"
+        official_no_semantic_gate = (
+            validity_gate == "pfgs360_official_no_semantic_gate"
+        )
         sky_mask = observation.sky_mask
         if official_sky_only and sky_mask is None:
             raise RuntimeError(
                 "pfgs360_official_sky_only requires a panoramic sky mask"
             )
+        if official_sky_only:
+            valid &= ~sky_mask.to(device=self.device, dtype=torch.bool)
+            return valid
+        if official_no_semantic_gate:
+            return valid
         if sky_mask is not None:
             valid &= ~sky_mask.to(device=self.device, dtype=torch.bool)
-        if official_sky_only:
-            return valid
         if observation.depth_confidence is not None:
             valid &= observation.depth_confidence.to(self.device) >= float(
                 self.settings.get("min_depth_confidence", 0.05)
