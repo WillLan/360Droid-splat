@@ -222,6 +222,10 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             "OB3D PFGS sky filtering disabled": pfgs["filter_sky"] is False,
             "OB3D Refiner voxel sizes": refiner_voxels
             == [0.02, 0.04, 0.08, 0.16],
+            "OB3D Refiner voxel override explicit": config[
+                "VoxelAnchorRefiner"
+            ].get("allow_voxel_size_override")
+            is True,
             "OB3D fusion voxel sizes": fusion_voxels
             == [0.02, 0.04, 0.08, 0.16],
         }
@@ -239,6 +243,10 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             "360VO PFGS sky filtering": pfgs["filter_sky"] is True,
             "360VO Refiner voxel sizes": refiner_voxels
             == [0.04, 0.08, 0.16, 0.32],
+            "360VO Refiner voxel override disabled": config[
+                "VoxelAnchorRefiner"
+            ].get("allow_voxel_size_override", False)
+            is False,
             "360VO fusion voxel sizes": fusion_voxels
             == [0.04, 0.08, 0.16, 0.32],
         }

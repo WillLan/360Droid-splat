@@ -801,3 +801,52 @@ def test_training_checkpoint_loads_directly_into_runtime_model(tmp_path: Path) -
             model=runtime_model,
             expected_sha256="0" * 64,
         )
+
+
+def test_runtime_can_explicitly_override_only_checkpoint_voxel_sizes(
+    tmp_path: Path,
+) -> None:
+    trained = VoxelAnchorConfig(
+        use_resnet_error=False,
+        pretrained_resnet=False,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+    )
+    training_model = VoxelAnchorTrainableModel(trained)
+    optimizer = torch.optim.AdamW(training_model.parameters(), lr=1.0e-4)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    checkpoint = save_checkpoint(
+        tmp_path / "anchor_voxel_override.pt",
+        model=training_model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config={"VoxelAnchorRefiner": dict(vars(trained))},
+        step=1,
+        metrics={},
+        adapter_sha256="synthetic",
+        stage2_checkpoint_sha256=None,
+    )
+    runtime = replace(trained, voxel_sizes=(0.02, 0.04, 0.08, 0.16))
+    runtime_model = VoxelAnchorStage3Model(runtime)
+
+    with pytest.raises(ValueError, match="config mismatch for voxel_sizes"):
+        load_voxel_anchor_checkpoint(
+            checkpoint,
+            model=runtime_model,
+            expected_config=runtime,
+        )
+
+    load_voxel_anchor_checkpoint(
+        checkpoint,
+        model=runtime_model,
+        expected_config=runtime,
+        allow_voxel_size_override=True,
+    )
+
+    structurally_different = replace(runtime, hidden_dim=runtime.hidden_dim + 1)
+    with pytest.raises(ValueError, match="config mismatch for hidden_dim"):
+        load_voxel_anchor_checkpoint(
+            checkpoint,
+            model=runtime_model,
+            expected_config=structurally_different,
+            allow_voxel_size_override=True,
+        )

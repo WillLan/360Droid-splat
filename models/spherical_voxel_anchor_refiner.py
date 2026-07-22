@@ -1041,6 +1041,7 @@ def load_voxel_anchor_checkpoint(
     expected_adapter_sha256: str | None = None,
     expected_stage2_checkpoint_sha256: str | None = None,
     expected_config: VoxelAnchorConfig | None = None,
+    allow_voxel_size_override: bool = False,
 ) -> dict[str, Any]:
     checkpoint_path = Path(path)
     if expected_sha256:
@@ -1093,6 +1094,8 @@ def load_voxel_anchor_checkpoint(
             "iterations",
             "use_resnet_error",
         ):
+            if name == "voxel_sizes" and allow_voxel_size_override:
+                continue
             if getattr(trained, name) != getattr(expected_config, name):
                 raise ValueError(
                     "Voxel-anchor checkpoint config mismatch for "

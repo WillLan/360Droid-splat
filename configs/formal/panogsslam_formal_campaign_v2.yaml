@@ -34,6 +34,7 @@ datasets:
     config_overrides:
       VoxelAnchorRefiner:
         voxel_sizes: [0.02, 0.04, 0.08, 0.16]
+        allow_voxel_size_override: true
       SphericalSelfiRuntime:
         sky:
           enabled: false
@@ -62,6 +63,7 @@ datasets:
     config_overrides:
       VoxelAnchorRefiner:
         voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+        allow_voxel_size_override: false
       SphericalSelfiRuntime:
         sky:
           enabled: true

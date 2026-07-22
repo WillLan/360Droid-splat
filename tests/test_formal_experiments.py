@@ -69,6 +69,7 @@ def test_formal_v2_applies_dataset_specific_sky_and_voxel_policies() -> None:
         0.08,
         0.16,
     ]
+    assert ob3d_config["VoxelAnchorRefiner"]["allow_voxel_size_override"] is True
 
     vo = next(value for value in runs if value.dataset == "360vo")
     vo_config = _deep_merge_config(copy.deepcopy(base), vo.config_overrides)
@@ -80,6 +81,7 @@ def test_formal_v2_applies_dataset_specific_sky_and_voxel_policies() -> None:
         0.16,
         0.32,
     ]
+    assert vo_config["VoxelAnchorRefiner"]["allow_voxel_size_override"] is False
 
 
 def test_formal_run_validator_requires_paper_artifact_contract(tmp_path: Path) -> None:

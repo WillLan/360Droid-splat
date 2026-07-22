@@ -346,6 +346,9 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 expected_adapter_sha256=self.adapter_sha,
                 expected_stage2_checkpoint_sha256=stage2_sha,
                 expected_config=self.voxel_anchor_config,
+                allow_voxel_size_override=bool(
+                    voxel_cfg.get("allow_voxel_size_override", False)
+                ),
             )
             self.voxel_anchor_model.eval()
             renderer_cfg = dict(
