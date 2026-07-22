@@ -331,6 +331,69 @@ def _verify_weight_manifest(path: Path, *, verify_files: bool) -> str:
     return _sha256(path)
 
 
+def _prepare_torch_home(
+    campaign: dict[str, Any],
+    *,
+    formal_root: Path,
+    weight_manifest: Path,
+) -> Path | None:
+    """Create a writable Torch cache without mutating the immutable weight pack."""
+
+    configured = campaign.get("torch_home")
+    if configured in (None, ""):
+        return None
+    torch_home = Path(str(configured))
+    if not torch_home.is_absolute():
+        torch_home = formal_root / torch_home
+    torch_home = torch_home.resolve()
+    checkpoints = torch_home / "hub" / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    if not os.access(checkpoints, os.W_OK):
+        raise PermissionError(f"Torch checkpoint cache is not writable: {checkpoints}")
+
+    manifest = json.loads(weight_manifest.read_text(encoding="utf-8"))
+    candidates = [
+        entry
+        for entry in manifest.get("files", [])
+        if str(entry.get("role")) == "lpips_alexnet_backbone"
+    ]
+    if len(candidates) != 1:
+        raise ValueError(
+            "Weight manifest must contain exactly one lpips_alexnet_backbone"
+        )
+    entry = candidates[0]
+    source = Path(str(entry["destination"]))
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    expected_size = int(entry["size_bytes"])
+    expected_sha256 = str(entry["sha256"])
+    if int(source.stat().st_size) != expected_size or _sha256(source) != expected_sha256:
+        raise ValueError(f"Immutable LPIPS backbone failed verification: {source}")
+    destination = checkpoints / source.name
+    if not destination.is_file() or (
+        int(destination.stat().st_size) != expected_size
+        or _sha256(destination) != expected_sha256
+    ):
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        shutil.copy2(source, temporary)
+        if int(temporary.stat().st_size) != expected_size or _sha256(temporary) != expected_sha256:
+            temporary.unlink(missing_ok=True)
+            raise ValueError(f"Copied LPIPS backbone failed verification: {temporary}")
+        temporary.replace(destination)
+    _write_json(
+        formal_root / "runtime_cache" / "manifest.json",
+        {
+            "torch_home": str(torch_home),
+            "source": str(source),
+            "destination": str(destination),
+            "size_bytes": expected_size,
+            "sha256": expected_sha256,
+        },
+    )
+    return torch_home
+
+
 def prepare_campaign(
     campaign_path: Path,
     *,
@@ -346,6 +409,11 @@ def prepare_campaign(
         weight_manifest,
         verify_files=verify_weight_files,
     )
+    torch_home = _prepare_torch_home(
+        campaign,
+        formal_root=root,
+        weight_manifest=weight_manifest,
+    )
     base_path = Path(str(campaign["base_config"]))
     if not base_path.is_absolute():
         base_path = repo_root / base_path
@@ -354,8 +422,13 @@ def prepare_campaign(
     _assert_formal_mainline(base, seed=seed)
     commit = _git_commit(repo_root)
     runs = _expand_runs(campaign)
-    if len(runs) != 34:
-        raise ValueError(f"Expected 34 formal runs, got {len(runs)}")
+    expected_run_count = int(campaign.get("expected_run_count", 34))
+    if expected_run_count <= 0:
+        raise ValueError("expected_run_count must be positive")
+    if len(runs) != expected_run_count:
+        raise ValueError(
+            f"Expected {expected_run_count} formal runs, got {len(runs)}"
+        )
     for run in runs:
         _verify_dataset_run(run)
 
@@ -419,9 +492,10 @@ def prepare_campaign(
         "formal_root": str(root),
         "base_config": str(base_path),
         "seed": seed,
+        "expected_run_count": expected_run_count,
         "weights_manifest": str(weight_manifest),
         "weights_manifest_sha256": weight_manifest_sha256,
-        "torch_home": campaign.get("torch_home"),
+        "torch_home": str(torch_home) if torch_home is not None else None,
         "resource_limits": campaign.get("resource_limits", {}),
         "max_concurrent_workers": 2,
         "runs": expanded,
@@ -742,6 +816,7 @@ def run_worker(formal_root: Path, *, repo_root: Path, worker: int, gpu: int) -> 
                         ],
                     )
                     if validation["valid"]:
+                        (run_root / "failed.json").unlink(missing_ok=True)
                         complete.write_text(
                             json.dumps(
                                 {

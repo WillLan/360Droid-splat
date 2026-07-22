@@ -12,12 +12,21 @@ from tools.formal_experiments import (
     _assert_dataset_policy,
     _deep_merge_config,
     _expand_runs,
+    _prepare_torch_home,
+    _sha256,
     validate_run,
 )
+from tools.formal_phase_supervisor import phase_status
+from tools.formal_cleanup_monitor import completed_runs
 
 
 def _campaign() -> dict:
     path = Path(__file__).parents[1] / "configs/formal/panogsslam_formal_campaign_v2.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _v3_campaign(name: str) -> dict:
+    path = Path(__file__).parents[1] / f"configs/formal/{name}"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
@@ -30,6 +39,17 @@ def test_formal_campaign_expands_to_balanced_34_run_queue() -> None:
     assert {run.worker for run in runs} == {0, 1}
     loads = [sum(run.frames for run in runs if run.worker == worker) for worker in (0, 1)]
     assert loads == [3700, 3700]
+
+
+def test_v3_campaigns_are_balanced_independent_phases() -> None:
+    ob3d = _expand_runs(_v3_campaign("panogsslam_formal_ob3d_v3.yaml"))
+    vo = _expand_runs(_v3_campaign("panogsslam_formal_360vo200_v3.yaml"))
+
+    assert len(ob3d) == 24
+    assert len(vo) == 10
+    assert [sum(run.frames for run in ob3d if run.worker == worker) for worker in (0, 1)] == [1200, 1200]
+    assert [sum(run.frames for run in vo if run.worker == worker) for worker in (0, 1)] == [1000, 1000]
+    assert all(run.frames == 200 and run.dataset == "360vo" for run in vo)
 
 
 def test_formal_base_config_locks_the_confirmed_mainline() -> None:
@@ -82,6 +102,72 @@ def test_formal_v2_applies_dataset_specific_sky_and_voxel_policies() -> None:
         0.32,
     ]
     assert vo_config["VoxelAnchorRefiner"]["allow_voxel_size_override"] is False
+
+
+def test_writable_torch_home_copies_and_verifies_lpips_backbone(tmp_path: Path) -> None:
+    immutable = tmp_path / "immutable/alexnet-owt-7be5be79.pth"
+    immutable.parent.mkdir()
+    immutable.write_bytes(b"offline alexnet weights")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "role": "lpips_alexnet_backbone",
+                        "destination": str(immutable),
+                        "size_bytes": immutable.stat().st_size,
+                        "sha256": _sha256(immutable),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    formal_root = tmp_path / "formal"
+    formal_root.mkdir()
+
+    torch_home = _prepare_torch_home(
+        {"torch_home": "runtime_cache/torch"},
+        formal_root=formal_root,
+        weight_manifest=manifest,
+    )
+
+    assert torch_home == (formal_root / "runtime_cache/torch").resolve()
+    copied = torch_home / "hub/checkpoints" / immutable.name
+    assert copied.read_bytes() == immutable.read_bytes()
+    assert _sha256(copied) == _sha256(immutable)
+    assert (formal_root / "runtime_cache/manifest.json").is_file()
+
+
+def test_phase_status_enforces_hard_count_and_failed_runs(tmp_path: Path) -> None:
+    root = tmp_path / "phase"
+    runs = [{"run_id": f"run_{index}"} for index in range(3)]
+    root.mkdir()
+    (root / "campaign.json").write_text(
+        json.dumps({"expected_run_count": 3, "runs": runs}), encoding="utf-8"
+    )
+    (root / "runs/run_0").mkdir(parents=True)
+    (root / "runs/run_0/complete.marker").write_text("{}", encoding="utf-8")
+    (root / "runs/run_1").mkdir(parents=True)
+    (root / "runs/run_1/failed.json").write_text("{}", encoding="utf-8")
+
+    assert phase_status(root, expected_run_count=3) == {
+        "complete": 1,
+        "failed": ["run_1"],
+        "pending": 1,
+    }
+
+
+def test_cleanup_counter_ignores_smoke_markers(tmp_path: Path) -> None:
+    (tmp_path / "ob3d/runs/a").mkdir(parents=True)
+    (tmp_path / "ob3d/runs/a/complete.marker").write_text("ok", encoding="utf-8")
+    (tmp_path / "smoke/ob3d_metric_4frame").mkdir(parents=True)
+    (tmp_path / "smoke/ob3d_metric_4frame/complete.marker").write_text(
+        "ok", encoding="utf-8"
+    )
+
+    assert completed_runs(tmp_path) == 1
 
 
 def test_formal_run_validator_requires_paper_artifact_contract(tmp_path: Path) -> None:

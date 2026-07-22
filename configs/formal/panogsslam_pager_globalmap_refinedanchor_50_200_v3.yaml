@@ -1,0 +1,6 @@
+base_config: panogsslam_pager_globalmap_refinedanchor_50_200_v2.yaml
+
+# v3 changes campaign orchestration and metric caching only. The confirmed
+# PaGeR + SphereGlue + Global-Map-Sim3 + CAMERA50/JOINT200 algorithm is inherited.
+WeightsAndBiases:
+  group: panogsslam-formal-pager-globalmap-refinedanchor-50-200-v3

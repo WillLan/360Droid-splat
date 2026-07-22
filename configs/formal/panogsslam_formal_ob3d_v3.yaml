@@ -1,0 +1,57 @@
+version: 3
+name: panogsslam_pager_globalmap_refinedanchor_50_200_ob3d_v3
+expected_run_count: 24
+base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
+formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
+weights_manifest: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/manifest.json
+torch_home: runtime_cache/torch
+seed: 123
+max_concurrent_workers: 2
+resource_limits:
+  min_available_memory_gib: 80
+  min_free_disk_gib: 100
+  max_prelaunch_cpu_load_fraction: 0.80
+  monitor_interval_sec: 15
+  consecutive_swap_growth_limit: 2
+datasets:
+  - name: ob3d
+    type: ob3d
+    root: /mnt/disk1/lanboyang/Datasets/PFGS360/OB3D/OB3D
+    frames: 100
+    scenes:
+      - archiviz-flat
+      - barbershop
+      - bistro
+      - classroom
+      - emerald-square
+      - fisher-hut
+      - lone-monk
+      - pavillion
+      - restroom
+      - san-miguel
+      - sponza
+      - sun-temple
+    splits: [Egocentric, Non-Egocentric]
+    config_overrides:
+      VoxelAnchorRefiner:
+        voxel_sizes: [0.02, 0.04, 0.08, 0.16]
+        allow_voxel_size_override: true
+      SphericalSelfiRuntime:
+        sky:
+          enabled: false
+          required: false
+      SphericalSelfiGlobalBackend:
+        voxel_fusion:
+          voxel_sizes: [0.02, 0.04, 0.08, 0.16]
+        map_optimization:
+          pfgs360:
+            validity_gate: pfgs360_official_no_semantic_gate
+            filter_sky: false
+      Mapping:
+        sky_mask_enable: false
+        sky_mask_source: none
+      SkyBox:
+        enabled: false
+        optimize: false
+        optimization_mask_enable: false
+        force_sky_render: false

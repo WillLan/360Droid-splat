@@ -166,6 +166,7 @@ def execute_cleanup(
     *,
     formal_root: Path,
     finalize_protected: bool,
+    required_completed: int | None = None,
 ) -> list[str]:
     deletion = json.loads(deletion_manifest_path.read_text(encoding="utf-8"))
     outputs = Path(deletion["outputs_root"]).resolve()
@@ -179,10 +180,17 @@ def execute_cleanup(
     )
     _verify_weight_copies(weight_manifest_path)
     complete_markers = list(formal_root.glob("runs/*/complete.marker"))
-    required_completed = 34 if finalize_protected else 1
-    if len(complete_markers) < required_completed:
+    complete_markers.extend(formal_root.glob("*/runs/*/complete.marker"))
+    required = (
+        int(required_completed)
+        if required_completed is not None
+        else (34 if finalize_protected else 1)
+    )
+    if required <= 0:
+        raise ValueError("required_completed must be positive")
+    if len(complete_markers) < required:
         raise RuntimeError(
-            f"Cleanup requires {required_completed} validated formal runs; found {len(complete_markers)}"
+            f"Cleanup requires {required} validated formal runs; found {len(complete_markers)}"
         )
     active = _active_process_paths(outputs)
     if active:
@@ -228,6 +236,7 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--formal-root", type=Path)
     parser.add_argument("--finalize-protected", action="store_true")
+    parser.add_argument("--required-completed", type=int)
     args = parser.parse_args()
     deletion_manifest = args.archive / "deletion_manifest.json"
     if not args.execute:
@@ -240,6 +249,7 @@ def main() -> None:
         deletion_manifest,
         formal_root=args.formal_root,
         finalize_protected=bool(args.finalize_protected),
+        required_completed=args.required_completed,
     )
     print(json.dumps(removed, indent=2))
 
