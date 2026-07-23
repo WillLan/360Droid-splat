@@ -32,6 +32,7 @@ def _sky_config(
     *,
     count: int = 64,
     bootstrap_chunks: int = 2,
+    optimize_all_chunks: bool = False,
     steps: int = 1,
 ) -> dict:
     return {
@@ -40,6 +41,7 @@ def _sky_config(
             "enabled": True,
             "num_gaussians": count,
             "bootstrap_chunks": bootstrap_chunks,
+            "optimize_all_chunks": optimize_all_chunks,
             "optimize_steps_per_chunk": steps,
             "sky_threshold": 0.6,
             "sh_degree": 3,
@@ -222,6 +224,71 @@ def test_sky_optimization_updates_only_sky_then_freezes_all_parameters() -> None
     )
 
 
+def test_sky_optimization_continues_after_radius_bootstrap_when_enabled() -> None:
+    config = _sky_config(optimize_all_chunks=True)
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    gaussian_map.xyz = nn.Parameter(torch.tensor([[2.0, 0.0, 0.0]]))
+    mapper = PanoGaussianMapper(
+        gaussian_map,
+        renderer=_DifferentiableSkyRenderer(),
+    )
+    image = torch.full((3, 8, 16), 0.8)
+    probability = torch.full((1, 8, 16), 0.9)
+    for frame_id in range(2):
+        pose = torch.eye(4)
+        pose[0, 3] = 0.1 * frame_id
+        mapper.register_observation_values(
+            frame_id=frame_id,
+            image=image,
+            c2w=pose,
+            is_keyframe=True,
+            sky_mask=probability >= 0.6,
+            sky_probability=probability,
+        )
+
+    sphere = gaussian_map.sky_sphere
+    center_before = sphere.center.detach().clone()
+    directions_before = sphere.directions.detach().clone()
+    for window_id in range(2):
+        metrics = mapper.optimize_sky_sphere(
+            window_id=window_id,
+            recent_frame_ids=(0, 1),
+            seed=123,
+        )
+        assert metrics["sky_sphere_steps"] == 1.0
+        assert metrics["sky_sphere_frozen"] == 0.0
+    assert int(sphere.chunks_completed.item()) == 2
+    assert not sphere.frozen
+    radius_after_bootstrap = sphere.radius.detach().clone()
+    parameters_after_bootstrap = {
+        name: value.detach().clone()
+        for name, value in sphere.named_parameters()
+    }
+
+    with torch.no_grad():
+        gaussian_map.xyz[0] = torch.tensor([1000.0, 0.0, 0.0])
+    metrics = mapper.optimize_sky_sphere(
+        window_id=2,
+        recent_frame_ids=(0, 1),
+        seed=123,
+    )
+
+    assert metrics["sky_sphere_steps"] == 1.0
+    assert metrics["sky_sphere_frozen"] == 0.0
+    assert int(sphere.chunks_completed.item()) == 3
+    torch.testing.assert_close(sphere.radius, radius_after_bootstrap)
+    torch.testing.assert_close(sphere.center, center_before)
+    torch.testing.assert_close(sphere.directions, directions_before)
+    assert any(
+        not torch.equal(parameters_after_bootstrap[name], value)
+        for name, value in sphere.named_parameters()
+    )
+    metadata = sphere.metadata()
+    assert metadata["radius_bootstrap_complete"] is True
+    assert metadata["optimize_all_chunks"] is True
+    assert metadata["frozen_chunk"] is None
+
+
 def test_sky_composite_preserves_scene_geometry_and_query_bitwise() -> None:
     config = _sky_config(count=32)
     gaussian_map = PanoGaussianMap(config=config, device="cpu")
@@ -342,6 +409,7 @@ def test_360vo_skysphere_formal_config_and_ob3d_policy_are_isolated() -> None:
     assert resolved["SkyBox"]["enabled"] is False
     assert resolved["SkySphere"]["enabled"] is True
     assert resolved["SkySphere"]["num_gaussians"] == 65536
+    assert resolved["SkySphere"]["optimize_all_chunks"] is True
     assert "backend/sky_sphere" in _SLAM_CORE_VISUAL_WANDB_KEYS
     assert (
         resolved["SphericalSelfiGlobalBackend"]["global_graph"][

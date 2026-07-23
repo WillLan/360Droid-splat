@@ -248,6 +248,10 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
                 not sky_sphere_enabled
                 or abs(float(sky_sphere["sky_threshold"]) - 0.6) < 1.0e-12
             ),
+            "360VO SkySphere all-chunk optimization": (
+                not sky_sphere_enabled
+                or sky_sphere.get("optimize_all_chunks", False) is True
+            ),
             "360VO backend sky threshold": abs(
                 float(backend["global_graph"]["sky_threshold"]) - 0.6
             )

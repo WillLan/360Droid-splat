@@ -47,6 +47,7 @@ datasets:
         enabled: true
         num_gaussians: 65536
         bootstrap_chunks: 10
+        optimize_all_chunks: true
         optimize_steps_per_chunk: 20
         sky_threshold: 0.6
         sh_degree: 3

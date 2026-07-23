@@ -85,6 +85,9 @@ class PanoLOGSkySphere(nn.Module):
         self.enabled = bool(config.get("enabled", False))
         self.num_gaussians = int(config.get("num_gaussians", 65536))
         self.bootstrap_chunks = max(1, int(config.get("bootstrap_chunks", 10)))
+        self.optimize_all_chunks = bool(
+            config.get("optimize_all_chunks", False)
+        )
         self.optimize_steps_per_chunk = max(
             0, int(config.get("optimize_steps_per_chunk", 20))
         )
@@ -195,7 +198,7 @@ class PanoLOGSkySphere(nn.Module):
 
     @property
     def frozen(self) -> bool:
-        return bool(self.frozen_flag.item())
+        return bool(self.frozen_flag.item()) and not self.optimize_all_chunks
 
     @property
     def get_xyz(self) -> torch.Tensor:
@@ -425,7 +428,11 @@ class PanoLOGSkySphere(nn.Module):
         scene_xyz: torch.Tensor,
         camera_centers: torch.Tensor,
     ) -> float:
-        if not self.initialized or self.frozen:
+        if (
+            not self.initialized
+            or self.frozen
+            or int(self.chunks_completed.item()) >= self.bootstrap_chunks
+        ):
             return float(self.radius.detach().cpu())
         candidate = self._radius_candidate(scene_xyz, camera_centers)
         if float(candidate) <= float(self.radius):
@@ -440,9 +447,14 @@ class PanoLOGSkySphere(nn.Module):
         if not self.initialized:
             return False
         self.chunks_completed.add_(1)
-        if int(self.chunks_completed.item()) >= self.bootstrap_chunks:
+        if (
+            not self.optimize_all_chunks
+            and int(self.chunks_completed.item()) >= self.bootstrap_chunks
+        ):
             self.frozen_flag.fill_(True)
             self.set_trainable(False)
+        elif self.optimize_all_chunks:
+            self.frozen_flag.fill_(False)
         return self.frozen
 
     def camera_radius_ratio(self, c2w: torch.Tensor) -> float:
@@ -488,6 +500,10 @@ class PanoLOGSkySphere(nn.Module):
             ),
             "chunks_completed": int(self.chunks_completed.item()),
             "bootstrap_chunks": int(self.bootstrap_chunks),
+            "radius_bootstrap_complete": bool(
+                int(self.chunks_completed.item()) >= self.bootstrap_chunks
+            ),
+            "optimize_all_chunks": bool(self.optimize_all_chunks),
             "frozen_chunk": (
                 int(self.bootstrap_chunks) if self.frozen else None
             ),
