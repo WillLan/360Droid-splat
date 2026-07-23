@@ -20,7 +20,7 @@ WeightsAndBiases:
     - pfgs360-dia
     - refined-anchor-growth
     - recent3-chunks
-    - visible-gaussian-update
+    - all-render-contributors
     - camera50
     - joint200
     - formal100

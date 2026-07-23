@@ -187,8 +187,10 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
         "JOINT 200": int(optimization["joint_steps"]) == 200,
         "recent three chunks": int(optimization["recent_window_count"]) == 3,
         "one sampled frame": int(optimization["sample_observations_per_step"]) == 1,
-        "visible Gaussian update": pfgs["gaussian_update_scope"]
-        == "sampled_view_visible",
+        "global Gaussian candidate set": optimization["optimize_all_gaussians"]
+        is True,
+        "all render-contributor Gaussian update": pfgs["gaussian_update_scope"]
+        == "all_render_contributors",
         "fixed seed": int(optimization["seed"]) == int(seed),
         "core W&B preset": config["WeightsAndBiases"]["runtime_log_preset"]
         == "slam_core_visuals",

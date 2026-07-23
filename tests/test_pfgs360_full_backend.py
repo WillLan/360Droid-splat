@@ -237,6 +237,68 @@ class _PartiallyVisibleFakeRenderer(_DifferentiableFakeRenderer):
         return output
 
 
+class _PartialContributorFakeRenderer(_DifferentiableFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        height, width = int(camera.image_height), int(camera.image_width)
+        count = gaussians.anchor_count()
+        contributor_count = max(0, count - 44)
+        if contributor_count:
+            rows = slice(0, contributor_count)
+            viewspace = gaussians.xyz[:, :2]
+            scalar = (
+                gaussians.xyz[rows].mean()
+                + gaussians.get_scaling[rows].mean()
+                + gaussians.get_rotation[rows].mean()
+                + gaussians.get_opacity[rows].mean()
+                + gaussians.get_sh_coefficients[rows].mean()
+                + camera.c2w[:3, 3].mean()
+            )
+            rgb = torch.sigmoid(scalar).expand(3, height, width)
+            depth = (
+                1.0 + 0.01 * gaussians.xyz[rows].mean()
+            ).expand(1, height, width)
+        else:
+            viewspace = gaussians.xyz[:, :2]
+            rgb = torch.zeros(3, height, width, device=gaussians.xyz.device)
+            depth = torch.ones(1, height, width, device=gaussians.xyz.device)
+        accumulated = torch.zeros(count, device=gaussians.xyz.device)
+        accumulated[: count // 2] = 1.0
+        answers = None
+        if query_values is not None:
+            answers = torch.zeros(
+                count,
+                int(query_values.shape[-1]),
+                device=gaussians.xyz.device,
+            )
+        return {
+            "render": rgb,
+            "depth": depth,
+            "alpha": torch.ones(1, height, width, device=gaussians.xyz.device),
+            "opacity": torch.ones(1, height, width, device=gaussians.xyz.device),
+            "render_distort": torch.zeros(
+                1,
+                height,
+                width,
+                device=gaussians.xyz.device,
+            ),
+            "radii": torch.ones(count, device=gaussians.xyz.device),
+            "accum_visible": accumulated,
+            "query_answers": answers,
+            "viewspace_points": viewspace,
+        }
+
+
+class _NoAccumulatedVisibilityFakeRenderer(_DifferentiableFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        output = super().render(
+            camera,
+            gaussians,
+            query_values=query_values,
+        )
+        output.pop("accum_visible", None)
+        return output
+
+
 def _registered_mapper(renderer) -> PanoGaussianMapper:
     gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
     gaussian_map.configure_lazy_owner_transforms(True)
@@ -426,6 +488,97 @@ def test_sampled_view_visible_scope_requires_accumulated_visibility() -> None:
         assert "accum_visible" in str(error)
     else:
         raise AssertionError("Visible-only updates must require rasterizer visibility")
+
+
+def test_joint_stage_updates_all_render_contributors_and_freezes_noncontributors() -> None:
+    mapper = _registered_mapper(_PartialContributorFakeRenderer())
+    grid_x, grid_y = torch.meshgrid(
+        torch.arange(12),
+        torch.arange(12),
+        indexing="ij",
+    )
+    xyz = torch.stack(
+        [grid_x.flatten(), grid_y.flatten(), torch.ones(144)],
+        dim=-1,
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(144, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    before = {
+        name: getattr(mapper.map, name).detach().clone()
+        for name in mapper.map._gaussian_parameter_names()
+    }
+    mapper._pfgs360_gaussian_moments = {}
+    for name in mapper.map._gaussian_parameter_names():
+        parameter = getattr(mapper.map, name)
+        mapper._pfgs360_gaussian_moments[name] = {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.ones_like(parameter),
+            "exp_avg_sq": torch.ones_like(parameter),
+        }
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "refine_every_joint_steps": 0,
+            "gaussian_update_scope": "all_render_contributors",
+            "sampling_policy": "uniform",
+        },
+    )
+    metrics = engine._joint_stage(
+        engine._observations((0, 1, 2, 3)),
+        2,
+        124,
+    )
+
+    assert metrics["joint_gaussian_scope_all_render_contributors"] == 1.0
+    assert metrics["joint_visible_gaussians_min"] == 100.0
+    assert metrics["joint_visible_gaussians_max"] == 100.0
+    assert metrics["joint_contributing_gaussians_mean"] == 100.0
+    for name, expected in before.items():
+        actual = getattr(mapper.map, name).detach()
+        assert not torch.equal(actual[:100], expected[:100]), name
+        assert torch.equal(actual[100:], expected[100:]), name
+        state = mapper._pfgs360_gaussian_moments[name]
+        assert bool((state["exp_avg"][100:] == 0).all()), name
+        assert bool((state["exp_avg_sq"][100:] == 0).all()), name
+
+
+def test_all_render_contributors_scope_does_not_require_accumulated_visibility() -> None:
+    mapper = _registered_mapper(_NoAccumulatedVisibilityFakeRenderer())
+    grid_x, grid_y = torch.meshgrid(
+        torch.arange(12),
+        torch.arange(12),
+        indexing="ij",
+    )
+    xyz = torch.stack(
+        [grid_x.flatten(), grid_y.flatten(), torch.ones(144)],
+        dim=-1,
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(144, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "gaussian_update_scope": "all_render_contributors",
+            "refine_every_joint_steps": 0,
+        },
+    )
+    metrics = engine._joint_stage(
+        engine._observations((0, 1, 2, 3)),
+        1,
+        124,
+    )
+    assert metrics["joint_contributing_gaussians_mean"] == 144.0
 
 
 def test_refined_anchor_joint_path_never_runs_conventional_topology(monkeypatch) -> None:
@@ -868,7 +1021,7 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
     assert validated.insertion_dedup_radius_voxels == 1.0
 
 
-def test_recent_visible_50_200_config_has_confirmed_scope_and_learning_rates() -> None:
+def test_recent_three_chunk_50_200_configs_have_confirmed_scope_and_learning_rates() -> None:
     config_root = Path(__file__).parents[1] / "configs"
     pointmap = load_config(
         config_root
@@ -893,15 +1046,25 @@ def test_recent_visible_50_200_config_has_confirmed_scope_and_learning_rates() -
         assert optimize["sample_observations_per_step"] == 1
         assert optimize["pose_lr"] == 1.0e-4
         assert optimize["joint_pose_lr"] == 2.0e-5
-        assert optimize["optimize_all_gaussians"] is False
         assert pfgs["frame_scope"] == "recent_chunks"
         assert pfgs["sampling_policy"] == "uniform"
-        assert pfgs["gaussian_update_scope"] == "sampled_view_visible"
         assert pfgs["visibility_threshold"] == 0.0
         assert pfgs["topology_refine_enabled"] is False
         assert config["WeightsAndBiases"]["runtime_log_preset"] == (
             "slam_core_visuals"
         )
+    pointmap_optimization = pointmap["SphericalSelfiGlobalBackend"][
+        "map_optimization"
+    ]
+    assert pointmap_optimization["optimize_all_gaussians"] is False
+    assert pointmap_optimization["pfgs360"]["gaussian_update_scope"] == (
+        "sampled_view_visible"
+    )
+    pager_optimization = pager["SphericalSelfiGlobalBackend"]["map_optimization"]
+    assert pager_optimization["optimize_all_gaussians"] is True
+    assert pager_optimization["pfgs360"]["gaussian_update_scope"] == (
+        "all_render_contributors"
+    )
     assert pager["SphericalSelfiRuntime"]["pager_depth"]["enabled"] is True
 
 

@@ -456,10 +456,14 @@ class PFGS360FullBackend:
         self.gaussian_update_scope = str(
             self.settings.get("gaussian_update_scope", "all")
         ).strip().lower()
-        if self.gaussian_update_scope not in {"all", "sampled_view_visible"}:
+        if self.gaussian_update_scope not in {
+            "all",
+            "sampled_view_visible",
+            "all_render_contributors",
+        }:
             raise ValueError(
-                "PFGS360 gaussian_update_scope must be 'all' or "
-                "'sampled_view_visible'"
+                "PFGS360 gaussian_update_scope must be 'all', "
+                "'sampled_view_visible', or 'all_render_contributors'"
             )
         self.visibility_threshold = float(
             self.settings.get("visibility_threshold", 0.0)
@@ -816,6 +820,11 @@ class PFGS360FullBackend:
         count = self.map.anchor_count()
         if self.gaussian_update_scope == "all":
             return torch.ones(count, device=self.device, dtype=torch.bool)
+        if self.gaussian_update_scope == "all_render_contributors":
+            raise RuntimeError(
+                "all_render_contributors must be determined from rendering "
+                "gradients after backward"
+            )
         accumulated = package.get("accum_visible")
         if not torch.is_tensor(accumulated) or int(accumulated.numel()) != count:
             raise RuntimeError(
@@ -828,6 +837,44 @@ class PFGS360FullBackend:
         return torch.isfinite(accumulated) & (
             accumulated > float(self.visibility_threshold)
         )
+
+    def _gaussian_gradient_contributor_mask(
+        self,
+        parameter_groups: list[dict[str, Any]],
+    ) -> torch.Tensor:
+        """Return rows that received a gradient through the sampled render."""
+
+        count = self.map.anchor_count()
+        contributors = torch.zeros(count, device=self.device, dtype=torch.bool)
+        gaussian_group_count = 0
+        for group in parameter_groups:
+            if str(group.get("name", "")) == "poses":
+                continue
+            gaussian_group_count += 1
+            if len(group["params"]) != 1:
+                raise RuntimeError("PFGS360 Gaussian groups must contain one tensor")
+            parameter = group["params"][0]
+            if int(parameter.shape[0]) != count:
+                raise RuntimeError(
+                    "PFGS360 Gaussian gradient rows do not match the map"
+                )
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if int(gradient.shape[0]) != count:
+                raise RuntimeError(
+                    "PFGS360 Gaussian gradient rows do not match the map"
+                )
+            row_has_gradient = gradient.detach().reshape(count, -1).ne(0).any(dim=1)
+            contributors |= row_has_gradient.to(
+                device=self.device,
+                dtype=torch.bool,
+            )
+        if gaussian_group_count != len(self.map._gaussian_parameter_names()):
+            raise RuntimeError(
+                "PFGS360 contributor detection did not inspect every Gaussian group"
+            )
+        return contributors
 
     @staticmethod
     def _mask_gaussian_gradients_and_moments(
@@ -1211,13 +1258,41 @@ class PFGS360FullBackend:
             for step_index, observation in enumerate(schedule):
                 optimizer.zero_grad(set_to_none=True)
                 package = self._render(observation)
-                visible_gaussians = self._gaussian_visibility_mask(package)
-                visible_counts.append(int(visible_gaussians.sum().item()))
                 target = observation.image.to(device=self.device, dtype=self.dtype)
                 mask = None
                 if observation.sky_mask is not None:
                     mask = ~observation.sky_mask.to(device=self.device, dtype=torch.bool)
-                loss, _ = pfgs360_photometric_loss(package["render"], target, mask=mask)
+                render_loss, _ = pfgs360_photometric_loss(
+                    package["render"],
+                    target,
+                    mask=mask,
+                )
+                distortion = package.get("render_distort")
+                if torch.is_tensor(distortion):
+                    balance = pfgs360_spherical_weight(
+                        int(target.shape[-2]),
+                        int(target.shape[-1]),
+                        device=target.device,
+                        dtype=target.dtype,
+                    )
+                    depth = package["depth"].clamp_min(1.0e-3)
+                    render_loss = render_loss + float(
+                        self.settings.get("distortion_weight", 0.01)
+                    ) * (balance * distortion / depth).mean().nan_to_num()
+                if not bool(torch.isfinite(render_loss)):
+                    raise FloatingPointError("Non-finite PFGS360 JOINT render loss")
+
+                if self.gaussian_update_scope == "all_render_contributors":
+                    render_loss.backward()
+                    visible_gaussians = self._gaussian_gradient_contributor_mask(
+                        parameter_groups
+                    )
+                    regularizer = render_loss.new_zeros(())
+                else:
+                    visible_gaussians = self._gaussian_visibility_mask(package)
+                    regularizer = render_loss.new_zeros(())
+
+                visible_counts.append(int(visible_gaussians.sum().item()))
                 if (
                     bool(visible_gaussians.any())
                     and (step_index + 1)
@@ -1235,29 +1310,24 @@ class PFGS360FullBackend:
                         if int(positive.numel()) > 0
                         else excessive.new_zeros(())
                     )
-                    loss = loss + float(self.settings.get("phys_ratio_weight", 0.1)) * phys
-                distortion = package.get("render_distort")
-                if torch.is_tensor(distortion):
-                    balance = pfgs360_spherical_weight(
-                        int(target.shape[-2]),
-                        int(target.shape[-1]),
-                        device=target.device,
-                        dtype=target.dtype,
-                    )
-                    depth = package["depth"].clamp_min(1.0e-3)
-                    loss = loss + float(
-                        self.settings.get("distortion_weight", 0.01)
-                    ) * (balance * distortion / depth).mean().nan_to_num()
+                    regularizer = regularizer + float(
+                        self.settings.get("phys_ratio_weight", 0.1)
+                    ) * phys
                 if bool(visible_gaussians.any()):
-                    loss = loss + float(
+                    regularizer = regularizer + float(
                         self.settings.get("opacity_regularizer_weight", 0.01)
                     ) * self.map.get_opacity[visible_gaussians].mean()
-                    loss = loss + float(
+                    regularizer = regularizer + float(
                         self.settings.get("scale_regularizer_weight", 0.01)
                     ) * self.map.get_scaling[visible_gaussians].mean()
+                loss = render_loss + regularizer
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError("Non-finite PFGS360 JOINT loss")
-                loss.backward()
+                if self.gaussian_update_scope == "all_render_contributors":
+                    if regularizer.requires_grad:
+                        regularizer.backward()
+                else:
+                    loss.backward()
                 if pose_params:
                     self._clip_pose_gradients(
                         pose_params,
@@ -1331,6 +1401,9 @@ class PFGS360FullBackend:
             "joint_gaussian_scope_sampled_view_visible": float(
                 self.gaussian_update_scope == "sampled_view_visible"
             ),
+            "joint_gaussian_scope_all_render_contributors": float(
+                self.gaussian_update_scope == "all_render_contributors"
+            ),
             "joint_visible_gaussians_mean": float(
                 sum(visible_counts) / max(1, len(visible_counts))
             ),
@@ -1339,6 +1412,23 @@ class PFGS360FullBackend:
             ),
             "joint_visible_gaussians_max": float(
                 max(visible_counts) if visible_counts else 0
+            ),
+            "joint_contributing_gaussians_mean": float(
+                sum(visible_counts) / max(1, len(visible_counts))
+                if self.gaussian_update_scope == "all_render_contributors"
+                else 0.0
+            ),
+            "joint_contributing_gaussians_min": float(
+                min(visible_counts)
+                if visible_counts
+                and self.gaussian_update_scope == "all_render_contributors"
+                else 0
+            ),
+            "joint_contributing_gaussians_max": float(
+                max(visible_counts)
+                if visible_counts
+                and self.gaussian_update_scope == "all_render_contributors"
+                else 0
             ),
         }
         if topology_refine_enabled:
