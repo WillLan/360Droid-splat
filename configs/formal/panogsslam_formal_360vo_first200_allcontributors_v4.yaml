@@ -1,5 +1,5 @@
 version: 4
-name: panogsslam_pager_globalmap_refinedanchor_50_200_allcontributors_360vo_first200_v4
+name: panogsslam_allcontributors_360vo_first200_v4
 expected_run_count: 10
 base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
 formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
