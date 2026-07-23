@@ -179,6 +179,7 @@ class PFGS360Renderer:
         *,
         background: torch.Tensor | None = None,
         query_values: torch.Tensor | None = None,
+        compose_background: bool = True,
     ) -> RenderPackage:
         total_start = time.perf_counter()
         profile: dict[str, float] = {
@@ -186,6 +187,7 @@ class PFGS360Renderer:
             "profile_renderer_rasterize_sec": 0.0,
             "profile_renderer_postprocess_sec": 0.0,
             "profile_renderer_skybox_sec": 0.0,
+            "profile_renderer_skysphere_sec": 0.0,
             "profile_renderer_total_sec": 0.0,
             "profile_renderer_materialized_gaussians": 0.0,
         }
@@ -208,8 +210,18 @@ class PFGS360Renderer:
             pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
             profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
             section_start = time.perf_counter()
-            pkg = self._compose_skybox(camera, source_gaussians, pkg)
-            profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+            pkg = self._compose_background(
+                camera,
+                source_gaussians,
+                pkg,
+                enabled=bool(compose_background and query_values is None),
+            )
+            background_sec = float(time.perf_counter() - section_start)
+            profile[
+                "profile_renderer_skysphere_sec"
+                if bool(getattr(source_gaussians, "has_sky_sphere", False))
+                else "profile_renderer_skybox_sec"
+            ] = background_sec
             profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
             return self._attach_profile(pkg, profile)
 
@@ -232,9 +244,19 @@ class PFGS360Renderer:
             pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
             profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
             section_start = time.perf_counter()
-            pkg = self._compose_skybox(camera, source_gaussians, pkg)
+            pkg = self._compose_background(
+                camera,
+                source_gaussians,
+                pkg,
+                enabled=bool(compose_background and query_values is None),
+            )
             self._sync_for_profile(gaussians.get_xyz.device)
-            profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+            background_sec = float(time.perf_counter() - section_start)
+            profile[
+                "profile_renderer_skysphere_sec"
+                if bool(getattr(source_gaussians, "has_sky_sphere", False))
+                else "profile_renderer_skybox_sec"
+            ] = background_sec
             profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
             return self._attach_profile(pkg, profile)
 
@@ -252,9 +274,19 @@ class PFGS360Renderer:
         pkg = self._postprocess_materialized(source_gaussians, materialized, pkg)
         profile["profile_renderer_postprocess_sec"] = float(time.perf_counter() - section_start)
         section_start = time.perf_counter()
-        pkg = self._compose_skybox(camera, source_gaussians, pkg)
+        pkg = self._compose_background(
+            camera,
+            source_gaussians,
+            pkg,
+            enabled=bool(compose_background and query_values is None),
+        )
         self._sync_for_profile(gaussians.get_xyz.device)
-        profile["profile_renderer_skybox_sec"] = float(time.perf_counter() - section_start)
+        background_sec = float(time.perf_counter() - section_start)
+        profile[
+            "profile_renderer_skysphere_sec"
+            if bool(getattr(source_gaussians, "has_sky_sphere", False))
+            else "profile_renderer_skybox_sec"
+        ] = background_sec
         profile["profile_renderer_total_sec"] = float(time.perf_counter() - total_start)
         return self._attach_profile(pkg, profile)
 
@@ -353,6 +385,83 @@ class PFGS360Renderer:
         out["gs_only"] = rgb
         out["sky_bg_only"] = sky_rgb
         out["sky_bg_alpha"] = trans
+        return out
+
+    def _compose_background(
+        self,
+        camera: PanoRenderCamera,
+        gaussians,
+        pkg: RenderPackage,
+        *,
+        enabled: bool,
+    ) -> RenderPackage:
+        if not enabled:
+            return pkg
+        sphere = getattr(gaussians, "sky_sphere", None)
+        if sphere is not None and bool(getattr(sphere, "enabled", False)):
+            return self._compose_sky_sphere(camera, gaussians, pkg)
+        return self._compose_skybox(camera, gaussians, pkg)
+
+    def _compose_sky_sphere(
+        self,
+        camera: PanoRenderCamera,
+        gaussians,
+        pkg: RenderPackage,
+    ) -> RenderPackage:
+        sphere = getattr(gaussians, "sky_sphere", None)
+        if sphere is None or not bool(getattr(sphere, "enabled", False)):
+            return pkg
+        scene_rgb = pkg.get("render")
+        scene_alpha = pkg.get("alpha")
+        if not torch.is_tensor(scene_rgb) or not torch.is_tensor(scene_alpha):
+            return pkg
+        if not bool(getattr(sphere, "initialized", False)):
+            sky_rgb = torch.zeros_like(scene_rgb)
+            sky_alpha = torch.zeros_like(scene_alpha)
+            out = dict(pkg)
+            out.update(
+                {
+                    "scene_rgb": scene_rgb,
+                    "scene_alpha": scene_alpha,
+                    "sky_rgb": sky_rgb,
+                    "sky_alpha": sky_alpha,
+                    "composite_rgb": scene_rgb,
+                }
+            )
+            return out
+        ratio, warning = sphere.validate_camera(camera.c2w)
+        sky_package = self.render(
+            camera,
+            sphere,
+            background=torch.zeros(
+                3,
+                device=scene_rgb.device,
+                dtype=scene_rgb.dtype,
+            ),
+            compose_background=False,
+        )
+        sky_rgb = sky_package.get("render")
+        sky_alpha = sky_package.get("alpha")
+        if not torch.is_tensor(sky_rgb) or not torch.is_tensor(sky_alpha):
+            raise RuntimeError("SkySphere renderer did not return RGB and alpha")
+        transmittance = (1.0 - scene_alpha).clamp(0.0, 1.0)
+        composite = scene_rgb + transmittance * sky_rgb.to(scene_rgb)
+        out = dict(pkg)
+        out.update(
+            {
+                "render": composite.clamp(0.0, 1.0),
+                "scene_rgb": scene_rgb,
+                "scene_alpha": scene_alpha,
+                "sky_rgb": sky_rgb,
+                "sky_alpha": sky_alpha,
+                "composite_rgb": composite.clamp(0.0, 1.0),
+                "gs_only": scene_rgb,
+                "sky_bg_only": sky_rgb,
+                "sky_bg_alpha": transmittance,
+                "sky_sphere_camera_radius_ratio": float(ratio),
+                "sky_sphere_camera_radius_warning": bool(warning),
+            }
+        )
         return out
 
     def _render_gsplat360(

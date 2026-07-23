@@ -211,6 +211,8 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
     sky = runtime["sky"]
     mapping = config["Mapping"]
     skybox = config["SkyBox"]
+    sky_sphere = dict(config.get("SkySphere", {}) or {})
+    sky_sphere_enabled = bool(sky_sphere.get("enabled", False))
     if run.dataset == "ob3d":
         expected = {
             "OB3D Sky Head disabled": sky["enabled"] is False,
@@ -219,6 +221,7 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             "OB3D mapping sky source disabled": str(mapping["sky_mask_source"]).lower()
             == "none",
             "OB3D skybox disabled": skybox["enabled"] is False,
+            "OB3D SkySphere disabled": sky_sphere_enabled is False,
             "OB3D DIA has no semantic gate": pfgs["validity_gate"]
             == "pfgs360_official_no_semantic_gate",
             "OB3D PFGS sky filtering disabled": pfgs["filter_sky"] is False,
@@ -239,7 +242,16 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             "360VO mapping sky mask enabled": mapping["sky_mask_enable"] is True,
             "360VO mapping sky source": str(mapping["sky_mask_source"]).lower()
             == "panovggt_head",
-            "360VO skybox enabled": skybox["enabled"] is True,
+            "360VO one sky renderer enabled": bool(skybox["enabled"])
+            != sky_sphere_enabled,
+            "360VO SkySphere threshold": (
+                not sky_sphere_enabled
+                or abs(float(sky_sphere["sky_threshold"]) - 0.6) < 1.0e-12
+            ),
+            "360VO backend sky threshold": abs(
+                float(backend["global_graph"]["sky_threshold"]) - 0.6
+            )
+            < 1.0e-12,
             "360VO DIA sky-only gate": pfgs["validity_gate"]
             == "pfgs360_official_sky_only",
             "360VO PFGS sky filtering": pfgs["filter_sky"] is True,
@@ -464,6 +476,15 @@ def prepare_campaign(
                 "global-map-sim3",
                 "refined-anchor",
                 "camera50-joint200",
+                *(
+                    ["sky-sphere"]
+                    if bool(
+                        dict(config.get("SkySphere", {}) or {}).get(
+                            "enabled", False
+                        )
+                    )
+                    else ["skybox"]
+                ),
                 run.dataset,
                 run.scene,
                 run.split.lower(),

@@ -7485,3 +7485,43 @@ def test_global_map_and_pointmap_failure_rolls_back_transaction() -> None:
     assert backend.frame_pose_owner_node == owners_before
     assert backend._last_overlap_alignment_failure is not None
     assert backend._last_overlap_alignment_failure["accepted"] is False
+
+
+def test_boundary_transaction_restores_sky_sphere_state() -> None:
+    config = {
+        "SkyBox": {"enabled": False},
+        "SkySphere": {
+            "enabled": True,
+            "num_gaussians": 16,
+            "bootstrap_chunks": 10,
+            "optimize_steps_per_chunk": 1,
+            "sky_threshold": 0.6,
+            "initialization": "fibonacci",
+        },
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    mapper = PanoGaussianMapper(gaussian_map)
+    backend = _boundary_backend(gaussian_map, mapper=mapper)
+    image = torch.rand(3, 8, 16)
+    probability = torch.ones(1, 8, 16)
+    assert gaussian_map.sky_sphere.initialize(
+        observations=[(image, torch.eye(4), probability)],
+        scene_xyz=torch.tensor([[1.0, 0.0, 0.0]]),
+        camera_centers=torch.zeros(1, 3),
+    )
+    snapshot = backend._snapshot_boundary_transaction()
+    original = {
+        name: value.detach().clone()
+        for name, value in gaussian_map.sky_sphere.state_dict().items()
+    }
+    with torch.no_grad():
+        gaussian_map.sky_sphere.features.add_(7.0)
+        gaussian_map.sky_sphere.radius.mul_(3.0)
+        gaussian_map.sky_sphere.chunks_completed.add_(4)
+    mapper._pending_sky_sphere_diagnostic = {"window_id": 99}
+
+    backend._restore_boundary_transaction(snapshot)
+
+    for name, value in gaussian_map.sky_sphere.state_dict().items():
+        torch.testing.assert_close(value, original[name])
+    assert mapper.consume_sky_sphere_diagnostic() is None

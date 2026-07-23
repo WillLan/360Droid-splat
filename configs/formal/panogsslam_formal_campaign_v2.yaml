@@ -70,6 +70,8 @@ datasets:
           required: true
           threshold: 0.6
       SphericalSelfiGlobalBackend:
+        global_graph:
+          sky_threshold: 0.6
         voxel_fusion:
           voxel_sizes: [0.04, 0.08, 0.16, 0.32]
         map_optimization:

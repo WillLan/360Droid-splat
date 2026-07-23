@@ -635,6 +635,7 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "backend/render_vs_gt_panorama",
         "backend/new_gaussians_per_chunk",
         "backend/pfgs360_new_anchor_admission",
+        "backend/sky_sphere",
         "backend/selfi_global_map_anchor_scale",
         "backend/selfi_global_map_root_relative_scale",
         "backend/selfi_global_map_anchor_fallback",
@@ -1562,6 +1563,67 @@ class SlamRuntimeLogger:
                 step=step,
             )
         return combined_path
+
+    def observe_sky_sphere(
+        self,
+        diagnostic: dict,
+        *,
+        step: int | None = None,
+    ) -> Path | None:
+        """Save and publish the one fixed PanoLOG Sky-Sphere panel."""
+
+        if not isinstance(diagnostic, dict):
+            return None
+        panels = [
+            _image_tensor_to_pil(diagnostic["target"]),
+            _image_tensor_to_pil(diagnostic["scene_rgb"]),
+            _image_tensor_to_pil(diagnostic["sky_rgb"]),
+            _image_tensor_to_pil(diagnostic["composite_rgb"]),
+            _scalar_tensor_to_pil(diagnostic["sky_probability"]),
+            _scalar_tensor_to_pil(diagnostic["sky_alpha"]),
+        ]
+        labels = (
+            "GT",
+            "scene-only",
+            "sky-only",
+            "composite",
+            "sky probability",
+            "sky alpha",
+        )
+        width = max(panel.width for panel in panels)
+        height = max(panel.height for panel in panels)
+        title_height = 28
+        canvas = Image.new(
+            "RGB",
+            (len(panels) * width, height + title_height),
+            "white",
+        )
+        draw = ImageDraw.Draw(canvas)
+        for index, (panel, label) in enumerate(zip(panels, labels)):
+            if panel.size != (width, height):
+                panel = panel.resize((width, height), Image.BILINEAR)
+            canvas.paste(panel, (index * width, title_height))
+            draw.text((index * width + 6, 7), label, fill=(0, 0, 0))
+        canvas = _resize_to_max_width(canvas, self.kf_opt_max_width)
+        path = None
+        if self.save_local:
+            directory = self.visualization_dir / "sky_sphere"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (
+                f"window_{int(diagnostic.get('window_id', -1)):06d}_"
+                f"frame_{int(diagnostic.get('frame_id', -1)):06d}.png"
+            )
+            canvas.save(path)
+        if self.run is not None and self._wandb is not None:
+            self._log_wandb_payload(
+                {
+                    "backend/sky_sphere": self._wandb.Image(
+                        str(path) if path is not None else canvas
+                    )
+                },
+                step=step,
+            )
+        return path
 
     def observe_depth_insertion_diagnostic(
         self,
@@ -2943,6 +3005,9 @@ class PanoDroidGSSlamSystem:
         frame_cache: dict[int, PanoFrame] = {}
         final_frame_records: dict[int, dict] = {}
         local_ba_window_records: list[dict] = []
+        frontend_sky_cache: dict[
+            int, tuple[torch.Tensor | None, torch.Tensor | None]
+        ] = {}
         chunk_keyframe_anchor_frame_id: int | None = None
         frame_count = 0
         keyframes = 0
@@ -2965,10 +3030,31 @@ class PanoDroidGSSlamSystem:
                 profile_file.flush()
             logger.observe_profile(profile)
 
-        def frontend_sky_mask_for_frame(frame_id: int, image: torch.Tensor) -> torch.Tensor | None:
-            getter = getattr(self.frontend, "sky_mask_for_frame", None)
+        def frontend_sky_for_frame(
+            frame_id: int,
+            image: torch.Tensor,
+        ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+            cached = frontend_sky_cache.get(int(frame_id))
+            if cached is not None:
+                return cached
             height, width = int(image.shape[-2]), int(image.shape[-1])
-            mask = getter(int(frame_id), image_size=(height, width)) if callable(getter) else None
+            probability_getter = getattr(
+                self.frontend, "sky_probability_for_frame", None
+            )
+            probability = (
+                probability_getter(
+                    int(frame_id),
+                    image_size=(height, width),
+                )
+                if callable(probability_getter)
+                else None
+            )
+            mask_getter = getattr(self.frontend, "sky_mask_for_frame", None)
+            mask = (
+                mask_getter(int(frame_id), image_size=(height, width))
+                if callable(mask_getter)
+                else None
+            )
             if mask is None and frontend_sky_required:
                 raise RuntimeError(
                     f"frame {int(frame_id)}: Mapping.sky_mask_source=panovggt_head requires PanoVGGT sky head mask."
@@ -2980,7 +3066,25 @@ class PanoDroidGSSlamSystem:
                     device=torch.device("cpu"),
                     insertion_hints=None,
                 )
-            return None if mask is None else mask.detach().cpu().bool()
+            normalized_mask = (
+                None if mask is None else mask.detach().cpu().bool()
+            )
+            normalized_probability = (
+                None
+                if probability is None
+                else probability.detach().cpu().to(torch.float16)
+            )
+            if normalized_probability is None and normalized_mask is not None:
+                normalized_probability = normalized_mask.to(torch.float16)
+            result = (normalized_mask, normalized_probability)
+            frontend_sky_cache[int(frame_id)] = result
+            return result
+
+        def frontend_sky_mask_for_frame(
+            frame_id: int,
+            image: torch.Tensor,
+        ) -> torch.Tensor | None:
+            return frontend_sky_for_frame(frame_id, image)[0]
 
         def current_frontend_chunk_frame_ids_full() -> list[int]:
             ids: list[int] = []
@@ -3186,7 +3290,12 @@ class PanoDroidGSSlamSystem:
             )
             return concatenate_seed_batches(batches, frame_id=int(template.frame_id))
 
-        def remember_final_frame(out: FrontendOutput, source_frame: PanoFrame, sky_mask: torch.Tensor | None) -> None:
+        def remember_final_frame(
+            out: FrontendOutput,
+            source_frame: PanoFrame,
+            sky_mask: torch.Tensor | None,
+            sky_probability: torch.Tensor | None,
+        ) -> None:
             gt_pose = None
             meta = source_frame.meta or {}
             if meta.get("gt_c2w") is not None:
@@ -3196,6 +3305,11 @@ class PanoDroidGSSlamSystem:
                 "pose_c2w": out.pose_c2w.detach().cpu().float(),
                 "gt_c2w": gt_pose,
                 "sky_mask": None if sky_mask is None else sky_mask.detach().cpu().bool(),
+                "sky_probability": (
+                    None
+                    if sky_probability is None
+                    else sky_probability.detach().cpu().to(torch.float16)
+                ),
             }
 
         def update_frontend_graph_window_hint(out) -> None:
@@ -3391,7 +3505,9 @@ class PanoDroidGSSlamSystem:
                 conf = conf_by_frame.get(fid) if isinstance(conf_by_frame, dict) else None
                 if pose is None or inv is None:
                     continue
-                sky_mask = frontend_sky_mask_for_frame(fid, source_frame.image)
+                sky_mask, sky_probability = frontend_sky_for_frame(
+                    fid, source_frame.image
+                )
                 self.mapper.register_observation_values(
                     frame_id=fid,
                     image=source_frame.image,
@@ -3400,6 +3516,7 @@ class PanoDroidGSSlamSystem:
                     depth_confidence=conf,
                     is_keyframe=fid in registered_keyframes,
                     sky_mask=sky_mask,
+                    sky_probability=sky_probability,
                 )
                 count += 1
             return count
@@ -4619,6 +4736,12 @@ class PanoDroidGSSlamSystem:
                     anchor_admission,
                     step=max(1, int(logger._step) + 1),
                 )
+            sky_sphere_diagnostic = self.mapper.consume_sky_sphere_diagnostic()
+            if sky_sphere_diagnostic is not None:
+                logger.observe_sky_sphere(
+                    sky_sphere_diagnostic,
+                    step=max(1, int(logger._step) + 1),
+                )
             consume_spherical_selfi_geometry_updates(outputs)
             last_feedforward_metrics = dict(metrics)
             successful_steps = float(metrics.get("steps", 0.0))
@@ -4716,8 +4839,15 @@ class PanoDroidGSSlamSystem:
             if effective_is_keyframe != frontend_is_keyframe:
                 out = replace(out, is_keyframe=bool(effective_is_keyframe))
             output_profile["is_keyframe"] = int(bool(out.is_keyframe))
-            sky_mask = frontend_sky_mask_for_frame(int(out.frame_id), backend_image)
-            remember_final_frame(out, replace(source_frame, image=backend_image), sky_mask)
+            sky_mask, sky_probability = frontend_sky_for_frame(
+                int(out.frame_id), backend_image
+            )
+            remember_final_frame(
+                out,
+                replace(source_frame, image=backend_image),
+                sky_mask,
+                sky_probability,
+            )
             if (feedforward_window_enabled or resplat_direct_fusion_enabled or spherical_selfi_global_enabled) and out.inverse_depth is not None:
                 section_start = time.perf_counter()
                 self.mapper.register_observation(
@@ -4725,6 +4855,7 @@ class PanoDroidGSSlamSystem:
                     backend_image,
                     is_keyframe=bool(out.is_keyframe),
                     sky_mask=sky_mask,
+                    sky_probability=sky_probability,
                 )
                 if spherical_selfi_global_enabled:
                     geometry_update = spherical_selfi_geometry_by_frame.get(int(out.frame_id))
@@ -5140,6 +5271,10 @@ class PanoDroidGSSlamSystem:
             root = output_dir / "final_all_frames"
             panel_dir = root / "render_vs_gt"
             render_dir = root / "render_rgb"
+            scene_dir = root / "scene_rgb"
+            sky_dir = root / "sky_rgb"
+            sky_alpha_dir = root / "sky_alpha"
+            sky_probability_dir = root / "sky_probability"
             trajectory_dir = root / "trajectory"
             panel_dir.mkdir(parents=True, exist_ok=True)
             render_dir.mkdir(parents=True, exist_ok=True)
@@ -5183,6 +5318,8 @@ class PanoDroidGSSlamSystem:
                     "mean_psnr": None,
                     "mean_ssim": None,
                     "mean_lpips": None,
+                    "mean_sky_psnr": None,
+                    "mean_sky_lpips": None,
                     "ate_rmse": None,
                     "ate_count": 0,
                 }
@@ -5194,6 +5331,8 @@ class PanoDroidGSSlamSystem:
             psnrs: list[float] = []
             ssims: list[float] = []
             lpips_values: list[float] = []
+            sky_psnrs: list[float] = []
+            sky_lpips_values: list[float] = []
             pred_xyz: list[np.ndarray] = []
             gt_xyz: list[np.ndarray] = []
             trajectory_frame_ids: list[int] = []
@@ -5252,6 +5391,9 @@ class PanoDroidGSSlamSystem:
                 psnrs.append(psnr)
                 ssim_value = None
                 lpips_value = None
+                sky_psnr = None
+                sky_lpips_value = None
+                sky_pixel_ratio = None
                 if official_image_metrics:
                     assert ssim_function is not None and lpips_metric is not None
                     with torch.no_grad():
@@ -5271,6 +5413,59 @@ class PanoDroidGSSlamSystem:
                         )
                     ssims.append(ssim_value)
                     lpips_values.append(lpips_value)
+                if torch.is_tensor(sky_mask):
+                    sky_metric_mask = sky_mask.detach().to(
+                        device=metric_device,
+                        dtype=torch.float32,
+                    )
+                    while sky_metric_mask.ndim > 2:
+                        sky_metric_mask = sky_metric_mask[0]
+                    if tuple(sky_metric_mask.shape) != tuple(
+                        target_metric.shape[-2:]
+                    ):
+                        sky_metric_mask = F.interpolate(
+                            sky_metric_mask.view(
+                                1, 1, *sky_metric_mask.shape
+                            ),
+                            size=tuple(
+                                int(value)
+                                for value in target_metric.shape[-2:]
+                            ),
+                            mode="nearest",
+                        )[0, 0]
+                    sky_metric_mask = (sky_metric_mask >= 0.5).float()
+                    sky_pixel_ratio = float(sky_metric_mask.mean().item())
+                    if bool(sky_metric_mask.bool().any()):
+                        sky_mse = (
+                            (
+                                (render_metric - target_metric).square()
+                                * sky_metric_mask.unsqueeze(0)
+                            ).sum()
+                            / (
+                                3.0
+                                * sky_metric_mask.sum().clamp_min(1.0)
+                            )
+                        ).clamp_min(1.0e-12)
+                        sky_psnr = float(
+                            (-10.0 * torch.log10(sky_mse)).item()
+                        )
+                        sky_psnrs.append(sky_psnr)
+                        if official_image_metrics:
+                            assert lpips_metric is not None
+                            with torch.no_grad():
+                                sky_lpips_value = float(
+                                    lpips_metric(
+                                        (
+                                            render_metric
+                                            * sky_metric_mask.unsqueeze(0)
+                                        ).unsqueeze(0),
+                                        (
+                                            target_metric
+                                            * sky_metric_mask.unsqueeze(0)
+                                        ).unsqueeze(0),
+                                    ).item()
+                                )
+                            sky_lpips_values.append(sky_lpips_value)
 
                 render = render_metric.detach().cpu()
                 target = target_metric.detach().cpu()
@@ -5279,6 +5474,35 @@ class PanoDroidGSSlamSystem:
                 render_img = _image_tensor_to_pil(render)
                 render_path = render_dir / f"frame_{int(frame_id):06d}.png"
                 render_img.save(render_path)
+                scene_path = None
+                sky_path = None
+                sky_alpha_path = None
+                sky_probability_path = None
+                if torch.is_tensor(pkg.get("scene_rgb")):
+                    scene_dir.mkdir(parents=True, exist_ok=True)
+                    scene_path = scene_dir / f"frame_{int(frame_id):06d}.png"
+                    _image_tensor_to_pil(pkg["scene_rgb"]).save(scene_path)
+                if torch.is_tensor(pkg.get("sky_rgb")):
+                    sky_dir.mkdir(parents=True, exist_ok=True)
+                    sky_path = sky_dir / f"frame_{int(frame_id):06d}.png"
+                    _image_tensor_to_pil(pkg["sky_rgb"]).save(sky_path)
+                if torch.is_tensor(pkg.get("sky_alpha")):
+                    sky_alpha_dir.mkdir(parents=True, exist_ok=True)
+                    sky_alpha_path = (
+                        sky_alpha_dir / f"frame_{int(frame_id):06d}.png"
+                    )
+                    _scalar_tensor_to_pil(pkg["sky_alpha"]).save(
+                        sky_alpha_path
+                    )
+                if torch.is_tensor(rec.get("sky_probability")):
+                    sky_probability_dir.mkdir(parents=True, exist_ok=True)
+                    sky_probability_path = (
+                        sky_probability_dir
+                        / f"frame_{int(frame_id):06d}.png"
+                    )
+                    _scalar_tensor_to_pil(rec["sky_probability"]).save(
+                        sky_probability_path
+                    )
                 w, h = target_img.size
                 canvas = Image.new("RGB", (2 * w, h + 26), "white")
                 canvas.paste(target_img, (0, 26))
@@ -5300,7 +5524,26 @@ class PanoDroidGSSlamSystem:
                         "psnr": psnr,
                         "ssim": ssim_value,
                         "lpips": lpips_value,
+                        "sky_psnr": sky_psnr,
+                        "sky_lpips": sky_lpips_value,
+                        "sky_pixel_ratio": sky_pixel_ratio,
                         "render_rgb": str(render_path),
+                        "scene_rgb": (
+                            None if scene_path is None else str(scene_path)
+                        ),
+                        "sky_rgb": (
+                            None if sky_path is None else str(sky_path)
+                        ),
+                        "sky_alpha": (
+                            None
+                            if sky_alpha_path is None
+                            else str(sky_alpha_path)
+                        ),
+                        "sky_probability": (
+                            None
+                            if sky_probability_path is None
+                            else str(sky_probability_path)
+                        ),
                         "render_vs_gt": str(panel_path),
                     }
                 )
@@ -5397,10 +5640,21 @@ class PanoDroidGSSlamSystem:
             metrics = {
                 "render_count": int(len(per_frame)),
                 "image_metric_protocol": image_metric_mode,
+                "sky_metric_protocol": (
+                    "binary_sky_mask_psnr_and_lpips_zeroed_outside_mask"
+                ),
                 "mean_psnr": float(np.mean(psnrs)) if psnrs else None,
                 "mean_ssim": float(np.mean(ssims)) if ssims else None,
                 "mean_lpips": (
                     float(np.mean(lpips_values)) if lpips_values else None
+                ),
+                "mean_sky_psnr": (
+                    float(np.mean(sky_psnrs)) if sky_psnrs else None
+                ),
+                "mean_sky_lpips": (
+                    float(np.mean(sky_lpips_values))
+                    if sky_lpips_values
+                    else None
                 ),
                 "ate_rmse": primary_ate_rmse,
                 "ate_count": int(len(pred_xyz)),
@@ -5427,7 +5681,15 @@ class PanoDroidGSSlamSystem:
             ) as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=("frame_id", "psnr", "ssim", "lpips"),
+                    fieldnames=(
+                        "frame_id",
+                        "psnr",
+                        "ssim",
+                        "lpips",
+                        "sky_psnr",
+                        "sky_lpips",
+                        "sky_pixel_ratio",
+                    ),
                 )
                 writer.writeheader()
                 writer.writerows(
@@ -5455,6 +5717,8 @@ class PanoDroidGSSlamSystem:
                 "final_all_frames": None,
                 "final_skybox_erp_preview": None,
                 "final_skybox_faces": None,
+                "final_sky_sphere_ply": None,
+                "final_sky_sphere_metadata": None,
             }
             if bool(results_cfg.get("save_final_ply", False)):
                 try:
@@ -5478,6 +5742,32 @@ class PanoDroidGSSlamSystem:
                         logger.log_artifact_file(mlp_path)
                 except Exception as exc:
                     self.mapper.stats.notes.append(f"final checkpoint save failed: {exc!r}")
+            if self.map.has_sky_sphere:
+                try:
+                    sky_sphere_dir = output_dir / "sky_sphere"
+                    sky_sphere_dir.mkdir(parents=True, exist_ok=True)
+                    sky_sphere_ply = sky_sphere_dir / "sky_sphere.ply"
+                    saved_ply = self.map.save_sky_sphere_ply(sky_sphere_ply)
+                    if saved_ply is not None:
+                        artifacts["final_sky_sphere_ply"] = str(saved_ply)
+                        logger.log_artifact_file(Path(saved_ply))
+                    metadata_path = sky_sphere_dir / "metadata.json"
+                    metadata_path.write_text(
+                        json.dumps(
+                            self.map.sky_sphere.metadata(),
+                            indent=2,
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                    artifacts["final_sky_sphere_metadata"] = str(
+                        metadata_path
+                    )
+                    logger.log_artifact_file(metadata_path)
+                except Exception as exc:
+                    self.mapper.stats.notes.append(
+                        f"final SkySphere save failed: {exc!r}"
+                    )
             if bool(results_cfg.get("save_final_keyframe_renders", False)):
                 stride = max(1, int(results_cfg.get("final_keyframe_render_stride", 1)))
                 max_count = int(results_cfg.get("final_keyframe_render_max", 0))
@@ -5748,12 +6038,20 @@ class PanoDroidGSSlamSystem:
                         "mean_psnr",
                         "mean_ssim",
                         "mean_lpips",
+                        "mean_sky_psnr",
+                        "mean_sky_lpips",
                         "ate_count",
                     }
                 },
                 "final_all_frames_mean_psnr": final_all_metrics.get("mean_psnr"),
                 "final_all_frames_mean_ssim": final_all_metrics.get("mean_ssim"),
                 "final_all_frames_mean_lpips": final_all_metrics.get("mean_lpips"),
+                "final_all_frames_mean_sky_psnr": final_all_metrics.get(
+                    "mean_sky_psnr"
+                ),
+                "final_all_frames_mean_sky_lpips": final_all_metrics.get(
+                    "mean_sky_lpips"
+                ),
                 "runtime": runtime_payload,
                 "runtime_path": str(runtime_path),
                 "backend_final_trajectory_png": final_backend_traj,

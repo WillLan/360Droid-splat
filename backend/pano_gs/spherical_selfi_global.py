@@ -45,6 +45,7 @@ from models.spherical_voxel_anchor_refiner import voxelize_per_pixel_gaussians
 
 from .adapter import PanoRenderCamera, PFGS360Renderer
 from .mapper import PanoGaussianMap, PanoGaussianMapper
+from .sky_sphere import SkySphereCameraBoundaryError
 from .sim3_graph import (
     CoincidentPanoramaFactor,
     DenseSphericalFactorBlock,
@@ -1465,6 +1466,21 @@ class SphericalSelfiGlobalBackend:
                 for owner, value in self.map._lazy_owner_current_transforms.items()
             },
             "map_lazy_sh_cache": dict(self.map._lazy_sh_rotation_cache),
+            "map_sky_sphere_state": {
+                name: value.detach().clone()
+                for name, value in self.map.sky_sphere.state_dict().items()
+            },
+            "mapper_sky_sphere_diagnostic": (
+                None
+                if self.mapper is None
+                else copy.deepcopy(
+                    getattr(
+                        self.mapper,
+                        "_pending_sky_sphere_diagnostic",
+                        None,
+                    )
+                )
+            ),
             "loop_memory": list(self.loop_detector.memory),
             "loop_descriptor_offsets": list(
                 getattr(self.loop_detector, "_descriptor_offsets", [])
@@ -1577,6 +1593,10 @@ class SphericalSelfiGlobalBackend:
         ]
         self.map._lazy_owner_current_transforms = state["map_lazy_current"]
         self.map._lazy_sh_rotation_cache = state["map_lazy_sh_cache"]
+        self.map.sky_sphere.load_state_dict(
+            state["map_sky_sphere_state"],
+            strict=True,
+        )
         self.loop_detector.memory = state["loop_memory"]
         self.loop_detector._descriptor_offsets = state[
             "loop_descriptor_offsets"
@@ -1601,6 +1621,9 @@ class SphericalSelfiGlobalBackend:
                 self.mapper.optimizer = state["mapper_optimizer"]
             if hasattr(self.mapper, "stats"):
                 self.mapper.stats.n_anchors = state["mapper_anchor_count"]
+            self.mapper._pending_sky_sphere_diagnostic = state[
+                "mapper_sky_sphere_diagnostic"
+            ]
 
     def _dense_factor_information_options(self) -> dict[str, bool | float]:
         return {
@@ -8569,6 +8592,13 @@ class SphericalSelfiGlobalBackend:
                 metrics["new_frame_count"] = float(len(new_frame_ids))
                 metrics["active_chunk_count"] = float(len(active_owner_window_ids))
                 metrics["pose_to_graph_sync_disabled"] = 1.0
+                metrics.update(
+                    self.mapper.optimize_sky_sphere(
+                        window_id=int(window_id),
+                        recent_frame_ids=visited_frame_ids,
+                        seed=int(self.map_optimize_config.get("seed", 123)),
+                    )
+                )
                 return metrics
             if self.map_optimization_strategy == "gaussian_only_staged":
                 recent_frame_ids = self._map_optimization_frame_ids(
@@ -8754,6 +8784,14 @@ class SphericalSelfiGlobalBackend:
                             committed.get("tail_mean_loss", 0.0)
                         )
             return metrics
+        except SkySphereCameraBoundaryError:
+            if backend_transaction is not None:
+                self._restore_boundary_transaction(backend_transaction)
+            if self.geometry_rollback_on_failure:
+                self.mapper.rollback_spherical_selfi_window()
+            else:
+                self.mapper.commit_spherical_selfi_window()
+            raise
         except (RuntimeError, ValueError, KeyError) as exc:
             if backend_transaction is not None:
                 self._restore_boundary_transaction(backend_transaction)

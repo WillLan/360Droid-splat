@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from backend.pano_gs.adapter import PFGS360Renderer, PanoRenderCamera
 from backend.pano_gs.losses import BackendLossWeights, backend_render_loss
 from backend.pano_gs.pose_param import PoseDelta
+from backend.pano_gs.sky_sphere import PanoLOGSkySphere
 from frontend.pano_droid.interfaces import FrontendOutput
 from frontend.pano_droid.spherical_camera import bearing_to_erp_pixel, erp_pixel_to_bearing, pixel_grid
 from geometry.pose import invert_c2w
@@ -101,6 +102,7 @@ class MapperKeyframe:
     gaussian_start: int
     gaussian_end: int
     sky_mask: torch.Tensor | None = None
+    sky_probability: torch.Tensor | None = None
     target_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
 
@@ -112,6 +114,7 @@ class MapperObservation:
     pose_c2w: torch.Tensor
     is_keyframe: bool = False
     sky_mask: torch.Tensor | None = None
+    sky_probability: torch.Tensor | None = None
     target_depth: torch.Tensor | None = None
     depth_confidence: torch.Tensor | None = None
     target_depth_local: torch.Tensor | None = None
@@ -180,6 +183,7 @@ class PanoGaussianMap(nn.Module):
         self.device_hint = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._reset_parameters()
         self._reset_skybox()
+        self._reset_sky_sphere()
         self._anchor_level = torch.zeros(0, dtype=torch.int8)
         self._anchor_voxel_size = torch.zeros(0, dtype=torch.float32)
         self._anchor_grid_coord = torch.zeros(0, 3, dtype=torch.int32)
@@ -233,6 +237,16 @@ class PanoGaussianMap(nn.Module):
                 dtype=torch.float32,
             )
             self.skybox_logits = nn.Parameter(self._inv_sigmoid(init))
+
+    def _reset_sky_sphere(self) -> None:
+        cfg = self.config.get("SkySphere", {}) if isinstance(self.config, dict) else {}
+        self.sky_sphere = PanoLOGSkySphere(
+            config=cfg if isinstance(cfg, dict) else {},
+            scene_config=self.config,
+            device=self.device_hint,
+        )
+        if self.sky_sphere.enabled and self.has_skybox:
+            raise ValueError("SkySphere and SkyBox are mutually exclusive")
 
     @property
     def get_xyz(self) -> torch.Tensor:
@@ -562,6 +576,21 @@ class PanoGaussianMap(nn.Module):
         if self.skybox_logits is None or not self.skybox_optimize:
             return []
         return [self.skybox_logits]
+
+    @property
+    def has_sky_sphere(self) -> bool:
+        return bool(self.sky_sphere.enabled and self.sky_sphere.initialized)
+
+    def sky_sphere_parameters(self) -> list[nn.Parameter]:
+        if not self.has_sky_sphere or self.sky_sphere.frozen:
+            return []
+        return [
+            self.sky_sphere.rotation,
+            self.sky_sphere.scaling,
+            self.sky_sphere.opacity_logit,
+            self.sky_sphere.features,
+            self.sky_sphere.sh_rest,
+        ]
 
     def anchor_count(self) -> int:
         return int(self.xyz.shape[0])
@@ -1596,11 +1625,85 @@ class PanoGaussianMap(nn.Module):
                 self._anchor_depth_selected_levels
             ),
             "config": self.config,
+            "sky_sphere": self.sky_sphere.metadata(),
         }
         if self._lazy_owner_transforms_enabled:
             payload["lazy_owner_transforms"] = self.lazy_owner_transform_state()
         torch.save(payload, path)
         return str(path)
+
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        map_location: str | torch.device | None = None,
+        strict: bool = True,
+    ) -> dict:
+        """Restore scene and optional Sky-Sphere state.
+
+        Checkpoints written before Sky-Sphere support have no ``sky_sphere.*``
+        keys. Those keys are the only missing fields accepted in strict mode.
+        """
+
+        payload = torch.load(
+            Path(path),
+            map_location=map_location or self.device_hint,
+            weights_only=False,
+        )
+        state = dict(payload.get("state_dict", payload))
+        for name in (
+            "xyz",
+            "rotation",
+            "scaling",
+            "opacity_logit",
+            "features",
+            "sh_rest",
+        ):
+            value = state.get(name)
+            if torch.is_tensor(value):
+                setattr(
+                    self,
+                    name,
+                    nn.Parameter(
+                        value.detach().to(self.device_hint),
+                    ),
+                )
+        result = self.load_state_dict(state, strict=False)
+        missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith("sky_sphere.")
+        ]
+        if strict and (missing or result.unexpected_keys):
+            raise RuntimeError(
+                "Gaussian checkpoint is incompatible: "
+                f"missing={missing}, unexpected={result.unexpected_keys}"
+            )
+        metadata = payload.get("pfgs360_metadata")
+        if isinstance(metadata, dict):
+            for name in self._anchor_metadata_names():
+                value = metadata.get(name)
+                if torch.is_tensor(value):
+                    setattr(self, name, value.detach().cpu().clone())
+        lazy = payload.get("lazy_owner_transforms")
+        if isinstance(lazy, dict):
+            self.configure_lazy_owner_transforms(
+                bool(lazy.get("enabled", False))
+            )
+            self._lazy_owner_reference_transforms = {
+                int(owner): torch.as_tensor(value).detach().cpu().float().clone()
+                for owner, value in dict(lazy.get("reference", {}) or {}).items()
+            }
+            self._lazy_owner_current_transforms = {
+                int(owner): torch.as_tensor(value).detach().cpu().float().clone()
+                for owner, value in dict(lazy.get("current", {}) or {}).items()
+            }
+        return payload
+
+    def save_sky_sphere_ply(self, path: str | Path) -> str | None:
+        if not self.has_sky_sphere:
+            return None
+        return self.sky_sphere.save_ply(path)
 
 
 class PanoGaussianMapper:
@@ -1701,6 +1804,7 @@ class PanoGaussianMapper:
         self._spherical_selfi_rollback_state: tuple[dict[str, torch.Tensor], dict[int, torch.Tensor]] | None = None
         self._pfgs360_joint_steps = 0
         self._pfgs360_gaussian_moments: dict[str, dict[str, object]] = {}
+        self._sky_sphere_warning_recorded = False
         self.last_inserted_range: tuple[int, int] = (0, 0)
         self.last_requested_source_flat_idx: torch.Tensor | None = None
         self.last_inserted_source_flat_idx: torch.Tensor | None = None
@@ -1850,7 +1954,18 @@ class PanoGaussianMapper:
         if image is not None:
             register_start, register_end = self.last_inserted_range
             self._register_keyframe(frontend_output, image, start=register_start, end=register_end, sky_mask=sky_mask)
-            self.register_observation(frontend_output, image, is_keyframe=True, sky_mask=sky_mask)
+            existing_probability = (
+                self.observations[int(frontend_output.frame_id)].sky_probability
+                if int(frontend_output.frame_id) in self.observations
+                else None
+            )
+            self.register_observation(
+                frontend_output,
+                image,
+                is_keyframe=True,
+                sky_mask=sky_mask,
+                sky_probability=existing_probability,
+            )
         if n == 0:
             self.stats.notes.append(f"frame {frontend_output.frame_id}: no seeds inserted")
         if self.novel_insertion_enabled and requested != n:
@@ -1911,6 +2026,11 @@ class PanoGaussianMapper:
                 gaussian_start=start,
                 gaussian_end=end,
                 sky_mask=None if obs.sky_mask is None else obs.sky_mask.detach().cpu().bool(),
+                sky_probability=(
+                    None
+                    if obs.sky_probability is None
+                    else obs.sky_probability.detach().cpu().to(torch.float16)
+                ),
                 target_depth=None if obs.target_depth is None else obs.target_depth.detach().cpu().float(),
                 depth_confidence=None if obs.depth_confidence is None else obs.depth_confidence.detach().cpu().float(),
             )
@@ -2768,6 +2888,312 @@ class PanoGaussianMapper:
         )
         return metrics
 
+    def optimize_sky_sphere(
+        self,
+        *,
+        window_id: int,
+        recent_frame_ids: list[int] | tuple[int, ...],
+        seed: int,
+    ) -> dict[str, float]:
+        """Run the finite PanoLOG-style sky bootstrap stage."""
+
+        sphere = self.map.sky_sphere
+        if not sphere.enabled:
+            return {}
+        recent_ids = tuple(dict.fromkeys(int(value) for value in recent_frame_ids))
+        available = [
+            observation
+            for _, observation in sorted(self.observations.items())
+            if observation.sky_probability is not None
+        ]
+        if not available:
+            raise RuntimeError("SkySphere requires registered sky probabilities")
+        camera_centers = torch.stack(
+            [
+                (
+                    self.pose_deltas[int(observation.frame_id)]()
+                    if int(observation.frame_id) in self.pose_deltas
+                    else observation.pose_c2w
+                )[:3, 3]
+                .detach()
+                .to(device=self.map.get_xyz.device, dtype=torch.float32)
+                for observation in available
+            ],
+            dim=0,
+        )
+        if not sphere.initialized:
+            initialization_observations = []
+            for observation in available:
+                pose = (
+                    self.pose_deltas[int(observation.frame_id)]()
+                    if int(observation.frame_id) in self.pose_deltas
+                    else observation.pose_c2w
+                )
+                initialization_observations.append(
+                    (
+                        observation.image,
+                        pose,
+                        observation.sky_probability,
+                    )
+                )
+            initialized = sphere.initialize(
+                observations=initialization_observations,
+                scene_xyz=self.map.get_xyz.detach(),
+                camera_centers=camera_centers,
+            )
+            if not initialized:
+                raise RuntimeError("SkySphere initialization failed")
+        radius = sphere.update_bootstrap_radius(
+            scene_xyz=self.map.get_xyz.detach(),
+            camera_centers=camera_centers,
+        )
+        if sphere.frozen:
+            return {
+                "sky_sphere_enabled": 1.0,
+                "sky_sphere_initialized": 1.0,
+                "sky_sphere_frozen": 1.0,
+                "sky_sphere_radius": float(radius),
+                "sky_sphere_steps": 0.0,
+            }
+
+        cfg = self.map.config.get("SkySphere", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        learning_rates = {
+            "feature_dc": float(cfg.get("feature_lr", 2.0e-3)),
+            "sh_rest": float(cfg.get("sh_rest_lr", 1.0e-4)),
+            "opacity": float(cfg.get("opacity_lr", 1.0e-3)),
+            "scaling": float(cfg.get("scaling_lr", 1.0e-4)),
+            "rotation": float(cfg.get("rotation_lr", 1.0e-4)),
+        }
+        sphere.set_trainable(True)
+        optimizer = torch.optim.Adam(
+            sphere.parameter_groups(learning_rates),
+            eps=float(cfg.get("adam_eps", 1.0e-15)),
+            weight_decay=0.0,
+        )
+        recent = [
+            observation
+            for observation in available
+            if int(observation.frame_id) in recent_ids
+        ]
+        recent = recent or available[-max(1, min(4, len(available))):]
+        history = [
+            observation
+            for observation in available
+            if int(observation.frame_id) not in {
+                int(value.frame_id) for value in recent
+            }
+        ]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed) + int(window_id) * 104729)
+        last_loss = 0.0
+        last_l1 = 0.0
+        last_dssim = 0.0
+        last_alpha = 0.0
+        last_observation = recent[-1]
+        steps = int(sphere.optimize_steps_per_chunk)
+        center_before = sphere.center.detach().clone()
+        directions_before = sphere.directions.detach().clone()
+        try:
+            from backend.pano_gs.pfgs360_full import (
+                pfgs360_photometric_loss,
+                pfgs360_spherical_weight,
+            )
+
+            for _ in range(steps):
+                selected = [
+                    recent[
+                        int(
+                            torch.randint(
+                                len(recent),
+                                (),
+                                generator=generator,
+                            )
+                        )
+                    ]
+                ]
+                if history:
+                    selected.append(
+                        history[
+                            int(
+                                torch.randint(
+                                    len(history),
+                                    (),
+                                    generator=generator,
+                                )
+                            )
+                        ]
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                losses = []
+                l1_values = []
+                dssim_values = []
+                alpha_values = []
+                for observation in selected:
+                    last_observation = observation
+                    target = observation.image.to(
+                        device=self.map.get_xyz.device,
+                        dtype=torch.float32,
+                    )
+                    pose = (
+                        self.pose_deltas[int(observation.frame_id)]()
+                        if int(observation.frame_id) in self.pose_deltas
+                        else observation.pose_c2w
+                    ).detach().to(target)
+                    camera = PanoRenderCamera(
+                        image_height=int(target.shape[-2]),
+                        image_width=int(target.shape[-1]),
+                        c2w=pose,
+                    )
+                    package = self.renderer.render(
+                        camera,
+                        sphere,
+                        compose_background=False,
+                    )
+                    sky_rgb = package["render"]
+                    sky_alpha = package["alpha"]
+                    probability = PanoLOGSkySphere._normalize_probability(
+                        observation.sky_probability,
+                        height=int(target.shape[-2]),
+                        width=int(target.shape[-1]),
+                        device=target.device,
+                        dtype=target.dtype,
+                    ).unsqueeze(0)
+                    photometric, parts = pfgs360_photometric_loss(
+                        sky_rgb,
+                        target,
+                        mask=probability,
+                    )
+                    balance = pfgs360_spherical_weight(
+                        int(target.shape[-2]),
+                        int(target.shape[-1]),
+                        device=target.device,
+                        dtype=target.dtype,
+                    )
+                    reliable_sky = (
+                        probability >= float(sphere.sky_threshold)
+                    ).to(probability)
+                    weight = balance * probability * reliable_sky
+                    alpha_loss = (
+                        (weight * (1.0 - sky_alpha).square()).sum()
+                        / weight.sum().clamp_min(1.0e-8)
+                    )
+                    total = photometric + float(
+                        cfg.get("alpha_coverage_weight", 0.05)
+                    ) * alpha_loss
+                    losses.append(total)
+                    l1_values.append(parts["l1"])
+                    dssim_values.append(parts["dssim"])
+                    alpha_values.append(alpha_loss.detach())
+                loss = torch.stack(losses).mean()
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("Non-finite SkySphere optimization loss")
+                loss.backward()
+                parameters = [
+                    parameter
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                ]
+                if not all(
+                    parameter.grad is None
+                    or bool(torch.isfinite(parameter.grad).all())
+                    for parameter in parameters
+                ):
+                    raise FloatingPointError("Non-finite SkySphere gradient")
+                optimizer.step()
+                if not all(bool(torch.isfinite(parameter).all()) for parameter in parameters):
+                    raise FloatingPointError("Non-finite SkySphere parameter")
+                last_loss = float(loss.detach().cpu())
+                last_l1 = float(torch.stack(l1_values).mean().cpu())
+                last_dssim = float(torch.stack(dssim_values).mean().cpu())
+                last_alpha = float(torch.stack(alpha_values).mean().cpu())
+        finally:
+            sphere.set_trainable(False)
+        if not torch.equal(center_before, sphere.center.detach()):
+            raise RuntimeError("SkySphere optimization modified its fixed center")
+        if not torch.equal(directions_before, sphere.directions.detach()):
+            raise RuntimeError("SkySphere optimization modified fixed directions")
+        frozen = sphere.complete_chunk()
+        self._pending_sky_sphere_diagnostic = self._sky_sphere_diagnostic(
+            last_observation,
+            window_id=int(window_id),
+        )
+        return {
+            "sky_sphere_enabled": 1.0,
+            "sky_sphere_initialized": 1.0,
+            "sky_sphere_frozen": float(bool(frozen)),
+            "sky_sphere_radius": float(sphere.radius.detach().cpu()),
+            "sky_sphere_steps": float(steps),
+            "sky_sphere_loss": float(last_loss),
+            "sky_sphere_l1": float(last_l1),
+            "sky_sphere_dssim": float(last_dssim),
+            "sky_sphere_alpha_loss": float(last_alpha),
+            "sky_sphere_chunks_completed": float(
+                int(sphere.chunks_completed.item())
+            ),
+        }
+
+    @torch.no_grad()
+    def _sky_sphere_diagnostic(
+        self,
+        observation: MapperObservation,
+        *,
+        window_id: int,
+    ) -> dict[str, object]:
+        target = observation.image.to(
+            device=self.map.get_xyz.device,
+            dtype=torch.float32,
+        )
+        pose = (
+            self.pose_deltas[int(observation.frame_id)]()
+            if int(observation.frame_id) in self.pose_deltas
+            else observation.pose_c2w
+        ).detach().to(target)
+        camera = PanoRenderCamera(
+            image_height=int(target.shape[-2]),
+            image_width=int(target.shape[-1]),
+            c2w=pose,
+        )
+        scene = self.renderer.render(
+            camera,
+            self.map,
+            compose_background=False,
+        )
+        sky = self.renderer.render(
+            camera,
+            self.map.sky_sphere,
+            compose_background=False,
+        )
+        scene_rgb = scene["render"]
+        scene_alpha = scene["alpha"]
+        composite = (
+            scene_rgb + (1.0 - scene_alpha).clamp(0.0, 1.0) * sky["render"]
+        ).clamp(0.0, 1.0)
+        probability = PanoLOGSkySphere._normalize_probability(
+            observation.sky_probability,
+            height=int(target.shape[-2]),
+            width=int(target.shape[-1]),
+            device=target.device,
+            dtype=target.dtype,
+        )
+        return {
+            "window_id": int(window_id),
+            "frame_id": int(observation.frame_id),
+            "target": target.detach().cpu(),
+            "scene_rgb": scene_rgb.detach().cpu(),
+            "sky_rgb": sky["render"].detach().cpu(),
+            "composite_rgb": composite.detach().cpu(),
+            "sky_probability": probability.detach().cpu(),
+            "sky_alpha": sky["alpha"].detach().cpu(),
+            "metadata": self.map.sky_sphere.metadata(),
+        }
+
+    def consume_sky_sphere_diagnostic(self):
+        value = getattr(self, "_pending_sky_sphere_diagnostic", None)
+        self._pending_sky_sphere_diagnostic = None
+        return value
+
     def consume_pfgs360_anchor_admission(self):
         """Return and clear the latest fixed-key refined-anchor diagnostic."""
 
@@ -2803,6 +3229,11 @@ class PanoGaussianMapper:
                 gaussian_start=0,
                 gaussian_end=self.map.anchor_count(),
                 sky_mask=None if observation.sky_mask is None else observation.sky_mask.detach().cpu().bool(),
+                sky_probability=(
+                    None
+                    if observation.sky_probability is None
+                    else observation.sky_probability.detach().cpu().to(torch.float16)
+                ),
                 target_depth=None if observation.target_depth is None else observation.target_depth.detach().cpu().float(),
                 depth_confidence=None if observation.depth_confidence is None else observation.depth_confidence.detach().cpu().float(),
             )
@@ -2834,6 +3265,7 @@ class PanoGaussianMapper:
         *,
         is_keyframe: bool | None = None,
         sky_mask: torch.Tensor | None = None,
+        sky_probability: torch.Tensor | None = None,
     ) -> None:
         self.register_observation_values(
             frame_id=int(frontend_output.frame_id),
@@ -2845,6 +3277,7 @@ class PanoGaussianMapper:
             world_points_confidence=frontend_output.world_points_confidence,
             is_keyframe=bool(frontend_output.is_keyframe) if is_keyframe is None else bool(is_keyframe),
             sky_mask=sky_mask,
+            sky_probability=sky_probability,
         )
 
     def register_observation_values(
@@ -2859,6 +3292,7 @@ class PanoGaussianMapper:
         world_points_confidence: torch.Tensor | None = None,
         is_keyframe: bool = False,
         sky_mask: torch.Tensor | None = None,
+        sky_probability: torch.Tensor | None = None,
     ) -> None:
         img = image.detach().cpu().float()
         if img.ndim == 4 and int(img.shape[0]) == 1:
@@ -2890,12 +3324,33 @@ class PanoGaussianMapper:
                 device=torch.device("cpu"),
             )
             conf = conf.masked_fill(sky_depth_mask.bool(), 0.0)
+        probability = None
+        if sky_probability is not None:
+            probability = PanoLOGSkySphere._normalize_probability(
+                sky_probability,
+                height=int(img.shape[-2]),
+                width=int(img.shape[-1]),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        elif sky is not None:
+            probability = self._normalize_skybox_mask(
+                sky,
+                height=int(img.shape[-2]),
+                width=int(img.shape[-1]),
+                device=torch.device("cpu"),
+            ).float()
         self.observations[frame_id] = MapperObservation(
             frame_id=frame_id,
             image=img,
             pose_c2w=c2w.detach().cpu().float(),
             is_keyframe=bool(is_keyframe),
             sky_mask=sky.detach().cpu().bool() if torch.is_tensor(sky) else None,
+            sky_probability=(
+                None
+                if probability is None
+                else probability.detach().cpu().to(torch.float16)
+            ),
             target_depth=None if depth is None else depth.detach().cpu().float(),
             depth_confidence=None if conf is None else conf.detach().cpu().float(),
         )
@@ -4296,6 +4751,15 @@ class PanoGaussianMapper:
             gaussian_start=int(start),
             gaussian_end=int(end),
             sky_mask=sky_mask.detach().cpu().bool() if torch.is_tensor(sky_mask) else None,
+            sky_probability=(
+                None
+                if frame_id not in self.observations
+                or self.observations[frame_id].sky_probability is None
+                else self.observations[frame_id]
+                .sky_probability.detach()
+                .cpu()
+                .to(torch.float16)
+            ),
             target_depth=self._keyframe_target_depth(frontend_output, image, sky_mask=sky_mask),
             depth_confidence=self._keyframe_depth_confidence(frontend_output, image, sky_mask=sky_mask),
         )
@@ -4707,14 +5171,30 @@ class PanoGaussianMapper:
         c2w: torch.Tensor,
         sky_mask: torch.Tensor | None = None,
     ) -> dict | None:
-        if self.map.anchor_count() == 0 and not self.map.has_skybox:
+        if (
+            self.map.anchor_count() == 0
+            and not self.map.has_skybox
+            and not self.map.has_sky_sphere
+        ):
             return None
         target = image.to(device=self.map.get_xyz.device, dtype=self.map.get_xyz.dtype)
         H, W = int(target.shape[-2]), int(target.shape[-1])
         camera = PanoRenderCamera(image_height=H, image_width=W, c2w=c2w.to(target))
         with torch.no_grad():
             pkg = self.renderer.render(camera, self.map)
-            return self._apply_skybox_optimization_mask(pkg, self._skybox_mask_for_target(target, sky_mask))
+            if (
+                bool(pkg.get("sky_sphere_camera_radius_warning", False))
+                and not self._sky_sphere_warning_recorded
+            ):
+                self.stats.notes.append(
+                    "SkySphere camera distance exceeded warning ratio: "
+                    f"{float(pkg['sky_sphere_camera_radius_ratio']):.4f}"
+                )
+                self._sky_sphere_warning_recorded = True
+            return self._apply_skybox_optimization_mask(
+                pkg,
+                self._skybox_mask_for_target(target, sky_mask),
+            )
 
     def _skybox_optimization_mask_enabled(self) -> bool:
         return bool(self._skybox_mask_enabled() and getattr(self.map, "skybox_optimize", False))
@@ -4840,7 +5320,11 @@ class PanoGaussianMapper:
     def render_keyframe_diagnostic(self, frame_id: int) -> KeyframeRenderDiagnostic | None:
         """Render an optimized keyframe for post-optimization diagnostics."""
 
-        if self.map.anchor_count() == 0 and not self.map.has_skybox:
+        if (
+            self.map.anchor_count() == 0
+            and not self.map.has_skybox
+            and not self.map.has_sky_sphere
+        ):
             return None
         frame_id = int(frame_id)
         keyframe = next((kf for kf in self.keyframes if int(kf.frame_id) == frame_id), None)

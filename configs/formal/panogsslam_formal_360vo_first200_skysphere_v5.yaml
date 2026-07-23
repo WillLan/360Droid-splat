@@ -1,5 +1,5 @@
-version: 3
-name: panogsslam_pager_globalmap_refinedanchor_50_200_360vo200_v3
+version: 5
+name: panogsslam_skysphere_360vo_first200_v5
 expected_run_count: 10
 base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
 formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
@@ -16,7 +16,7 @@ resource_limits:
 datasets:
   - name: 360vo
     type: ob3d
-    root: /mnt/disk1/zwh/Dataset/360VO-PFGS360-200-formal-v1
+    root: /mnt/disk1/zwh/Dataset/360VO-PFGS360
     frames: 200
     scenes: [seq0, seq1, seq2, seq3, seq4, seq5, seq6, seq7, seq8, seq9]
     splits: [Egocentric]
@@ -42,4 +42,23 @@ datasets:
         sky_mask_enable: true
         sky_mask_source: panovggt_head
       SkyBox:
+        enabled: false
+      SkySphere:
         enabled: true
+        num_gaussians: 65536
+        bootstrap_chunks: 10
+        optimize_steps_per_chunk: 20
+        sky_threshold: 0.6
+        sh_degree: 3
+        radius_scene_multiplier: 8.0
+        radius_camera_multiplier: 16.0
+        initialization: fibonacci
+        exclude_from_geometry: true
+        feature_lr: 2.0e-3
+        sh_rest_lr: 1.0e-4
+        opacity_lr: 1.0e-3
+        scaling_lr: 1.0e-4
+        rotation_lr: 1.0e-4
+        alpha_coverage_weight: 0.05
+        warn_camera_radius_ratio: 0.25
+        abort_camera_radius_ratio: 0.8
