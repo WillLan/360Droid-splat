@@ -21,7 +21,14 @@ from PIL import Image, ImageDraw
 
 from backend.pano_gs import NeuralScaffoldPanoMap, PFGS360Renderer, PanoGaussianMap, PanoGaussianMapper
 from frontend.pano_droid.adapter import build_frontend_from_config
-from frontend.pano_droid.dataset import discover_erp_images, discover_ob3d_images, load_erp_image, load_ob3d_camera_c2w
+from frontend.pano_droid.dataset import (
+    discover_erp_images,
+    discover_ob3d_images,
+    discover_rar_pano_images,
+    load_erp_image,
+    load_ob3d_camera_c2w,
+    load_rar_pano_reconstruction_c2w,
+)
 from frontend.pano_droid.interfaces import FrontendOutput, PanoFrame
 from frontend.pano_droid.spherical_camera import erp_pixel_to_bearing, pixel_grid
 from frontend.pano_droid.spherical_ba import se3_exp, skew
@@ -241,6 +248,11 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
             scene=ds_cfg.get("scene", ds_cfg.get("sequence")),
             split=str(ds_cfg.get("split", "Egocentric")),
         )
+    elif dataset_type == "rar_pano":
+        sequence = ds_cfg.get("scene", ds_cfg.get("sequence"))
+        if sequence is None:
+            raise ValueError("RAR_pano Dataset.scene or Dataset.sequence is required")
+        files = discover_rar_pano_images(root, sequence=str(sequence))
     else:
         files = discover_erp_images(root, sequence=ds_cfg.get("sequence"))
     begin = int(ds_cfg.get("begin", 0))
@@ -252,7 +264,15 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
     h = ds_cfg.get("erp_resize_height")
     w = ds_cfg.get("erp_resize_width")
     resize = (int(h), int(w)) if h is not None and w is not None else None
-    gt_poses = {} if dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"} else _load_panocity_gt_poses(root)
+    if dataset_type == "rar_pano":
+        gt_poses = load_rar_pano_reconstruction_c2w(
+            root,
+            sequence=str(ds_cfg.get("scene", ds_cfg.get("sequence"))),
+        )
+    elif dataset_type in {"ob3d", "ob3d_pfgs360", "pfgs360_ob3d"}:
+        gt_poses = {}
+    else:
+        gt_poses = _load_panocity_gt_poses(root)
     for frame_id, path in indexed_files:
         gt = gt_poses.get(str(Path(path).resolve()))
         if gt is None:
@@ -262,6 +282,8 @@ def iter_sequence_frames(config: dict) -> Iterable[PanoFrame]:
         meta = {"path": path, "source_frame_index": int(frame_id)}
         if gt is not None:
             meta["gt_c2w"] = torch.from_numpy(gt).float()
+            if dataset_type == "rar_pano":
+                meta["gt_pose_source"] = "opensfm_reconstruction_pseudo_gt"
         yield PanoFrame(
             image=load_erp_image(path, resize=resize),
             timestamp=float(frame_id),

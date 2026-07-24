@@ -4,16 +4,19 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from system.pano_droid_gs_slam import load_config
 from tools.formal_experiments import (
+    RunSpec,
     _assert_formal_mainline,
     _assert_dataset_policy,
     _deep_merge_config,
     _expand_runs,
     _prepare_torch_home,
     _sha256,
+    _verify_dataset_run,
     validate_run,
 )
 from tools.formal_phase_supervisor import phase_status
@@ -50,6 +53,106 @@ def test_v3_campaigns_are_balanced_independent_phases() -> None:
     assert [sum(run.frames for run in ob3d if run.worker == worker) for worker in (0, 1)] == [1200, 1200]
     assert [sum(run.frames for run in vo if run.worker == worker) for worker in (0, 1)] == [1000, 1000]
     assert all(run.frames == 200 and run.dataset == "360vo" for run in vo)
+
+
+def test_rar_pano_campaign_uses_every_frame_and_ob3d_geometry_policy() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _v3_campaign("panogsslam_formal_rar_pano_v10.yaml")
+    runs = _expand_runs(campaign)
+    expected_frames = {
+        "I_alley": 145,
+        "I_avenue": 272,
+        "I_bridge": 147,
+        "I_bypath": 86,
+        "I_garden": 210,
+        "O_car": 188,
+        "O_lion": 253,
+        "O_statuary": 270,
+        "O_stone": 171,
+    }
+
+    assert len(runs) == 9
+    assert {run.scene: run.frames for run in runs} == expected_frames
+    assert all(run.dataset_type == "rar_pano" for run in runs)
+    assert all(run.split == "Full" for run in runs)
+    assert [sum(run.frames for run in runs if run.worker == worker) for worker in (0, 1)] == [
+        903,
+        839,
+    ]
+
+    base = load_config(root / campaign["base_config"])
+    resolved = _deep_merge_config(
+        copy.deepcopy(base),
+        runs[0].config_overrides,
+    )
+    _assert_formal_mainline(resolved, seed=123)
+    _assert_dataset_policy(resolved, runs[0])
+    assert resolved["SphericalSelfiRuntime"]["sky"]["enabled"] is False
+    assert resolved["Mapping"]["sky_mask_enable"] is False
+    assert resolved["SkyBox"]["enabled"] is False
+    assert resolved["SkySphere"]["enabled"] is False
+    pfgs = resolved["SphericalSelfiGlobalBackend"]["map_optimization"][
+        "pfgs360"
+    ]
+    assert pfgs["atomic_refined_anchor_replacement"] is True
+    assert pfgs["append_only_refined_anchors"] is True
+    assert pfgs["growth_hash_dedup_enabled"] is False
+    assert pfgs["anchor_footprint"] == {
+        "enabled": True,
+        "sigma": 2.0,
+        "min_radius_pixels": 1.0,
+        "max_radius_pixels": 8.0,
+        "min_pixels": 1,
+        "min_coverage": 0.05,
+    }
+    assert (
+        resolved["Dataset"]["reference_pose_source"]
+        == "opensfm_reconstruction_pseudo_gt"
+    )
+    assert resolved["Dataset"]["reference_pose_usage"] == "evaluation_only"
+
+
+def test_rar_pano_dataset_verifier_requires_exact_images_and_opensfm_shots(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "I_alley" / "images"
+    image_dir.mkdir(parents=True)
+    for name in ("001.png", "002.png"):
+        (image_dir / name).write_bytes(b"png")
+    (image_dir / "comparison_001.png").write_bytes(b"not a frame")
+    (tmp_path / "I_alley" / "reconstruction.json").write_text(
+        json.dumps(
+            [
+                {
+                    "shots": {
+                        name: {
+                            "rotation": [0.0, 0.0, 0.0],
+                            "translation": [0.0, 0.0, 0.0],
+                        }
+                        for name in ("001.png", "002.png")
+                    }
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    run = RunSpec(
+        run_id="rar_pano__i_alley__full",
+        dataset="rar_pano",
+        dataset_type="rar_pano",
+        root=str(tmp_path),
+        scene="I_alley",
+        split="Full",
+        frames=2,
+        config_overrides={},
+        worker=0,
+    )
+
+    _verify_dataset_run(run)
+
+    mismatched = RunSpec(**{**run.__dict__, "frames": 1})
+    with pytest.raises(ValueError, match="all-frame run requires exactly 1"):
+        _verify_dataset_run(mismatched)
 
 
 def test_formal_base_config_locks_the_confirmed_mainline() -> None:

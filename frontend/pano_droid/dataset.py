@@ -77,6 +77,114 @@ def discover_ob3d_images(root: str, *, scene: str | None = None, split: str = "E
     raise FileNotFoundError(f"No OB3D ERP images found under {root} scene={scene!r} split={split!r}")
 
 
+def discover_rar_pano_images(root: str, *, sequence: str) -> list[str]:
+    """Discover the contiguous numeric frames of one RAR_pano sequence."""
+
+    image_dir = Path(root) / str(sequence) / "images"
+    if not image_dir.is_dir():
+        raise FileNotFoundError(f"RAR_pano image directory does not exist: {image_dir}")
+    numeric_name = re.compile(r"^(?P<frame>\d+)\.(?:png|jpe?g)$", re.IGNORECASE)
+    indexed: list[tuple[int, Path]] = []
+    for path in image_dir.iterdir():
+        if not path.is_file():
+            continue
+        match = numeric_name.fullmatch(path.name)
+        if match is not None:
+            indexed.append((int(match.group("frame")), path))
+    if not indexed:
+        raise FileNotFoundError(
+            f"No numeric RAR_pano frames found under {image_dir}"
+        )
+    indexed.sort(key=lambda item: (item[0], item[1].name))
+    frame_numbers = [item[0] for item in indexed]
+    if len(frame_numbers) != len(set(frame_numbers)):
+        raise ValueError(f"RAR_pano contains duplicate numeric frame ids: {image_dir}")
+    expected = list(range(1, len(frame_numbers) + 1))
+    if frame_numbers != expected:
+        raise ValueError(f"RAR_pano frames are not contiguous: {image_dir}")
+    return [str(path) for _, path in indexed]
+
+
+def _opensfm_angle_axis_to_rotation(rotation: object) -> np.ndarray:
+    vector = np.asarray(rotation, dtype=np.float64)
+    if vector.shape != (3,) or not np.isfinite(vector).all():
+        raise ValueError("OpenSfM shot rotation must be a finite angle-axis vector")
+    angle = float(np.linalg.norm(vector))
+    if angle < 1.0e-12:
+        return np.eye(3, dtype=np.float64)
+    axis = vector / angle
+    x, y, z = axis
+    skew_axis = np.array(
+        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+        dtype=np.float64,
+    )
+    return (
+        np.eye(3, dtype=np.float64)
+        + math.sin(angle) * skew_axis
+        + (1.0 - math.cos(angle)) * (skew_axis @ skew_axis)
+    )
+
+
+def load_rar_pano_reconstruction_c2w(
+    root: str,
+    *,
+    sequence: str,
+) -> dict[str, np.ndarray]:
+    """Load OpenSfM reconstruction poses as pseudo-GT camera-to-world poses.
+
+    OpenSfM stores an angle-axis rotation and translation that map world points
+    into a camera.  These reference poses are inverted here and are intended
+    only for trajectory evaluation, never as input to the SLAM algorithm.
+    """
+
+    sequence_dir = Path(root) / str(sequence)
+    reconstruction_path = sequence_dir / "reconstruction.json"
+    if not reconstruction_path.is_file():
+        raise FileNotFoundError(
+            f"RAR_pano reconstruction does not exist: {reconstruction_path}"
+        )
+    with reconstruction_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, list) or len(payload) != 1:
+        raise ValueError(
+            "RAR_pano reconstruction.json must contain exactly one reconstruction"
+        )
+    reconstruction = payload[0]
+    if not isinstance(reconstruction, dict):
+        raise ValueError("RAR_pano reconstruction entry must be a mapping")
+    shots = reconstruction.get("shots")
+    if not isinstance(shots, dict) or not shots:
+        raise ValueError("RAR_pano reconstruction has no OpenSfM shots")
+
+    image_dir = sequence_dir / "images"
+    poses: dict[str, np.ndarray] = {}
+    for name, shot in shots.items():
+        if not isinstance(shot, dict):
+            raise ValueError(f"Invalid OpenSfM shot payload for {name!r}")
+        rotation_w2c = _opensfm_angle_axis_to_rotation(shot.get("rotation"))
+        translation_w2c = np.asarray(shot.get("translation"), dtype=np.float64)
+        if translation_w2c.shape != (3,) or not np.isfinite(
+            translation_w2c
+        ).all():
+            raise ValueError(
+                f"OpenSfM shot translation must be finite for {name!r}"
+            )
+        rotation_c2w = rotation_w2c.T
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = rotation_c2w.astype(np.float32)
+        c2w[:3, 3] = (
+            -rotation_c2w @ translation_w2c
+        ).astype(np.float32)
+        if not np.isfinite(c2w).all() or not np.isclose(
+            np.linalg.det(c2w[:3, :3]), 1.0, atol=1.0e-4
+        ):
+            raise ValueError(f"Invalid OpenSfM pose for {name!r}")
+        image_path = image_dir / str(name)
+        poses[str(name)] = c2w
+        poses[str(image_path.resolve())] = c2w
+    return poses
+
+
 def load_ob3d_camera_c2w(image_path: str | Path) -> np.ndarray | None:
     """Load the neighboring OB3D camera JSON as a 4x4 pose when present."""
 

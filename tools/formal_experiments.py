@@ -27,6 +27,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from system.pano_droid_gs_slam import load_config  # noqa: E402
+from frontend.pano_droid.dataset import (  # noqa: E402
+    discover_rar_pano_images,
+    load_rar_pano_reconstruction_c2w,
+)
 
 
 REQUIRED_TRAJECTORY_METRICS = (
@@ -118,11 +122,23 @@ def _campaign_root(campaign: dict[str, Any], repo_root: Path) -> Path:
 def _expand_runs(campaign: dict[str, Any]) -> list[RunSpec]:
     raw_runs: list[dict[str, Any]] = []
     for dataset in campaign.get("datasets", []):
+        scene_frames = dict(dataset.get("scene_frames", {}) or {})
         for scene in dataset.get("scenes", []):
             for split in dataset.get("splits", []):
                 dataset_name = str(dataset["name"])
                 scene_name = str(scene)
                 split_name = str(split)
+                frame_count = scene_frames.get(scene_name, dataset.get("frames"))
+                if frame_count is None:
+                    raise ValueError(
+                        f"Dataset {dataset_name} has no frame count for {scene_name}"
+                    )
+                frame_count = int(frame_count)
+                if frame_count <= 0:
+                    raise ValueError(
+                        f"Dataset {dataset_name} frame count must be positive "
+                        f"for {scene_name}"
+                    )
                 run_id = (
                     f"{dataset_name}__{scene_name}__{split_name}"
                     .lower()
@@ -136,7 +152,7 @@ def _expand_runs(campaign: dict[str, Any]) -> list[RunSpec]:
                         "root": str(dataset["root"]),
                         "scene": scene_name,
                         "split": split_name,
-                        "frames": int(dataset["frames"]),
+                        "frames": frame_count,
                         "config_overrides": copy.deepcopy(
                             dict(dataset.get("config_overrides", {}) or {})
                         ),
@@ -213,27 +229,56 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
     skybox = config["SkyBox"]
     sky_sphere = dict(config.get("SkySphere", {}) or {})
     sky_sphere_enabled = bool(sky_sphere.get("enabled", False))
-    if run.dataset == "ob3d":
+    if run.dataset in {"ob3d", "rar_pano"}:
+        label = "OB3D" if run.dataset == "ob3d" else "RAR_pano"
         expected = {
-            "OB3D Sky Head disabled": sky["enabled"] is False,
-            "OB3D sky not required": sky["required"] is False,
-            "OB3D mapping sky mask disabled": mapping["sky_mask_enable"] is False,
-            "OB3D mapping sky source disabled": str(mapping["sky_mask_source"]).lower()
+            f"{label} Sky Head disabled": sky["enabled"] is False,
+            f"{label} sky not required": sky["required"] is False,
+            f"{label} mapping sky mask disabled": mapping["sky_mask_enable"] is False,
+            f"{label} mapping sky source disabled": str(mapping["sky_mask_source"]).lower()
             == "none",
-            "OB3D skybox disabled": skybox["enabled"] is False,
-            "OB3D SkySphere disabled": sky_sphere_enabled is False,
-            "OB3D DIA has no semantic gate": pfgs["validity_gate"]
+            f"{label} skybox disabled": skybox["enabled"] is False,
+            f"{label} SkySphere disabled": sky_sphere_enabled is False,
+            f"{label} DIA has no semantic gate": pfgs["validity_gate"]
             == "pfgs360_official_no_semantic_gate",
-            "OB3D PFGS sky filtering disabled": pfgs["filter_sky"] is False,
-            "OB3D Refiner voxel sizes": refiner_voxels
+            f"{label} PFGS sky filtering disabled": pfgs["filter_sky"] is False,
+            f"{label} Refiner voxel sizes": refiner_voxels
             == [0.02, 0.04, 0.08, 0.16],
-            "OB3D Refiner voxel override explicit": config[
+            f"{label} Refiner voxel override explicit": config[
                 "VoxelAnchorRefiner"
             ].get("allow_voxel_size_override")
             is True,
-            "OB3D fusion voxel sizes": fusion_voxels
+            f"{label} fusion voxel sizes": fusion_voxels
             == [0.02, 0.04, 0.08, 0.16],
         }
+        if run.dataset == "rar_pano":
+            expected.update(
+                {
+                    "RAR_pano latest atomic refined-anchor replacement": pfgs[
+                        "atomic_refined_anchor_replacement"
+                    ]
+                    is True,
+                    "RAR_pano append-only refined-anchor growth": pfgs[
+                        "append_only_refined_anchors"
+                    ]
+                    is True,
+                    "RAR_pano latest no-Hash admission": pfgs[
+                        "growth_hash_dedup_enabled"
+                    ]
+                    is False,
+                    "RAR_pano latest anchor footprint": pfgs[
+                        "anchor_footprint"
+                    ]
+                    == {
+                        "enabled": True,
+                        "sigma": 2.0,
+                        "min_radius_pixels": 1.0,
+                        "max_radius_pixels": 8.0,
+                        "min_pixels": 1,
+                        "min_coverage": 0.05,
+                    },
+                }
+            )
     elif run.dataset == "360vo":
         expected = {
             "360VO Sky Head enabled": sky["enabled"] is True,
@@ -289,6 +334,8 @@ def _create_browse_links(root: Path, runs: list[RunSpec]) -> None:
         run_root = root / "runs" / run.run_id
         if run.dataset == "ob3d":
             link = root / "ob3d" / run.scene / run.split
+        elif run.dataset == "rar_pano":
+            link = root / "rar_pano" / run.scene
         else:
             link = root / "360vo" / run.scene
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -303,6 +350,31 @@ def _create_browse_links(root: Path, runs: list[RunSpec]) -> None:
 
 
 def _verify_dataset_run(run: RunSpec) -> None:
+    if run.dataset_type == "rar_pano":
+        images = discover_rar_pano_images(run.root, sequence=run.scene)
+        poses = load_rar_pano_reconstruction_c2w(
+            run.root,
+            sequence=run.scene,
+        )
+        image_names = {Path(path).name for path in images}
+        shot_names = {
+            key
+            for key in poses
+            if not Path(key).is_absolute()
+        }
+        if len(images) != run.frames:
+            raise ValueError(
+                f"Dataset {run.run_id} has {len(images)} contiguous numeric "
+                f"images, but the all-frame run requires exactly {run.frames}"
+            )
+        if image_names != shot_names:
+            missing = sorted(image_names - shot_names)
+            extra = sorted(shot_names - image_names)
+            raise ValueError(
+                f"RAR_pano image/OpenSfM shot mismatch for {run.run_id}: "
+                f"missing={missing[:5]} extra={extra[:5]}"
+            )
+        return
     sequence = Path(run.root) / run.scene / run.split
     image_dir = sequence / "images"
     camera_dir = sequence / "cameras"
@@ -492,7 +564,15 @@ def prepare_campaign(
                             "enabled", False
                         )
                     )
-                    else ["skybox"]
+                    else (
+                        ["skybox"]
+                        if bool(
+                            dict(config.get("SkyBox", {}) or {}).get(
+                                "enabled", False
+                            )
+                        )
+                        else ["sky-disabled"]
+                    )
                 ),
                 run.dataset,
                 run.scene,
