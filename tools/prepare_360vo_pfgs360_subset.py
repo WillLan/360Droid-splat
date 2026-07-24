@@ -58,6 +58,33 @@ def uniform_list_indices(total_count: int, target_count: int) -> list[int]:
     return indices
 
 
+def strided_prefix_list_indices(
+    total_count: int,
+    *,
+    source_prefix_count: int,
+    source_stride: int,
+    target_count: int | None = None,
+) -> list[int]:
+    """Select ``0, stride, ...`` from a fixed prefix of the ordered source."""
+
+    if source_prefix_count <= 0:
+        raise ValueError("source_prefix_count must be positive")
+    if source_prefix_count > total_count:
+        raise ValueError(
+            f"Only {total_count} valid images are available for a "
+            f"{source_prefix_count}-frame prefix"
+        )
+    if source_stride <= 0:
+        raise ValueError("source_stride must be positive")
+    indices = list(range(0, source_prefix_count, source_stride))
+    if target_count is not None and len(indices) != target_count:
+        raise ValueError(
+            f"Prefix/stride selects {len(indices)} frames, not target_count="
+            f"{target_count}"
+        )
+    return indices
+
+
 def quaternion_xyzw_to_rotation(values: tuple[float, float, float, float]) -> np.ndarray:
     quaternion = np.asarray(values, dtype=np.float64)
     norm = float(np.linalg.norm(quaternion))
@@ -221,6 +248,8 @@ def convert_sequence(
     sequence_name: str,
     *,
     target_count: int = 200,
+    source_prefix_count: int | None = None,
+    source_stride: int = 1,
     expected_size: tuple[int, int] = (1920, 960),
     expected_mode: str = "RGBA",
     check_only: bool = False,
@@ -235,7 +264,21 @@ def convert_sequence(
     image_names = {path.name for _, path in images}
     if image_names != set(gt):
         raise RuntimeError("Source images and GT do not form a one-to-one mapping")
-    selected = uniform_list_indices(len(images), target_count)
+    if source_prefix_count is None:
+        selected = uniform_list_indices(len(images), target_count)
+        sampling_formula = f"round(i * (N - 1) / ({target_count} - 1))"
+        sampling_mode = "uniform_full_sequence"
+    else:
+        selected = strided_prefix_list_indices(
+            len(images),
+            source_prefix_count=int(source_prefix_count),
+            source_stride=int(source_stride),
+            target_count=target_count,
+        )
+        sampling_formula = (
+            f"range(0, {int(source_prefix_count)}, {int(source_stride)})"
+        )
+        sampling_mode = "strided_source_prefix"
     for list_index in selected:
         with Image.open(images[list_index][1]) as image:
             image.verify()
@@ -245,7 +288,13 @@ def convert_sequence(
                     f"size={image.size}, mode={image.mode}"
                 )
     if check_only:
-        return {"sequence": sequence_name, "source_count": len(images), "selected_count": target_count}
+        return {
+            "sequence": sequence_name,
+            "source_count": len(images),
+            "selected_count": target_count,
+            "sampling_mode": sampling_mode,
+            "selected_source_list_indices": selected,
+        }
 
     output_root.mkdir(parents=True, exist_ok=True)
     image_dir = temporary / "images"
@@ -361,13 +410,18 @@ def convert_sequence(
                 }
             )
         metadata = {
-            "format": "pfgs360_360vo_uniform_subset_v1",
+            "format": "pfgs360_360vo_subset_v2",
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "sequence": sequence_name,
             "source_sequence": str(source_sequence.resolve()),
             "source_valid_image_count": len(images),
             "selected_frame_count": target_count,
-            "sampling_formula": f"round(i * (N - 1) / ({target_count} - 1))",
+            "sampling_mode": sampling_mode,
+            "sampling_formula": sampling_formula,
+            "source_prefix_count": (
+                None if source_prefix_count is None else int(source_prefix_count)
+            ),
+            "source_stride": int(source_stride),
             "sampling_interval_counts": dict(Counter(b - a for a, b in zip(selected[:-1], selected[1:]))),
             "first_selected_source_frame": images[selected[0]][0],
             "last_selected_source_frame": images[selected[-1]][0],
@@ -395,8 +449,8 @@ def convert_sequence(
         validation = validate_sequence(
             temporary,
             target_count=target_count,
-            expected_first_source=images[0][0],
-            expected_last_source=images[-1][0],
+            expected_first_source=images[selected[0]][0],
+            expected_last_source=images[selected[-1]][0],
         )
         output_data.parent.mkdir(parents=True, exist_ok=True)
         temporary.rename(output_data)
@@ -418,6 +472,18 @@ def main() -> None:
         default=Path("/mnt/disk1/zwh/Dataset/360VO-PFGS360-200-formal-v1"),
     )
     parser.add_argument("--target-count", type=int, default=200)
+    parser.add_argument(
+        "--source-prefix-count",
+        type=int,
+        default=None,
+        help="Select only from the first N ordered source frames.",
+    )
+    parser.add_argument(
+        "--source-stride",
+        type=int,
+        default=1,
+        help="List-index stride used with --source-prefix-count.",
+    )
     parser.add_argument("--sequences", nargs="*", default=[f"seq{i}" for i in range(10)])
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
@@ -430,21 +496,25 @@ def main() -> None:
             args.output_root,
             sequence,
             target_count=args.target_count,
+            source_prefix_count=args.source_prefix_count,
+            source_stride=args.source_stride,
             check_only=bool(args.check_only),
         )
         for sequence in args.sequences
     ]
     if (
         not args.check_only
-        and args.target_count == 200
         and set(args.sequences) == {f"seq{i}" for i in range(10)}
         and len(args.sequences) == 10
     ):
         dataset_manifest = {
-            "format": "pfgs360_360vo_200_formal_dataset_v1",
+            "format": "pfgs360_360vo_formal_dataset_v2",
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "source_root": str(args.source_root.resolve()),
             "output_root": str(args.output_root.resolve()),
+            "target_count": int(args.target_count),
+            "source_prefix_count": args.source_prefix_count,
+            "source_stride": int(args.source_stride),
             "sequences": results,
         }
         (args.output_root / "dataset_manifest.json").write_text(
