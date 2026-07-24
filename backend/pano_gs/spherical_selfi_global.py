@@ -8592,6 +8592,16 @@ class SphericalSelfiGlobalBackend:
                 append_only=True,
                 incoming_already_compacted=True,
             )
+            transaction_anchors_before = int(
+                atomic_plan["anchors_before_transaction"]
+            )
+            transaction_anchors_after = int(
+                commit_stats.get("anchors_after", self.map.anchor_count())
+            )
+            commit_stats["anchors_before"] = transaction_anchors_before
+            commit_stats["net_map_change"] = (
+                transaction_anchors_after - transaction_anchors_before
+            )
             if int(commit_stats.get("existing_removed_by_compaction", -1)) != 0:
                 raise RuntimeError(
                     "Append-only refined growth compacted the existing map"
@@ -8911,6 +8921,7 @@ class SphericalSelfiGlobalBackend:
             )
             footprint_masks[frame_id] = footprint_mask.detach()
         plan = {
+            "anchors_before_transaction": self.map.anchor_count(),
             "selected_prepared": selected_prepared,
             "tentative_prepared": tentative,
             "incoming_visibility": incoming_visibility,

@@ -2577,6 +2577,9 @@ def test_atomic_refined_growth_replaces_old_only_after_footprint_confirmation() 
     assert committed["inserted"] == committed["incoming_retained"]
     assert committed["existing_removed_by_compaction"] == 0
     assert gaussian_map.anchor_count() == committed["inserted"]
+    assert committed["anchors_before"] == 1
+    assert committed["anchors_after"] == committed["inserted"]
+    assert committed["net_map_change"] == committed["inserted"] - 1
 
 
 def test_refined_anchor_prepare_can_bypass_semantic_quality_gates() -> None:
