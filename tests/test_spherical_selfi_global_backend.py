@@ -2346,6 +2346,53 @@ def test_pfgs360_refined_anchor_footprint_wraps_seam_and_uses_coverage() -> None
     assert stats["footprint_admitted"] == 1
 
 
+def test_pfgs360_refined_anchor_footprint_ignores_nonfinite_covariance_rows() -> None:
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    height, width = packet.anchor_observation.image_size
+    fusion = Stage2GlobalMapFusion(
+        PanoGaussianMap(config={}, device="cpu"),
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    prepared = fusion.prepare_packet_batch(
+        packet, sim3_identity(), apply_semantic_gates=False
+    ).index(torch.tensor([0, 1]))
+    prepared.batch.xyz[:] = torch.tensor(
+        [[0.0, 0.0, 2.0], [0.2, 0.0, 2.0]]
+    )
+    prepared.batch.scale[:] = torch.tensor(
+        [[0.08, 0.08, 0.08], [float("nan"), 0.08, 0.08]]
+    )
+    prepared.batch.rotation[:] = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+    )
+    target = torch.ones(1, height, width, dtype=torch.bool)
+
+    selected, _, _, stats = (
+        SphericalSelfiGlobalBackend._pfgs360_anchor_footprint_admission(
+            prepared,
+            torch.eye(4),
+            source_supported=torch.tensor([True, True]),
+            image_size=(height, width),
+            target_mask=target,
+            sigma=2.0,
+            min_radius_pixels=1.0,
+            max_radius_pixels=8.0,
+            min_pixels=1,
+            min_coverage=0.05,
+        )
+    )
+
+    assert selected.tolist() == [True, False]
+    assert stats["footprint_supported"] == 1
+    assert stats["footprint_admitted"] == 1
+
+
 def test_append_only_refined_growth_preserves_every_existing_row() -> None:
     gaussian_map = PanoGaussianMap(
         config={

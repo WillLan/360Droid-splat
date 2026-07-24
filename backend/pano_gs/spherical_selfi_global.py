@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 import math
 import time
 from typing import Any, Callable
+import warnings
 
 import torch
 
@@ -8317,22 +8318,85 @@ class SphericalSelfiGlobalBackend:
         covariance_2d = (
             jacobian @ covariance_camera @ jacobian.transpose(-1, -2)
         )
+        covariance_2d = 0.5 * (
+            covariance_2d + covariance_2d.transpose(-1, -2)
+        )
         covariance_2d = covariance_2d + torch.eye(
             2, device=batch.xyz.device, dtype=batch.xyz.dtype
         ).unsqueeze(0) * 1.0e-6
-        eigenvalues, eigenvectors = torch.linalg.eigh(covariance_2d)
-        radii = (
+        finite_covariance = torch.isfinite(covariance_2d).all(dim=(-2, -1))
+        supported &= finite_covariance
+        rows = torch.nonzero(supported, as_tuple=False).flatten()
+        if int(rows.numel()) == 0:
+            return selected, union_mask, pixel, {
+                "footprint_supported": 0.0,
+                "footprint_admitted": 0.0,
+                "footprint_pixels": 0.0,
+                "footprint_hit_pixels": 0.0,
+            }
+
+        supported_covariance = covariance_2d.index_select(0, rows)
+        covariance_xx = supported_covariance[:, 0, 0]
+        covariance_xy = supported_covariance[:, 0, 1]
+        covariance_yy = supported_covariance[:, 1, 1]
+        eigen_midpoint = 0.5 * covariance_xx + 0.5 * covariance_yy
+        eigen_radius = torch.hypot(
+            0.5 * (covariance_xx - covariance_yy),
+            covariance_xy,
+        )
+        maximum_variance = (
+            float(max_radius_pixels) / max(float(sigma), 1.0e-8)
+        ) ** 2
+        eigenvalues = torch.stack(
+            [
+                eigen_midpoint - eigen_radius,
+                eigen_midpoint + eigen_radius,
+            ],
+            dim=-1,
+        )
+        eigenvalues = torch.nan_to_num(
+            eigenvalues,
+            nan=1.0e-8,
+            posinf=maximum_variance,
+            neginf=1.0e-8,
+        ).clamp(1.0e-8, maximum_variance)
+        major_angle = 0.5 * torch.atan2(
+            2.0 * covariance_xy,
+            covariance_xx - covariance_yy,
+        )
+        cosine = torch.cos(major_angle)
+        sine = torch.sin(major_angle)
+        eigenvectors = torch.stack(
+            [
+                torch.stack([-sine, cosine], dim=-1),
+                torch.stack([cosine, sine], dim=-1),
+            ],
+            dim=-1,
+        )
+        supported_radii = (
             float(sigma) * torch.sqrt(eigenvalues.clamp_min(1.0e-8))
         ).clamp(float(min_radius_pixels), float(max_radius_pixels))
-        covariance_limited = (
+        inverse_limited = (
             eigenvectors
-            @ torch.diag_embed((radii / float(sigma)).square())
+            @ torch.diag_embed(
+                (supported_radii / float(sigma)).square().reciprocal()
+            )
             @ eigenvectors.transpose(-1, -2)
         )
-        inverse_covariance = torch.linalg.inv(covariance_limited)
-        extent = torch.ceil(radii.amax(dim=-1)).long().clamp(
-            int(math.ceil(min_radius_pixels)),
-            int(math.ceil(max_radius_pixels)),
+        inverse_covariance = batch.xyz.new_zeros(count, 2, 2)
+        inverse_covariance.index_copy_(
+            0,
+            rows,
+            inverse_limited,
+        )
+        extent = torch.ones(count, device=batch.xyz.device, dtype=torch.long)
+        extent.index_copy_(
+            0,
+            rows,
+            torch.ceil(supported_radii.amax(dim=-1)).long().clamp(
+                int(math.ceil(min_radius_pixels)),
+                int(math.ceil(max_radius_pixels)),
+            ),
         )
         target = (
             None
@@ -9485,6 +9549,12 @@ class SphericalSelfiGlobalBackend:
             else:
                 self.mapper.commit_spherical_selfi_window()
             self.mapper.stats.notes.append(f"spherical-Selfi map optimization skipped: {exc!r}")
+            warnings.warn(
+                "spherical-Selfi map optimization transaction rolled back: "
+                f"{exc!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return {"steps": 0.0, "loss": 0.0, "window_rollback": 1.0}
         finally:
             self._optimization_packets.pop(int(window_id), None)
