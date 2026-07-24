@@ -382,6 +382,11 @@ class PFGS360Renderer:
         composed = rgb + trans * sky_rgb
         out = dict(pkg)
         out["render"] = composed.clamp(0.0, 1.0)
+        out["scene_rgb"] = rgb
+        out["scene_alpha"] = alpha
+        out["sky_rgb"] = sky_rgb
+        out["sky_alpha"] = torch.ones_like(alpha)
+        out["composite_rgb"] = composed.clamp(0.0, 1.0)
         out["gs_only"] = rgb
         out["sky_bg_only"] = sky_rgb
         out["sky_bg_alpha"] = trans

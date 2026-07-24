@@ -636,6 +636,7 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "backend/new_gaussians_per_chunk",
         "backend/pfgs360_new_anchor_admission",
         "backend/sky_sphere",
+        "backend/cubemap_sky",
         "backend/selfi_global_map_anchor_scale",
         "backend/selfi_global_map_root_relative_scale",
         "backend/selfi_global_map_anchor_fallback",
@@ -1570,7 +1571,7 @@ class SlamRuntimeLogger:
         *,
         step: int | None = None,
     ) -> Path | None:
-        """Save and publish the one fixed PanoLOG Sky-Sphere panel."""
+        """Save and publish one fixed sky-background diagnostic panel."""
 
         if not isinstance(diagnostic, dict):
             return None
@@ -1606,8 +1607,16 @@ class SlamRuntimeLogger:
             draw.text((index * width + 6, 7), label, fill=(0, 0, 0))
         canvas = _resize_to_max_width(canvas, self.kf_opt_max_width)
         path = None
+        mode = str(diagnostic.get("mode", "sky_sphere")).strip().lower()
+        key = (
+            "backend/cubemap_sky"
+            if mode == "cubemap"
+            else "backend/sky_sphere"
+        )
         if self.save_local:
-            directory = self.visualization_dir / "sky_sphere"
+            directory = self.visualization_dir / (
+                "cubemap_sky" if mode == "cubemap" else "sky_sphere"
+            )
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / (
                 f"window_{int(diagnostic.get('window_id', -1)):06d}_"
@@ -1617,7 +1626,7 @@ class SlamRuntimeLogger:
         if self.run is not None and self._wandb is not None:
             self._log_wandb_payload(
                 {
-                    "backend/sky_sphere": self._wandb.Image(
+                    key: self._wandb.Image(
                         str(path) if path is not None else canvas
                     )
                 },

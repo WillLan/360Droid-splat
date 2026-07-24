@@ -244,6 +244,11 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             == "panovggt_head",
             "360VO one sky renderer enabled": bool(skybox["enabled"])
             != sky_sphere_enabled,
+            "360VO CubeMap threshold": (
+                not bool(skybox["enabled"])
+                or abs(float(skybox.get("sky_threshold", 0.6)) - 0.6)
+                < 1.0e-12
+            ),
             "360VO SkySphere threshold": (
                 not sky_sphere_enabled
                 or abs(float(sky_sphere["sky_threshold"]) - 0.6) < 1.0e-12

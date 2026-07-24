@@ -1625,6 +1625,10 @@ class PanoGaussianMap(nn.Module):
                 self._anchor_depth_selected_levels
             ),
             "config": self.config,
+            "skybox": {
+                "initialized": bool(self._skybox_initialized),
+                "resolution": int(self.skybox_resolution),
+            },
             "sky_sphere": self.sky_sphere.metadata(),
         }
         if self._lazy_owner_transforms_enabled:
@@ -1639,7 +1643,7 @@ class PanoGaussianMap(nn.Module):
         map_location: str | torch.device | None = None,
         strict: bool = True,
     ) -> dict:
-        """Restore scene and optional Sky-Sphere state.
+        """Restore scene and optional learned sky-background state.
 
         Checkpoints written before Sky-Sphere support have no ``sky_sphere.*``
         keys. Those keys are the only missing fields accepted in strict mode.
@@ -1698,6 +1702,14 @@ class PanoGaussianMap(nn.Module):
                 int(owner): torch.as_tensor(value).detach().cpu().float().clone()
                 for owner, value in dict(lazy.get("current", {}) or {}).items()
             }
+        skybox = payload.get("skybox")
+        if isinstance(skybox, dict) and self.has_skybox:
+            self._skybox_initialized = bool(skybox.get("initialized", False))
+        elif self.has_skybox and torch.is_tensor(state.get("skybox_logits")):
+            # Legacy CubeMap checkpoints saved the learned face logits but not
+            # the runtime initialization flag.  Treat those faces as trained
+            # rather than overwriting them from the next observation.
+            self._skybox_initialized = True
         return payload
 
     def save_sky_sphere_ply(self, path: str | Path) -> str | None:
@@ -3134,6 +3146,224 @@ class PanoGaussianMapper:
             ),
         }
 
+    def optimize_cubemap_sky(
+        self,
+        *,
+        window_id: int,
+        recent_frame_ids: list[int] | tuple[int, ...],
+        new_frame_ids: list[int] | tuple[int, ...],
+        seed: int,
+    ) -> dict[str, float]:
+        """Run one transactional CubeMap-only optimization."""
+
+        parameter = getattr(self.map, "skybox_logits", None)
+        parameter_before = (
+            None
+            if not torch.is_tensor(parameter)
+            else parameter.detach().clone()
+        )
+        initialized_before = bool(
+            getattr(self.map, "_skybox_initialized", False)
+        )
+        diagnostic_before = getattr(
+            self,
+            "_pending_sky_sphere_diagnostic",
+            None,
+        )
+        try:
+            return self._optimize_cubemap_sky_impl(
+                window_id=int(window_id),
+                recent_frame_ids=recent_frame_ids,
+                new_frame_ids=new_frame_ids,
+                seed=int(seed),
+            )
+        except Exception:
+            if parameter_before is not None and torch.is_tensor(parameter):
+                with torch.no_grad():
+                    parameter.copy_(parameter_before)
+            self.map._skybox_initialized = initialized_before
+            self._pending_sky_sphere_diagnostic = diagnostic_before
+            raise
+
+    def _optimize_cubemap_sky_impl(
+        self,
+        *,
+        window_id: int,
+        recent_frame_ids: list[int] | tuple[int, ...],
+        new_frame_ids: list[int] | tuple[int, ...],
+        seed: int,
+    ) -> dict[str, float]:
+        """Optimize the opaque world-direction Cubemap independently of geometry."""
+
+        if not self.map.has_skybox or not bool(
+            getattr(self.map, "skybox_optimize", False)
+        ):
+            return {}
+        cfg = self.map.config.get("SkyBox", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if not bool(cfg.get("optimize_all_chunks", False)):
+            return {}
+        available = [
+            observation
+            for _, observation in sorted(self.observations.items())
+            if observation.sky_probability is not None
+        ]
+        if not available:
+            raise RuntimeError("CubeMap sky requires registered sky probabilities")
+        threshold = float(cfg.get("sky_threshold", 0.6))
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("SkyBox.sky_threshold must be in (0, 1)")
+        if not bool(getattr(self.map, "_skybox_initialized", False)):
+            initialized = False
+            for observation in available:
+                probability = PanoLOGSkySphere._normalize_probability(
+                    observation.sky_probability,
+                    height=int(observation.image.shape[-2]),
+                    width=int(observation.image.shape[-1]),
+                    device=observation.image.device,
+                    dtype=torch.float32,
+                )
+                initialized = self.map.initialize_skybox_from_image(
+                    observation.image,
+                    (
+                        self.pose_deltas[int(observation.frame_id)]()
+                        if int(observation.frame_id) in self.pose_deltas
+                        else observation.pose_c2w
+                    ).detach(),
+                    sky_mask=probability >= threshold,
+                )
+                if initialized:
+                    break
+            if not initialized:
+                raise RuntimeError("CubeMap sky initialization found no reliable sky")
+
+        recent_set = {int(value) for value in recent_frame_ids}
+        new_set = {int(value) for value in new_frame_ids}
+        current = [
+            observation
+            for observation in available
+            if int(observation.frame_id) in new_set
+        ]
+        if not current:
+            current = [
+                observation
+                for observation in available
+                if int(observation.frame_id) in recent_set
+            ]
+        current = current or available[-max(1, min(2, len(available))):]
+        history = [
+            observation
+            for observation in available
+            if int(observation.frame_id) not in {
+                int(value.frame_id) for value in current
+            }
+        ]
+        steps = max(0, int(cfg.get("optimize_steps_per_chunk", 20)))
+        if steps <= 0:
+            return {
+                "cubemap_sky_enabled": 1.0,
+                "cubemap_sky_initialized": 1.0,
+                "cubemap_sky_steps": 0.0,
+            }
+        parameter = self.map.skybox_logits
+        if parameter is None:
+            raise RuntimeError("CubeMap sky parameter is unavailable")
+        optimizer = torch.optim.Adam(
+            [parameter],
+            lr=float(cfg.get("lr", 1.0e-2)),
+            eps=float(cfg.get("adam_eps", 1.0e-15)),
+            weight_decay=0.0,
+        )
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed) + int(window_id) * 104729)
+        last_loss = 0.0
+        optimized_views = 0
+        reliable_pixels = 0
+        last_observation = current[-1]
+        from backend.pano_gs.pfgs360_full import pfgs360_photometric_loss
+
+        for step_index in range(steps):
+            selected = [current[step_index % len(current)]]
+            if history:
+                selected.append(
+                    history[
+                        int(
+                            torch.randint(
+                                len(history),
+                                (),
+                                generator=generator,
+                            )
+                        )
+                    ]
+                )
+            optimizer.zero_grad(set_to_none=True)
+            losses: list[torch.Tensor] = []
+            for observation in selected:
+                target = observation.image.to(
+                    device=self.map.get_xyz.device,
+                    dtype=torch.float32,
+                )
+                probability = PanoLOGSkySphere._normalize_probability(
+                    observation.sky_probability,
+                    height=int(target.shape[-2]),
+                    width=int(target.shape[-1]),
+                    device=target.device,
+                    dtype=target.dtype,
+                )
+                reliable = probability >= threshold
+                if not bool(reliable.any()):
+                    continue
+                pose = (
+                    self.pose_deltas[int(observation.frame_id)]()
+                    if int(observation.frame_id) in self.pose_deltas
+                    else observation.pose_c2w
+                ).detach().to(target)
+                directions = self.map._world_dirs_for_erp(
+                    int(target.shape[-2]),
+                    int(target.shape[-1]),
+                    pose,
+                )
+                sky_rgb = self.map.sample_skybox(directions).permute(
+                    2, 0, 1
+                ).contiguous()
+                loss, _ = pfgs360_photometric_loss(
+                    sky_rgb,
+                    target,
+                    mask=reliable,
+                )
+                losses.append(loss)
+                optimized_views += 1
+                reliable_pixels += int(reliable.sum().item())
+                last_observation = observation
+            if not losses:
+                continue
+            loss = torch.stack(losses).mean()
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("Non-finite CubeMap sky loss")
+            loss.backward()
+            if parameter.grad is not None and not bool(
+                torch.isfinite(parameter.grad).all()
+            ):
+                raise FloatingPointError("Non-finite CubeMap sky gradient")
+            optimizer.step()
+            if not bool(torch.isfinite(parameter).all()):
+                raise FloatingPointError("Non-finite CubeMap sky parameter")
+            last_loss = float(loss.detach().cpu())
+
+        self._pending_sky_sphere_diagnostic = self._cubemap_sky_diagnostic(
+            last_observation,
+            window_id=int(window_id),
+        )
+        return {
+            "cubemap_sky_enabled": 1.0,
+            "cubemap_sky_initialized": 1.0,
+            "cubemap_sky_steps": float(steps),
+            "cubemap_sky_loss": float(last_loss),
+            "cubemap_sky_optimized_views": float(optimized_views),
+            "cubemap_sky_reliable_pixels": float(reliable_pixels),
+        }
+
     @torch.no_grad()
     def _sky_sphere_diagnostic(
         self,
@@ -3178,6 +3408,7 @@ class PanoGaussianMapper:
             dtype=target.dtype,
         )
         return {
+            "mode": "sky_sphere",
             "window_id": int(window_id),
             "frame_id": int(observation.frame_id),
             "target": target.detach().cpu(),
@@ -3187,6 +3418,63 @@ class PanoGaussianMapper:
             "sky_probability": probability.detach().cpu(),
             "sky_alpha": sky["alpha"].detach().cpu(),
             "metadata": self.map.sky_sphere.metadata(),
+        }
+
+    @torch.no_grad()
+    def _cubemap_sky_diagnostic(
+        self,
+        observation: MapperObservation,
+        *,
+        window_id: int,
+    ) -> dict[str, object]:
+        target = observation.image.to(
+            device=self.map.get_xyz.device,
+            dtype=torch.float32,
+        )
+        pose = (
+            self.pose_deltas[int(observation.frame_id)]()
+            if int(observation.frame_id) in self.pose_deltas
+            else observation.pose_c2w
+        ).detach().to(target)
+        camera = PanoRenderCamera(
+            image_height=int(target.shape[-2]),
+            image_width=int(target.shape[-1]),
+            c2w=pose,
+        )
+        package = self.renderer.render(camera, self.map)
+        probability = PanoLOGSkySphere._normalize_probability(
+            observation.sky_probability,
+            height=int(target.shape[-2]),
+            width=int(target.shape[-1]),
+            device=target.device,
+            dtype=target.dtype,
+        )
+        sky_rgb = package.get("sky_rgb", package.get("sky_bg_only"))
+        if not torch.is_tensor(sky_rgb):
+            raise RuntimeError("CubeMap sky diagnostic has no sky RGB")
+        scene_rgb = package.get("scene_rgb", package.get("gs_only"))
+        scene_alpha = package.get("scene_alpha", package.get("alpha"))
+        if not torch.is_tensor(scene_rgb) or not torch.is_tensor(scene_alpha):
+            raise RuntimeError("CubeMap sky diagnostic has no scene render")
+        composite = package.get("composite_rgb", package.get("render"))
+        return {
+            "mode": "cubemap",
+            "window_id": int(window_id),
+            "frame_id": int(observation.frame_id),
+            "target": target.detach().cpu(),
+            "scene_rgb": scene_rgb.detach().cpu(),
+            "sky_rgb": sky_rgb.detach().cpu(),
+            "composite_rgb": composite.detach().cpu(),
+            "sky_probability": probability.detach().cpu(),
+            "sky_alpha": torch.ones_like(scene_alpha).detach().cpu(),
+            "metadata": {
+                "resolution": int(self.map.skybox_resolution),
+                "threshold": float(
+                    self.map.config.get("SkyBox", {}).get(
+                        "sky_threshold", 0.6
+                    )
+                ),
+            },
         }
 
     def consume_sky_sphere_diagnostic(self):

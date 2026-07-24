@@ -243,6 +243,44 @@ class _MaskAwareAttributedFakeRenderer(_AttributedFakeRenderer):
         return output
 
 
+class _SkyOccluderAttributedFakeRenderer(_DifferentiableFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        output = super().render(
+            camera,
+            gaussians,
+            query_values=query_values,
+        )
+        if query_values is None:
+            return output
+        assert int(query_values.shape[-1]) == 1
+        answers = torch.zeros(
+            gaussians.anchor_count(),
+            1,
+            device=gaussians.xyz.device,
+        )
+        frame_x = float(camera.c2w[0, 3].detach().cpu())
+        answers[0, 0] = 1.0
+        answers[1 if frame_x < 0.025 else 2, 0] = 1.0
+        output["query_answers"] = answers
+        output["accum_visible"] = torch.ones(
+            gaussians.anchor_count(),
+            device=gaussians.xyz.device,
+        )
+        return output
+
+
+class _SkyOccluderQueryFailureFakeRenderer(_AttributedFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        output = super().render(
+            camera,
+            gaussians,
+            query_values=query_values,
+        )
+        if query_values is not None and int(query_values.shape[-1]) == 1:
+            output["query_answers"] = None
+        return output
+
+
 class _PartiallyVisibleFakeRenderer(_DifferentiableFakeRenderer):
     def render(self, camera, gaussians, *, query_values=None):
         output = super().render(camera, gaussians, query_values=query_values)
@@ -808,6 +846,136 @@ def test_dia_applies_official_100_threshold_without_deletion_cap() -> None:
     assert metrics["dia_deleted"] == 120
     assert mapper.map.anchor_count() == 120
     assert bool((mapper.map.get_opacity <= 0.010001).all())
+
+
+def test_reliable_sky_threshold_is_inclusive_at_point_six() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    observation = mapper.observations[2]
+    probability = torch.full((1, 4, 8), 0.59)
+    probability[:, 1, 2] = 0.6
+    probability[:, 1, 3] = 0.61
+    observation.sky_probability = probability
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "sky_occluder_cleanup": {
+                "enabled": True,
+                "sky_threshold": 0.6,
+            }
+        },
+    )
+
+    mask = engine._reliable_sky_mask(observation)
+
+    assert mask is not None
+    assert int(mask.sum()) == 2
+    assert bool(mask[0, 1, 2])
+    assert bool(mask[0, 1, 3])
+    assert not bool(mask[0, 0, 0])
+
+
+def test_sky_occluder_cleanup_resets_single_view_and_deletes_two_view_hits() -> None:
+    mapper = _registered_mapper(_SkyOccluderAttributedFakeRenderer())
+    mapper.map.append_pfgs360_points(
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [0.1, 0.0, 1.0],
+                [0.2, 0.0, 1.0],
+            ]
+        ),
+        torch.rand(3, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    for frame_id in (2, 3):
+        mapper.observations[frame_id].sky_probability = torch.full(
+            (1, 4, 8),
+            0.6,
+        )
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "sky_occluder_cleanup": {
+                "enabled": True,
+                "sky_threshold": 0.6,
+                "responsibility_threshold": 0.8,
+                "reset_opacity": 0.01,
+            }
+        },
+    )
+
+    metrics = engine._sky_occluder_cleanup(
+        engine._observations((0, 1, 2, 3)),
+        (2, 3),
+    )
+
+    assert metrics["sky_occluder_query_views"] == 2.0
+    assert metrics["sky_occluder_reset"] == 2.0
+    assert metrics["sky_occluder_deleted"] == 1.0
+    assert mapper.map.anchor_count() == 2
+    torch.testing.assert_close(
+        mapper.map.get_opacity,
+        torch.full((2, 1), 0.01),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+
+
+def test_sky_occluder_query_failure_rolls_back_dia_and_scene_map() -> None:
+    mapper = _registered_mapper(_SkyOccluderQueryFailureFakeRenderer())
+    xyz = torch.stack(
+        [torch.arange(240), torch.zeros(240), torch.ones(240)], dim=-1
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(240, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    for frame_id in (2, 3):
+        mapper.observations[frame_id].sky_probability = torch.full(
+            (1, 4, 8),
+            0.6,
+        )
+    before = mapper.map.pfgs360_topology_snapshot()
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "sky_occluder_cleanup": {
+                "enabled": True,
+                "sky_threshold": 0.6,
+                "responsibility_threshold": 0.8,
+                "reset_opacity": 0.01,
+            },
+            "topology_refine_enabled": False,
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Sky occluder cleanup requires one-channel query attribution",
+    ):
+        engine.run(
+            frame_ids=(0, 1, 2, 3),
+            new_frame_ids=(2, 3),
+            owner_window_id=1,
+            camera_steps=0,
+            joint_steps=0,
+        )
+
+    assert mapper.map.anchor_count() == 240
+    torch.testing.assert_close(
+        mapper.map.xyz.detach().cpu(),
+        before["parameters"]["xyz"],
+    )
+    torch.testing.assert_close(
+        mapper.map.opacity_logit.detach().cpu(),
+        before["parameters"]["opacity_logit"],
+    )
 
 
 def test_refined_anchor_growth_runs_only_after_dia_old_map_deletion() -> None:

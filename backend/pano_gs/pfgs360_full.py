@@ -728,6 +728,130 @@ class PFGS360FullBackend:
             )
         return valid
 
+    def _reliable_sky_mask(self, observation) -> torch.Tensor | None:
+        probability = observation.sky_probability
+        if probability is None:
+            return None
+        target = observation.image
+        height, width = int(target.shape[-2]), int(target.shape[-1])
+        value = probability.detach().to(
+            device=self.device, dtype=torch.float32
+        )
+        while value.ndim > 2:
+            value = value[0]
+        if value.ndim != 2:
+            raise ValueError("Sky probability must resolve to HxW")
+        if tuple(value.shape) != (height, width):
+            value = F.interpolate(
+                value.view(1, 1, *value.shape),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+        cfg = dict(self.settings.get("sky_occluder_cleanup", {}) or {})
+        threshold = float(cfg.get("sky_threshold", 0.6))
+        return (value >= threshold).unsqueeze(0)
+
+    def _sky_occluder_cleanup(
+        self,
+        observations,
+        new_frame_ids: tuple[int, ...],
+    ) -> dict[str, float]:
+        """Reset/delete scene Gaussians attributed to reliable sky pixels."""
+
+        cfg = dict(self.settings.get("sky_occluder_cleanup", {}) or {})
+        if (
+            not bool(cfg.get("enabled", False))
+            or self.map.anchor_count() <= 0
+        ):
+            return {}
+        selected_ids = {int(value) for value in new_frame_ids}
+        selected = [
+            observation
+            for observation in observations
+            if int(observation.frame_id) in selected_ids
+        ]
+        if len(selected) < 2:
+            return {
+                "sky_occluder_query_views": 0.0,
+                "sky_occluder_reset": 0.0,
+                "sky_occluder_deleted": 0.0,
+            }
+        hits = torch.zeros(
+            self.map.anchor_count(),
+            device=self.device,
+            dtype=torch.int32,
+        )
+        query_views = 0
+        sky_pixels = 0
+        responsibility_threshold = float(
+            cfg.get("responsibility_threshold", 0.8)
+        )
+        for observation in selected[:2]:
+            sky = self._reliable_sky_mask(observation)
+            if sky is None or not bool(sky.any()):
+                continue
+            package = self._render(
+                observation,
+                query_values=sky[0].float().unsqueeze(-1),
+            )
+            answers = package.get("query_answers")
+            accumulated = package.get("accum_visible")
+            if not (
+                torch.is_tensor(answers)
+                and torch.is_tensor(accumulated)
+                and tuple(answers.shape)
+                == (self.map.anchor_count(), 1)
+            ):
+                raise RuntimeError(
+                    "Sky occluder cleanup requires one-channel query attribution"
+                )
+            responsibility = (
+                answers[:, 0]
+                / accumulated.reshape(-1).clamp_min(1.0e-8)
+            )
+            finite = torch.isfinite(responsibility) & (
+                accumulated.reshape(-1) > 0.0
+            )
+            hits += (
+                finite
+                & (responsibility >= responsibility_threshold)
+            ).int()
+            query_views += 1
+            sky_pixels += int(sky.sum().item())
+        if query_views < 2:
+            return {
+                "sky_occluder_query_views": float(query_views),
+                "sky_occluder_sky_pixels": float(sky_pixels),
+                "sky_occluder_reset": 0.0,
+                "sky_occluder_deleted": 0.0,
+            }
+        delete = hits >= 2
+        reset = hits == 1
+        reset_count = int(reset.sum().item())
+        if reset_count > 0:
+            opacity = float(cfg.get("reset_opacity", 0.01))
+            opacity = min(max(opacity, 1.0e-5), 1.0 - 1.0e-5)
+            limit = math.log(opacity / (1.0 - opacity))
+            with torch.no_grad():
+                self.map.opacity_logit[reset] = torch.minimum(
+                    self.map.opacity_logit[reset],
+                    self.map.opacity_logit.new_tensor(limit),
+                )
+            self._clear_opacity_moments(reset)
+        deleted = 0
+        if bool(delete.any()):
+            deleted = self.map.prune_anchors(delete)
+            self._remap_moments()
+        return {
+            "sky_occluder_query_views": float(query_views),
+            "sky_occluder_sky_pixels": float(sky_pixels),
+            "sky_occluder_single_view_hits": float(reset_count),
+            "sky_occluder_two_view_hits": float(delete.sum().item()),
+            "sky_occluder_reset": float(reset_count),
+            "sky_occluder_deleted": float(deleted),
+        }
+
     def _bootstrap(self, observations, owner_window_id: int) -> dict[str, int]:
         if self.map.anchor_count() > 0 or not observations:
             return {"raw": 0, "unique": 0, "occupied": 0, "inserted": 0}
@@ -1726,6 +1850,17 @@ class PFGS360FullBackend:
                     )
                 )
             metrics["dia_seconds"] = float(time.perf_counter() - started)
+            if not refined_bootstrap:
+                started = time.perf_counter()
+                metrics.update(
+                    self._sky_occluder_cleanup(
+                        observations,
+                        tuple(int(value) for value in new_frame_ids),
+                    )
+                )
+                metrics["sky_occluder_seconds"] = float(
+                    time.perf_counter() - started
+                )
             started = time.perf_counter()
             metrics.update(
                 self._joint_stage(

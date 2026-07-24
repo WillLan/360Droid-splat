@@ -335,6 +335,195 @@ def test_sky_composite_preserves_scene_geometry_and_query_bitwise() -> None:
     )
 
 
+def test_cubemap_composite_is_opaque_and_preserves_scene_geometry() -> None:
+    config = {
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 8,
+            "optimize": True,
+        },
+        "SkySphere": {"enabled": False},
+        "Training": {},
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    image = torch.full((3, 8, 16), 0.7)
+    assert gaussian_map.initialize_skybox_from_image(
+        image,
+        torch.eye(4),
+        sky_mask=torch.ones(1, 8, 16, dtype=torch.bool),
+    )
+    renderer = PFGS360Renderer(config=config, allow_fallback=True)
+    camera = PanoRenderCamera(8, 16, torch.eye(4))
+    depth = torch.rand(1, 8, 16)
+    query = torch.rand(3, 2)
+    scene_rgb = torch.full((3, 8, 16), 0.2)
+    scene_alpha = torch.full((1, 8, 16), 0.4)
+
+    composite = renderer._compose_skybox(
+        camera,
+        gaussian_map,
+        {
+            "render": scene_rgb,
+            "alpha": scene_alpha,
+            "depth": depth,
+            "query_answers": query,
+        },
+    )
+
+    assert composite["depth"] is depth
+    assert composite["query_answers"] is query
+    torch.testing.assert_close(composite["sky_alpha"], torch.ones_like(scene_alpha))
+    torch.testing.assert_close(
+        composite["composite_rgb"],
+        scene_rgb + (1.0 - scene_alpha) * composite["sky_rgb"],
+    )
+
+
+def test_cubemap_sky_optimizes_every_chunk_only_when_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = {
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 8,
+            "optimize": True,
+            "optimize_all_chunks": True,
+            "optimize_steps_per_chunk": 1,
+            "sky_threshold": 0.6,
+            "lr": 1.0e-2,
+        },
+        "SkySphere": {"enabled": False},
+        "Mapping": {
+            "sky_mask_enable": True,
+            "sky_mask_source": "panovggt_head",
+        },
+        "Training": {},
+    }
+    gaussian_map = PanoGaussianMap(config=config, device="cpu")
+    gaussian_map._skybox_initialized = True
+    mapper = PanoGaussianMapper(
+        gaussian_map,
+        renderer=_DifferentiableSkyRenderer(),
+    )
+    probability = torch.full((1, 8, 16), 0.6)
+    probability[:, 0, 0] = 0.59
+    for frame_id in range(2):
+        mapper.register_observation_values(
+            frame_id=frame_id,
+            image=torch.full((3, 8, 16), 0.8),
+            c2w=torch.eye(4),
+            sky_mask=probability >= 0.6,
+            sky_probability=probability,
+        )
+    monkeypatch.setattr(
+        mapper,
+        "_cubemap_sky_diagnostic",
+        lambda observation, *, window_id: {
+            "mode": "cubemap",
+            "window_id": window_id,
+            "frame_id": observation.frame_id,
+        },
+    )
+    scene_before = gaussian_map.xyz.detach().clone()
+    cubemap_before = gaussian_map.skybox_logits.detach().clone()
+
+    metrics = mapper.optimize_cubemap_sky(
+        window_id=0,
+        recent_frame_ids=(0, 1),
+        new_frame_ids=(1,),
+        seed=123,
+    )
+
+    assert metrics["cubemap_sky_steps"] == 1.0
+    assert metrics["cubemap_sky_reliable_pixels"] == 2.0 * (8 * 16 - 1)
+    assert not torch.equal(gaussian_map.skybox_logits, cubemap_before)
+    torch.testing.assert_close(gaussian_map.xyz, scene_before)
+
+    rollback_before = gaussian_map.skybox_logits.detach().clone()
+    monkeypatch.setattr(
+        mapper,
+        "_cubemap_sky_diagnostic",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic CubeMap diagnostic failure")
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic CubeMap diagnostic failure",
+    ):
+        mapper.optimize_cubemap_sky(
+            window_id=1,
+            recent_frame_ids=(0, 1),
+            new_frame_ids=(1,),
+            seed=123,
+        )
+    torch.testing.assert_close(
+        gaussian_map.skybox_logits,
+        rollback_before,
+    )
+
+    legacy = copy.deepcopy(config)
+    legacy["SkyBox"].pop("optimize_all_chunks")
+    legacy_map = PanoGaussianMap(config=legacy, device="cpu")
+    legacy_map._skybox_initialized = True
+    legacy_mapper = PanoGaussianMapper(
+        legacy_map,
+        renderer=_DifferentiableSkyRenderer(),
+    )
+    before = legacy_map.skybox_logits.detach().clone()
+    assert (
+        legacy_mapper.optimize_cubemap_sky(
+            window_id=0,
+            recent_frame_ids=(),
+            new_frame_ids=(),
+            seed=123,
+        )
+        == {}
+    )
+    torch.testing.assert_close(legacy_map.skybox_logits, before)
+
+
+def test_cubemap_checkpoint_restores_faces_and_initialization_state(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "SkyBox": {
+            "enabled": True,
+            "resolution": 8,
+            "optimize": True,
+        },
+        "SkySphere": {"enabled": False},
+        "Training": {},
+    }
+    source = PanoGaussianMap(config=config, device="cpu")
+    assert source.initialize_skybox_from_image(
+        torch.full((3, 8, 16), 0.7),
+        torch.eye(4),
+        sky_mask=torch.ones(1, 8, 16, dtype=torch.bool),
+    )
+    checkpoint = tmp_path / "cubemap.pt"
+    source.save_checkpoint(checkpoint)
+
+    restored = PanoGaussianMap(config=config, device="cpu")
+    restored.load_checkpoint(checkpoint)
+
+    assert restored._skybox_initialized is True
+    torch.testing.assert_close(
+        restored.skybox_logits,
+        source.skybox_logits,
+    )
+
+    legacy = tmp_path / "legacy_cubemap.pt"
+    torch.save({"state_dict": source.state_dict()}, legacy)
+    legacy_restored = PanoGaussianMap(config=config, device="cpu")
+    legacy_restored.load_checkpoint(legacy)
+    assert legacy_restored._skybox_initialized is True
+    torch.testing.assert_close(
+        legacy_restored.skybox_logits,
+        source.skybox_logits,
+    )
+
+
 def test_sky_sphere_checkpoint_roundtrip_and_legacy_checkpoint_loading(
     tmp_path: Path,
 ) -> None:
@@ -428,3 +617,35 @@ def test_360vo_skysphere_formal_config_and_ob3d_policy_are_isolated() -> None:
     _assert_dataset_policy(ob3d, ob3d_run)
     assert ob3d["SkyBox"]["enabled"] is False
     assert not bool(dict(ob3d.get("SkySphere", {}) or {}).get("enabled", False))
+
+
+def test_360vo_cubemap_formal_config_keeps_mainline_and_sky_cleanup() -> None:
+    root = Path(__file__).parents[1]
+    campaign_path = (
+        root
+        / "configs/formal/panogsslam_formal_360vo_first200_cubemap_v7.yaml"
+    )
+    campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+    base = load_config(root / campaign["base_config"])
+    run = _expand_runs(campaign)[0]
+    resolved = _deep_merge_config(copy.deepcopy(base), run.config_overrides)
+
+    _assert_formal_mainline(resolved, seed=123)
+    _assert_dataset_policy(resolved, run)
+    assert resolved["SkyBox"]["enabled"] is True
+    assert resolved["SkyBox"]["type"] == "cubemap"
+    assert resolved["SkyBox"]["resolution"] == 256
+    assert resolved["SkyBox"]["optimize_all_chunks"] is True
+    assert resolved["SkyBox"]["sky_threshold"] == 0.6
+    assert resolved["SkySphere"]["enabled"] is False
+    assert resolved["Results"]["save_skybox_previews"] is True
+    cleanup = resolved["SphericalSelfiGlobalBackend"]["map_optimization"][
+        "pfgs360"
+    ]["sky_occluder_cleanup"]
+    assert cleanup == {
+        "enabled": True,
+        "sky_threshold": 0.6,
+        "responsibility_threshold": 0.8,
+        "reset_opacity": 0.01,
+    }
+    assert "backend/cubemap_sky" in _SLAM_CORE_VISUAL_WANDB_KEYS

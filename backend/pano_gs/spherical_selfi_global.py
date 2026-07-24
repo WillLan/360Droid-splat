@@ -9352,13 +9352,27 @@ class SphericalSelfiGlobalBackend:
                 metrics["new_frame_count"] = float(len(new_frame_ids))
                 metrics["active_chunk_count"] = float(len(active_owner_window_ids))
                 metrics["pose_to_graph_sync_disabled"] = 1.0
-                metrics.update(
-                    self.mapper.optimize_sky_sphere(
-                        window_id=int(window_id),
-                        recent_frame_ids=visited_frame_ids,
-                        seed=int(self.map_optimize_config.get("seed", 123)),
+                if self.map.has_skybox:
+                    metrics.update(
+                        self.mapper.optimize_cubemap_sky(
+                            window_id=int(window_id),
+                            recent_frame_ids=visited_frame_ids,
+                            new_frame_ids=new_frame_ids,
+                            seed=int(
+                                self.map_optimize_config.get("seed", 123)
+                            ),
+                        )
                     )
-                )
+                else:
+                    metrics.update(
+                        self.mapper.optimize_sky_sphere(
+                            window_id=int(window_id),
+                            recent_frame_ids=visited_frame_ids,
+                            seed=int(
+                                self.map_optimize_config.get("seed", 123)
+                            ),
+                        )
+                    )
                 return metrics
             if self.map_optimization_strategy == "gaussian_only_staged":
                 recent_frame_ids = self._map_optimization_frame_ids(
