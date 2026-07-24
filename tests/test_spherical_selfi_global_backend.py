@@ -2456,7 +2456,7 @@ def test_append_only_refined_growth_preserves_every_existing_row() -> None:
         assert torch.equal(getattr(gaussian_map, name)[0], expected)
 
 
-def test_atomic_refined_growth_replaces_old_only_after_footprint_confirmation() -> None:
+def test_atomic_refined_growth_default_bypasses_hash_and_uses_footprint() -> None:
     packet = _refined_packet(
         1,
         torch.eye(4).repeat(4, 1, 1),
@@ -2541,7 +2541,9 @@ def test_atomic_refined_growth_replaces_old_only_after_footprint_confirmation() 
     )
     assert prepared["tentative"] > 0
     matched_old = prepared["_atomic_plan"]["matched_old_by_incoming"]
-    assert bool((matched_old == 0).any())
+    assert bool((matched_old == -1).all())
+    assert prepared["_atomic_plan"]["stats"]["hash_dedup_enabled"] == 0
+    assert prepared["_atomic_plan"]["stats"]["hash_matches"] == 0
     finalized = backend._update_pfgs360_refined_anchors(
         packet,
         sim3_identity(),
@@ -2555,6 +2557,14 @@ def test_atomic_refined_growth_replaces_old_only_after_footprint_confirmation() 
         confirmed_delete_mask=torch.tensor([True]),
         confirmed_reset_mask=torch.tensor([False]),
         atomic_plan=prepared["_atomic_plan"],
+    )
+    assert (
+        finalized["_atomic_plan"]["stats"]["pfgs360_anchor_hash_rejected"]
+        == 0
+    )
+    assert (
+        len(finalized["_atomic_plan"]["final_prepared"].batch)
+        == prepared["selected"]
     )
     assert gaussian_map.prune_anchors(torch.tensor([True])) == 1
     committed = backend._update_pfgs360_refined_anchors(

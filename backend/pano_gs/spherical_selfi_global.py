@@ -8524,6 +8524,9 @@ class SphericalSelfiGlobalBackend:
         event_name = str(event).strip().lower()
         settings = dict(self.map_optimize_config.get("pfgs360", {}) or {})
         footprint_cfg = dict(settings.get("anchor_footprint", {}) or {})
+        growth_hash_dedup_enabled = bool(
+            settings.get("growth_hash_dedup_enabled", False)
+        )
         prepared = self.fusion.prepare_packet_batch(
             packet,
             window_transform,
@@ -8694,17 +8697,35 @@ class SphericalSelfiGlobalBackend:
                 device=atomic_plan["existing_visible"].device
             )
             visible = atomic_plan["existing_visible"] & ~ignored
-            final_prepared, hash_stats, evidence = (
-                self.fusion.filter_against_visible_map(
-                    atomic_plan["selected_prepared"],
-                    incoming_anchor_visibility=atomic_plan[
-                        "incoming_visibility"
-                    ],
-                    existing_anchor_visibility=visible,
-                    radius_voxels=1.0,
-                    update_existing_statistics=True,
+            if growth_hash_dedup_enabled:
+                final_prepared, hash_stats, evidence = (
+                    self.fusion.filter_against_visible_map(
+                        atomic_plan["selected_prepared"],
+                        incoming_anchor_visibility=atomic_plan[
+                            "incoming_visibility"
+                        ],
+                        existing_anchor_visibility=visible,
+                        radius_voxels=1.0,
+                        update_existing_statistics=True,
+                    )
                 )
-            )
+            else:
+                final_prepared = atomic_plan["selected_prepared"]
+                evidence = None
+                matched_old = atomic_plan["matched_old_by_incoming"]
+                hash_stats = {
+                    "hash_requested": int(final_prepared.requested),
+                    "hash_candidates": len(final_prepared.batch),
+                    "hash_visible_incoming": int(
+                        atomic_plan["incoming_visibility"].sum().item()
+                    ),
+                    "hash_visible_existing": int(visible.sum().item()),
+                    "hash_matches": int((matched_old >= 0).sum().item()),
+                    "hash_hits": 0,
+                    "hash_kept": len(final_prepared.batch),
+                    "hash_radius_voxels": 1.0,
+                    "hash_dedup_enabled": 0,
+                }
             selected_sources = atomic_plan[
                 "selected_prepared"
             ].source_anchor_indices
@@ -8722,6 +8743,9 @@ class SphericalSelfiGlobalBackend:
                 **hash_stats,
                 "pfgs360_anchor_hash_rejected": hash_rejected,
                 "incoming_hash_kept": len(final_prepared.batch),
+                "growth_hash_dedup_enabled": int(
+                    growth_hash_dedup_enabled
+                ),
                 "unconfirmed_old_points_preserved": int(
                     (
                         (
@@ -8869,19 +8893,31 @@ class SphericalSelfiGlobalBackend:
         provisional = (provisional_delete | provisional_reset).to(
             existing_visible.device
         )
-        matched_old = self.fusion.visible_map_match_indices(
-            selected_prepared,
-            incoming_anchor_visibility=incoming_visibility,
-            existing_anchor_visibility=existing_visible,
-            radius_voxels=1.0,
-        )
+        if growth_hash_dedup_enabled:
+            matched_old = self.fusion.visible_map_match_indices(
+                selected_prepared,
+                incoming_anchor_visibility=incoming_visibility,
+                existing_anchor_visibility=existing_visible,
+                radius_voxels=1.0,
+            )
+        else:
+            matched_old = torch.full(
+                (len(selected_prepared.batch),),
+                -1,
+                device=selected_prepared.batch.xyz.device,
+                dtype=torch.long,
+            )
         matched = matched_old >= 0
         matched_provisional = torch.zeros_like(matched)
         if bool(matched.any()):
             matched_provisional[matched] = provisional.to(
                 matched_old.device
             ).index_select(0, matched_old[matched])
-        tentative_keep = ~matched | matched_provisional
+        tentative_keep = (
+            (~matched | matched_provisional)
+            if growth_hash_dedup_enabled
+            else torch.ones_like(matched)
+        )
         tentative = selected_prepared.index(
             torch.nonzero(tentative_keep, as_tuple=False).flatten()
         )
@@ -8892,12 +8928,18 @@ class SphericalSelfiGlobalBackend:
                 incoming_visibility.sum().item()
             ),
             "hash_visible_existing": int(existing_visible.sum().item()),
-            "hash_hits": int((matched & ~matched_provisional).sum().item()),
+            "hash_matches": int(matched.sum().item()),
+            "hash_hits": int(
+                (matched & ~matched_provisional).sum().item()
+                if growth_hash_dedup_enabled
+                else 0
+            ),
             "hash_provisional_matches": int(
                 matched_provisional.sum().item()
             ),
             "hash_kept": len(tentative.batch),
             "hash_radius_voxels": 1.0,
+            "hash_dedup_enabled": int(growth_hash_dedup_enabled),
         }
         tentative_sources = tentative.source_anchor_indices
         if tentative_sources is None:
@@ -8984,6 +9026,9 @@ class SphericalSelfiGlobalBackend:
         pfgs_settings = dict(
             getattr(self, "map_optimize_config", {}).get("pfgs360", {})
             or {}
+        )
+        growth_hash_dedup_enabled = bool(
+            pfgs_settings.get("growth_hash_dedup_enabled", False)
         )
         if bool(
             pfgs_settings.get("atomic_refined_anchor_replacement", False)
@@ -9130,13 +9175,32 @@ class SphericalSelfiGlobalBackend:
                 0, selected_rows.to(prepared.source_anchor_indices.device)
             )
             incoming_visibility[selected_sources.to(incoming_visibility.device)] = True
-        filtered, hash_stats, evidence_update = self.fusion.filter_against_visible_map(
-            selected_prepared,
-            incoming_anchor_visibility=incoming_visibility,
-            existing_anchor_visibility=existing_visible,
-            radius_voxels=1.0,
-            update_existing_statistics=True,
-        )
+        if growth_hash_dedup_enabled:
+            filtered, hash_stats, evidence_update = (
+                self.fusion.filter_against_visible_map(
+                    selected_prepared,
+                    incoming_anchor_visibility=incoming_visibility,
+                    existing_anchor_visibility=existing_visible,
+                    radius_voxels=1.0,
+                    update_existing_statistics=True,
+                )
+            )
+        else:
+            filtered = selected_prepared
+            evidence_update = None
+            hash_stats = {
+                "hash_requested": int(selected_prepared.requested),
+                "hash_candidates": len(selected_prepared.batch),
+                "hash_visible_incoming": int(
+                    incoming_visibility.sum().item()
+                ),
+                "hash_visible_existing": int(existing_visible.sum().item()),
+                "hash_matches": 0,
+                "hash_hits": 0,
+                "hash_kept": len(selected_prepared.batch),
+                "hash_radius_voxels": 1.0,
+                "hash_dedup_enabled": 0,
+            }
         selected_sources = selected_prepared.source_anchor_indices
         kept_sources = filtered.source_anchor_indices
         if selected_sources is None or kept_sources is None:
@@ -9174,6 +9238,9 @@ class SphericalSelfiGlobalBackend:
                 "pfgs360_anchor_source_supported": int(supported_union.sum().item()),
                 "pfgs360_anchor_dia_selected": int(selected_union.sum().item()),
                 "pfgs360_anchor_hash_rejected": int(hash_rejected_sources.numel()),
+                "growth_hash_dedup_enabled": int(
+                    growth_hash_dedup_enabled
+                ),
             },
         )
         self.mapper._pending_pfgs360_anchor_admission = {

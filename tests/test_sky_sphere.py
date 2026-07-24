@@ -649,3 +649,36 @@ def test_360vo_cubemap_formal_config_keeps_mainline_and_sky_cleanup() -> None:
         "reset_opacity": 0.01,
     }
     assert "backend/cubemap_sky" in _SLAM_CORE_VISUAL_WANDB_KEYS
+
+
+def test_360vo_cubemap_nohash_formal_config_disables_growth_hash_only() -> None:
+    root = Path(__file__).parents[1]
+    v7_path = (
+        root
+        / "configs/formal/panogsslam_formal_360vo_first200_cubemap_v7.yaml"
+    )
+    v8_path = (
+        root
+        / "configs/formal/panogsslam_formal_360vo_first200_cubemap_nohash_v8.yaml"
+    )
+    v7_campaign = yaml.safe_load(v7_path.read_text(encoding="utf-8"))
+    v8_campaign = yaml.safe_load(v8_path.read_text(encoding="utf-8"))
+    base = load_config(root / v8_campaign["base_config"])
+    v7_run = _expand_runs(v7_campaign)[0]
+    v8_run = _expand_runs(v8_campaign)[0]
+    v7 = _deep_merge_config(copy.deepcopy(base), v7_run.config_overrides)
+    v8 = _deep_merge_config(copy.deepcopy(base), v8_run.config_overrides)
+
+    _assert_formal_mainline(v8, seed=123)
+    _assert_dataset_policy(v8, v8_run)
+    v8_pfgs = v8["SphericalSelfiGlobalBackend"]["map_optimization"][
+        "pfgs360"
+    ]
+    assert v8_pfgs["growth_hash_dedup_enabled"] is False
+    assert v8_pfgs["atomic_refined_anchor_replacement"] is True
+    assert v8_pfgs["append_only_refined_anchors"] is True
+    assert v8_pfgs["anchor_footprint"] == v7[
+        "SphericalSelfiGlobalBackend"
+    ]["map_optimization"]["pfgs360"]["anchor_footprint"]
+    assert v8["SkyBox"] == v7["SkyBox"]
+    assert v8["SkySphere"] == v7["SkySphere"]

@@ -1,0 +1,82 @@
+version: 8
+name: panogsslam_cubemap_360vo_first200_atomic_append_nohash_v8
+expected_run_count: 10
+base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
+formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
+weights_manifest: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/manifest.json
+torch_home: runtime_cache/torch
+seed: 123
+max_concurrent_workers: 2
+resource_limits:
+  min_available_memory_gib: 80
+  min_free_disk_gib: 100
+  max_prelaunch_cpu_load_fraction: 0.80
+  monitor_interval_sec: 15
+  consecutive_swap_growth_limit: 2
+datasets:
+  - name: 360vo
+    type: ob3d
+    root: /mnt/disk1/zwh/Dataset/360VO-PFGS360
+    frames: 200
+    scenes: [seq0, seq1, seq2, seq3, seq4, seq5, seq6, seq7, seq8, seq9]
+    splits: [Egocentric]
+    config_overrides:
+      VoxelAnchorRefiner:
+        voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+        allow_voxel_size_override: false
+      SphericalSelfiRuntime:
+        sky:
+          enabled: true
+          required: true
+          threshold: 0.6
+      SphericalSelfiGlobalBackend:
+        global_graph:
+          sky_threshold: 0.6
+        voxel_fusion:
+          voxel_sizes: [0.04, 0.08, 0.16, 0.32]
+        map_optimization:
+          pose_lr: 1.0e-4
+          joint_pose_lr: 2.0e-5
+          xyz_lr: 1.0e-4
+          scaling_lr: 5.0e-4
+          rotation_lr: 2.0e-4
+          pfgs360:
+            validity_gate: pfgs360_official_sky_only
+            filter_sky: true
+            atomic_refined_anchor_replacement: true
+            append_only_refined_anchors: true
+            growth_hash_dedup_enabled: false
+            sky_occluder_cleanup:
+              enabled: true
+              sky_threshold: 0.6
+              responsibility_threshold: 0.8
+              reset_opacity: 0.01
+            anchor_footprint:
+              enabled: true
+              sigma: 2.0
+              min_radius_pixels: 1.0
+              max_radius_pixels: 8.0
+              min_pixels: 1
+              min_coverage: 0.05
+      Mapping:
+        sky_mask_enable: true
+        sky_mask_source: panovggt_head
+      SkyBox:
+        enabled: true
+        type: cubemap
+        resolution: 256
+        init_from_first_keyframe: true
+        optimize: true
+        optimization_mask_enable: true
+        force_sky_render: false
+        init_fallback_to_full_image: false
+        optimize_all_chunks: true
+        optimize_steps_per_chunk: 20
+        sky_threshold: 0.6
+        lr: 1.0e-2
+      SkySphere:
+        enabled: false
+      Results:
+        save_skybox_previews: true
+        skybox_preview_height: 256
+        skybox_preview_width: 512
