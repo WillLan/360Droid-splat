@@ -54,7 +54,11 @@ from .sim3_graph import (
     Sim3GraphOptimizeResult,
     s2_log_tangent_coordinates,
 )
-from .stage2_global_fusion import Stage2GlobalMapFusion
+from .stage2_global_fusion import (
+    ExistingAnchorEvidenceUpdate,
+    PreparedPacketFusion,
+    Stage2GlobalMapFusion,
+)
 
 
 @dataclass
@@ -8214,6 +8218,667 @@ class SphericalSelfiGlobalBackend:
         v = torch.round(pixel[:, 1]).long().clamp(0, height - 1)
         return (v * width + u)[valid].detach().cpu()
 
+    @staticmethod
+    def _pfgs360_quaternion_matrix(quaternion: torch.Tensor) -> torch.Tensor:
+        value = quaternion / torch.linalg.norm(
+            quaternion, dim=-1, keepdim=True
+        ).clamp_min(1.0e-8)
+        w, x, y, z = value.unbind(dim=-1)
+        return torch.stack(
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+            dim=-1,
+        ).reshape(*value.shape[:-1], 3, 3)
+
+    @classmethod
+    def _pfgs360_anchor_footprint_admission(
+        cls,
+        prepared: PreparedPacketFusion,
+        pose_c2w: torch.Tensor,
+        *,
+        source_supported: torch.Tensor,
+        image_size: tuple[int, int],
+        target_mask: torch.Tensor | None,
+        sigma: float = 2.0,
+        min_radius_pixels: float = 1.0,
+        max_radius_pixels: float = 8.0,
+        min_pixels: int = 1,
+        min_coverage: float = 0.05,
+        chunk_size: int = 4096,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+        """Admit anchors whose seam-safe projected covariance overlaps a mask."""
+
+        batch = prepared.batch
+        count = len(batch)
+        height, width = (int(value) for value in image_size)
+        selected = torch.zeros(count, device=batch.xyz.device, dtype=torch.bool)
+        union_mask = torch.zeros(
+            1, height, width, device=batch.xyz.device, dtype=torch.bool
+        )
+        pixel, projected = cls._pfgs360_anchor_pixels(
+            batch.xyz, pose_c2w, image_size=image_size
+        )
+        supported = (
+            projected
+            & source_supported.to(device=batch.xyz.device, dtype=torch.bool)
+        )
+        rows = torch.nonzero(supported, as_tuple=False).flatten()
+        if int(rows.numel()) == 0:
+            return selected, union_mask, pixel, {
+                "footprint_supported": 0.0,
+                "footprint_admitted": 0.0,
+                "footprint_pixels": 0.0,
+                "footprint_hit_pixels": 0.0,
+            }
+
+        pose = pose_c2w.to(batch.xyz)
+        camera_xyz = (batch.xyz - pose[:3, 3]) @ pose[:3, :3]
+        x, y, z = camera_xyz.unbind(dim=-1)
+        radius_sq = camera_xyz.square().sum(dim=-1).clamp_min(1.0e-12)
+        horizontal = torch.sqrt((x.square() + z.square()).clamp_min(1.0e-12))
+        jacobian = batch.xyz.new_zeros(count, 2, 3)
+        jacobian[:, 0, 0] = (
+            float(width) / (2.0 * math.pi)
+        ) * z / horizontal.square()
+        jacobian[:, 0, 2] = (
+            -float(width) / (2.0 * math.pi)
+        ) * x / horizontal.square()
+        jacobian[:, 1, 0] = (
+            -float(height) / math.pi
+        ) * x * y / (radius_sq * horizontal)
+        jacobian[:, 1, 1] = (
+            float(height) / math.pi
+        ) * horizontal / radius_sq
+        jacobian[:, 1, 2] = (
+            -float(height) / math.pi
+        ) * z * y / (radius_sq * horizontal)
+
+        rotation_world = cls._pfgs360_quaternion_matrix(batch.rotation)
+        covariance_world = (
+            rotation_world
+            @ torch.diag_embed(batch.scale.square())
+            @ rotation_world.transpose(-1, -2)
+        )
+        world_to_camera = pose[:3, :3].transpose(0, 1)
+        covariance_camera = (
+            world_to_camera.unsqueeze(0)
+            @ covariance_world
+            @ world_to_camera.transpose(0, 1).unsqueeze(0)
+        )
+        covariance_2d = (
+            jacobian @ covariance_camera @ jacobian.transpose(-1, -2)
+        )
+        covariance_2d = covariance_2d + torch.eye(
+            2, device=batch.xyz.device, dtype=batch.xyz.dtype
+        ).unsqueeze(0) * 1.0e-6
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance_2d)
+        radii = (
+            float(sigma) * torch.sqrt(eigenvalues.clamp_min(1.0e-8))
+        ).clamp(float(min_radius_pixels), float(max_radius_pixels))
+        covariance_limited = (
+            eigenvectors
+            @ torch.diag_embed((radii / float(sigma)).square())
+            @ eigenvectors.transpose(-1, -2)
+        )
+        inverse_covariance = torch.linalg.inv(covariance_limited)
+        extent = torch.ceil(radii.amax(dim=-1)).long().clamp(
+            int(math.ceil(min_radius_pixels)),
+            int(math.ceil(max_radius_pixels)),
+        )
+        target = (
+            None
+            if target_mask is None
+            else target_mask.to(
+                device=batch.xyz.device, dtype=torch.bool
+            ).reshape(height, width)
+        )
+        maximum = int(math.ceil(max_radius_pixels))
+        axis = torch.arange(
+            -maximum, maximum + 1, device=batch.xyz.device, dtype=torch.long
+        )
+        dy, dx = torch.meshgrid(axis, axis, indexing="ij")
+        offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+        offsets_float = offsets.to(dtype=batch.xyz.dtype)
+        footprint_pixels = 0
+        hit_pixels = 0
+        for start in range(0, int(rows.numel()), max(1, int(chunk_size))):
+            selected_rows = rows[start : start + max(1, int(chunk_size))]
+            local_offsets = offsets_float.unsqueeze(0).expand(
+                int(selected_rows.numel()), -1, -1
+            )
+            local_extent = extent.index_select(0, selected_rows)
+            inside_box = (
+                local_offsets[..., 0].abs() <= local_extent[:, None]
+            ) & (
+                local_offsets[..., 1].abs() <= local_extent[:, None]
+            )
+            inverse = inverse_covariance.index_select(0, selected_rows)
+            mahalanobis = torch.einsum(
+                "npi,nij,npj->np",
+                local_offsets,
+                inverse,
+                local_offsets,
+            )
+            inside = inside_box & (
+                mahalanobis <= float(sigma) * float(sigma) + 1.0e-6
+            )
+            centers = torch.round(pixel.index_select(0, selected_rows)).long()
+            u = torch.remainder(
+                centers[:, None, 0] + offsets[None, :, 0], width
+            )
+            v_raw = centers[:, None, 1] + offsets[None, :, 1]
+            valid_v = (v_raw >= 0) & (v_raw < height)
+            valid_footprint = inside & valid_v
+            footprint_count = valid_footprint.sum(dim=-1)
+            if target is None:
+                hit = valid_footprint
+            else:
+                sampled = target[
+                    v_raw.clamp(0, height - 1),
+                    u,
+                ]
+                hit = valid_footprint & sampled
+            hit_count = hit.sum(dim=-1)
+            if target is None:
+                admitted = footprint_count >= int(min_pixels)
+            else:
+                admitted = (
+                    (hit_count >= int(min_pixels))
+                    & (
+                        hit_count.to(batch.xyz.dtype)
+                        / footprint_count.clamp_min(1).to(batch.xyz.dtype)
+                        >= float(min_coverage)
+                    )
+                )
+            admitted_rows = selected_rows[admitted]
+            selected[admitted_rows] = True
+            admitted_pixels = valid_footprint & admitted[:, None]
+            if bool(admitted_pixels.any()):
+                union_mask[0, v_raw[admitted_pixels], u[admitted_pixels]] = True
+            footprint_pixels += int(
+                footprint_count[admitted].sum().detach().cpu()
+            )
+            hit_pixels += int(hit_count[admitted].sum().detach().cpu())
+        return selected, union_mask, pixel, {
+            "footprint_supported": float(rows.numel()),
+            "footprint_admitted": float(selected.sum().item()),
+            "footprint_pixels": float(footprint_pixels),
+            "footprint_hit_pixels": float(hit_pixels),
+        }
+
+    @staticmethod
+    def _remap_pfgs360_evidence(
+        evidence: ExistingAnchorEvidenceUpdate | None,
+        old_to_new: torch.Tensor | None,
+    ) -> ExistingAnchorEvidenceUpdate | None:
+        if evidence is None or old_to_new is None:
+            return evidence
+        mapping = old_to_new.detach().cpu().long()
+        rows = evidence.indices.detach().cpu().long()
+        if int(rows.numel()) == 0:
+            return evidence
+        remapped = mapping.index_select(0, rows)
+        valid = remapped >= 0
+        if not bool(valid.any()):
+            return None
+        return ExistingAnchorEvidenceUpdate(
+            indices=remapped[valid],
+            observation_count_delta=evidence.observation_count_delta[valid],
+            confidence_accum_delta=evidence.confidence_accum_delta[valid],
+            last_seen_frame=evidence.last_seen_frame[valid],
+        )
+
+    @torch.no_grad()
+    def _update_pfgs360_refined_anchors_atomic(
+        self,
+        packet: LocalGaussianWindowPacket,
+        window_transform: torch.Tensor,
+        *,
+        event: str,
+        owner_window_id: int,
+        observations,
+        new_frame_ids: tuple[int, ...],
+        mono_inlier_masks: dict[int, torch.Tensor],
+        optimized_poses: dict[int, torch.Tensor],
+        existing_anchor_visibility: dict[int, torch.Tensor],
+        provisional_delete_mask: torch.Tensor | None = None,
+        provisional_reset_mask: torch.Tensor | None = None,
+        confirmed_delete_mask: torch.Tensor | None = None,
+        confirmed_reset_mask: torch.Tensor | None = None,
+        atomic_plan: dict[str, Any] | None = None,
+        old_to_new: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        event_name = str(event).strip().lower()
+        settings = dict(self.map_optimize_config.get("pfgs360", {}) or {})
+        footprint_cfg = dict(settings.get("anchor_footprint", {}) or {})
+        prepared = self.fusion.prepare_packet_batch(
+            packet,
+            window_transform,
+            apply_semantic_gates=False,
+        )
+        compacted, compact_stats = self.fusion.compact_prepared_incoming(
+            prepared
+        )
+        if event_name == "bootstrap":
+            stats = self.fusion.commit_prepared_packet(
+                packet,
+                window_transform,
+                compacted,
+                append_only=True,
+                incoming_already_compacted=True,
+                extra_stats={
+                    **compact_stats,
+                    "pfgs360_refined_bootstrap": 1,
+                    "pfgs360_anchor_candidates": len(prepared.batch),
+                    "pfgs360_anchor_selected": len(compacted.batch),
+                    "pfgs360_hash_radius_voxels": 1.0,
+                    "existing_removed_by_compaction": 0,
+                },
+            )
+            if int(stats.get("existing_removed_by_compaction", -1)) != 0:
+                raise RuntimeError(
+                    "Append-only bootstrap removed existing anchors by compaction"
+                )
+            self.mapper._pending_pfgs360_anchor_admission = None
+            return {
+                "candidate": len(prepared.batch),
+                "selected": len(compacted.batch),
+                "inserted": int(stats.get("inserted", 0)),
+                **compact_stats,
+            }
+        if event_name == "atomic_commit":
+            if atomic_plan is None:
+                raise RuntimeError("Atomic refined-anchor commit requires a plan")
+            final_prepared = atomic_plan["final_prepared"]
+            evidence = self._remap_pfgs360_evidence(
+                atomic_plan.get("evidence_update"),
+                old_to_new,
+            )
+            extra_stats = dict(atomic_plan["stats"])
+            extra_stats.update(
+                {
+                    "confirmed_delete": int(
+                        0
+                        if confirmed_delete_mask is None
+                        else confirmed_delete_mask.sum().item()
+                    ),
+                    "confirmed_reset": int(
+                        0
+                        if confirmed_reset_mask is None
+                        else confirmed_reset_mask.sum().item()
+                    ),
+                    "existing_removed_by_compaction": 0,
+                }
+            )
+            commit_stats = self.fusion.commit_prepared_packet(
+                packet,
+                window_transform,
+                final_prepared,
+                evidence_update=evidence,
+                extra_stats=extra_stats,
+                append_only=True,
+                incoming_already_compacted=True,
+            )
+            if int(commit_stats.get("existing_removed_by_compaction", -1)) != 0:
+                raise RuntimeError(
+                    "Append-only refined growth compacted the existing map"
+                )
+            view_diagnostics = list(atomic_plan["view_diagnostics"])
+            kept_sources = final_prepared.source_anchor_indices
+            if kept_sources is None:
+                raise RuntimeError("Atomic refined commit lost source identities")
+            kept_set = kept_sources.to(compacted.batch.xyz.device)
+            for diagnostic in view_diagnostics:
+                selected_sources = diagnostic.pop("_selected_sources")
+                pixel = diagnostic.pop("_pixel")
+                selected_rows = diagnostic.pop("_selected_rows")
+                inserted = selected_rows & torch.isin(
+                    compacted.source_anchor_indices.to(selected_rows.device),
+                    kept_set.to(selected_rows.device),
+                )
+                rejected = selected_rows & ~inserted
+                image_size = tuple(atomic_plan["image_size"])
+                diagnostic["hash_rejected_pixels"] = self._pfgs360_pixel_indices(
+                    pixel,
+                    rejected.to(pixel.device),
+                    image_size=image_size,
+                )
+                diagnostic["inserted_pixels"] = self._pfgs360_pixel_indices(
+                    pixel,
+                    inserted.to(pixel.device),
+                    image_size=image_size,
+                )
+                _ = selected_sources
+            self.mapper._pending_pfgs360_anchor_admission = {
+                "window_id": int(packet.window_id),
+                "image_size": tuple(atomic_plan["image_size"]),
+                "views": view_diagnostics,
+                "candidate": int(atomic_plan["stats"]["pfgs360_anchor_candidates"]),
+                "source_view_rejected": int(
+                    atomic_plan["stats"]["pfgs360_anchor_source_rejected"]
+                ),
+                "dia_selected": int(
+                    atomic_plan["stats"]["pfgs360_anchor_dia_selected"]
+                ),
+                "hash_rejected": int(
+                    atomic_plan["stats"]["pfgs360_anchor_hash_rejected"]
+                ),
+                "inserted": int(commit_stats.get("inserted", 0)),
+            }
+            return {
+                "candidate": int(
+                    atomic_plan["stats"]["pfgs360_anchor_candidates"]
+                ),
+                "selected": int(
+                    atomic_plan["stats"]["pfgs360_anchor_dia_selected"]
+                ),
+                "hash_rejected": int(
+                    atomic_plan["stats"]["pfgs360_anchor_hash_rejected"]
+                ),
+                "inserted": int(commit_stats.get("inserted", 0)),
+                "incoming_precompact": int(
+                    commit_stats.get("incoming_precompact", 0)
+                ),
+                "incoming_hash_kept": int(len(final_prepared.batch)),
+                "incoming_appended": int(
+                    commit_stats.get("incoming_appended", 0)
+                ),
+                "incoming_retained": int(
+                    commit_stats.get("incoming_retained", 0)
+                ),
+                "net_map_change": int(commit_stats.get("net_map_change", 0)),
+                "existing_removed_by_compaction": 0,
+                "anchors_before": int(commit_stats.get("anchors_before", 0)),
+                "anchors_after": int(commit_stats.get("anchors_after", 0)),
+            }
+
+        if event_name not in {"atomic_prepare", "atomic_finalize"}:
+            raise ValueError(f"Unsupported atomic anchor event {event!r}")
+        if event_name == "atomic_finalize":
+            if atomic_plan is None:
+                raise RuntimeError("Atomic refined-anchor finalize requires a plan")
+            delete = (
+                torch.zeros(self.map.anchor_count(), dtype=torch.bool)
+                if confirmed_delete_mask is None
+                else confirmed_delete_mask.detach().cpu().bool()
+            )
+            reset = (
+                torch.zeros_like(delete)
+                if confirmed_reset_mask is None
+                else confirmed_reset_mask.detach().cpu().bool()
+            )
+            ignored = (delete | reset).to(
+                device=atomic_plan["existing_visible"].device
+            )
+            visible = atomic_plan["existing_visible"] & ~ignored
+            final_prepared, hash_stats, evidence = (
+                self.fusion.filter_against_visible_map(
+                    atomic_plan["selected_prepared"],
+                    incoming_anchor_visibility=atomic_plan[
+                        "incoming_visibility"
+                    ],
+                    existing_anchor_visibility=visible,
+                    radius_voxels=1.0,
+                    update_existing_statistics=True,
+                )
+            )
+            selected_sources = atomic_plan[
+                "selected_prepared"
+            ].source_anchor_indices
+            kept_sources = final_prepared.source_anchor_indices
+            if selected_sources is None or kept_sources is None:
+                raise RuntimeError("Atomic Hash lost source-anchor identity")
+            hash_rejected = int(
+                (~torch.isin(selected_sources, kept_sources)).sum().item()
+            )
+            atomic_plan = dict(atomic_plan)
+            atomic_plan["final_prepared"] = final_prepared
+            atomic_plan["evidence_update"] = evidence
+            atomic_plan["stats"] = {
+                **atomic_plan["stats"],
+                **hash_stats,
+                "pfgs360_anchor_hash_rejected": hash_rejected,
+                "incoming_hash_kept": len(final_prepared.batch),
+                "unconfirmed_old_points_preserved": int(
+                    (
+                        (
+                            atomic_plan["provisional_delete"]
+                            | atomic_plan["provisional_reset"]
+                        )
+                        & ~(delete | reset)
+                    ).sum().item()
+                ),
+            }
+            return {"_atomic_plan": atomic_plan}
+
+        if compacted.source_anchor_indices is None:
+            raise RuntimeError("Atomic refined growth requires source indices")
+        source_view_mask = packet.metadata.get("voxel_anchor_source_view_mask")
+        if not torch.is_tensor(source_view_mask):
+            raise RuntimeError("Atomic refined growth requires source-view bits")
+        frame_ids = tuple(int(value) for value in new_frame_ids)
+        if len(frame_ids) != 2:
+            raise RuntimeError(
+                "Atomic refined growth requires exactly two new frames"
+            )
+        frame_to_index = {
+            int(frame_id): index
+            for index, frame_id in enumerate(packet.frame_ids)
+        }
+        source_rows = compacted.source_anchor_indices.to(
+            device=source_view_mask.device, dtype=torch.long
+        )
+        support_bits = source_view_mask.long().index_select(0, source_rows)
+        image_size = tuple(
+            int(value) for value in packet.anchor_observation.image_size
+        )
+        selected_union = torch.zeros(
+            len(compacted.batch),
+            device=compacted.batch.xyz.device,
+            dtype=torch.bool,
+        )
+        supported_union = torch.zeros_like(selected_union)
+        existing_visible = torch.zeros(
+            self.map.anchor_count(),
+            device=self.map.xyz.device,
+            dtype=torch.bool,
+        )
+        view_diagnostics: list[dict[str, Any]] = []
+        observation_by_frame = {
+            int(value.frame_id): value for value in observations
+        }
+        footprint_options = {
+            "sigma": float(footprint_cfg.get("sigma", 2.0)),
+            "min_radius_pixels": float(
+                footprint_cfg.get("min_radius_pixels", 1.0)
+            ),
+            "max_radius_pixels": float(
+                footprint_cfg.get("max_radius_pixels", 8.0)
+            ),
+            "min_pixels": int(footprint_cfg.get("min_pixels", 1)),
+            "min_coverage": float(footprint_cfg.get("min_coverage", 0.05)),
+        }
+        per_view_rows: dict[int, torch.Tensor] = {}
+        per_view_pixels: dict[int, torch.Tensor] = {}
+        footprint_stats: dict[str, float] = {}
+        for frame_id in frame_ids:
+            frame_index = frame_to_index[frame_id]
+            pose = optimized_poses.get(frame_id)
+            mask = mono_inlier_masks.get(frame_id)
+            visible = existing_anchor_visibility.get(frame_id)
+            if pose is None or mask is None or visible is None:
+                raise RuntimeError(
+                    f"Incomplete atomic refined inputs for frame {frame_id}"
+                )
+            if int(visible.numel()) != self.map.anchor_count():
+                raise RuntimeError("Atomic Hash visibility is stale")
+            existing_visible |= visible.to(existing_visible)
+            source_supported = (
+                support_bits.to(compacted.batch.xyz.device)
+                & (1 << int(frame_index))
+            ) != 0
+            supported_union |= source_supported
+            selected, _, pixel, view_stats = (
+                self._pfgs360_anchor_footprint_admission(
+                    compacted,
+                    pose,
+                    source_supported=source_supported,
+                    image_size=image_size,
+                    target_mask=mask,
+                    **footprint_options,
+                )
+            )
+            selected_union |= selected
+            per_view_rows[frame_id] = selected
+            per_view_pixels[frame_id] = pixel
+            for key, value in view_stats.items():
+                footprint_stats[key] = footprint_stats.get(key, 0.0) + float(
+                    value
+                )
+            view_diagnostics.append(
+                {
+                    "frame_id": frame_id,
+                    "image": observation_by_frame[
+                        frame_id
+                    ].image.detach().cpu(),
+                    "mono_inlier_mask": mask.detach().cpu().bool(),
+                    "candidate_pixels": self._pfgs360_pixel_indices(
+                        pixel,
+                        source_supported,
+                        image_size=image_size,
+                    ),
+                    "dia_selected_pixels": self._pfgs360_pixel_indices(
+                        pixel,
+                        selected,
+                        image_size=image_size,
+                    ),
+                    "_pixel": pixel,
+                    "_selected_rows": selected,
+                    "_selected_sources": compacted.source_anchor_indices[
+                        selected
+                    ],
+                }
+            )
+        selected_rows = torch.nonzero(
+            selected_union, as_tuple=False
+        ).flatten()
+        selected_prepared = compacted.index(selected_rows)
+        incoming_visibility = torch.zeros(
+            packet.anchor_observation.num_anchors,
+            device=source_view_mask.device,
+            dtype=torch.bool,
+        )
+        if int(selected_rows.numel()) > 0:
+            sources = compacted.source_anchor_indices.index_select(
+                0, selected_rows.to(compacted.source_anchor_indices.device)
+            )
+            incoming_visibility[sources.to(incoming_visibility.device)] = True
+        provisional_delete = (
+            torch.zeros(self.map.anchor_count(), dtype=torch.bool)
+            if provisional_delete_mask is None
+            else provisional_delete_mask.detach().cpu().bool()
+        )
+        provisional_reset = (
+            torch.zeros_like(provisional_delete)
+            if provisional_reset_mask is None
+            else provisional_reset_mask.detach().cpu().bool()
+        )
+        provisional = (provisional_delete | provisional_reset).to(
+            existing_visible.device
+        )
+        matched_old = self.fusion.visible_map_match_indices(
+            selected_prepared,
+            incoming_anchor_visibility=incoming_visibility,
+            existing_anchor_visibility=existing_visible,
+            radius_voxels=1.0,
+        )
+        matched = matched_old >= 0
+        matched_provisional = torch.zeros_like(matched)
+        if bool(matched.any()):
+            matched_provisional[matched] = provisional.to(
+                matched_old.device
+            ).index_select(0, matched_old[matched])
+        tentative_keep = ~matched | matched_provisional
+        tentative = selected_prepared.index(
+            torch.nonzero(tentative_keep, as_tuple=False).flatten()
+        )
+        first_hash_stats = {
+            "hash_requested": int(selected_prepared.requested),
+            "hash_candidates": len(selected_prepared.batch),
+            "hash_visible_incoming": int(
+                incoming_visibility.sum().item()
+            ),
+            "hash_visible_existing": int(existing_visible.sum().item()),
+            "hash_hits": int((matched & ~matched_provisional).sum().item()),
+            "hash_provisional_matches": int(
+                matched_provisional.sum().item()
+            ),
+            "hash_kept": len(tentative.batch),
+            "hash_radius_voxels": 1.0,
+        }
+        tentative_sources = tentative.source_anchor_indices
+        if tentative_sources is None:
+            raise RuntimeError("Atomic tentative Hash lost source identity")
+        footprint_masks: dict[int, torch.Tensor] = {}
+        compacted_sources = compacted.source_anchor_indices
+        for frame_id in frame_ids:
+            supported = per_view_rows[frame_id] & torch.isin(
+                compacted_sources.to(per_view_rows[frame_id].device),
+                tentative_sources.to(per_view_rows[frame_id].device),
+            )
+            _, footprint_mask, _, _ = (
+                self._pfgs360_anchor_footprint_admission(
+                    compacted,
+                    optimized_poses[frame_id],
+                    source_supported=supported,
+                    image_size=image_size,
+                    target_mask=None,
+                    **footprint_options,
+                )
+            )
+            footprint_masks[frame_id] = footprint_mask.detach()
+        plan = {
+            "selected_prepared": selected_prepared,
+            "tentative_prepared": tentative,
+            "incoming_visibility": incoming_visibility,
+            "existing_visible": existing_visible,
+            "provisional_delete": provisional_delete,
+            "provisional_reset": provisional_reset,
+            "matched_old_by_incoming": matched_old.detach().cpu(),
+            "footprint_masks": footprint_masks,
+            "view_diagnostics": view_diagnostics,
+            "image_size": image_size,
+            "stats": {
+                **compact_stats,
+                **first_hash_stats,
+                **footprint_stats,
+                "pfgs360_refined_bootstrap": 0,
+                "pfgs360_anchor_candidates": len(prepared.batch),
+                "pfgs360_anchor_source_rejected": len(compacted.batch)
+                - int(supported_union.sum().item()),
+                "pfgs360_anchor_dia_selected": int(
+                    selected_union.sum().item()
+                ),
+                "pfgs360_anchor_tentative": len(tentative.batch),
+            },
+        }
+        return {
+            "_atomic_plan": plan,
+            "_footprint_masks": footprint_masks,
+            "candidate": len(prepared.batch),
+            "selected": int(selected_union.sum().item()),
+            "tentative": len(tentative.batch),
+        }
+
     @torch.no_grad()
     def _update_pfgs360_refined_anchors(
         self,
@@ -8227,6 +8892,7 @@ class SphericalSelfiGlobalBackend:
         mono_inlier_masks: dict[int, torch.Tensor],
         optimized_poses: dict[int, torch.Tensor],
         existing_anchor_visibility: dict[int, torch.Tensor],
+        **atomic_kwargs,
     ) -> dict[str, Any]:
         """Insert Refiner anchors selected by PFGS360 DIA masks.
 
@@ -8240,6 +8906,25 @@ class SphericalSelfiGlobalBackend:
             raise RuntimeError("PFGS360 refined growth requires anchor_observation")
         if int(owner_window_id) != int(packet.window_id):
             raise RuntimeError("PFGS360 refined growth owner does not match packet")
+        pfgs_settings = dict(
+            getattr(self, "map_optimize_config", {}).get("pfgs360", {})
+            or {}
+        )
+        if bool(
+            pfgs_settings.get("atomic_refined_anchor_replacement", False)
+        ):
+            return self._update_pfgs360_refined_anchors_atomic(
+                packet,
+                window_transform,
+                event=event,
+                owner_window_id=owner_window_id,
+                observations=observations,
+                new_frame_ids=new_frame_ids,
+                mono_inlier_masks=mono_inlier_masks,
+                optimized_poses=optimized_poses,
+                existing_anchor_visibility=existing_anchor_visibility,
+                **atomic_kwargs,
+            )
         source_view_mask = packet.metadata.get("voxel_anchor_source_view_mask")
         if not torch.is_tensor(source_view_mask):
             raise RuntimeError("PFGS360 refined growth requires source-view bits")

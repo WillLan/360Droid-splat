@@ -4774,12 +4774,19 @@ class PanoDroidGSSlamSystem:
                 and math.isfinite(float(value))
             }
             if scalar_metrics:
-                logger._log_wandb_payload(
-                    {
+                payload = {
                         f"backend/map_optimization/{key}": value
                         for key, value in scalar_metrics.items()
-                    },
-                    step=max(1, int(logger._step)),
+                }
+                if "dia_growth_inserted" in scalar_metrics:
+                    payload["backend/new_gaussians_per_chunk"] = int(
+                        scalar_metrics["dia_growth_inserted"]
+                    )
+                    payload["backend/selfi_global_anchors"] = int(
+                        self.map.anchor_count()
+                    )
+                logger._log_wandb_payload(
+                    payload, step=max(1, int(logger._step))
                 )
             write_profile(
                 "backend_spherical_selfi_map_optimization",

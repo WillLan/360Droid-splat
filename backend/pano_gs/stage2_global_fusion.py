@@ -153,15 +153,24 @@ class Stage2GlobalMapFusion:
         self,
         batch: GlobalExplicitGaussianBatch,
     ) -> GlobalExplicitGaussianBatch:
+        return batch.index(self._budget_indices(batch))
+
+    def _budget_indices(
+        self,
+        batch: GlobalExplicitGaussianBatch,
+    ) -> torch.Tensor:
+        """Return rows retained by the safety capacity without voxel merging."""
+
         if self.max_total_gaussians <= 0 or len(batch) <= self.max_total_gaussians:
-            return batch
+            return torch.arange(
+                len(batch), device=batch.xyz.device, dtype=torch.long
+            )
         if not self.coverage_aware_budget:
-            selected = torch.topk(
+            return torch.topk(
                 batch.quality,
                 k=self.max_total_gaussians,
                 largest=True,
             ).indices
-            return batch.index(selected)
 
         coarse = torch.floor(
             batch.xyz / float(self.coverage_coarse_cell_size)
@@ -189,7 +198,7 @@ class Stage2GlobalMapFusion:
         )
         coverage = coverage[coverage < len(batch)]
         if int(coverage.numel()) >= self.max_total_gaussians:
-            chosen = coverage.index_select(
+            return coverage.index_select(
                 0,
                 torch.topk(
                     batch.quality.index_select(0, coverage),
@@ -197,7 +206,6 @@ class Stage2GlobalMapFusion:
                     largest=True,
                 ).indices,
             )
-            return batch.index(chosen)
         selected_mask = torch.zeros(
             len(batch), device=batch.xyz.device, dtype=torch.bool
         )
@@ -212,7 +220,59 @@ class Stage2GlobalMapFusion:
                 largest=True,
             ).indices,
         )
-        return batch.index(torch.cat([coverage, fill], dim=0))
+        return torch.cat([coverage, fill], dim=0)
+
+    def compact_prepared_incoming(
+        self,
+        prepared: PreparedPacketFusion,
+    ) -> tuple[PreparedPacketFusion, dict[str, int]]:
+        """Compress duplicate refined anchors inside the incoming owner only."""
+
+        count = len(prepared.batch)
+        if count == 0:
+            return prepared, {
+                "incoming_precompact": 0,
+                "incoming_compacted": 0,
+                "incoming_internal_duplicates": 0,
+            }
+        batch = prepared.batch
+        level = batch.level.long()
+        voxel_size = batch.voxel_size[:, 0].to(batch.xyz).clamp_min(1.0e-8)
+        grid = torch.floor(batch.xyz / voxel_size[:, None]).to(torch.int64)
+        key = torch.cat(
+            [batch.owner_window_id[:, None], level[:, None], grid],
+            dim=-1,
+        )
+        unique, inverse = torch.unique(
+            key, dim=0, return_inverse=True, sorted=True
+        )
+        max_quality = batch.quality.new_full((int(unique.shape[0]),), -torch.inf)
+        max_quality.scatter_reduce_(
+            0, inverse, batch.quality, reduce="amax", include_self=True
+        )
+        rows = torch.arange(count, device=batch.xyz.device, dtype=torch.long)
+        candidates = torch.where(
+            batch.quality >= max_quality[inverse] - 1.0e-12,
+            rows,
+            torch.full_like(rows, count),
+        )
+        winners = torch.full(
+            (int(unique.shape[0]),),
+            count,
+            device=batch.xyz.device,
+            dtype=torch.long,
+        )
+        winners.scatter_reduce_(
+            0, inverse, candidates, reduce="amin", include_self=True
+        )
+        winners = winners[winners < count]
+        compacted = prepared.index(winners)
+        compacted.batch.grid_coord = grid.index_select(0, winners)
+        return compacted, {
+            "incoming_precompact": count,
+            "incoming_compacted": len(compacted.batch),
+            "incoming_internal_duplicates": count - len(compacted.batch),
+        }
 
     @staticmethod
     def _coverage_first_rows(
@@ -1190,6 +1250,103 @@ class Stage2GlobalMapFusion:
         )
         return filtered, stats, evidence_update
 
+    def visible_map_match_indices(
+        self,
+        prepared: PreparedPacketFusion,
+        *,
+        incoming_anchor_visibility: torch.Tensor,
+        existing_anchor_visibility: torch.Tensor,
+        radius_voxels: float = 1.0,
+    ) -> torch.Tensor:
+        """Return the winning visible old row for every incoming row, or -1."""
+
+        if not prepared.depth_selected or prepared.source_anchor_indices is None:
+            raise ValueError("Visible-map matching requires refined anchors")
+        incoming_visibility = (
+            incoming_anchor_visibility.detach().bool().reshape(-1)
+        )
+        existing_visibility = (
+            existing_anchor_visibility.detach().bool().reshape(-1)
+        )
+        if int(existing_visibility.numel()) != self.map.anchor_count():
+            raise ValueError(
+                "Existing anchor visibility must match the current map"
+            )
+        source = prepared.source_anchor_indices.to(
+            incoming_visibility.device
+        )
+        incoming_visible = incoming_visibility.index_select(0, source).to(
+            prepared.batch.xyz.device
+        )
+        output = torch.full(
+            (len(prepared.batch),),
+            -1,
+            device=prepared.batch.xyz.device,
+            dtype=torch.long,
+        )
+        incoming_rows = torch.nonzero(
+            incoming_visible, as_tuple=False
+        ).flatten()
+        existing_rows = torch.nonzero(
+            existing_visibility.to(self.map.xyz.device),
+            as_tuple=False,
+        ).flatten()
+        radius_scale = max(0.0, float(radius_voxels))
+        if (
+            int(incoming_rows.numel()) == 0
+            or int(existing_rows.numel()) == 0
+            or radius_scale <= 0.0
+        ):
+            return output
+        existing_rows_cpu = existing_rows.detach().cpu().long()
+        existing_xyz, existing_voxel = (
+            self.map.materialized_anchor_geometry_rows(existing_rows)
+        )
+        existing_xyz = existing_xyz.to(prepared.batch.xyz.device)
+        existing_voxel = existing_voxel.to(prepared.batch.xyz.device)
+        existing_level = self.map._anchor_level.index_select(
+            0, existing_rows_cpu
+        ).to(device=prepared.batch.xyz.device, dtype=torch.long)
+        existing_quality = self.map._anchor_quality.index_select(
+            0, existing_rows_cpu
+        ).to(
+            device=prepared.batch.xyz.device,
+            dtype=prepared.batch.quality.dtype,
+        )
+        existing_rows_device = existing_rows.to(prepared.batch.xyz.device)
+        for level in range(len(self.voxel_sizes)):
+            new_rows = torch.nonzero(
+                (prepared.batch.level == level) & incoming_visible,
+                as_tuple=False,
+            ).flatten()
+            old_selection = torch.nonzero(
+                existing_level == level, as_tuple=False
+            ).flatten()
+            if int(new_rows.numel()) == 0 or int(old_selection.numel()) == 0:
+                continue
+            matched_new, matched_old = self._match_visible_level_vectorized(
+                incoming_xyz=prepared.batch.xyz.detach().index_select(
+                    0, new_rows
+                ),
+                incoming_voxel=prepared.batch.voxel_size[
+                    new_rows, 0
+                ].detach(),
+                incoming_rows=new_rows,
+                existing_xyz=existing_xyz.index_select(0, old_selection),
+                existing_voxel=existing_voxel.index_select(0, old_selection),
+                existing_quality=existing_quality.index_select(
+                    0, old_selection
+                ),
+                existing_rows=existing_rows_device.index_select(
+                    0, old_selection
+                ),
+                radius_scale=radius_scale,
+                radius_cells=max(0, int(math.ceil(radius_scale))),
+            )
+            if int(matched_new.numel()) > 0:
+                output[matched_new] = matched_old.to(output.device)
+        return output
+
     def filter_against_visible_map(
         self,
         prepared: PreparedPacketFusion,
@@ -1409,6 +1566,8 @@ class Stage2GlobalMapFusion:
         *,
         evidence_update: ExistingAnchorEvidenceUpdate | None = None,
         extra_stats: dict[str, int | float] | None = None,
+        append_only: bool = False,
+        incoming_already_compacted: bool = False,
     ) -> dict[str, int | float]:
         before = self.map.anchor_count()
         depth_selected = bool(prepared.depth_selected)
@@ -1416,7 +1575,12 @@ class Stage2GlobalMapFusion:
             raise ValueError(
                 "Cannot mix legacy scale-selected packets into a depth-selected voxel-anchor map"
             )
-        if depth_selected:
+        if incoming_already_compacted:
+            incoming = prepared.batch
+        elif depth_selected and append_only:
+            prepared, _ = self.compact_prepared_incoming(prepared)
+            incoming = prepared.batch
+        elif depth_selected:
             incoming = prepared.batch
         else:
             incoming = self.compact_within_window(prepared.batch)
@@ -1435,14 +1599,48 @@ class Stage2GlobalMapFusion:
                 existing.last_seen_frame[rows],
                 evidence_update.last_seen_frame.to(existing.last_seen_frame),
             )
-        combined = incoming if len(existing) == 0 else self._concatenate([existing, incoming])
-        compacted = (
-            self._winner_take_owner_voxel(combined, preserve_levels=depth_selected)
-            if self.lazy_owner_transforms
-            else self._winner_take_global_voxel(combined, preserve_levels=depth_selected)
+        combined = (
+            incoming
+            if len(existing) == 0
+            else self._concatenate([existing, incoming])
         )
-        pre_cap_count = int(self.last_pre_cap_count)
-        saturated = bool(self.last_saturated)
+        existing_raw_parameters = (
+            {
+                name: getattr(self.map, name).detach()
+                for name in self.map._gaussian_parameter_names()
+            }
+            if append_only and len(existing) > 0
+            else {}
+        )
+        if append_only:
+            pre_cap_count = len(combined)
+            saturated = (
+                self.max_total_gaussians > 0
+                and pre_cap_count > self.max_total_gaussians
+            )
+            retained_rows = self._budget_indices(combined)
+            compacted = combined.index(retained_rows)
+            incoming_retained = int((retained_rows >= len(existing)).sum().item())
+            existing_retained = int((retained_rows < len(existing)).sum().item())
+            existing_removed_by_capacity = len(existing) - existing_retained
+            existing_removed_by_compaction = 0
+        else:
+            compacted = (
+                self._winner_take_owner_voxel(
+                    combined, preserve_levels=depth_selected
+                )
+                if self.lazy_owner_transforms
+                else self._winner_take_global_voxel(
+                    combined, preserve_levels=depth_selected
+                )
+            )
+            pre_cap_count = int(self.last_pre_cap_count)
+            saturated = bool(self.last_saturated)
+            incoming_retained = max(0, len(compacted) - len(existing))
+            existing_removed_by_capacity = 0
+            existing_removed_by_compaction = max(
+                0, len(existing) - min(len(existing), len(compacted))
+            )
         if self.lazy_owner_transforms:
             self.map.set_lazy_owner_transform(
                 int(packet.window_id),
@@ -1453,12 +1651,40 @@ class Stage2GlobalMapFusion:
         if depth_selected:
             self._depth_selected_mode = True
         self._write_map(compacted)
+        if append_only:
+            mapping = torch.full(
+                (len(compacted),), -1, dtype=torch.long
+            )
+            retained_cpu = retained_rows.detach().cpu().long()
+            old_rows = retained_cpu < len(existing)
+            mapping[old_rows] = retained_cpu[old_rows]
+            if bool(old_rows.any()):
+                output_rows = torch.nonzero(
+                    old_rows, as_tuple=False
+                ).flatten()
+                source_rows = mapping[old_rows]
+                with torch.no_grad():
+                    for name, original in existing_raw_parameters.items():
+                        parameter = getattr(self.map, name)
+                        parameter[output_rows.to(parameter.device)] = (
+                            original.index_select(
+                                0, source_rows.to(original.device)
+                            ).to(parameter)
+                        )
+            self.map._pfgs360_last_topology_mapping = mapping
         after = len(compacted)
-        inserted_or_replaced = max(0, after - before)
+        inserted_or_replaced = int(incoming_retained)
         stats: dict[str, int | float] = {
             "requested": int(prepared.requested),
             "window_compacted": len(incoming),
             "inserted": inserted_or_replaced,
+            "incoming_precompact": int(prepared.requested),
+            "incoming_hash_kept": len(incoming),
+            "incoming_appended": len(incoming),
+            "incoming_retained": inserted_or_replaced,
+            "net_map_change": after - before,
+            "existing_removed_by_compaction": existing_removed_by_compaction,
+            "existing_removed_by_capacity": existing_removed_by_capacity,
             "deduplicated": max(0, len(combined) - after),
             "anchors_before": before,
             "anchors_after": after,

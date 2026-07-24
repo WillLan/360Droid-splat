@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
+import yaml
 
 from backend.pano_gs.mapper import PanoGaussianMap, PanoGaussianMapper
 from backend.pano_gs.pfgs360_full import (
@@ -14,6 +16,7 @@ from backend.pano_gs.pfgs360_full import (
 from backend.pano_gs.pose_param import PoseDelta
 from system.pano_droid_gs_slam import (
     _SLAM_CORE_VISUAL_WANDB_KEYS,
+    _deep_merge_config,
     _resolve_cpu_threading_config,
     _requires_refiner_insertion_dedup,
     load_config,
@@ -223,6 +226,20 @@ class _AttributedFakeRenderer(_DifferentiableFakeRenderer):
             answers[:120, 0] = 1.0
             answers[120:240, 1] = 1.0
             output["query_answers"] = answers
+        return output
+
+
+class _MaskAwareAttributedFakeRenderer(_AttributedFakeRenderer):
+    def render(self, camera, gaussians, *, query_values=None):
+        output = super().render(
+            camera, gaussians, query_values=query_values
+        )
+        if query_values is not None and not bool(
+            (query_values > 0.0).any()
+        ):
+            output["query_answers"] = torch.zeros_like(
+                output["query_answers"]
+            )
         return output
 
 
@@ -841,6 +858,76 @@ def test_refined_anchor_growth_runs_only_after_dia_old_map_deletion() -> None:
     ]
 
 
+def test_atomic_dia_preserves_old_points_without_admitted_footprint() -> None:
+    mapper = _registered_mapper(_MaskAwareAttributedFakeRenderer())
+    xyz = torch.stack(
+        [torch.arange(240), torch.zeros(240), torch.ones(240)], dim=-1
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(240, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    opacity_before = mapper.map.opacity_logit.detach().clone()
+    calls = []
+
+    def update(**kwargs):
+        event = kwargs["event"]
+        calls.append(event)
+        if event == "atomic_prepare":
+            height, width = 4, 8
+            return {
+                "_atomic_plan": {"synthetic": True},
+                "_footprint_masks": {
+                    2: torch.zeros(1, height, width, dtype=torch.bool),
+                    3: torch.zeros(1, height, width, dtype=torch.bool),
+                },
+                "_replacement_eligible_old_mask": torch.ones(
+                    mapper.map.anchor_count(), dtype=torch.bool
+                ),
+            }
+        if event == "atomic_finalize":
+            return {"_atomic_plan": kwargs["atomic_plan"]}
+        if event == "atomic_commit":
+            return {
+                "candidate": 0,
+                "selected": 0,
+                "inserted": 0,
+                "incoming_retained": 0,
+                "existing_removed_by_compaction": 0,
+            }
+        raise AssertionError(event)
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "growth_source": "refined_anchor",
+            "atomic_refined_anchor_replacement": True,
+            "validity_gate": "pfgs360_official_sky_only",
+            "min_reset_gaussians": 100,
+            "min_delete_gaussians": 100,
+        },
+        refined_anchor_update=update,
+    )
+    metrics = engine._dia(
+        engine._observations((0, 1, 2, 3)), (2, 3), 1
+    )
+
+    assert calls == [
+        "atomic_prepare",
+        "atomic_finalize",
+        "atomic_commit",
+    ]
+    assert metrics["dia_provisional_delete_candidates"] == 120
+    assert metrics["dia_provisional_reset_candidates"] == 120
+    assert metrics["dia_deleted"] == 0
+    assert metrics["dia_reset_applied"] == 0
+    assert mapper.map.anchor_count() == 240
+    torch.testing.assert_close(mapper.map.opacity_logit, opacity_before)
+
+
 def test_query_failure_rolls_back_bootstrap_pose_and_topology() -> None:
     mapper = _registered_mapper(_AttributedFakeRenderer(fail_query=True))
     deltas_before = {
@@ -1155,6 +1242,56 @@ def test_refined_anchor_admission_saves_two_local_views_and_one_chunk_panel(
     directory = path.parent
     assert (directory / "window_000002_frame_000004.png").exists()
     assert (directory / "window_000002_frame_000005.png").exists()
+
+
+def test_formal_v6_enables_atomic_append_footprints_and_lower_geometry_lr() -> None:
+    root = Path(__file__).parents[1]
+    campaign = yaml.safe_load(
+        (
+            root
+            / "configs/formal/panogsslam_formal_360vo_first200_skysphere_v6.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    config = load_config(root / campaign["base_config"])
+    config = _deep_merge_config(
+        config, campaign["datasets"][0]["config_overrides"]
+    )
+    runtime = config["SphericalSelfiRuntime"]
+    backend = config["SphericalSelfiGlobalBackend"]
+    optimization = backend["map_optimization"]
+    pfgs = optimization["pfgs360"]
+
+    assert runtime["pager_depth"]["enabled"] is True
+    assert runtime["local_ba"]["matching"]["type"] == "superpoint_sphereglue"
+    assert backend["rendered_overlap_alignment"]["mode"] == (
+        "two_frame_global_map_full_sim3"
+    )
+    assert backend["rendered_overlap_alignment"]["acceptance_policy"] == (
+        "diagnostics_only"
+    )
+    assert backend["global_graph"]["node_mode"] == "chunk_first_stride"
+    assert optimization["camera_steps"] == 50
+    assert optimization["joint_steps"] == 200
+    assert optimization["pose_lr"] == pytest.approx(1.0e-4)
+    assert optimization["joint_pose_lr"] == pytest.approx(2.0e-5)
+    assert optimization["xyz_lr"] == pytest.approx(1.0e-4)
+    assert optimization["scaling_lr"] == pytest.approx(5.0e-4)
+    assert optimization["rotation_lr"] == pytest.approx(2.0e-4)
+    assert pfgs["atomic_refined_anchor_replacement"] is True
+    assert pfgs["append_only_refined_anchors"] is True
+    assert pfgs["anchor_footprint"] == {
+        "enabled": True,
+        "sigma": 2.0,
+        "min_radius_pixels": 1.0,
+        "max_radius_pixels": 8.0,
+        "min_pixels": 1,
+        "min_coverage": 0.05,
+    }
+    assert config["SkySphere"]["enabled"] is True
+    assert config["SkySphere"]["optimize_all_chunks"] is True
+    assert config["WeightsAndBiases"]["runtime_log_preset"] == (
+        "slam_core_visuals"
+    )
 
 
 def test_strict_pfgs360_refined_packet_does_not_require_legacy_dedup() -> None:

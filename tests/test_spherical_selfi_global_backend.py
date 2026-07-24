@@ -2301,6 +2301,237 @@ def test_pfgs360_refined_anchor_projection_wraps_panorama_seam() -> None:
     assert pixel[1, 0] > width - 0.01
 
 
+def test_pfgs360_refined_anchor_footprint_wraps_seam_and_uses_coverage() -> None:
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    height, width = packet.anchor_observation.image_size
+    fusion = Stage2GlobalMapFusion(
+        PanoGaussianMap(config={}, device="cpu"),
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    prepared = fusion.prepare_packet_batch(
+        packet, sim3_identity(), apply_semantic_gates=False
+    ).index(torch.tensor([0]))
+    prepared.batch.xyz[0] = torch.tensor([-1.0e-4, 0.0, -2.0])
+    prepared.batch.scale[0] = torch.tensor([0.2, 0.08, 0.08])
+    prepared.batch.rotation[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    target = torch.zeros(1, height, width, dtype=torch.bool)
+    center = height // 2
+    target[:, max(0, center - 1) : center + 2, :2] = True
+    target[:, max(0, center - 1) : center + 2, -2:] = True
+
+    selected, footprint, _, stats = (
+        SphericalSelfiGlobalBackend._pfgs360_anchor_footprint_admission(
+            prepared,
+            torch.eye(4),
+            source_supported=torch.tensor([True]),
+            image_size=(height, width),
+            target_mask=target,
+            sigma=2.0,
+            min_radius_pixels=1.0,
+            max_radius_pixels=8.0,
+            min_pixels=1,
+            min_coverage=0.05,
+        )
+    )
+
+    assert selected.tolist() == [True]
+    assert bool(footprint[:, :, 0].any())
+    assert bool(footprint[:, :, -1].any())
+    assert stats["footprint_admitted"] == 1
+
+
+def test_append_only_refined_growth_preserves_every_existing_row() -> None:
+    gaussian_map = PanoGaussianMap(
+        config={
+            "MapRepresentation": {
+                "gaussian_parameterization": "traditional_3dgs"
+            }
+        },
+        device="cpu",
+    )
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=torch.tensor([[7.0, 8.0, 9.0]]),
+            rgb=torch.tensor([[0.2, 0.3, 0.4]]),
+            confidence=torch.ones(1),
+            scale=torch.full((1,), 0.03),
+            level=torch.zeros(1, dtype=torch.long),
+            frame_id=0,
+        )
+    )
+    fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+        lazy_owner_transforms=True,
+    )
+    fusion.map.set_lazy_owner_transform(0, torch.eye(4), set_reference=True)
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    prepared = fusion.prepare_packet_batch(
+        packet, sim3_identity(), apply_semantic_gates=False
+    )
+    compacted, compact_stats = fusion.compact_prepared_incoming(prepared)
+    parameters_before = {
+        name: getattr(gaussian_map, name)[0].detach().clone()
+        for name in gaussian_map._gaussian_parameter_names()
+    }
+    metadata_before = {
+        name: getattr(gaussian_map, name)[0].detach().clone()
+        for name in gaussian_map._anchor_metadata_names()
+    }
+
+    stats = fusion.commit_prepared_packet(
+        packet,
+        sim3_identity(),
+        compacted,
+        append_only=True,
+        incoming_already_compacted=True,
+        extra_stats=compact_stats,
+    )
+
+    assert stats["existing_removed_by_compaction"] == 0
+    assert stats["inserted"] == stats["incoming_retained"]
+    assert stats["inserted"] == gaussian_map.anchor_count() - 1
+    for name, expected in parameters_before.items():
+        assert torch.equal(getattr(gaussian_map, name)[0], expected)
+    for name, expected in metadata_before.items():
+        assert torch.equal(getattr(gaussian_map, name)[0], expected)
+
+
+def test_atomic_refined_growth_replaces_old_only_after_footprint_confirmation() -> None:
+    packet = _refined_packet(
+        1,
+        torch.eye(4).repeat(4, 1, 1),
+        (2, 3, 4, 5),
+    )
+    packet.metadata["voxel_anchor_source_view_mask"] = torch.full(
+        (packet.anchor_observation.num_anchors,),
+        (1 << 2) | (1 << 3),
+        dtype=torch.long,
+    )
+    gaussian_map = PanoGaussianMap(
+        config={
+            "MapRepresentation": {
+                "gaussian_parameterization": "traditional_3dgs"
+            }
+        },
+        device="cpu",
+    )
+    backend = SphericalSelfiGlobalBackend.__new__(
+        SphericalSelfiGlobalBackend
+    )
+    backend.map = gaussian_map
+    backend.mapper = SimpleNamespace(
+        _pending_pfgs360_anchor_admission=None,
+        _pfgs360_gaussian_moments={},
+    )
+    backend.map_optimize_config = {
+        "pfgs360": {
+            "atomic_refined_anchor_replacement": True,
+            "anchor_footprint": {
+                "enabled": True,
+                "sigma": 2.0,
+                "min_radius_pixels": 1.0,
+                "max_radius_pixels": 8.0,
+                "min_pixels": 1,
+                "min_coverage": 0.05,
+            },
+        }
+    }
+    backend.fusion = Stage2GlobalMapFusion(
+        gaussian_map,
+        voxel_sizes=(0.04, 0.08, 0.16, 0.32),
+        min_confidence=0.0,
+        min_opacity=0.0,
+    )
+    incoming = backend.fusion.prepare_packet_batch(
+        packet, sim3_identity(), apply_semantic_gates=False
+    )
+    gaussian_map.add_seeds(
+        GaussianSeedBatch(
+            xyz=incoming.batch.xyz[:1],
+            rgb=torch.full((1, 3), 0.2),
+            confidence=torch.ones(1),
+            scale=incoming.batch.voxel_size[:1, 0],
+            level=incoming.batch.level[:1],
+            frame_id=0,
+        )
+    )
+    height, width = packet.anchor_observation.image_size
+    masks = {
+        4: torch.ones(1, height, width, dtype=torch.bool),
+        5: torch.ones(1, height, width, dtype=torch.bool),
+    }
+    poses = {4: torch.eye(4), 5: torch.eye(4)}
+    visibility = {4: torch.ones(1, dtype=torch.bool), 5: torch.ones(1, dtype=torch.bool)}
+
+    prepared = backend._update_pfgs360_refined_anchors(
+        packet,
+        sim3_identity(),
+        event="atomic_prepare",
+        owner_window_id=1,
+        observations=(
+            SimpleNamespace(frame_id=4, image=torch.zeros(3, height, width)),
+            SimpleNamespace(frame_id=5, image=torch.zeros(3, height, width)),
+        ),
+        new_frame_ids=(4, 5),
+        mono_inlier_masks=masks,
+        optimized_poses=poses,
+        existing_anchor_visibility=visibility,
+        provisional_delete_mask=torch.tensor([True]),
+        provisional_reset_mask=torch.tensor([False]),
+    )
+    assert prepared["tentative"] > 0
+    matched_old = prepared["_atomic_plan"]["matched_old_by_incoming"]
+    assert bool((matched_old == 0).any())
+    finalized = backend._update_pfgs360_refined_anchors(
+        packet,
+        sim3_identity(),
+        event="atomic_finalize",
+        owner_window_id=1,
+        observations=(),
+        new_frame_ids=(4, 5),
+        mono_inlier_masks=masks,
+        optimized_poses=poses,
+        existing_anchor_visibility=visibility,
+        confirmed_delete_mask=torch.tensor([True]),
+        confirmed_reset_mask=torch.tensor([False]),
+        atomic_plan=prepared["_atomic_plan"],
+    )
+    assert gaussian_map.prune_anchors(torch.tensor([True])) == 1
+    committed = backend._update_pfgs360_refined_anchors(
+        packet,
+        sim3_identity(),
+        event="atomic_commit",
+        owner_window_id=1,
+        observations=(),
+        new_frame_ids=(4, 5),
+        mono_inlier_masks=masks,
+        optimized_poses=poses,
+        existing_anchor_visibility={},
+        confirmed_delete_mask=torch.tensor([True]),
+        confirmed_reset_mask=torch.tensor([False]),
+        atomic_plan=finalized["_atomic_plan"],
+        old_to_new=torch.tensor([-1]),
+    )
+
+    assert committed["inserted"] > 0
+    assert committed["inserted"] == committed["incoming_retained"]
+    assert committed["existing_removed_by_compaction"] == 0
+    assert gaussian_map.anchor_count() == committed["inserted"]
+
+
 def test_refined_anchor_prepare_can_bypass_semantic_quality_gates() -> None:
     packet = _refined_packet(
         0,

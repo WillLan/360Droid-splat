@@ -1042,6 +1042,7 @@ class PFGS360FullBackend:
         inconsistent_hits = torch.zeros(self.map.anchor_count(), device=self.device, dtype=torch.int32)
         inlier_hits = torch.zeros_like(inconsistent_hits)
         mono_inlier_masks: dict[int, torch.Tensor] = {}
+        render_inconsistent_masks: dict[int, torch.Tensor] = {}
         growth_xyz: list[torch.Tensor] = []
         growth_rgb: list[torch.Tensor] = []
         mono_inlier_pixels = 0
@@ -1095,6 +1096,9 @@ class PFGS360FullBackend:
             query_views += 1
             if frame_id in new_set:
                 mono_inlier_masks[frame_id] = mono_inlier.detach()
+                render_inconsistent_masks[frame_id] = (
+                    render_inconsistent.detach()
+                )
             if (
                 not self.uses_refined_anchor_growth
                 and frame_id in new_set
@@ -1110,27 +1114,25 @@ class PFGS360FullBackend:
                 growth_rgb.append(rgb)
             del package, answers, accum, responsibility
 
-        cull = inlier_hits > 0
-        reset = (inconsistent_hits > 0) & ~cull
+        provisional_cull = inlier_hits > 0
+        provisional_reset = (inconsistent_hits > 0) & ~provisional_cull
+        atomic_refined = (
+            self.uses_refined_anchor_growth
+            and bool(
+                self.settings.get(
+                    "atomic_refined_anchor_replacement", False
+                )
+            )
+        )
+        cull = provisional_cull
+        reset = provisional_reset
         reset_count = int(reset.sum().item())
         cull_count = int(cull.sum().item())
         reset_applied = 0
-        if reset_count >= int(self.settings.get("min_reset_gaussians", 100)):
-            limit = math.log(0.01 / 0.99)
-            with torch.no_grad():
-                self.map.opacity_logit[reset] = torch.minimum(
-                    self.map.opacity_logit[reset],
-                    self.map.opacity_logit.new_tensor(limit),
-                )
-            reset_applied = reset_count
-            self._clear_opacity_moments(reset)
         deleted = 0
-        if cull_count >= int(self.settings.get("min_delete_gaussians", 100)):
-            deleted = self.map.prune_anchors(cull)
-            self._remap_moments()
         growth = {"raw": 0, "unique": 0, "occupied": 0, "inserted": 0}
         refined_stats: dict[str, Any] = {}
-        if self.uses_refined_anchor_growth:
+        if atomic_refined:
             if self.refined_anchor_update is None:
                 raise RuntimeError(
                     "Refined-anchor PFGS360 growth requires an anchor update handler"
@@ -1155,6 +1157,226 @@ class PFGS360FullBackend:
                         )
                     visibility[frame_id] = visible.detach()
                     optimized_poses[frame_id] = self._pose(observation).detach()
+            preparation = self.refined_anchor_update(
+                event="atomic_prepare",
+                owner_window_id=int(owner_window_id),
+                observations=tuple(observations),
+                new_frame_ids=tuple(sorted(new_set)),
+                mono_inlier_masks=mono_inlier_masks,
+                optimized_poses=optimized_poses,
+                existing_anchor_visibility=visibility,
+                provisional_delete_mask=provisional_cull.detach(),
+                provisional_reset_mask=provisional_reset.detach(),
+            )
+            atomic_plan = preparation.get("_atomic_plan")
+            footprint_masks = preparation.get("_footprint_masks")
+            if not isinstance(atomic_plan, dict) or not isinstance(
+                footprint_masks, dict
+            ):
+                raise RuntimeError(
+                    "Atomic refined-anchor preparation returned no plan"
+                )
+            confirmed_inconsistent_hits = torch.zeros_like(inconsistent_hits)
+            confirmed_inlier_hits = torch.zeros_like(inlier_hits)
+            confirmed_query_views = 0
+            for observation in observations:
+                frame_id = int(observation.frame_id)
+                if frame_id not in new_set:
+                    continue
+                footprint = footprint_masks.get(frame_id)
+                mono_inlier = mono_inlier_masks.get(frame_id)
+                render_inconsistent = render_inconsistent_masks.get(frame_id)
+                if (
+                    footprint is None
+                    or mono_inlier is None
+                    or render_inconsistent is None
+                ):
+                    raise RuntimeError(
+                        f"Atomic replacement lacks frame {frame_id} masks"
+                    )
+                footprint = footprint.to(
+                    device=self.device, dtype=torch.bool
+                )
+                query = torch.stack(
+                    [
+                        (render_inconsistent & footprint)[0].float(),
+                        (mono_inlier & footprint)[0].float(),
+                    ],
+                    dim=-1,
+                )
+                with torch.no_grad():
+                    package = self._render(
+                        observation, query_values=query
+                    )
+                answers = package.get("query_answers")
+                accum = package.get("accum_visible")
+                if not (
+                    torch.is_tensor(answers)
+                    and torch.is_tensor(accum)
+                ):
+                    raise RuntimeError(
+                        "Atomic DIA requires query_answers and accum_visible"
+                    )
+                if tuple(answers.shape) != (
+                    self.map.anchor_count(),
+                    2,
+                ):
+                    raise RuntimeError(
+                        "Atomic DIA query answer shape mismatch"
+                    )
+                responsibility = answers / accum.view(-1, 1).clamp_min(
+                    1.0e-8
+                )
+                finite = (
+                    torch.isfinite(responsibility).all(dim=-1)
+                    & (accum > 0.0)
+                )
+                threshold = float(
+                    self.settings.get(
+                        "query_responsibility_threshold", 0.8
+                    )
+                )
+                confirmed_inconsistent_hits += (
+                    finite & (responsibility[:, 0] >= threshold)
+                ).int()
+                confirmed_inlier_hits += (
+                    finite & (responsibility[:, 1] >= threshold)
+                ).int()
+                confirmed_query_views += 1
+            confirmed_cull = (
+                (confirmed_inlier_hits > 0)
+                & provisional_cull
+            )
+            confirmed_reset = (
+                (confirmed_inconsistent_hits > 0)
+                & provisional_reset
+                & ~confirmed_cull
+            )
+            if int(confirmed_cull.sum().item()) < int(
+                self.settings.get("min_delete_gaussians", 100)
+            ):
+                confirmed_cull.zero_()
+            if int(confirmed_reset.sum().item()) < int(
+                self.settings.get("min_reset_gaussians", 100)
+            ):
+                confirmed_reset.zero_()
+            finalized = self.refined_anchor_update(
+                event="atomic_finalize",
+                owner_window_id=int(owner_window_id),
+                observations=tuple(observations),
+                new_frame_ids=tuple(sorted(new_set)),
+                mono_inlier_masks=mono_inlier_masks,
+                optimized_poses=optimized_poses,
+                existing_anchor_visibility=visibility,
+                confirmed_delete_mask=confirmed_cull.detach(),
+                confirmed_reset_mask=confirmed_reset.detach(),
+                atomic_plan=atomic_plan,
+            )
+            atomic_plan = finalized.get("_atomic_plan")
+            if not isinstance(atomic_plan, dict):
+                raise RuntimeError(
+                    "Atomic refined-anchor finalize returned no plan"
+                )
+            reset = confirmed_reset
+            cull = confirmed_cull
+            reset_count = int(reset.sum().item())
+            cull_count = int(cull.sum().item())
+            if reset_count > 0:
+                limit = math.log(0.01 / 0.99)
+                with torch.no_grad():
+                    self.map.opacity_logit[reset] = torch.minimum(
+                        self.map.opacity_logit[reset],
+                        self.map.opacity_logit.new_tensor(limit),
+                    )
+                reset_applied = reset_count
+                self._clear_opacity_moments(reset)
+            old_count = self.map.anchor_count()
+            old_to_new = torch.arange(old_count, dtype=torch.long)
+            if cull_count > 0:
+                deleted = self.map.prune_anchors(cull)
+                topology_mapping = (
+                    self.map._pfgs360_last_topology_mapping
+                )
+                old_to_new = torch.full(
+                    (old_count,), -1, dtype=torch.long
+                )
+                old_to_new[topology_mapping.long()] = torch.arange(
+                    int(topology_mapping.numel()), dtype=torch.long
+                )
+                self._remap_moments()
+            refined_stats = self.refined_anchor_update(
+                event="atomic_commit",
+                owner_window_id=int(owner_window_id),
+                observations=tuple(observations),
+                new_frame_ids=tuple(sorted(new_set)),
+                mono_inlier_masks=mono_inlier_masks,
+                optimized_poses=optimized_poses,
+                existing_anchor_visibility={},
+                confirmed_delete_mask=cull.detach(),
+                confirmed_reset_mask=reset.detach(),
+                atomic_plan=atomic_plan,
+                old_to_new=old_to_new,
+            )
+            self._remap_moments()
+            growth = {
+                "raw": int(refined_stats.get("candidate", 0)),
+                "unique": int(refined_stats.get("selected", 0)),
+                "occupied": 0,
+                "inserted": int(refined_stats.get("inserted", 0)),
+            }
+            query_views += int(confirmed_query_views)
+        else:
+            if reset_count >= int(
+                self.settings.get("min_reset_gaussians", 100)
+            ):
+                limit = math.log(0.01 / 0.99)
+                with torch.no_grad():
+                    self.map.opacity_logit[reset] = torch.minimum(
+                        self.map.opacity_logit[reset],
+                        self.map.opacity_logit.new_tensor(limit),
+                    )
+                reset_applied = reset_count
+                self._clear_opacity_moments(reset)
+            if cull_count >= int(
+                self.settings.get("min_delete_gaussians", 100)
+            ):
+                deleted = self.map.prune_anchors(cull)
+                self._remap_moments()
+        if self.uses_refined_anchor_growth and not atomic_refined:
+            if self.refined_anchor_update is None:
+                raise RuntimeError(
+                    "Refined-anchor PFGS360 growth requires an anchor update handler"
+                )
+            visibility: dict[int, torch.Tensor] = {}
+            optimized_poses: dict[int, torch.Tensor] = {}
+            with torch.no_grad():
+                for observation in observations:
+                    frame_id = int(observation.frame_id)
+                    if frame_id not in new_set:
+                        continue
+                    package = self._render(observation)
+                    accum = package.get("accum_visible")
+                    radii = package.get("radii")
+                    if (
+                        torch.is_tensor(accum)
+                        and int(accum.numel()) == self.map.anchor_count()
+                    ):
+                        visible = torch.isfinite(accum) & (accum > 0.0)
+                    elif (
+                        torch.is_tensor(radii)
+                        and int(radii.numel()) == self.map.anchor_count()
+                    ):
+                        visible = torch.isfinite(radii) & (
+                            radii.reshape(-1) > 0.0
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Refined-anchor Hash requires per-Gaussian visibility"
+                        )
+                    visibility[frame_id] = visible.detach()
+                    optimized_poses[frame_id] = self._pose(
+                        observation
+                    ).detach()
             refined_stats = self.refined_anchor_update(
                 event="growth",
                 owner_window_id=int(owner_window_id),
@@ -1187,10 +1409,17 @@ class PFGS360FullBackend:
             "dia_render_views": float(len(observations)),
             "dia_query_views": float(query_views),
             "dia_mono_inlier_pixels": float(mono_inlier_pixels),
+            "dia_provisional_reset_candidates": float(
+                provisional_reset.sum().item()
+            ),
+            "dia_provisional_delete_candidates": float(
+                provisional_cull.sum().item()
+            ),
             "dia_reset_candidates": float(reset_count),
             "dia_reset_applied": float(reset_applied),
             "dia_delete_candidates": float(cull_count),
             "dia_deleted": float(deleted),
+            "dia_atomic_replacement": float(atomic_refined),
             "dia_growth_raw": float(growth["raw"]),
             "dia_growth_unique": float(growth["unique"]),
             "dia_growth_occupied": float(growth["occupied"]),
