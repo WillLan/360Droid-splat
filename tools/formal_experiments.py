@@ -159,8 +159,8 @@ def _expand_runs(campaign: dict[str, Any]) -> list[RunSpec]:
                     }
                 )
     workers = int(campaign.get("max_concurrent_workers", 2))
-    if workers != 2:
-        raise ValueError("The formal campaign is locked to exactly two workers")
+    if workers < 1 or workers > 4:
+        raise ValueError("Formal campaign workers must be in [1, 4]")
     loads = [0 for _ in range(workers)]
     assigned: dict[str, int] = {}
     for run in sorted(raw_runs, key=lambda item: (-item["frames"], item["run_id"])):
@@ -229,8 +229,8 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
     skybox = config["SkyBox"]
     sky_sphere = dict(config.get("SkySphere", {}) or {})
     sky_sphere_enabled = bool(sky_sphere.get("enabled", False))
-    if run.dataset in {"ob3d", "rar_pano"}:
-        label = "OB3D" if run.dataset == "ob3d" else "RAR_pano"
+    if run.dataset == "ob3d":
+        label = "OB3D"
         expected = {
             f"{label} Sky Head disabled": sky["enabled"] is False,
             f"{label} sky not required": sky["required"] is False,
@@ -251,32 +251,78 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             f"{label} fusion voxel sizes": fusion_voxels
             == [0.02, 0.04, 0.08, 0.16],
         }
-        if run.dataset == "rar_pano":
+    elif run.dataset == "rar_pano":
+        geometry_only = bool(sky.get("geometry_only", False))
+        expected = {
+            "RAR_pano mapping sky mask disabled": mapping["sky_mask_enable"] is False,
+            "RAR_pano mapping sky source disabled": str(
+                mapping["sky_mask_source"]
+            ).lower()
+            == "none",
+            "RAR_pano skybox disabled": skybox["enabled"] is False,
+            "RAR_pano SkySphere disabled": sky_sphere_enabled is False,
+            "RAR_pano DIA has no semantic gate": pfgs["validity_gate"]
+            == "pfgs360_official_no_semantic_gate",
+            "RAR_pano PFGS sky filtering disabled": pfgs["filter_sky"] is False,
+            "RAR_pano latest atomic refined-anchor replacement": pfgs[
+                "atomic_refined_anchor_replacement"
+            ]
+            is True,
+            "RAR_pano append-only refined-anchor growth": pfgs[
+                "append_only_refined_anchors"
+            ]
+            is True,
+            "RAR_pano latest no-Hash admission": pfgs[
+                "growth_hash_dedup_enabled"
+            ]
+            is False,
+            "RAR_pano latest anchor footprint": pfgs["anchor_footprint"]
+            == {
+                "enabled": True,
+                "sigma": 2.0,
+                "min_radius_pixels": 1.0,
+                "max_radius_pixels": 8.0,
+                "min_pixels": 1,
+                "min_coverage": 0.05,
+            },
+        }
+        if geometry_only:
             expected.update(
                 {
-                    "RAR_pano latest atomic refined-anchor replacement": pfgs[
-                        "atomic_refined_anchor_replacement"
-                    ]
+                    "RAR_pano geometry-only Sky Head enabled": sky["enabled"]
                     is True,
-                    "RAR_pano append-only refined-anchor growth": pfgs[
-                        "append_only_refined_anchors"
-                    ]
-                    is True,
-                    "RAR_pano latest no-Hash admission": pfgs[
-                        "growth_hash_dedup_enabled"
-                    ]
+                    "RAR_pano geometry-only sky required": sky["required"] is True,
+                    "RAR_pano geometry-only sky threshold": abs(
+                        float(sky["threshold"]) - 0.6
+                    )
+                    < 1.0e-12,
+                    "RAR_pano graph sky threshold": abs(
+                        float(backend["global_graph"]["sky_threshold"]) - 0.6
+                    )
+                    < 1.0e-12,
+                    "RAR_pano native Refiner voxel sizes": refiner_voxels
+                    == [0.04, 0.08, 0.16, 0.32],
+                    "RAR_pano Refiner voxel override disabled": config[
+                        "VoxelAnchorRefiner"
+                    ].get("allow_voxel_size_override", False)
                     is False,
-                    "RAR_pano latest anchor footprint": pfgs[
-                        "anchor_footprint"
-                    ]
-                    == {
-                        "enabled": True,
-                        "sigma": 2.0,
-                        "min_radius_pixels": 1.0,
-                        "max_radius_pixels": 8.0,
-                        "min_pixels": 1,
-                        "min_coverage": 0.05,
-                    },
+                    "RAR_pano native fusion voxel sizes": fusion_voxels
+                    == [0.04, 0.08, 0.16, 0.32],
+                }
+            )
+        else:
+            expected.update(
+                {
+                    "RAR_pano legacy Sky Head disabled": sky["enabled"] is False,
+                    "RAR_pano legacy sky not required": sky["required"] is False,
+                    "RAR_pano legacy Refiner voxel sizes": refiner_voxels
+                    == [0.02, 0.04, 0.08, 0.16],
+                    "RAR_pano legacy Refiner voxel override explicit": config[
+                        "VoxelAnchorRefiner"
+                    ].get("allow_voxel_size_override")
+                    is True,
+                    "RAR_pano legacy fusion voxel sizes": fusion_voxels
+                    == [0.02, 0.04, 0.08, 0.16],
                 }
             )
     elif run.dataset == "360vo":
@@ -571,7 +617,18 @@ def prepare_campaign(
                                 "enabled", False
                             )
                         )
-                        else ["sky-disabled"]
+                        else (
+                            ["sky-geometry-only"]
+                            if bool(
+                                dict(
+                                    config["SphericalSelfiRuntime"].get(
+                                        "sky", {}
+                                    )
+                                    or {}
+                                ).get("geometry_only", False)
+                            )
+                            else ["sky-disabled"]
+                        )
                     )
                 ),
                 run.dataset,
@@ -609,7 +666,7 @@ def prepare_campaign(
         "weights_manifest_sha256": weight_manifest_sha256,
         "torch_home": str(torch_home) if torch_home is not None else None,
         "resource_limits": campaign.get("resource_limits", {}),
-        "max_concurrent_workers": 2,
+        "max_concurrent_workers": int(campaign.get("max_concurrent_workers", 2)),
         "runs": expanded,
     }
     _write_json(root / "campaign.json", campaign_payload)
@@ -735,6 +792,64 @@ def _gpu_processes(gpu: int) -> list[int]:
     return [int(line.strip()) for line in output.splitlines() if line.strip().isdigit()]
 
 
+def _wait_until_resources_ready(
+    formal_root: Path,
+    run_root: Path,
+    *,
+    gpu: int,
+    min_memory: int,
+    min_disk: int,
+    max_cpu_fraction: float,
+    poll_sec: int,
+    stable_samples: int,
+    wait: bool,
+) -> dict[str, int] | None:
+    """Wait without a child process until system and target-GPU state is stable."""
+
+    previous: dict[str, int] | None = None
+    stable = 0
+    while True:
+        current = _read_resource_snapshot(formal_root)
+        load_fraction = (
+            current["load_1m_milli"]
+            / 1000.0
+            / max(1, current["cpu_count"])
+        )
+        gpu_processes = _gpu_processes(gpu)
+        swap_grew = (
+            previous is not None
+            and (
+                current["pswpin"] > previous["pswpin"]
+                or current["pswpout"] > previous["pswpout"]
+            )
+        )
+        ready = (
+            current["available_memory"] >= min_memory
+            and current["free_disk"] >= min_disk
+            and load_fraction <= max_cpu_fraction
+            and not gpu_processes
+            and not swap_grew
+        )
+        stable = stable + 1 if ready else 0
+        state = {
+            "snapshot": current,
+            "load_fraction": load_fraction,
+            "gpu_processes": gpu_processes,
+            "swap_grew": swap_grew,
+            "stable_samples": stable,
+            "required_stable_samples": stable_samples,
+            "time": time.time(),
+        }
+        _write_json(run_root / "paused_resource_guard.json", state)
+        if stable >= stable_samples:
+            (run_root / "paused_resource_guard.json").unlink(missing_ok=True)
+            return current
+        if not wait:
+            return None
+        previous = current
+        time.sleep(max(1, poll_sec))
+
+
 def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
@@ -777,7 +892,9 @@ def _acquire_worker_lock(formal_root: Path, worker: int, max_workers: int) -> Pa
             lock.unlink(missing_ok=True)
     active = list(lock_dir.glob("worker_*.lock"))
     if len(active) >= max_workers:
-        raise RuntimeError("Formal campaign already has the maximum two active workers")
+        raise RuntimeError(
+            f"Formal campaign already has the maximum {max_workers} active workers"
+        )
     lock = lock_dir / f"worker_{worker}.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -800,6 +917,14 @@ def run_worker(formal_root: Path, *, repo_root: Path, worker: int, gpu: int) -> 
         max_cpu_fraction = float(limits.get("max_prelaunch_cpu_load_fraction", 0.8))
         interval = int(limits.get("monitor_interval_sec", 15))
         swap_limit = int(limits.get("consecutive_swap_growth_limit", 2))
+        wait_for_resources = bool(limits.get("wait_for_resources", False))
+        stable_samples = max(
+            1, int(limits.get("resource_retry_stable_samples", 1))
+        )
+        retry_poll_sec = max(
+            1, int(limits.get("resource_retry_poll_sec", interval))
+        )
+        max_attempts = max(1, int(limits.get("max_attempts", 2)))
         python = "/mnt/disk1/lanboyang/miniconda3/envs/pfgs360/bin/python"
         runs = [entry for entry in campaign["runs"] if int(entry["worker"]) == worker]
         for entry in runs:
@@ -809,31 +934,21 @@ def run_worker(formal_root: Path, *, repo_root: Path, worker: int, gpu: int) -> 
                 continue
             base_config = _load_yaml(Path(entry["resolved_config"]))
             succeeded = False
-            for attempt_number in (1, 2):
+            for attempt_number in range(1, max_attempts + 1):
                 attempt_dir = run_root / f"attempt_{attempt_number:03d}"
                 attempt_dir.mkdir(parents=True, exist_ok=True)
-                snapshot = _read_resource_snapshot(formal_root)
-                load_fraction = (
-                    snapshot["load_1m_milli"]
-                    / 1000.0
-                    / max(1, snapshot["cpu_count"])
+                snapshot = _wait_until_resources_ready(
+                    formal_root,
+                    run_root,
+                    gpu=gpu,
+                    min_memory=min_memory,
+                    min_disk=min_disk,
+                    max_cpu_fraction=max_cpu_fraction,
+                    poll_sec=retry_poll_sec,
+                    stable_samples=stable_samples,
+                    wait=wait_for_resources,
                 )
-                gpu_processes = _gpu_processes(gpu)
-                if (
-                    snapshot["available_memory"] < min_memory
-                    or snapshot["free_disk"] < min_disk
-                    or load_fraction > max_cpu_fraction
-                    or gpu_processes
-                ):
-                    _write_json(
-                        run_root / "paused_resource_guard.json",
-                        {
-                            "snapshot": snapshot,
-                            "load_fraction": load_fraction,
-                            "gpu_processes": gpu_processes,
-                            "time": time.time(),
-                        },
-                    )
+                if snapshot is None:
                     return
                 config = copy.deepcopy(base_config)
                 config["Results"]["save_dir"] = str(attempt_dir)
@@ -855,13 +970,22 @@ def run_worker(formal_root: Path, *, repo_root: Path, worker: int, gpu: int) -> 
                 _write_json(attempt_dir / "run_provenance.json", provenance)
                 log_path = attempt_dir / "run.log"
                 env = os.environ.copy()
+                native_threads = int(
+                    dict(
+                        dict(config.get("Runtime", {}) or {}).get(
+                            "cpu_threading", {}
+                        )
+                        or {}
+                    ).get("native_threads", 8)
+                )
+                native_threads = max(1, native_threads)
                 env.update(
                     {
                         "CUDA_VISIBLE_DEVICES": str(gpu),
-                        "OMP_NUM_THREADS": "8",
-                        "MKL_NUM_THREADS": "8",
-                        "OPENBLAS_NUM_THREADS": "8",
-                        "NUMEXPR_NUM_THREADS": "8",
+                        "OMP_NUM_THREADS": str(native_threads),
+                        "MKL_NUM_THREADS": str(native_threads),
+                        "OPENBLAS_NUM_THREADS": str(native_threads),
+                        "NUMEXPR_NUM_THREADS": str(native_threads),
                         "PYTHONUNBUFFERED": "1",
                     }
                 )
@@ -942,7 +1066,9 @@ def run_worker(formal_root: Path, *, repo_root: Path, worker: int, gpu: int) -> 
                         succeeded = True
                         aggregate_campaign(formal_root)
                         break
-                if attempt_number == 1 and not resource_abort and _transient_failure(log_path):
+                if attempt_number < max_attempts and (
+                    resource_abort or _transient_failure(log_path)
+                ):
                     continue
                 break
             if not succeeded:

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import tools.formal_experiments as formal_experiments
 from system.pano_droid_gs_slam import load_config
 from tools.formal_experiments import (
     RunSpec,
@@ -17,6 +18,7 @@ from tools.formal_experiments import (
     _prepare_torch_home,
     _sha256,
     _verify_dataset_run,
+    _wait_until_resources_ready,
     validate_run,
 )
 from tools.formal_phase_supervisor import phase_status
@@ -110,6 +112,102 @@ def test_rar_pano_campaign_uses_every_frame_and_ob3d_geometry_policy() -> None:
         == "opensfm_reconstruction_pseudo_gt"
     )
     assert resolved["Dataset"]["reference_pose_usage"] == "evaluation_only"
+
+
+def test_rar_pano_voxel004_geometry_sky_campaign_is_three_worker_safe_queue() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _v3_campaign(
+        "panogsslam_formal_rar_pano_v11_voxel004_skygeom.yaml"
+    )
+    runs = _expand_runs(campaign)
+    assert len(runs) == 9
+    assert {run.worker for run in runs} == {0, 1, 2}
+    assert [
+        sum(run.frames for run in runs if run.worker == worker)
+        for worker in (0, 1, 2)
+    ] == [590, 603, 549]
+
+    base = load_config(root / campaign["base_config"])
+    resolved = _deep_merge_config(
+        copy.deepcopy(base),
+        runs[0].config_overrides,
+    )
+    _assert_formal_mainline(resolved, seed=123)
+    _assert_dataset_policy(resolved, runs[0])
+    sky = resolved["SphericalSelfiRuntime"]["sky"]
+    assert sky["enabled"] is True
+    assert sky["required"] is True
+    assert sky["threshold"] == 0.6
+    assert sky["geometry_only"] is True
+    assert resolved["Mapping"]["sky_mask_enable"] is False
+    assert resolved["SkyBox"]["enabled"] is False
+    assert resolved["SkySphere"]["enabled"] is False
+    assert resolved["VoxelAnchorRefiner"]["voxel_sizes"] == [
+        0.04,
+        0.08,
+        0.16,
+        0.32,
+    ]
+    assert resolved["VoxelAnchorRefiner"]["allow_voxel_size_override"] is False
+    assert resolved["SphericalSelfiGlobalBackend"]["voxel_fusion"][
+        "voxel_sizes"
+    ] == [0.04, 0.08, 0.16, 0.32]
+    assert resolved["Runtime"]["cpu_threading"] == {
+        "enabled": True,
+        "intraop_threads": 2,
+        "interop_threads": 1,
+        "native_threads": 2,
+        "opencv_threads": 1,
+    }
+    assert campaign["resource_limits"]["wait_for_resources"] is True
+    assert campaign["resource_limits"]["max_attempts"] == 4
+
+
+def test_resource_wait_requires_stable_swap_samples_before_resuming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def snapshot(pswpin: int) -> dict[str, int]:
+        return {
+            "available_memory": 200 * 1024**3,
+            "free_disk": 200 * 1024**3,
+            "pswpin": pswpin,
+            "pswpout": 0,
+            "cpu_count": 100,
+            "load_1m_milli": 1000,
+        }
+
+    values = iter([snapshot(10), snapshot(11), snapshot(11), snapshot(11)])
+    monkeypatch.setattr(
+        formal_experiments,
+        "_read_resource_snapshot",
+        lambda formal_root: next(values),
+    )
+    monkeypatch.setattr(
+        formal_experiments,
+        "_gpu_processes",
+        lambda gpu: [],
+    )
+    monkeypatch.setattr(formal_experiments.time, "sleep", lambda seconds: None)
+    formal_root = tmp_path / "formal"
+    run_root = formal_root / "run"
+    formal_root.mkdir()
+
+    result = _wait_until_resources_ready(
+        formal_root,
+        run_root,
+        gpu=3,
+        min_memory=80 * 1024**3,
+        min_disk=50 * 1024**3,
+        max_cpu_fraction=0.8,
+        poll_sec=30,
+        stable_samples=2,
+        wait=True,
+    )
+
+    assert result is not None
+    assert result["pswpin"] == 11
+    assert not (run_root / "paused_resource_guard.json").exists()
 
 
 def test_rar_pano_dataset_verifier_requires_exact_images_and_opensfm_shots(

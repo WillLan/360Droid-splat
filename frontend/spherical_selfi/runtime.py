@@ -366,6 +366,11 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         self.sky_enabled = bool(sky_cfg.get("enabled", False))
         self.sky_required = bool(sky_cfg.get("required", self.sky_enabled))
         self.sky_threshold = float(sky_cfg.get("threshold", 0.5))
+        self.sky_geometry_only = bool(sky_cfg.get("geometry_only", False))
+        if self.sky_geometry_only and not self.sky_enabled:
+            raise ValueError(
+                "SphericalSelfiRuntime.sky.geometry_only requires sky.enabled=true"
+            )
         self.sky_adapter = None
         self.sky_feature_hook: str | None = None
         self.sky_feature_key: str | int | None = None
@@ -1168,7 +1173,7 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
                 observation.image_size,
             ).reshape(batch, views, 3, *observation.image_size)
         target_valid = observation.valid_mask.bool()
-        if sky_prob is not None:
+        if sky_prob is not None and not self.sky_geometry_only:
             resized_sky = sky_prob.to(target_valid.device)
             if tuple(resized_sky.shape[-2:]) != tuple(observation.image_size):
                 batch, views = int(resized_sky.shape[0]), int(resized_sky.shape[1])
@@ -1863,6 +1868,10 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         frame_id: int,
         image_size: tuple[int, int] | None = None,
     ) -> torch.Tensor | None:
+        if self.sky_geometry_only:
+            self.sky_mask_by_frame.pop(int(frame_id), None)
+            self.sky_prob_by_frame.pop(int(frame_id), None)
+            return None
         mask = self.sky_mask_by_frame.pop(int(frame_id), None)
         if mask is None:
             return None
@@ -1879,6 +1888,8 @@ class SphericalSelfiWindowFrontend(PanoDROIDFrontend, LocalGaussianWindowQueue):
         frame_id: int,
         image_size: tuple[int, int] | None = None,
     ) -> torch.Tensor | None:
+        if self.sky_geometry_only:
+            return None
         probability = self.sky_prob_by_frame.get(int(frame_id))
         if probability is None:
             return None

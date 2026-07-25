@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from frontend.spherical_selfi.pager_depth import (
     PaGeRDepthProvider,
     align_pager_depth_to_panovggt,
 )
+from frontend.spherical_selfi.runtime import SphericalSelfiWindowFrontend
 from system.pano_droid_gs_slam import _SLAM_CORE_VISUAL_WANDB_KEYS, load_config
 
 
@@ -75,6 +77,38 @@ def test_pager_alignment_fails_instead_of_falling_back() -> None:
             min_valid_pixels=1,
             min_valid_ratio=0.01,
         )
+
+
+def test_geometry_only_sky_filters_geometry_but_not_refiner_or_mapper() -> None:
+    runtime = SphericalSelfiWindowFrontend.__new__(SphericalSelfiWindowFrontend)
+    runtime.head_device = torch.device("cpu")
+    runtime.sky_threshold = 0.6
+    runtime.sky_geometry_only = True
+    runtime.voxel_anchor_config = object()
+    runtime.sky_mask_by_frame = {
+        7: torch.ones(1, 4, 8, dtype=torch.bool),
+    }
+    runtime.sky_prob_by_frame = {
+        7: torch.ones(1, 4, 8),
+    }
+    observation = SimpleNamespace(
+        valid_mask=torch.ones(1, 1, 1, 4, 8, dtype=torch.bool),
+        image_size=(4, 8),
+    )
+    probability = torch.ones(1, 1, 1, 4, 8)
+
+    _, valid = runtime._prepare_voxel_anchor_inputs(
+        observation,
+        torch.empty(0),
+        torch.zeros(1, 1, 3, 4, 8),
+        probability,
+    )
+
+    assert bool(valid.all())
+    assert runtime.sky_probability_for_frame(7, image_size=(4, 8)) is None
+    assert runtime.sky_mask_for_frame(7, image_size=(4, 8)) is None
+    assert 7 not in runtime.sky_mask_by_frame
+    assert 7 not in runtime.sky_prob_by_frame
 
 
 def test_pager_provider_caches_raw_depth_by_frame_id_across_windows() -> None:
