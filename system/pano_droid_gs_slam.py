@@ -656,6 +656,8 @@ _SLAM_CORE_VISUAL_WANDB_KEYS = frozenset(
         "slam/pfgs360_ate",
         "backend/render_vs_gt_panorama",
         "backend/new_gaussians_per_chunk",
+        "backend/total_anchors",
+        "backend/total_anchor_delta",
         "backend/pfgs360_new_anchor_admission",
         "backend/sky_sphere",
         "backend/cubemap_sky",
@@ -4809,6 +4811,15 @@ class PanoDroidGSSlamSystem:
                         f"backend/map_optimization/{key}": value
                         for key, value in scalar_metrics.items()
                 }
+                total_anchors = int(self.map.anchor_count())
+                total_anchor_delta = int(
+                    scalar_metrics.get(
+                        "dia_anchor_net_map_change",
+                        scalar_metrics.get("bootstrap_inserted", 0.0),
+                    )
+                )
+                payload["backend/total_anchors"] = total_anchors
+                payload["backend/total_anchor_delta"] = total_anchor_delta
                 if "dia_growth_inserted" in scalar_metrics:
                     payload["backend/new_gaussians_per_chunk"] = int(
                         scalar_metrics["dia_growth_inserted"]

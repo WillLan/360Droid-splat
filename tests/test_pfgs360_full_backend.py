@@ -1262,6 +1262,8 @@ def test_refined_anchor_formal_config_keeps_pointmap_mainline_and_disables_topol
         "opencv_threads": 2,
     }
     assert "backend/pfgs360_new_anchor_admission" in _SLAM_CORE_VISUAL_WANDB_KEYS
+    assert "backend/total_anchors" in _SLAM_CORE_VISUAL_WANDB_KEYS
+    assert "backend/total_anchor_delta" in _SLAM_CORE_VISUAL_WANDB_KEYS
     assert not any(
         key.startswith("backend/pfgs360_new_anchor_admission_view_")
         for key in _SLAM_CORE_VISUAL_WANDB_KEYS
