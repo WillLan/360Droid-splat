@@ -163,6 +163,40 @@ def test_rar_pano_voxel004_geometry_sky_campaign_is_three_worker_safe_queue() ->
     assert campaign["resource_limits"]["max_attempts"] == 4
 
 
+def test_rar_pano_depthbins_voxel002_campaign_explicitly_overrides_checkpoint() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _v3_campaign(
+        "panogsslam_formal_rar_pano_v12_depthbins_voxel002_skygeom.yaml"
+    )
+    runs = _expand_runs(campaign)
+    assert len(runs) == 9
+    assert {run.worker for run in runs} == {0, 1, 2}
+    assert [
+        sum(run.frames for run in runs if run.worker == worker)
+        for worker in (0, 1, 2)
+    ] == [590, 603, 549]
+
+    base = load_config(root / campaign["base_config"])
+    resolved = _deep_merge_config(
+        copy.deepcopy(base),
+        runs[0].config_overrides,
+    )
+    _assert_formal_mainline(resolved, seed=123)
+    _assert_dataset_policy(resolved, runs[0])
+    refiner = resolved["VoxelAnchorRefiner"]
+    assert refiner["depth_boundaries"] == [2.5, 5.0, 20.0]
+    assert refiner["voxel_sizes"] == [0.02, 0.04, 0.16, 0.32]
+    assert refiner["allow_depth_boundary_override"] is True
+    assert refiner["allow_voxel_size_override"] is True
+    assert resolved["SphericalSelfiGlobalBackend"]["voxel_fusion"][
+        "voxel_sizes"
+    ] == [0.02, 0.04, 0.16, 0.32]
+    assert resolved["SphericalSelfiRuntime"]["sky"]["geometry_only"] is True
+    assert resolved["Mapping"]["sky_mask_enable"] is False
+    assert resolved["SkyBox"]["enabled"] is False
+    assert resolved["SkySphere"]["enabled"] is False
+
+
 def test_resource_wait_requires_stable_swap_samples_before_resuming(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

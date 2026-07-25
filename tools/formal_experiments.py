@@ -222,7 +222,11 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
     runtime = config["SphericalSelfiRuntime"]
     backend = config["SphericalSelfiGlobalBackend"]
     pfgs = backend["map_optimization"]["pfgs360"]
-    refiner_voxels = [float(value) for value in config["VoxelAnchorRefiner"]["voxel_sizes"]]
+    refiner_cfg = config["VoxelAnchorRefiner"]
+    refiner_depth_boundaries = [
+        float(value) for value in refiner_cfg["depth_boundaries"]
+    ]
+    refiner_voxels = [float(value) for value in refiner_cfg["voxel_sizes"]]
     fusion_voxels = [float(value) for value in backend["voxel_fusion"]["voxel_sizes"]]
     sky = runtime["sky"]
     mapping = config["Mapping"]
@@ -287,6 +291,18 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
             },
         }
         if geometry_only:
+            native_refiner_geometry = (
+                refiner_depth_boundaries == [5.0, 20.0, 40.0]
+                and refiner_voxels == [0.04, 0.08, 0.16, 0.32]
+                and refiner_cfg.get("allow_depth_boundary_override", False) is False
+                and refiner_cfg.get("allow_voxel_size_override", False) is False
+            )
+            explicit_refiner_geometry_override = (
+                refiner_depth_boundaries == [2.5, 5.0, 20.0]
+                and refiner_voxels == [0.02, 0.04, 0.16, 0.32]
+                and refiner_cfg.get("allow_depth_boundary_override") is True
+                and refiner_cfg.get("allow_voxel_size_override") is True
+            )
             expected.update(
                 {
                     "RAR_pano geometry-only Sky Head enabled": sky["enabled"]
@@ -300,14 +316,13 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
                         float(backend["global_graph"]["sky_threshold"]) - 0.6
                     )
                     < 1.0e-12,
-                    "RAR_pano native Refiner voxel sizes": refiner_voxels
-                    == [0.04, 0.08, 0.16, 0.32],
-                    "RAR_pano Refiner voxel override disabled": config[
-                        "VoxelAnchorRefiner"
-                    ].get("allow_voxel_size_override", False)
-                    is False,
-                    "RAR_pano native fusion voxel sizes": fusion_voxels
-                    == [0.04, 0.08, 0.16, 0.32],
+                    "RAR_pano supported Refiner geometry partition": (
+                        native_refiner_geometry
+                        or explicit_refiner_geometry_override
+                    ),
+                    "RAR_pano fusion voxel sizes match Refiner": (
+                        fusion_voxels == refiner_voxels
+                    ),
                 }
             )
         else:

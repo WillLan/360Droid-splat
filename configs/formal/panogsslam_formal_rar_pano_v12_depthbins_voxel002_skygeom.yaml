@@ -1,0 +1,95 @@
+version: 12
+name: panogsslam_rar_pano_real_depthbins_voxel002_skygeom_v12
+expected_run_count: 9
+base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
+formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
+weights_manifest: /mnt/disk1/lanboyang/Project/360Droid-splat/artifacts/checkpoints/panogsslam_formal_mainline_v1/manifest.json
+torch_home: runtime_cache/torch
+seed: 123
+max_concurrent_workers: 3
+resource_limits:
+  min_available_memory_gib: 80
+  min_free_disk_gib: 50
+  max_prelaunch_cpu_load_fraction: 0.80
+  monitor_interval_sec: 15
+  consecutive_swap_growth_limit: 2
+  wait_for_resources: true
+  resource_retry_stable_samples: 3
+  resource_retry_poll_sec: 30
+  max_attempts: 4
+datasets:
+  - name: rar_pano
+    type: rar_pano
+    root: /mnt/disk1/lanboyang/Datasets/RAR_pano
+    scenes:
+      - I_alley
+      - I_avenue
+      - I_bridge
+      - I_bypath
+      - I_garden
+      - O_car
+      - O_lion
+      - O_statuary
+      - O_stone
+    scene_frames:
+      I_alley: 145
+      I_avenue: 272
+      I_bridge: 147
+      I_bypath: 86
+      I_garden: 210
+      O_car: 188
+      O_lion: 253
+      O_statuary: 270
+      O_stone: 171
+    splits: [Full]
+    config_overrides:
+      Dataset:
+        reference_pose_source: opensfm_reconstruction_pseudo_gt
+        reference_pose_usage: evaluation_only
+      Runtime:
+        cpu_threading:
+          enabled: true
+          intraop_threads: 2
+          interop_threads: 1
+          native_threads: 2
+          opencv_threads: 1
+      VoxelAnchorRefiner:
+        depth_boundaries: [2.5, 5.0, 20.0]
+        voxel_sizes: [0.02, 0.04, 0.16, 0.32]
+        allow_depth_boundary_override: true
+        allow_voxel_size_override: true
+      SphericalSelfiRuntime:
+        sky:
+          enabled: true
+          required: true
+          threshold: 0.6
+          geometry_only: true
+      SphericalSelfiGlobalBackend:
+        global_graph:
+          sky_threshold: 0.6
+        voxel_fusion:
+          voxel_sizes: [0.02, 0.04, 0.16, 0.32]
+        map_optimization:
+          pfgs360:
+            validity_gate: pfgs360_official_no_semantic_gate
+            filter_sky: false
+            atomic_refined_anchor_replacement: true
+            append_only_refined_anchors: true
+            growth_hash_dedup_enabled: false
+            anchor_footprint:
+              enabled: true
+              sigma: 2.0
+              min_radius_pixels: 1.0
+              max_radius_pixels: 8.0
+              min_pixels: 1
+              min_coverage: 0.05
+      Mapping:
+        sky_mask_enable: false
+        sky_mask_source: none
+      SkyBox:
+        enabled: false
+        optimize: false
+        optimization_mask_enable: false
+        force_sky_render: false
+      SkySphere:
+        enabled: false

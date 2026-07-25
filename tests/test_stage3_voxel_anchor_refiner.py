@@ -803,7 +803,7 @@ def test_training_checkpoint_loads_directly_into_runtime_model(tmp_path: Path) -
         )
 
 
-def test_runtime_can_explicitly_override_only_checkpoint_voxel_sizes(
+def test_runtime_can_explicitly_override_checkpoint_depth_bins_and_voxel_sizes(
     tmp_path: Path,
 ) -> None:
     trained = VoxelAnchorConfig(
@@ -825,20 +825,33 @@ def test_runtime_can_explicitly_override_only_checkpoint_voxel_sizes(
         adapter_sha256="synthetic",
         stage2_checkpoint_sha256=None,
     )
-    runtime = replace(trained, voxel_sizes=(0.02, 0.04, 0.08, 0.16))
+    runtime = replace(
+        trained,
+        depth_boundaries=(2.5, 5.0, 20.0),
+        voxel_sizes=(0.02, 0.04, 0.16, 0.32),
+    )
     runtime_model = VoxelAnchorStage3Model(runtime)
 
-    with pytest.raises(ValueError, match="config mismatch for voxel_sizes"):
+    with pytest.raises(ValueError, match="config mismatch for depth_boundaries"):
         load_voxel_anchor_checkpoint(
             checkpoint,
             model=runtime_model,
             expected_config=runtime,
         )
 
+    with pytest.raises(ValueError, match="config mismatch for depth_boundaries"):
+        load_voxel_anchor_checkpoint(
+            checkpoint,
+            model=runtime_model,
+            expected_config=runtime,
+            allow_voxel_size_override=True,
+        )
+
     load_voxel_anchor_checkpoint(
         checkpoint,
         model=runtime_model,
         expected_config=runtime,
+        allow_depth_boundary_override=True,
         allow_voxel_size_override=True,
     )
 
@@ -848,5 +861,6 @@ def test_runtime_can_explicitly_override_only_checkpoint_voxel_sizes(
             checkpoint,
             model=runtime_model,
             expected_config=structurally_different,
+            allow_depth_boundary_override=True,
             allow_voxel_size_override=True,
         )
