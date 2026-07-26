@@ -7,8 +7,6 @@ must use :func:`apply_sim3_to_pose` when moving a camera between frames.
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from frontend.pano_droid.spherical_ba import skew, so3_exp
@@ -121,43 +119,57 @@ def sim3_exp(delta: torch.Tensor) -> torch.Tensor:
 
 
 def so3_log(rotation: torch.Tensor) -> torch.Tensor:
-    trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
-    vee = torch.stack(
-        [
-            rotation[..., 2, 1] - rotation[..., 1, 2],
-            rotation[..., 0, 2] - rotation[..., 2, 0],
-            rotation[..., 1, 0] - rotation[..., 0, 1],
-        ],
-        dim=-1,
-    )
-    # ``acos(cos_theta)`` has an infinite derivative at the identity.  The
-    # value is well-defined there, but reverse-mode differentiation through a
-    # zero-residual graph factor consequently produced NaN Jacobians.  For a
-    # proper rotation ``||vee(R-R^T)|| / 2 == |sin(theta)|``; atan2 therefore
-    # yields the same principal angle with a finite identity derivative.
-    sine_magnitude = 0.5 * torch.linalg.vector_norm(vee, dim=-1)
-    theta = torch.atan2(sine_magnitude, cos_theta)
-    sin_theta = torch.sin(theta)
-    regular = theta / (2.0 * sin_theta.clamp_min(1.0e-8))
-    omega = regular[..., None] * vee
-    small = theta < 1.0e-4
-    omega = torch.where(small[..., None], 0.5 * vee, omega)
+    """Stable principal SO(3) logarithm over the complete [0, pi] range."""
 
-    # Near pi, the skew part is poorly conditioned. Recover the axis from the
-    # diagonal and select its signs from the symmetric off-diagonal entries.
-    near_pi = (math.pi - theta).abs() < 1.0e-3
-    if bool(near_pi.any()):
-        diagonal = rotation.diagonal(dim1=-2, dim2=-1)
-        axis = torch.sqrt(((diagonal + 1.0) * 0.5).clamp_min(0.0))
-        axis_x = axis[..., 0]
-        axis_y = torch.copysign(axis[..., 1], rotation[..., 0, 1] + rotation[..., 1, 0])
-        axis_z = torch.copysign(axis[..., 2], rotation[..., 0, 2] + rotation[..., 2, 0])
-        axis = torch.stack([axis_x, axis_y, axis_z], dim=-1)
-        axis = torch.nn.functional.normalize(axis, dim=-1, eps=1.0e-8)
-        omega_pi = theta[..., None] * axis
-        omega = torch.where(near_pi[..., None], omega_pi, omega)
-    return omega
+    if rotation.shape[-2:] != (3, 3):
+        raise ValueError(
+            f"rotation must end in 3x3, got {tuple(rotation.shape)}"
+        )
+    eps = torch.finfo(rotation.dtype).eps
+    m00, m01, m02 = rotation[..., 0, 0], rotation[..., 0, 1], rotation[..., 0, 2]
+    m10, m11, m12 = rotation[..., 1, 0], rotation[..., 1, 1], rotation[..., 1, 2]
+    m20, m21, m22 = rotation[..., 2, 0], rotation[..., 2, 1], rotation[..., 2, 2]
+    q_abs = torch.stack(
+        (
+            1.0 + m00 + m11 + m22,
+            1.0 + m00 - m11 - m22,
+            1.0 - m00 + m11 - m22,
+            1.0 - m00 - m11 + m22,
+        ),
+        dim=-1,
+    ).clamp_min(eps).sqrt()
+    candidates = torch.stack(
+        (
+            torch.stack((q_abs[..., 0].square(), m21 - m12, m02 - m20, m10 - m01), dim=-1),
+            torch.stack((m21 - m12, q_abs[..., 1].square(), m10 + m01, m02 + m20), dim=-1),
+            torch.stack((m02 - m20, m10 + m01, q_abs[..., 2].square(), m12 + m21), dim=-1),
+            torch.stack((m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3].square()), dim=-1),
+        ),
+        dim=-2,
+    )
+    candidates = candidates / (2.0 * q_abs[..., :, None].clamp_min(eps))
+    choice = q_abs.argmax(dim=-1)
+    gather = choice[..., None, None].expand(*choice.shape, 1, 4)
+    quaternion = candidates.gather(dim=-2, index=gather).squeeze(-2)
+    quaternion = torch.nn.functional.normalize(quaternion, dim=-1, eps=eps)
+    quaternion = torch.where(
+        (quaternion[..., :1] < 0.0),
+        -quaternion,
+        quaternion,
+    )
+    vector = quaternion[..., 1:]
+    vector_norm = torch.linalg.vector_norm(vector, dim=-1)
+    theta = 2.0 * torch.atan2(
+        vector_norm,
+        quaternion[..., 0].clamp_min(0.0),
+    )
+    axis = vector / vector_norm[..., None].clamp_min(eps)
+    regular = theta[..., None] * axis
+    return torch.where(
+        (vector_norm < 1.0e-6)[..., None],
+        2.0 * vector,
+        regular,
+    )
 
 
 def sim3_log(transform: torch.Tensor) -> torch.Tensor:

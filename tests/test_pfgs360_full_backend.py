@@ -14,6 +14,7 @@ from backend.pano_gs.pfgs360_full import (
     sample_erp_with_wrap,
 )
 from backend.pano_gs.pose_param import PoseDelta
+from frontend.pano_droid.spherical_ba import skew
 from geometry.sim3 import (
     project_rotation_to_so3,
     sim3_components,
@@ -101,6 +102,28 @@ def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
     assert float(rotation_error) <= 1.0e-4
     assert float(translation_error) <= 1.0e-4
     torch.testing.assert_close(pose.canonical_pose(), new_base)
+
+
+def test_so3_log_roundtrips_random_axes_near_pi() -> None:
+    generator = torch.Generator().manual_seed(19)
+    axes = torch.randn(128, 3, generator=generator)
+    axes = torch.nn.functional.normalize(axes, dim=-1)
+    angles = torch.linspace(2.9, 3.14, 128)
+    rotations = torch.stack(
+        [torch.matrix_exp(skew(axis * angle)) for axis, angle in zip(axes, angles)]
+    )
+
+    recovered = so3_log(rotations)
+    reconstructed = torch.stack(
+        [torch.matrix_exp(skew(value)) for value in recovered]
+    )
+
+    torch.testing.assert_close(
+        reconstructed,
+        rotations,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
 
 
 def test_owner_rebase_preserves_world_gaussians_and_rebases_adam() -> None:
