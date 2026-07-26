@@ -33,6 +33,7 @@ from geometry.sim3 import (
     apply_sim3_to_c2w,
     canonicalize_c2w,
     canonicalize_sim3,
+    project_rotation_to_so3,
     rebase_c2w_to_sim3_anchor,
     sim3_components,
     sim3_from_components,
@@ -9464,6 +9465,7 @@ class SphericalSelfiGlobalBackend:
         root = self.graph.fixed_node_id
         updated_owners: set[int] = set()
         max_scale_change = 0.0
+        max_log_scale_change = 0.0
         max_effective_pose_change = 0.0
         total_rebased_rows = 0.0
         for owner, frame_ids in sorted(by_owner.items()):
@@ -9495,7 +9497,12 @@ class SphericalSelfiGlobalBackend:
                 corrections,
                 iterations=5,
             ).to(old_owner)
-            new_rotation = mean[:3, :3] @ old_rotation
+            # Pose writeback is SE(3)-only.  Project the composed rotation back
+            # to SO(3) before rebuilding the Sim(3), otherwise float32 SVD and
+            # determinant round-off can be misinterpreted as a scale update.
+            new_rotation = project_rotation_to_so3(
+                mean[:3, :3] @ old_rotation
+            )
             new_translation = (
                 mean[:3, :3] @ old_translation + mean[:3, 3]
             )
@@ -9508,6 +9515,14 @@ class SphericalSelfiGlobalBackend:
             max_scale_change = max(
                 max_scale_change,
                 abs(float((new_scale - old_scale).detach().cpu())),
+            )
+            log_scale_change = (
+                new_scale.clamp_min(torch.finfo(new_scale.dtype).eps).log()
+                - old_scale.clamp_min(torch.finfo(old_scale.dtype).eps).log()
+            ).abs()
+            max_log_scale_change = max(
+                max_log_scale_change,
+                float(log_scale_change.detach().cpu()),
             )
             rebase = self.map.rebase_owner_preserving_world(
                 owner,
@@ -9549,9 +9564,15 @@ class SphericalSelfiGlobalBackend:
                 affected_node_ids=updated_owners,
                 reason="pfgs360_official_owner_writeback",
             )
-        if max_scale_change > 1.0e-8:
+        # Sim(3) stores scale implicitly in a float32 3x3 block.  Reconstructing
+        # the block and decomposing it again is not bit-exact, so guard the
+        # scale-invariant log ratio at a tolerance still far below any
+        # meaningful graph update.
+        if max_log_scale_change > 1.0e-5:
             raise RuntimeError(
-                "PFGS360 owner pose writeback changed graph scale"
+                "PFGS360 owner pose writeback changed graph scale: "
+                f"max_abs={max_scale_change:.9g}, "
+                f"max_log={max_log_scale_change:.9g}"
             )
         if max_effective_pose_change > 2.0e-5:
             raise RuntimeError(
@@ -9561,6 +9582,9 @@ class SphericalSelfiGlobalBackend:
             "pose_owner_writeback_count": float(len(updated_owners)),
             "pose_owner_rebased_gaussians": float(total_rebased_rows),
             "pose_owner_scale_max_change": float(max_scale_change),
+            "pose_owner_log_scale_max_change": float(
+                max_log_scale_change
+            ),
             "pose_effective_pose_max_change": float(
                 max_effective_pose_change
             ),

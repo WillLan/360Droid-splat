@@ -14,6 +14,11 @@ from backend.pano_gs.pfgs360_full import (
     sample_erp_with_wrap,
 )
 from backend.pano_gs.pose_param import PoseDelta
+from geometry.sim3 import (
+    project_rotation_to_so3,
+    sim3_components,
+    sim3_from_components,
+)
 from system.pano_droid_gs_slam import (
     _SLAM_CORE_VISUAL_WANDB_KEYS,
     _deep_merge_config,
@@ -187,6 +192,41 @@ def test_progressive_sh_degree_rotates_full_lazy_owner_tensor() -> None:
     assert coefficients.shape == (1, 9, 3)
     assert rotation.shape == (9, 9)
     assert torch.isfinite(coefficients).all()
+
+
+def test_owner_writeback_rotation_projection_preserves_implicit_scale() -> None:
+    scale = torch.tensor(0.037, dtype=torch.float32)
+    old_rotation = torch.tensor(
+        [
+            [0.99995, -0.01, 0.0],
+            [0.01, 0.99995, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    correction = torch.tensor(
+        [
+            [0.9950042, -0.0998334, 0.0],
+            [0.0998334, 0.9950042, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    old_owner = sim3_from_components(
+        scale,
+        project_rotation_to_so3(old_rotation),
+        torch.zeros(3),
+    )
+    old_scale, stored_rotation, translation = sim3_components(old_owner)
+    new_owner = sim3_from_components(
+        old_scale,
+        project_rotation_to_so3(correction @ stored_rotation),
+        translation,
+    )
+    new_scale = sim3_components(new_owner)[0]
+    log_change = (new_scale.log() - old_scale.log()).abs()
+
+    assert float(log_change) <= 1.0e-6
 
 
 def test_erp_sampler_wraps_longitude_seam() -> None:
