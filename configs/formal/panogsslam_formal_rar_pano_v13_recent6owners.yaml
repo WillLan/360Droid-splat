@@ -1,5 +1,5 @@
 version: 13
-name: panogsslam_rar_pano_real_depthbins_voxel002_skygeom_recent6owners_v13
+name: panogsslam_rar_recent6owners_v13
 expected_run_count: 9
 base_config: configs/formal/panogsslam_pager_globalmap_refinedanchor_50_200_v3.yaml
 formal_root_parent: /mnt/disk1/lanboyang/Project/360Droid-splat/formal_results
