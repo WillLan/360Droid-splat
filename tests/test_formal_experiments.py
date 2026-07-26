@@ -238,6 +238,33 @@ def test_rar_pano_recent6_owner_campaign_is_four_worker_default() -> None:
     )
 
 
+def test_rar_pano_official_chunkwise_campaign_passes_formal_guards() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _v3_campaign(
+        "panogsslam_formal_rar_pano_v14_pfgs360_official.yaml"
+    )
+    runs = _expand_runs(campaign)
+
+    assert len(runs) == 9
+    assert {run.worker for run in runs} == {0, 1, 2, 3}
+    base = load_config(root / campaign["base_config"])
+    for run in runs:
+        resolved = _deep_merge_config(
+            copy.deepcopy(base),
+            run.config_overrides,
+        )
+        _assert_formal_mainline(resolved, seed=123)
+        _assert_dataset_policy(resolved, run)
+
+    optimization = resolved["SphericalSelfiGlobalBackend"]["map_optimization"]
+    assert optimization["strategy"] == "pfgs360_official_chunkwise"
+    assert optimization["initial_steps"] == 1000
+    assert optimization["camera_steps"] == 500
+    assert optimization["joint_steps"] == 500
+    assert optimization["final_finetune_steps"] == 10000
+    assert optimization["pfgs360"]["growth_hash_dedup_enabled"] is True
+
+
 def test_resource_wait_requires_stable_swap_samples_before_resuming(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -184,6 +184,7 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
     backend = config["SphericalSelfiGlobalBackend"]
     optimization = backend["map_optimization"]
     pfgs = optimization["pfgs360"]
+    strategy = str(optimization.get("strategy", ""))
     expected = {
         "PaGeR enabled": runtime["pager_depth"]["enabled"] is True,
         "SphereGlue matcher": runtime["local_ba"]["matching"]["type"]
@@ -199,20 +200,46 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
         "refined-anchor growth": pfgs["growth_source"] == "refined_anchor",
         "refined-anchor bootstrap": pfgs["bootstrap_source"]
         == "refined_anchor_all_views",
-        "CAMERA 50": int(optimization["camera_steps"]) == 50,
-        "JOINT 200": int(optimization["joint_steps"]) == 200,
-        "recent three chunks": int(optimization["recent_window_count"]) == 3,
-        "one sampled frame": int(optimization["sample_observations_per_step"]) == 1,
-        "global Gaussian candidate set": optimization["optimize_all_gaussians"]
-        is True,
-        "supported Gaussian update scope": pfgs["gaussian_update_scope"]
-        in {"all_render_contributors", "recent_owner_chunks"},
         "fixed seed": int(optimization["seed"]) == int(seed),
         "core W&B preset": config["WeightsAndBiases"]["runtime_log_preset"]
         == "slam_core_visuals",
         "official image metrics": config["Results"]["final_image_metrics"]
         == "pfgs360_official",
     }
+    if strategy == "pfgs360_official_chunkwise":
+        expected.update(
+            {
+                "INITIAL 1000": int(optimization["initial_steps"]) == 1000,
+                "CAMERA 500": int(optimization["camera_steps"]) == 500,
+                "JOINT 500": int(optimization["joint_steps"]) == 500,
+                "FINETUNE 10000": int(optimization["final_finetune_steps"])
+                == 10000,
+                "all-visited frame scope": pfgs["frame_scope"] == "all_visited",
+                "official latter-half sampling": pfgs["sampling_policy"]
+                == "pfgs360_latter_half_biased",
+                "official full Gaussian tensor": pfgs["gaussian_update_scope"]
+                == "official_full_tensor",
+                "no optimization rollback": pfgs["rollback_policy"] == "none",
+            }
+        )
+    else:
+        expected.update(
+            {
+                "CAMERA 50": int(optimization["camera_steps"]) == 50,
+                "JOINT 200": int(optimization["joint_steps"]) == 200,
+                "recent three chunks": int(optimization["recent_window_count"]) == 3,
+                "one sampled frame": int(
+                    optimization["sample_observations_per_step"]
+                )
+                == 1,
+                "global Gaussian candidate set": optimization[
+                    "optimize_all_gaussians"
+                ]
+                is True,
+                "supported Gaussian update scope": pfgs["gaussian_update_scope"]
+                in {"all_render_contributors", "recent_owner_chunks"},
+            }
+        )
     failed = [name for name, passed in expected.items() if not passed]
     if (
         pfgs["gaussian_update_scope"] == "recent_owner_chunks"
@@ -262,6 +289,10 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
         }
     elif run.dataset == "rar_pano":
         geometry_only = bool(sky.get("geometry_only", False))
+        official_chunkwise = (
+            backend["map_optimization"].get("strategy")
+            == "pfgs360_official_chunkwise"
+        )
         expected = {
             "RAR_pano mapping sky mask disabled": mapping["sky_mask_enable"] is False,
             "RAR_pano mapping sky source disabled": str(
@@ -281,10 +312,10 @@ def _assert_dataset_policy(config: dict[str, Any], run: RunSpec) -> None:
                 "append_only_refined_anchors"
             ]
             is True,
-            "RAR_pano latest no-Hash admission": pfgs[
-                "growth_hash_dedup_enabled"
-            ]
-            is False,
+            "RAR_pano configured Hash admission": bool(
+                pfgs["growth_hash_dedup_enabled"]
+            )
+            is official_chunkwise,
             "RAR_pano latest anchor footprint": pfgs["anchor_footprint"]
             == {
                 "enabled": True,
