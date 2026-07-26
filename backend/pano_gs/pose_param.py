@@ -71,7 +71,17 @@ class PoseDelta(nn.Module):
         self.delta = nn.Parameter(init_delta.detach().clone().to(dtype=base.dtype).view(6))
 
     def forward(self) -> torch.Tensor:
-        return se3_exp(self.delta) @ self.base_c2w
+        # Compose the six-DoF residual in float64, then return the canonical
+        # pose dtype expected by the renderer.  A float32 log/exp composition
+        # can lose millimetres when a near-pi residual is rebased in a
+        # large-coordinate scene, even though the final 4x4 pose is float32.
+        # The operation is only on one 4x4 pose and has negligible cost beside
+        # rasterization while retaining gradients to the float32 parameter.
+        refined = (
+            se3_exp(self.delta.to(dtype=torch.float64))
+            @ self.base_c2w.to(dtype=torch.float64)
+        )
+        return refined.to(dtype=self.base_c2w.dtype)
 
     def rebase(
         self,
@@ -101,7 +111,10 @@ class PoseDelta(nn.Module):
         base = canonicalize_c2w(
             ensure_homogeneous(base_c2w.detach().clone().to(self.base_c2w))
         )
-        relative = effective @ torch.linalg.inv(base)
+        relative = (
+            effective.to(dtype=torch.float64)
+            @ torch.linalg.inv(base.to(dtype=torch.float64))
+        )
         delta = se3_log(relative)
         if not bool(torch.isfinite(delta).all()):
             raise FloatingPointError("Pose rebase produced a non-finite SE(3) residual")

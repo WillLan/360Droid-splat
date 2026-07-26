@@ -82,13 +82,14 @@ def test_pose_delta_effective_pose_rebase_is_render_invariant() -> None:
 
 def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
     base = torch.eye(4)
+    base[:3, 3] = torch.tensor([125.0, -80.0, 40.0])
     pose = PoseDelta(
         base,
         torch.tensor([0.1, -0.2, 0.05, 3.14, 0.0, 0.0]),
     )
     effective = pose().detach().clone()
     new_base = torch.eye(4)
-    new_base[:3, 3] = torch.tensor([1.0, 0.5, -0.25])
+    new_base[:3, 3] = torch.tensor([-75.0, 45.0, 20.0])
 
     pose.rebase_preserving_effective_pose(new_base)
 
@@ -97,10 +98,10 @@ def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
     rotation_error = torch.linalg.norm(
         so3_log(relative_error[:3, :3])
     )
-    translation_error = torch.linalg.norm(relative_error[:3, 3])
+    translation_error = torch.linalg.norm(rebased[:3, 3] - effective[:3, 3])
 
-    assert float(rotation_error) <= 1.0e-4
-    assert float(translation_error) <= 5.0e-4
+    assert float(rotation_error.detach()) <= 1.0e-4
+    assert float(translation_error.detach()) <= 5.0e-4
     torch.testing.assert_close(pose.canonical_pose(), new_base)
 
 

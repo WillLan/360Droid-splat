@@ -9560,8 +9560,12 @@ class SphericalSelfiGlobalBackend:
                 rotation_error = torch.linalg.norm(
                     so3_log(effective_error[:3, :3])
                 )
+                # Camera-to-world translation is the camera center.  Compare
+                # centers directly: the translation block of after@before^-1
+                # also contains rotation-around-origin round-off and grows
+                # spuriously with the global coordinate magnitude.
                 translation_error = torch.linalg.norm(
-                    effective_error[:3, 3]
+                    after[:3, 3] - before[:3, 3]
                 )
                 max_effective_rotation_error = max(
                     max_effective_rotation_error,
