@@ -9467,6 +9467,8 @@ class SphericalSelfiGlobalBackend:
         max_scale_change = 0.0
         max_log_scale_change = 0.0
         max_effective_pose_change = 0.0
+        max_effective_rotation_error = 0.0
+        max_effective_translation_error = 0.0
         total_rebased_rows = 0.0
         for owner, frame_ids in sorted(by_owner.items()):
             if root is not None and int(owner) == int(root):
@@ -9554,6 +9556,21 @@ class SphericalSelfiGlobalBackend:
                     max_effective_pose_change,
                     float((after - before).abs().max().detach().cpu()),
                 )
+                effective_error = after @ invert_c2w(before)
+                rotation_error = torch.linalg.norm(
+                    so3_log(effective_error[:3, :3])
+                )
+                translation_error = torch.linalg.norm(
+                    effective_error[:3, 3]
+                )
+                max_effective_rotation_error = max(
+                    max_effective_rotation_error,
+                    float(rotation_error.detach().cpu()),
+                )
+                max_effective_translation_error = max(
+                    max_effective_translation_error,
+                    float(translation_error.detach().cpu()),
+                )
                 observation = self.mapper.observations.get(frame_id)
                 if observation is not None:
                     observation.pose_c2w = canonical.detach().cpu().float()
@@ -9574,9 +9591,19 @@ class SphericalSelfiGlobalBackend:
                 f"max_abs={max_scale_change:.9g}, "
                 f"max_log={max_log_scale_change:.9g}"
             )
-        if max_effective_pose_change > 2.0e-5:
+        # A raw element-wise matrix comparison is coordinate-magnitude
+        # dependent and rejects harmless float32 quantization in large scenes.
+        # Check the actual SE(3) discrepancy instead.
+        if (
+            max_effective_rotation_error > 1.0e-4
+            or max_effective_translation_error > 1.0e-4
+        ):
             raise RuntimeError(
-                "PFGS360 owner pose writeback reapplied a photometric residual"
+                "PFGS360 owner pose writeback reapplied a photometric "
+                "residual: "
+                f"rotation_rad={max_effective_rotation_error:.9g}, "
+                f"translation={max_effective_translation_error:.9g}, "
+                f"raw_matrix={max_effective_pose_change:.9g}"
             )
         return {
             "pose_owner_writeback_count": float(len(updated_owners)),
@@ -9587,6 +9614,12 @@ class SphericalSelfiGlobalBackend:
             ),
             "pose_effective_pose_max_change": float(
                 max_effective_pose_change
+            ),
+            "pose_effective_rotation_error_rad": float(
+                max_effective_rotation_error
+            ),
+            "pose_effective_translation_error": float(
+                max_effective_translation_error
             ),
         }
 

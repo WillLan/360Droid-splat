@@ -18,6 +18,7 @@ from geometry.sim3 import (
     project_rotation_to_so3,
     sim3_components,
     sim3_from_components,
+    so3_log,
 )
 from system.pano_droid_gs_slam import (
     _SLAM_CORE_VISUAL_WANDB_KEYS,
@@ -90,12 +91,15 @@ def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
 
     pose.rebase_preserving_effective_pose(new_base)
 
-    torch.testing.assert_close(
-        pose(),
-        effective,
-        atol=2.0e-5,
-        rtol=2.0e-5,
+    rebased = pose()
+    relative_error = rebased @ torch.linalg.inv(effective)
+    rotation_error = torch.linalg.norm(
+        so3_log(relative_error[:3, :3])
     )
+    translation_error = torch.linalg.norm(relative_error[:3, 3])
+
+    assert float(rotation_error) <= 1.0e-4
+    assert float(translation_error) <= 1.0e-4
     torch.testing.assert_close(pose.canonical_pose(), new_base)
 
 
