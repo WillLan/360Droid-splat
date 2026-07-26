@@ -6316,6 +6316,26 @@ def test_recent_owner_gaussian_scope_freezes_older_rows_exactly() -> None:
     assert bool((gaussian_map.xyz.detach()[1:].abs() > 0.0).all())
 
 
+def test_pose_frame_window_and_gaussian_owner_window_are_independent() -> None:
+    backend = SphericalSelfiGlobalBackend.__new__(
+        SphericalSelfiGlobalBackend
+    )
+    backend.window_order = list(range(9))
+    backend.packets = {window: object() for window in backend.window_order}
+    backend.map_optimize_recent_windows = 3
+    backend.map_optimize_gaussian_owner_windows = 6
+
+    assert backend._map_optimization_window_ids(8) == (6, 7, 8)
+    assert backend._map_optimization_gaussian_owner_window_ids(8) == (
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    )
+
+
 def test_photometric_only_mapper_loss_disables_all_non_rgb_terms() -> None:
     mapper = PanoGaussianMapper(PanoGaussianMap(config={}, device="cpu"))
     weights = mapper._feedforward_loss_weights(photometric_only=True)

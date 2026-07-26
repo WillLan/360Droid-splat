@@ -460,10 +460,27 @@ class PFGS360FullBackend:
             "all",
             "sampled_view_visible",
             "all_render_contributors",
+            "recent_owner_chunks",
         }:
             raise ValueError(
                 "PFGS360 gaussian_update_scope must be 'all', "
-                "'sampled_view_visible', or 'all_render_contributors'"
+                "'sampled_view_visible', 'all_render_contributors', or "
+                "'recent_owner_chunks'"
+            )
+        self.active_owner_window_ids = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in self.settings.get(
+                    "active_owner_window_ids", ()
+                )
+            )
+        )
+        if (
+            self.gaussian_update_scope == "recent_owner_chunks"
+            and not self.active_owner_window_ids
+        ):
+            raise ValueError(
+                "recent_owner_chunks requires active_owner_window_ids"
             )
         self.visibility_threshold = float(
             self.settings.get("visibility_threshold", 0.0)
@@ -944,6 +961,19 @@ class PFGS360FullBackend:
         count = self.map.anchor_count()
         if self.gaussian_update_scope == "all":
             return torch.ones(count, device=self.device, dtype=torch.bool)
+        if self.gaussian_update_scope == "recent_owner_chunks":
+            owner = getattr(self.map, "_anchor_owner_window_id", None)
+            if not torch.is_tensor(owner) or int(owner.numel()) != count:
+                raise RuntimeError(
+                    "recent_owner_chunks requires one owner id per Gaussian"
+                )
+            owner_rows = owner.to(device=self.device, dtype=torch.long)
+            selected = torch.zeros(
+                count, device=self.device, dtype=torch.bool
+            )
+            for owner_window_id in self.active_owner_window_ids:
+                selected |= owner_rows == int(owner_window_id)
+            return selected
         if self.gaussian_update_scope == "all_render_contributors":
             raise RuntimeError(
                 "all_render_contributors must be determined from rendering "
@@ -1603,6 +1633,11 @@ class PFGS360FullBackend:
         max_radii = None if grad_sum is None else torch.zeros_like(grad_sum)
         last_loss = 0.0
         visible_counts: list[int] = []
+        owner_scope_mask = (
+            self._gaussian_visibility_mask({})
+            if self.gaussian_update_scope == "recent_owner_chunks"
+            else None
+        )
         sky_parameters = self.map.skybox_parameters()
         sky_requires_grad = [parameter.requires_grad for parameter in sky_parameters]
         try:
@@ -1640,6 +1675,10 @@ class PFGS360FullBackend:
                     visible_gaussians = self._gaussian_gradient_contributor_mask(
                         parameter_groups
                     )
+                    regularizer = render_loss.new_zeros(())
+                elif self.gaussian_update_scope == "recent_owner_chunks":
+                    assert owner_scope_mask is not None
+                    visible_gaussians = owner_scope_mask
                     regularizer = render_loss.new_zeros(())
                 else:
                     visible_gaussians = self._gaussian_visibility_mask(package)
@@ -1706,7 +1745,7 @@ class PFGS360FullBackend:
                         gradient = viewspace.grad
                     if torch.is_tensor(gradient) and int(gradient.shape[0]) == self.map.anchor_count():
                         magnitude = torch.linalg.norm(gradient.detach(), dim=-1)
-                        visible = magnitude > 0.0
+                        visible = (magnitude > 0.0) & visible_gaussians
                         assert grad_sum is not None and grad_count is not None
                         grad_sum[visible] += magnitude[visible]
                         grad_count[visible] += 1.0
@@ -1756,6 +1795,19 @@ class PFGS360FullBackend:
             ),
             "joint_gaussian_scope_all_render_contributors": float(
                 self.gaussian_update_scope == "all_render_contributors"
+            ),
+            "joint_gaussian_scope_recent_owner_chunks": float(
+                self.gaussian_update_scope == "recent_owner_chunks"
+            ),
+            "joint_gaussian_owner_window_count": float(
+                len(self.active_owner_window_ids)
+                if self.gaussian_update_scope == "recent_owner_chunks"
+                else 0
+            ),
+            "joint_gaussian_owner_rows": float(
+                int(owner_scope_mask.sum().item())
+                if owner_scope_mask is not None
+                else 0
             ),
             "joint_visible_gaussians_mean": float(
                 sum(visible_counts) / max(1, len(visible_counts))

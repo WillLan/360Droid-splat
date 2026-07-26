@@ -636,6 +636,76 @@ def test_all_render_contributors_scope_does_not_require_accumulated_visibility()
     assert metrics["joint_contributing_gaussians_mean"] == 144.0
 
 
+def test_recent_owner_chunks_scope_uses_only_owner_ids_without_visibility() -> None:
+    mapper = _registered_mapper(_NoAccumulatedVisibilityFakeRenderer())
+    grid_x, grid_y = torch.meshgrid(
+        torch.arange(12),
+        torch.arange(12),
+        indexing="ij",
+    )
+    xyz = torch.stack(
+        [grid_x.flatten(), grid_y.flatten(), torch.ones(144)],
+        dim=-1,
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(144, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    mapper.map._anchor_owner_window_id[72:] = 6
+    before = {
+        name: getattr(mapper.map, name).detach().clone()
+        for name in mapper.map._gaussian_parameter_names()
+    }
+    mapper._pfgs360_gaussian_moments = {}
+    for name in mapper.map._gaussian_parameter_names():
+        parameter = getattr(mapper.map, name)
+        mapper._pfgs360_gaussian_moments[name] = {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.ones_like(parameter),
+            "exp_avg_sq": torch.ones_like(parameter),
+        }
+
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "refine_every_joint_steps": 0,
+            "gaussian_update_scope": "recent_owner_chunks",
+            "active_owner_window_ids": (6,),
+            "sampling_policy": "uniform",
+        },
+    )
+    metrics = engine._joint_stage(
+        engine._observations((0, 1, 2, 3)),
+        2,
+        124,
+    )
+
+    assert metrics["joint_gaussian_scope_recent_owner_chunks"] == 1.0
+    assert metrics["joint_gaussian_owner_window_count"] == 1.0
+    assert metrics["joint_gaussian_owner_rows"] == 72.0
+    assert metrics["joint_visible_gaussians_min"] == 72.0
+    assert metrics["joint_visible_gaussians_max"] == 72.0
+    for name, expected in before.items():
+        actual = getattr(mapper.map, name).detach()
+        assert torch.equal(actual[:72], expected[:72]), name
+        assert not torch.equal(actual[72:], expected[72:]), name
+        state = mapper._pfgs360_gaussian_moments[name]
+        assert bool((state["exp_avg"][:72] == 0).all()), name
+        assert bool((state["exp_avg_sq"][:72] == 0).all()), name
+
+
+def test_recent_owner_chunks_requires_explicit_owner_ids() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    with pytest.raises(ValueError, match="active_owner_window_ids"):
+        PFGS360FullBackend(
+            mapper,
+            {"gaussian_update_scope": "recent_owner_chunks"},
+        )
+
+
 def test_refined_anchor_joint_path_never_runs_conventional_topology(monkeypatch) -> None:
     mapper = _registered_mapper(_DifferentiableFakeRenderer())
     grid_x, grid_y = torch.meshgrid(torch.arange(12), torch.arange(12), indexing="ij")

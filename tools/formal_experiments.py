@@ -205,8 +205,8 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
         "one sampled frame": int(optimization["sample_observations_per_step"]) == 1,
         "global Gaussian candidate set": optimization["optimize_all_gaussians"]
         is True,
-        "all render-contributor Gaussian update": pfgs["gaussian_update_scope"]
-        == "all_render_contributors",
+        "supported Gaussian update scope": pfgs["gaussian_update_scope"]
+        in {"all_render_contributors", "recent_owner_chunks"},
         "fixed seed": int(optimization["seed"]) == int(seed),
         "core W&B preset": config["WeightsAndBiases"]["runtime_log_preset"]
         == "slam_core_visuals",
@@ -214,6 +214,11 @@ def _assert_formal_mainline(config: dict[str, Any], *, seed: int) -> None:
         == "pfgs360_official",
     }
     failed = [name for name, passed in expected.items() if not passed]
+    if (
+        pfgs["gaussian_update_scope"] == "recent_owner_chunks"
+        and int(optimization.get("gaussian_owner_window_count", 0)) <= 0
+    ):
+        failed.append("positive recent Gaussian owner window")
     if failed:
         raise ValueError("Formal mainline invariant failure: " + ", ".join(failed))
 

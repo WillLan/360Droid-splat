@@ -960,6 +960,15 @@ class SphericalSelfiGlobalBackend:
             1,
             int(optimize_cfg.get("recent_window_count", 1)),
         )
+        self.map_optimize_gaussian_owner_windows = max(
+            1,
+            int(
+                optimize_cfg.get(
+                    "gaussian_owner_window_count",
+                    self.map_optimize_recent_windows,
+                )
+            ),
+        )
         self.map_optimize_photometric_only = bool(
             optimize_cfg.get("photometric_only", False)
         )
@@ -9360,6 +9369,11 @@ class SphericalSelfiGlobalBackend:
                     raise RuntimeError(
                         "PFGS360 refined growth requires the live chunk packet"
                     )
+                gaussian_owner_window_ids = (
+                    self._map_optimization_gaussian_owner_window_ids(
+                        int(window_id)
+                    )
+                )
                 new_frame_ids = self._pfgs360_chunk_new_frame_ids(live_packet)
                 refined_anchor_update = None
                 if str(pfgs_settings.get("growth_source", "raw_depth")).strip().lower() == "refined_anchor":
@@ -9412,12 +9426,20 @@ class SphericalSelfiGlobalBackend:
                                 "latter_half_sample_probability", 0.7
                             )
                         ),
+                        "active_owner_window_ids": tuple(
+                            gaussian_owner_window_ids
+                        ),
                     },
                     refined_anchor_update=refined_anchor_update,
                 )
                 metrics["optimized_frame_count"] = float(len(visited_frame_ids))
                 metrics["new_frame_count"] = float(len(new_frame_ids))
-                metrics["active_chunk_count"] = float(len(active_owner_window_ids))
+                metrics["active_chunk_count"] = float(
+                    len(gaussian_owner_window_ids)
+                )
+                metrics["pose_frame_chunk_count"] = float(
+                    len(active_owner_window_ids)
+                )
                 metrics["pose_to_graph_sync_disabled"] = 1.0
                 if self.map.has_skybox:
                     metrics.update(
@@ -9812,6 +9834,22 @@ class SphericalSelfiGlobalBackend:
             return (window,) if window in self.packets else ()
         start = max(0, index - self.map_optimize_recent_windows + 1)
         return tuple(int(value) for value in self.window_order[start : index + 1])
+
+    def _map_optimization_gaussian_owner_window_ids(
+        self, window_id: int
+    ) -> tuple[int, ...]:
+        window = int(window_id)
+        try:
+            index = self.window_order.index(window)
+        except ValueError:
+            return (window,) if window in self.packets else ()
+        start = max(
+            0,
+            index - self.map_optimize_gaussian_owner_windows + 1,
+        )
+        return tuple(
+            int(value) for value in self.window_order[start : index + 1]
+        )
 
     def _map_optimization_frame_ids(self, window_id: int) -> tuple[int, ...]:
         frame_ids: list[int] = []

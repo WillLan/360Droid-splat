@@ -197,6 +197,47 @@ def test_rar_pano_depthbins_voxel002_campaign_explicitly_overrides_checkpoint() 
     assert resolved["SkySphere"]["enabled"] is False
 
 
+def test_rar_pano_recent6_owner_campaign_is_four_worker_default() -> None:
+    root = Path(__file__).parents[1]
+    campaign = _v3_campaign(
+        "panogsslam_formal_rar_pano_v13_recent6owners.yaml"
+    )
+    runs = _expand_runs(campaign)
+    assert len(runs) == 9
+    assert {run.worker for run in runs} == {0, 1, 2, 3}
+
+    base = load_config(root / campaign["base_config"])
+    resolved = _deep_merge_config(
+        copy.deepcopy(base),
+        runs[0].config_overrides,
+    )
+    _assert_formal_mainline(resolved, seed=123)
+    _assert_dataset_policy(resolved, runs[0])
+    optimize = resolved["SphericalSelfiGlobalBackend"][
+        "map_optimization"
+    ]
+    assert optimize["recent_window_count"] == 3
+    assert optimize["camera_steps"] == 50
+    assert optimize["joint_steps"] == 200
+    assert optimize["gaussian_owner_window_count"] == 6
+    assert optimize["pfgs360"]["frame_scope"] == "recent_chunks"
+    assert (
+        optimize["pfgs360"]["gaussian_update_scope"]
+        == "recent_owner_chunks"
+    )
+    assert resolved["SphericalSelfiRuntime"]["pager_depth"]["enabled"] is True
+    assert (
+        resolved["SphericalSelfiRuntime"]["local_ba"]["matching"]["type"]
+        == "superpoint_sphereglue"
+    )
+    assert (
+        resolved["SphericalSelfiGlobalBackend"][
+            "rendered_overlap_alignment"
+        ]["mode"]
+        == "two_frame_global_map_full_sim3"
+    )
+
+
 def test_resource_wait_requires_stable_swap_samples_before_resuming(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
