@@ -8,33 +8,13 @@ import torch
 from torch import nn
 
 from frontend.pano_droid.spherical_ba import se3_exp, skew
-from geometry.sim3 import canonicalize_c2w
+from geometry.sim3 import canonicalize_c2w, so3_log
 
 
 def ensure_homogeneous(T: torch.Tensor) -> torch.Tensor:
     if T.shape[-2:] != (4, 4):
         raise ValueError(f"Expected a 4x4 transform, got {tuple(T.shape)}")
     return T
-
-
-def so3_log(rotation: torch.Tensor) -> torch.Tensor:
-    """Stable logarithm of a proper rotation matrix."""
-
-    trace = torch.diagonal(rotation, dim1=-2, dim2=-1).sum(dim=-1)
-    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
-    theta = torch.acos(cosine)
-    vee = torch.stack(
-        (
-            rotation[..., 2, 1] - rotation[..., 1, 2],
-            rotation[..., 0, 2] - rotation[..., 2, 0],
-            rotation[..., 1, 0] - rotation[..., 0, 1],
-        ),
-        dim=-1,
-    )
-    sine = torch.sin(theta)
-    scale = theta / (2.0 * sine).clamp_min(1.0e-8)
-    small = theta < 1.0e-4
-    return torch.where(small[..., None], 0.5 * vee, scale[..., None] * vee)
 
 
 def se3_log(transform: torch.Tensor) -> torch.Tensor:

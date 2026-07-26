@@ -120,7 +120,7 @@ def sim3_exp(delta: torch.Tensor) -> torch.Tensor:
     return torch.matrix_exp(algebra)
 
 
-def _so3_log(rotation: torch.Tensor) -> torch.Tensor:
+def so3_log(rotation: torch.Tensor) -> torch.Tensor:
     trace = rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
     cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
     vee = torch.stack(
@@ -165,7 +165,7 @@ def sim3_log(transform: torch.Tensor) -> torch.Tensor:
 
     scale, rotation, translation = sim3_components(transform)
     sigma = scale.clamp_min(torch.finfo(scale.dtype).eps).log()
-    omega = _so3_log(rotation)
+    omega = so3_log(rotation)
     eye = torch.eye(3, device=transform.device, dtype=transform.dtype).expand(*transform.shape[:-2], 3, 3)
     a = skew(omega) + sigma[..., None, None] * eye
 

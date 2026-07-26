@@ -78,6 +78,27 @@ def test_pose_delta_effective_pose_rebase_is_render_invariant() -> None:
     torch.testing.assert_close(pose.canonical_pose(), new_base)
 
 
+def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
+    base = torch.eye(4)
+    pose = PoseDelta(
+        base,
+        torch.tensor([0.1, -0.2, 0.05, 3.14, 0.0, 0.0]),
+    )
+    effective = pose().detach().clone()
+    new_base = torch.eye(4)
+    new_base[:3, 3] = torch.tensor([1.0, 0.5, -0.25])
+
+    pose.rebase_preserving_effective_pose(new_base)
+
+    torch.testing.assert_close(
+        pose(),
+        effective,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    torch.testing.assert_close(pose.canonical_pose(), new_base)
+
+
 def test_owner_rebase_preserves_world_gaussians_and_rebases_adam() -> None:
     gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
     gaussian_map.configure_lazy_owner_transforms(True)
