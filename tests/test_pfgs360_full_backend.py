@@ -50,6 +50,110 @@ def test_pose_delta_rebase_preserves_photometric_residual() -> None:
     assert not torch.equal(pose().detach(), new_base)
 
 
+def test_pose_delta_effective_pose_rebase_is_render_invariant() -> None:
+    base = torch.eye(4)
+    pose = PoseDelta(
+        base,
+        torch.tensor([0.1, -0.2, 0.05, 0.02, -0.03, 0.01]),
+    )
+    effective = pose().detach().clone()
+    new_base = torch.eye(4)
+    new_base[:3, :3] = torch.tensor(
+        [
+            [0.9950042, -0.0998334, 0.0],
+            [0.0998334, 0.9950042, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    new_base[:3, 3] = torch.tensor([1.0, 0.5, -0.25])
+
+    pose.rebase_preserving_effective_pose(new_base)
+
+    torch.testing.assert_close(pose(), effective, atol=2.0e-5, rtol=2.0e-5)
+    torch.testing.assert_close(pose.canonical_pose(), new_base)
+
+
+def test_owner_rebase_preserves_world_gaussians_and_rebases_adam() -> None:
+    gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
+    gaussian_map.configure_lazy_owner_transforms(True)
+    reference = torch.eye(4)
+    gaussian_map.set_lazy_owner_transform(2, reference, set_reference=True)
+    xyz = torch.stack(
+        (
+            torch.arange(12),
+            torch.zeros(12),
+            torch.ones(12),
+        ),
+        dim=-1,
+    ).float() * 0.02
+    result = gaussian_map.append_pfgs360_points(
+        xyz,
+        torch.rand(12, 3),
+        owner_window_id=2,
+        frame_id=0,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    assert result["inserted"] == 12
+    old_current = torch.eye(4)
+    old_current[:3, :3] = torch.tensor(
+        [
+            [0.9950042, -0.0998334, 0.0],
+            [0.0998334, 0.9950042, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    old_current[:3, 3] = torch.tensor([0.3, -0.1, 0.2])
+    gaussian_map.set_lazy_owner_transform(2, old_current)
+    xyz_before = gaussian_map.get_xyz.detach().clone()
+    rotation_before = gaussian_map.get_rotation.detach().clone()
+    scale_before = gaussian_map.get_scaling.detach().clone()
+    moments = {
+        "xyz": {
+            "exp_avg": torch.ones_like(gaussian_map.xyz),
+            "exp_avg_sq": torch.ones_like(gaussian_map.xyz),
+        },
+        "rotation": {
+            "exp_avg": torch.ones_like(gaussian_map.rotation),
+            "exp_avg_sq": torch.ones_like(gaussian_map.rotation),
+        },
+        "sh_rest": {
+            "exp_avg": torch.ones_like(gaussian_map.sh_rest),
+            "exp_avg_sq": torch.ones_like(gaussian_map.sh_rest),
+        },
+    }
+    new_current = torch.eye(4)
+    new_current[:3, :3] = torch.tensor(
+        [
+            [0.9800666, 0.0, 0.1986693],
+            [0.0, 1.0, 0.0],
+            [-0.1986693, 0.0, 0.9800666],
+        ]
+    )
+    new_current[:3, 3] = torch.tensor([-0.2, 0.4, 0.1])
+    moments_before = moments["xyz"]["exp_avg"].clone()
+
+    stats = gaussian_map.rebase_owner_preserving_world(
+        2,
+        new_current,
+        adam_moments=moments,
+    )
+
+    assert stats["owner_rows_rebased"] == 12
+    torch.testing.assert_close(gaussian_map.get_xyz, xyz_before)
+    torch.testing.assert_close(
+        gaussian_map.get_rotation,
+        rotation_before,
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+    torch.testing.assert_close(gaussian_map.get_scaling, scale_before)
+    assert not torch.equal(moments["xyz"]["exp_avg"], moments_before)
+    state = gaussian_map.lazy_owner_transform_state()
+    torch.testing.assert_close(state["reference"][2], new_current)
+    torch.testing.assert_close(state["current"][2], new_current)
+
+
 def test_erp_sampler_wraps_longitude_seam() -> None:
     image = torch.arange(8, dtype=torch.float32).view(1, 1, 8)
     pixels = torch.tensor([[[-0.25, 0.0], [7.75, 0.0], [8.25, 0.0]]])
@@ -172,7 +276,14 @@ def test_pfgs360_refine_has_no_deletion_cap_and_keeps_metadata_aligned() -> None
 
 
 class _DifferentiableFakeRenderer:
-    def render(self, camera, gaussians, *, query_values=None):
+    def render(
+        self,
+        camera,
+        gaussians,
+        *,
+        query_values=None,
+        background=None,
+    ):
         height, width = int(camera.image_height), int(camera.image_width)
         count = gaussians.anchor_count()
         if count:
@@ -282,8 +393,20 @@ class _SkyOccluderQueryFailureFakeRenderer(_AttributedFakeRenderer):
 
 
 class _PartiallyVisibleFakeRenderer(_DifferentiableFakeRenderer):
-    def render(self, camera, gaussians, *, query_values=None):
-        output = super().render(camera, gaussians, query_values=query_values)
+    def render(
+        self,
+        camera,
+        gaussians,
+        *,
+        query_values=None,
+        background=None,
+    ):
+        output = super().render(
+            camera,
+            gaussians,
+            query_values=query_values,
+            background=background,
+        )
         count = gaussians.anchor_count()
         visible = torch.zeros(count, device=gaussians.xyz.device)
         visible[: count // 2] = 1.0
@@ -403,6 +526,474 @@ def test_full_backend_runs_camera_dia_joint_and_keeps_owner_transform() -> None:
     assert owner_before["enabled"] == owner_after["enabled"]
     assert torch.equal(owner_before["reference"][0], owner_after["reference"][0])
     assert torch.equal(owner_before["current"][0], owner_after["current"][0])
+
+
+def _seed_official_map(mapper: PanoGaussianMapper, count: int = 120) -> None:
+    xyz = torch.stack(
+        (
+            torch.arange(count),
+            torch.zeros(count),
+            torch.ones(count),
+        ),
+        dim=-1,
+    ).float() * 0.02
+    result = mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(count, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    assert result["inserted"] == count
+
+
+def test_official_initial_freezes_xyz_and_all_poses() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    _seed_official_map(mapper)
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "sampling_policy": "pfgs360_latter_half_biased",
+            "random_background": True,
+        },
+    )
+    observations = engine._observations((0, 1, 2, 3))
+    xyz_before = mapper.map.xyz.detach().clone()
+    pose_before = {
+        frame_id: pose.delta.detach().clone()
+        for frame_id, pose in mapper.pose_deltas.items()
+    }
+    opacity_before = mapper.map.opacity_logit.detach().clone()
+
+    metrics = engine._initial_stage(observations, 3, 17)
+
+    assert metrics["initial_steps"] == 3
+    assert metrics["initial_xyz_frozen"] == 1
+    assert metrics["initial_pose_frozen"] == 1
+    assert torch.equal(mapper.map.xyz.detach(), xyz_before)
+    assert all(
+        torch.equal(mapper.pose_deltas[frame_id].delta, value)
+        for frame_id, value in pose_before.items()
+    )
+    assert all(
+        mapper.pose_deltas[frame_id].delta.grad is None
+        for frame_id in pose_before
+    )
+    assert not torch.equal(
+        mapper.map.opacity_logit.detach(),
+        opacity_before,
+    )
+
+
+def test_official_sampler_is_latter_half_biased_over_all_history() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "sampling_policy": "pfgs360_latter_half_biased",
+            "latter_half_sample_probability": 0.7,
+        },
+    )
+    observations = engine._observations((0, 1, 2, 3))
+    schedule = engine._sampling_schedule(observations, 1000, 31)
+    latter = sum(int(value.frame_id) >= 2 for value in schedule)
+
+    assert len(schedule) == 1000
+    assert 650 <= latter <= 750
+    assert {int(value.frame_id) for value in schedule} == {0, 1, 2, 3}
+
+
+def test_owner_pose_writeback_robust_mean_rejects_large_outlier() -> None:
+    corrections = []
+    for value in (0.09, 0.10, 0.11, 0.10, 8.0):
+        transform = torch.eye(4)
+        transform[0, 3] = value
+        corrections.append(transform)
+
+    mean = SphericalSelfiGlobalBackend._pfgs360_huber_owner_correction(
+        corrections,
+        iterations=5,
+    )
+
+    assert float(mean[0, 3]) == pytest.approx(0.1, abs=4.0e-3)
+    torch.testing.assert_close(mean[:3, :3], torch.eye(3), atol=1.0e-6, rtol=0)
+
+
+def test_official_full_tensor_does_not_mask_invisible_adam_rows() -> None:
+    mapper = _registered_mapper(_PartiallyVisibleFakeRenderer())
+    _seed_official_map(mapper)
+    count = mapper.map.anchor_count()
+    mapper._pfgs360_gaussian_moments = {
+        "xyz": {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.ones_like(mapper.map.xyz) * 0.1,
+            "exp_avg_sq": torch.ones_like(mapper.map.xyz) * 0.01,
+        }
+    }
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "gaussian_update_scope": "official_full_tensor",
+            "sampling_policy": "pfgs360_latter_half_biased",
+            "topology_refine_enabled": False,
+        },
+    )
+    invisible = torch.arange(count) >= count // 2
+    before = mapper.map.xyz.detach().clone()
+
+    metrics = engine._official_joint_stage(
+        engine._observations((0, 1, 2, 3)),
+        1,
+        41,
+        stage_name="joint",
+        topology_steps=0,
+    )
+
+    assert metrics["joint_full_tensor_gaussians"] == 1
+    assert mapper.pose_deltas[0].delta.grad is None
+    assert not torch.equal(
+        mapper.map.xyz.detach()[invisible],
+        before[invisible],
+    )
+
+
+def test_official_topology_ood_is_relative_to_all_visited_cameras() -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    world = torch.tensor(
+        [
+            [100.0, 0.0, 0.0],
+            [1000.0, 0.0, 0.0],
+        ]
+    )
+    output = mapper.map.append_pfgs360_points(
+        world,
+        torch.rand(2, 3),
+        owner_window_id=0,
+        frame_id=0,
+        voxel_size=0.01,
+        initial_opacity=0.5,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    assert output["inserted"] == 2
+
+    metrics = mapper.map.pfgs360_refine_topology(
+        torch.zeros(2),
+        torch.zeros(2),
+        grad_threshold=1.0,
+        cull_opacity=0.0,
+        ood_distance=10.0,
+        camera_centers=torch.tensor([[100.0, 0.0, 0.0]]),
+        ood_chunk_size=1,
+    )
+
+    assert metrics["culled"] == 1
+    assert mapper.map.anchor_count() == 1
+    torch.testing.assert_close(
+        mapper.map.get_xyz[0],
+        world[0],
+        atol=1.0e-6,
+        rtol=0,
+    )
+
+
+def test_official_joint_refines_topology_inside_stage_every_100_steps(
+    monkeypatch,
+) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    _seed_official_map(mapper)
+    calls: list[int] = []
+
+    def refine(mean_absgrad, max_radii, **kwargs):
+        calls.append(int(mapper._pfgs360_joint_steps))
+        mapper.map._pfgs360_last_topology_mapping = torch.arange(
+            mapper.map.anchor_count(),
+            dtype=torch.long,
+        )
+        return {
+            "split": 0,
+            "split_children": 0,
+            "duplicate": 0,
+            "culled": 0,
+            "after": mapper.map.anchor_count(),
+        }
+
+    monkeypatch.setattr(mapper.map, "pfgs360_refine_topology", refine)
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "gaussian_update_scope": "official_full_tensor",
+            "sampling_policy": "pfgs360_latter_half_biased",
+            "refine_every_joint_steps": 100,
+        },
+    )
+    metrics = engine._official_joint_stage(
+        engine._observations((0, 1, 2, 3)),
+        200,
+        43,
+        stage_name="joint",
+        topology_steps=200,
+    )
+
+    assert metrics["joint_steps"] == 200
+    assert calls == [100, 200]
+
+
+def test_official_finetune_is_exactly_10000_with_first_500_topology(
+    monkeypatch,
+) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    _seed_official_map(mapper)
+    captured = {}
+    engine = PFGS360FullBackend(mapper)
+
+    def stage(observations, steps, seed, **kwargs):
+        captured.update(steps=steps, seed=seed, **kwargs)
+        return {"finetune_steps": float(steps)}
+
+    monkeypatch.setattr(engine, "_official_joint_stage", stage)
+    metrics = engine.run_official_finetune(
+        frame_ids=(0, 1, 2, 3),
+        steps=10000,
+        topology_steps=500,
+        seed=47,
+    )
+
+    assert metrics["finetune_steps"] == 10000
+    assert captured["steps"] == 10000
+    assert captured["topology_steps"] == 500
+    assert captured["xyz_lr_final"] == pytest.approx(1.6e-6)
+    assert captured["pose_lr_final"] == pytest.approx(5.0e-6)
+
+
+def test_official_failure_does_not_restore_mutated_map(monkeypatch) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    engine = PFGS360FullBackend(
+        mapper,
+        {"save_recovery_checkpoints": False},
+    )
+
+    def bootstrap(observations, owner_window_id):
+        _seed_official_map(mapper)
+        return {"raw": 120, "unique": 120, "occupied": 0, "inserted": 120}
+
+    def fail_initial(observations, steps, seed):
+        with torch.no_grad():
+            mapper.map.xyz.add_(3.0)
+        raise FloatingPointError("synthetic non-finite failure")
+
+    monkeypatch.setattr(engine, "_bootstrap", bootstrap)
+    monkeypatch.setattr(engine, "_initial_stage", fail_initial)
+
+    with pytest.raises(FloatingPointError):
+        engine.run_official_chunkwise(
+            frame_ids=(0, 1, 2, 3),
+            new_frame_ids=(0, 1, 2, 3),
+            owner_window_id=0,
+            initial_steps=1,
+            camera_steps=1,
+            joint_steps=1,
+            seed=53,
+        )
+
+    assert mapper.map.anchor_count() == 120
+    assert bool((mapper.map.xyz.detach() >= 3.0).any())
+
+
+def test_official_recovery_checkpoint_contains_resume_state(tmp_path) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    _seed_official_map(mapper)
+    mapper._pfgs360_official_global_step = 321
+    mapper._pfgs360_official_chunk_index = 7
+    mapper._pfgs360_gaussian_moments = {
+        "xyz": {
+            "step": torch.tensor(4.0),
+            "exp_avg": torch.ones_like(mapper.map.xyz),
+            "exp_avg_sq": torch.full_like(mapper.map.xyz, 2.0),
+        }
+    }
+    mapper._pfgs360_densification_state = {
+        "grad_sum": torch.arange(
+            mapper.map.anchor_count(),
+            dtype=torch.float32,
+        )
+    }
+    mapper.map.active_sh_degree = 2
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "recovery_checkpoint_dir": str(tmp_path),
+            "save_recovery_checkpoints": True,
+        },
+    )
+
+    path = engine._save_recovery_checkpoint("before_joint")
+    assert path is not None
+    state = torch.load(path, map_location="cpu", weights_only=True)
+
+    assert state["official_stage"] == "before_joint"
+    assert state["official_global_step"] == 321
+    assert state["official_chunk_index"] == 7
+    assert state["active_sh_degree"] == 2
+    assert "xyz" in state["moments"]
+    assert "grad_sum" in state["densification"]
+    assert torch.is_tensor(state["torch_rng_state"])
+
+
+def test_official_four_chunk_state_machine_orders_all_stages(monkeypatch) -> None:
+    mapper = _registered_mapper(_DifferentiableFakeRenderer())
+    engine = PFGS360FullBackend(
+        mapper,
+        {"save_recovery_checkpoints": False},
+    )
+    calls: list[str] = []
+
+    def bootstrap(observations, owner_window_id):
+        calls.append("bootstrap")
+        _seed_official_map(mapper)
+        return {
+            "raw": 120,
+            "unique": 120,
+            "occupied": 0,
+            "inserted": 120,
+        }
+
+    def initial(observations, steps, seed):
+        calls.append("initial")
+        return {"initial_steps": float(steps)}
+
+    def camera(observations, steps, seed):
+        calls.append("camera")
+        return {"camera_steps": float(steps)}
+
+    def dia(observations, new_frame_ids, owner_window_id):
+        calls.append("dia")
+        return {"dia_render_views": float(len(observations))}
+
+    def joint(observations, steps, seed, **kwargs):
+        calls.append("joint")
+        return {"joint_steps": float(steps)}
+
+    monkeypatch.setattr(engine, "_bootstrap", bootstrap)
+    monkeypatch.setattr(engine, "_initial_stage", initial)
+    monkeypatch.setattr(engine, "_camera_stage", camera)
+    monkeypatch.setattr(engine, "_dia", dia)
+    monkeypatch.setattr(engine, "_official_joint_stage", joint)
+
+    active_degrees = []
+    for chunk_index in range(4):
+        metrics = engine.run_official_chunkwise(
+            frame_ids=(0, 1, 2, 3),
+            new_frame_ids=(2, 3),
+            owner_window_id=2 * chunk_index,
+            initial_steps=1000,
+            camera_steps=500,
+            joint_steps=500,
+            seed=101 + chunk_index,
+        )
+        active_degrees.append(int(metrics["active_sh_degree"]))
+
+    assert calls == [
+        "bootstrap",
+        "initial",
+        "camera",
+        "dia",
+        "joint",
+        "camera",
+        "dia",
+        "joint",
+        "camera",
+        "dia",
+        "joint",
+    ]
+    assert active_degrees == [0, 1, 2, 2]
+    assert mapper._pfgs360_official_chunk_index == 4
+
+
+def test_official_chunkwise_config_resolves_confirmed_mainline() -> None:
+    config = load_config(
+        Path(__file__).parents[1]
+        / "configs"
+        / (
+            "spherical_selfi_ob3d_global_map_sim3_sphereglue_pager_"
+            "ba_100_pfgs360_official_chunkwise.yaml"
+        )
+    )
+    runtime = config["SphericalSelfiRuntime"]
+    backend = config["SphericalSelfiGlobalBackend"]
+    optimize = backend["map_optimization"]
+    pfgs = optimize["pfgs360"]
+
+    assert runtime["pager_depth"]["enabled"] is True
+    assert runtime["local_ba"]["matching"]["type"] == "superpoint_sphereglue"
+    assert (
+        backend["rendered_overlap_alignment"]["mode"]
+        == "two_frame_global_map_full_sim3"
+    )
+    assert (
+        backend["rendered_overlap_alignment"]["acceptance_policy"]
+        == "diagnostics_only"
+    )
+    assert backend["global_graph"]["node_mode"] == "chunk_first_stride"
+    assert optimize["strategy"] == "pfgs360_official_chunkwise"
+    assert optimize["initial_steps"] == 1000
+    assert optimize["camera_steps"] == 500
+    assert optimize["joint_steps"] == 500
+    assert optimize["final_finetune_steps"] == 10000
+    assert optimize["finetune_topology_steps"] == 500
+    assert pfgs["frame_scope"] == "all_visited"
+    assert pfgs["sampling_policy"] == "pfgs360_latter_half_biased"
+    assert pfgs["gaussian_update_scope"] == "official_full_tensor"
+    assert pfgs["rollback_policy"] == "none"
+    assert pfgs["exclude_new_frames_from_delete_evidence"] is True
+    assert pfgs["topology_refine_enabled"] is True
+    assert config["Training"]["pfgs360_absgrad"] is True
+    assert (
+        config["WeightsAndBiases"]["runtime_log_preset"]
+        == "slam_core_visuals"
+    )
+    runtime_backend = dict(backend)
+    runtime_backend["_voxel_anchor_refiner_enabled"] = True
+    validated = SphericalSelfiGlobalBackend(
+        PanoGaussianMap(config=config, device="cpu"),
+        renderer=object(),
+        config=runtime_backend,
+    )
+    assert (
+        validated.map_optimization_strategy
+        == "pfgs360_official_chunkwise"
+    )
+
+
+def test_official_rar_campaign_uses_full_sequences_and_single_attempt() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "formal"
+        / "panogsslam_formal_rar_pano_v14_pfgs360_official.yaml"
+    )
+    manifest = yaml.safe_load(path.read_text(encoding="utf-8"))
+    dataset = manifest["datasets"][0]
+    optimize = dataset["config_overrides"][
+        "SphericalSelfiGlobalBackend"
+    ]["map_optimization"]
+    pfgs = optimize["pfgs360"]
+
+    assert manifest["expected_run_count"] == 9
+    assert manifest["max_concurrent_workers"] == 4
+    assert manifest["resource_limits"]["max_attempts"] == 1
+    assert len(dataset["scenes"]) == 9
+    assert set(dataset["scenes"]) == set(dataset["scene_frames"])
+    assert all(
+        int(dataset["scene_frames"][scene]) > 0
+        for scene in dataset["scenes"]
+    )
+    assert optimize["strategy"] == "pfgs360_official_chunkwise"
+    assert optimize["final_finetune_steps"] == 10000
+    assert pfgs["growth_source"] == "refined_anchor"
+    assert pfgs["atomic_refined_anchor_replacement"] is True
+    assert pfgs["growth_hash_dedup_enabled"] is True
 
 
 def test_refined_anchor_bootstrap_never_calls_raw_point_growth(monkeypatch) -> None:
@@ -916,6 +1507,39 @@ def test_dia_applies_official_100_threshold_without_deletion_cap() -> None:
     assert metrics["dia_deleted"] == 120
     assert mapper.map.anchor_count() == 120
     assert bool((mapper.map.get_opacity <= 0.010001).all())
+
+
+def test_official_dia_never_uses_current_chunk_frames_as_delete_evidence() -> None:
+    mapper = _registered_mapper(_AttributedFakeRenderer())
+    xyz = torch.stack(
+        [torch.arange(240), torch.zeros(240), torch.ones(240)], dim=-1
+    ).float() * 0.02
+    mapper.map.append_pfgs360_points(
+        xyz,
+        torch.rand(240, 3),
+        owner_window_id=0,
+        frame_id=0,
+        min_unique_voxels=100,
+    )
+    engine = PFGS360FullBackend(
+        mapper,
+        {
+            "exclude_new_frames_from_delete_evidence": True,
+            "min_reset_gaussians": 1,
+            "min_delete_gaussians": 1,
+        },
+    )
+
+    metrics = engine._dia(
+        engine._observations((0, 1, 2, 3)),
+        (0, 1, 2, 3),
+        0,
+    )
+
+    assert metrics["dia_provisional_reset_candidates"] == 0
+    assert metrics["dia_provisional_delete_candidates"] == 0
+    assert metrics["dia_reset_applied"] == 0
+    assert metrics["dia_deleted"] == 0
 
 
 def test_reliable_sky_threshold_is_inclusive_at_point_six() -> None:

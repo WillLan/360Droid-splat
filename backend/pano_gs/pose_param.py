@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from frontend.pano_droid.spherical_ba import se3_exp
+from frontend.pano_droid.spherical_ba import se3_exp, skew
 from geometry.sim3 import canonicalize_c2w
 
 
@@ -15,6 +15,55 @@ def ensure_homogeneous(T: torch.Tensor) -> torch.Tensor:
     if T.shape[-2:] != (4, 4):
         raise ValueError(f"Expected a 4x4 transform, got {tuple(T.shape)}")
     return T
+
+
+def so3_log(rotation: torch.Tensor) -> torch.Tensor:
+    """Stable logarithm of a proper rotation matrix."""
+
+    trace = torch.diagonal(rotation, dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.acos(cosine)
+    vee = torch.stack(
+        (
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    sine = torch.sin(theta)
+    scale = theta / (2.0 * sine).clamp_min(1.0e-8)
+    small = theta < 1.0e-4
+    return torch.where(small[..., None], 0.5 * vee, scale[..., None] * vee)
+
+
+def se3_log(transform: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`se3_exp` for finite SE(3) transforms."""
+
+    rotation = transform[..., :3, :3]
+    translation = transform[..., :3, 3]
+    omega = so3_log(rotation)
+    theta = torch.linalg.norm(omega, dim=-1, keepdim=True)
+    theta2 = theta.square()
+    matrix = skew(omega)
+    eye = torch.eye(3, device=transform.device, dtype=transform.dtype)
+    eye = eye.expand(*transform.shape[:-2], 3, 3)
+    small = theta < 1.0e-4
+    coefficient = torch.where(
+        small,
+        1.0 / 12.0 + theta2 / 720.0,
+        (
+            1.0
+            - 0.5
+            * theta
+            * torch.sin(theta)
+            / (1.0 - torch.cos(theta)).clamp_min(1.0e-8)
+        )
+        / theta2.clamp_min(1.0e-8),
+    )
+    inverse_v = eye - 0.5 * matrix + coefficient[..., None] * (matrix @ matrix)
+    rho = torch.einsum("...ij,...j->...i", inverse_v, translation)
+    return torch.cat((rho, omega), dim=-1)
 
 
 @dataclass
@@ -64,6 +113,21 @@ class PoseDelta(nn.Module):
             self.base_c2w.copy_(base)
             if not preserve_delta:
                 self.delta.zero_()
+
+    def rebase_preserving_effective_pose(self, base_c2w: torch.Tensor) -> None:
+        """Change the graph-owned base while preserving the rendered pose."""
+
+        effective = self.forward().detach()
+        base = canonicalize_c2w(
+            ensure_homogeneous(base_c2w.detach().clone().to(self.base_c2w))
+        )
+        relative = effective @ torch.linalg.inv(base)
+        delta = se3_log(relative)
+        if not bool(torch.isfinite(delta).all()):
+            raise FloatingPointError("Pose rebase produced a non-finite SE(3) residual")
+        with torch.no_grad():
+            self.base_c2w.copy_(base)
+            self.delta.copy_(delta.to(self.delta))
 
     def canonical_pose(self) -> torch.Tensor:
         return self.base_c2w.detach().clone()

@@ -372,6 +372,191 @@ class PanoGaussianMap(nn.Module):
             },
         }
 
+    def rebase_owner_preserving_world(
+        self,
+        owner_window_id: int,
+        transform: torch.Tensor,
+        *,
+        adam_moments: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, float]:
+        """Re-anchor one owner without changing materialized Gaussian geometry.
+
+        Photometric pose refinement may update the rotation and translation of
+        an owner node while Sim(3) scale remains graph-owned.  Resetting the
+        lazy reference directly would otherwise move every Gaussian belonging
+        to that owner.  This method first materializes those rows, rebases the
+        stored tensors and matching Adam moments, then installs the new owner
+        transform as both reference and current state.
+        """
+
+        owner = int(owner_window_id)
+        value = transform.detach().cpu().float().clone()
+        if tuple(value.shape) != (4, 4) or not bool(torch.isfinite(value).all()):
+            raise ValueError("Owner rebase requires a finite 4x4 Sim(3)")
+        count = self.anchor_count()
+        if (
+            not self._lazy_owner_transforms_enabled
+            or owner not in self._lazy_owner_reference_transforms
+            or owner not in self._lazy_owner_current_transforms
+            or int(self._anchor_owner_window_id.numel()) != count
+        ):
+            self.set_lazy_owner_transform(owner, value, set_reference=True)
+            return {"owner_rows_rebased": 0.0}
+        rows_cpu = torch.nonzero(
+            self._anchor_owner_window_id == owner,
+            as_tuple=False,
+        ).flatten()
+        if int(rows_cpu.numel()) == 0:
+            self.set_lazy_owner_transform(owner, value, set_reference=True)
+            return {"owner_rows_rebased": 0.0}
+
+        rows = rows_cpu.to(device=self.xyz.device)
+        old_delta = self._lazy_owner_delta(
+            owner,
+            device=self.xyz.device,
+            dtype=self.xyz.dtype,
+        )
+        old_scale, old_rotation, _ = sim3_components(old_delta)
+        world_xyz = apply_sim3(old_delta, self.xyz.detach().index_select(0, rows))
+        delta_quaternion = matrix_to_quaternion(old_rotation).view(1, 4)
+        world_rotation = normalize_quaternion(
+            quaternion_multiply(
+                delta_quaternion,
+                self._base_rotation().detach().index_select(0, rows),
+            )
+        )
+        world_scale = (
+            old_scale
+            * self._base_scaling().detach().index_select(0, rows)
+        )
+        old_sh_matrix = self._lazy_sh_rotation_matrix(
+            owner,
+            device=self.xyz.device,
+            dtype=self.xyz.dtype,
+        )
+        base_coefficients = (
+            self._base_sh_coefficients().detach().index_select(0, rows)
+        )
+        world_coefficients = torch.einsum(
+            "ij,njc->nic",
+            old_sh_matrix,
+            base_coefficients,
+        )
+
+        with torch.no_grad():
+            self.xyz[rows] = world_xyz
+            self.rotation[rows] = world_rotation
+            self.scaling[rows] = self._scale_parameter_from_actual(world_scale)
+            self.features[rows] = self._feature_parameter_from_sh_dc(
+                world_coefficients[:, 0]
+            )
+            if int(self.sh_rest.shape[1]) > 0:
+                self.sh_rest[rows] = world_coefficients[:, 1:]
+            voxel = self._anchor_voxel_size.index_select(0, rows_cpu).to(
+                device=world_xyz.device,
+                dtype=world_xyz.dtype,
+            )
+            grid = torch.round(
+                world_xyz / voxel.clamp_min(1.0e-8).unsqueeze(-1)
+            ).to(device="cpu", dtype=torch.int32)
+            self._anchor_grid_coord[rows_cpu] = grid
+
+        if adam_moments:
+            linear = old_delta[:3, :3]
+            quaternion_basis = torch.eye(
+                4, device=self.xyz.device, dtype=self.xyz.dtype
+            )
+            quaternion_linear_rows = quaternion_multiply(
+                delta_quaternion.expand(4, -1),
+                quaternion_basis,
+            )
+            sh_rest_matrix = old_sh_matrix[1:, 1:]
+
+            def transform_rows(
+                state_name: str,
+                first_transform,
+                second_transform,
+            ) -> None:
+                state = adam_moments.get(state_name)
+                if not isinstance(state, dict):
+                    return
+                for field, operation in (
+                    ("exp_avg", first_transform),
+                    ("exp_avg_sq", second_transform),
+                    ("max_exp_avg_sq", second_transform),
+                ):
+                    tensor = state.get(field)
+                    if not torch.is_tensor(tensor) or tensor.ndim == 0:
+                        continue
+                    if int(tensor.shape[0]) != count:
+                        raise RuntimeError(
+                            f"Adam {state_name}.{field} is not aligned with map rows"
+                        )
+                    state_rows = rows_cpu.to(device=tensor.device)
+                    selected = tensor.index_select(0, state_rows)
+                    tensor[state_rows] = operation(selected)
+
+            transform_rows(
+                "xyz",
+                lambda tensor: tensor
+                @ linear.to(device=tensor.device, dtype=tensor.dtype).transpose(0, 1),
+                lambda tensor: tensor
+                @ linear.to(device=tensor.device, dtype=tensor.dtype)
+                .square()
+                .transpose(0, 1),
+            )
+            transform_rows(
+                "rotation",
+                lambda tensor: tensor
+                @ quaternion_linear_rows.to(
+                    device=tensor.device, dtype=tensor.dtype
+                ),
+                lambda tensor: tensor
+                @ quaternion_linear_rows.to(
+                    device=tensor.device, dtype=tensor.dtype
+                ).square(),
+            )
+            if int(sh_rest_matrix.numel()) > 0:
+                transform_rows(
+                    "sh_rest",
+                    lambda tensor: torch.einsum(
+                        "ij,njc->nic",
+                        sh_rest_matrix.to(
+                            device=tensor.device, dtype=tensor.dtype
+                        ),
+                        tensor,
+                    ),
+                    lambda tensor: torch.einsum(
+                        "ij,njc->nic",
+                        sh_rest_matrix.to(
+                            device=tensor.device, dtype=tensor.dtype
+                        ).square(),
+                        tensor,
+                    ),
+                )
+
+        self.set_lazy_owner_transform(owner, value, set_reference=True)
+        materialized_xyz = self.get_xyz.detach().index_select(0, rows)
+        materialized_rotation = self.get_rotation.detach().index_select(0, rows)
+        materialized_scale = self.get_scaling.detach().index_select(0, rows)
+        if not (
+            torch.allclose(materialized_xyz, world_xyz, atol=1.0e-5, rtol=1.0e-5)
+            and torch.allclose(
+                materialized_rotation,
+                world_rotation,
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+            and torch.allclose(
+                materialized_scale,
+                world_scale,
+                atol=1.0e-5,
+                rtol=1.0e-5,
+            )
+        ):
+            raise RuntimeError("Owner rebase changed materialized Gaussian geometry")
+        return {"owner_rows_rebased": float(rows.numel())}
+
     def materialized_anchor_voxel_size(
         self,
         *,
@@ -838,6 +1023,8 @@ class PanoGaussianMap(nn.Module):
         split_samples: int = 2,
         cull_opacity: float = 0.005,
         ood_distance: float = 1.0e5,
+        camera_centers: torch.Tensor | None = None,
+        ood_chunk_size: int = 8192,
     ) -> dict[str, int]:
         """Conventional PFGS360 split/duplicate/low-opacity refinement."""
 
@@ -853,10 +1040,41 @@ class PanoGaussianMap(nn.Module):
         selected = torch.isfinite(grad) & (grad > float(grad_threshold))
         split_mask = selected & (actual_scale > float(split_scale_threshold))
         duplicate_mask = selected & ~split_mask
+        world_xyz = self.get_xyz.detach()
+        non_finite = ~torch.isfinite(self.xyz.detach()).all(dim=-1)
+        if camera_centers is None:
+            outside_all_cameras = (
+                torch.linalg.norm(world_xyz, dim=-1) > float(ood_distance)
+            )
+        else:
+            centers = camera_centers.detach().to(world_xyz)
+            if centers.ndim != 2 or tuple(centers.shape[1:]) != (3,):
+                raise ValueError(
+                    "PFGS360 topology camera centers must have shape Nx3"
+                )
+            if int(centers.shape[0]) == 0:
+                raise ValueError(
+                    "PFGS360 topology requires at least one camera center"
+                )
+            outside_all_cameras = torch.empty(
+                count,
+                device=world_xyz.device,
+                dtype=torch.bool,
+            )
+            chunk_size = max(1, int(ood_chunk_size))
+            for start in range(0, count, chunk_size):
+                stop = min(count, start + chunk_size)
+                minimum_distance = torch.cdist(
+                    world_xyz[start:stop],
+                    centers,
+                ).amin(dim=1)
+                outside_all_cameras[start:stop] = (
+                    minimum_distance > float(ood_distance)
+                )
         cull_mask = (
             (self.get_opacity.detach().view(-1) < float(cull_opacity))
-            | ~torch.isfinite(self.xyz.detach()).all(dim=-1)
-            | (torch.linalg.norm(self.get_xyz.detach(), dim=-1) > float(ood_distance))
+            | non_finite
+            | outside_all_cameras
         )
         split_idx = torch.nonzero(split_mask & ~cull_mask, as_tuple=False).flatten()
         duplicate_idx = torch.nonzero(duplicate_mask & ~cull_mask, as_tuple=False).flatten()
@@ -1816,6 +2034,10 @@ class PanoGaussianMapper:
         self._spherical_selfi_rollback_state: tuple[dict[str, torch.Tensor], dict[int, torch.Tensor]] | None = None
         self._pfgs360_joint_steps = 0
         self._pfgs360_gaussian_moments: dict[str, dict[str, object]] = {}
+        self._pfgs360_official_global_step = 0
+        self._pfgs360_official_chunk_index = 0
+        self._pfgs360_official_stage = "idle"
+        self._pfgs360_densification_state: dict[str, object] = {}
         self._sky_sphere_warning_recorded = False
         self.last_inserted_range: tuple[int, int] = (0, 0)
         self.last_requested_source_flat_idx: torch.Tensor | None = None
@@ -2895,6 +3117,82 @@ class PanoGaussianMapper:
         self.stats.last_phase = "pfgs360_full_50_50"
         self.stats.optimization_steps += int(metrics.get("camera_steps", 0.0))
         self.stats.optimization_steps += int(metrics.get("joint_steps", 0.0))
+        self.stats.last_pose_delta_norm = self._pose_delta_norm(
+            [int(value) for value in frame_ids]
+        )
+        return metrics
+
+    def optimize_pfgs360_official_chunkwise(
+        self,
+        *,
+        window_id: int,
+        frame_ids: list[int] | tuple[int, ...],
+        new_frame_ids: list[int] | tuple[int, ...],
+        settings: dict | None = None,
+        refined_anchor_update=None,
+    ) -> dict[str, float]:
+        from backend.pano_gs.pfgs360_full import PFGS360FullBackend
+
+        cfg = dict(settings or {})
+        engine = PFGS360FullBackend(
+            self,
+            cfg,
+            refined_anchor_update=refined_anchor_update,
+        )
+        metrics = engine.run_official_chunkwise(
+            frame_ids=frame_ids,
+            new_frame_ids=new_frame_ids,
+            owner_window_id=int(window_id),
+            initial_steps=int(cfg.get("initial_steps", 1000)),
+            camera_steps=int(cfg.get("camera_steps", 500)),
+            joint_steps=int(cfg.get("joint_steps", 500)),
+            seed=int(cfg.get("seed", 123)) + int(window_id),
+        )
+        self.optimizer = self.map.make_optimizer(
+            lr=float(cfg.get("fallback_lr", 2.0e-3))
+        )
+        self.stats.n_anchors = self.map.anchor_count()
+        self.stats.last_phase = "pfgs360_official_chunkwise"
+        self.stats.optimization_steps += int(
+            metrics.get("initial_steps", 0.0)
+        )
+        self.stats.optimization_steps += int(
+            metrics.get("camera_steps", 0.0)
+        )
+        self.stats.optimization_steps += int(
+            metrics.get("joint_steps", 0.0)
+        )
+        self.stats.last_pose_delta_norm = self._pose_delta_norm(
+            [int(value) for value in frame_ids]
+        )
+        return metrics
+
+    def finalize_pfgs360_official(
+        self,
+        *,
+        frame_ids: list[int] | tuple[int, ...],
+        settings: dict | None = None,
+    ) -> dict[str, float]:
+        from backend.pano_gs.pfgs360_full import PFGS360FullBackend
+
+        cfg = dict(settings or {})
+        engine = PFGS360FullBackend(self, cfg)
+        metrics = engine.run_official_finetune(
+            frame_ids=frame_ids,
+            steps=int(cfg.get("final_finetune_steps", 10000)),
+            topology_steps=int(
+                cfg.get("finetune_topology_steps", 500)
+            ),
+            seed=int(cfg.get("seed", 123)) + 1_000_003,
+        )
+        self.optimizer = self.map.make_optimizer(
+            lr=float(cfg.get("fallback_lr", 2.0e-3))
+        )
+        self.stats.n_anchors = self.map.anchor_count()
+        self.stats.last_phase = "pfgs360_official_finetune"
+        self.stats.optimization_steps += int(
+            metrics.get("finetune_steps", 0.0)
+        )
         self.stats.last_pose_delta_norm = self._pose_delta_norm(
             [int(value) for value in frame_ids]
         )
@@ -5121,7 +5419,10 @@ class PanoGaussianMapper:
             else {}
         )
         optimize = dict(cfg.get("map_optimization", {}) or {})
-        return str(optimize.get("strategy", "")).strip().lower() == "pfgs360_full_50_50"
+        return str(optimize.get("strategy", "")).strip().lower() in {
+            "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
+        }
 
     def apply_frontend_pose_updates(self, updates: dict[int, torch.Tensor]) -> int:
         """Replace registered keyframe pose bases with frontend graph updates."""

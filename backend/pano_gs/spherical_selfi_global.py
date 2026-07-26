@@ -41,6 +41,8 @@ from geometry.sim3 import (
     sim3_log,
     weighted_umeyama,
 )
+from backend.pano_gs.pose_param import so3_log
+from frontend.pano_droid.spherical_ba import so3_exp
 from models.spherical_selfi_stage3_ba import build_stage3_match_cache
 from models.spherical_voxel_anchor_refiner import voxelize_per_pixel_gaussians
 
@@ -983,16 +985,19 @@ class SphericalSelfiGlobalBackend:
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
             "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
         }:
             raise ValueError(
                 "map_optimization.strategy must be 'legacy', "
                 "'gaussian_only_staged', 'gaussian_only_joint_3dgs', "
-                "or 'pfgs360_full_50_50'"
+                "'pfgs360_full_50_50', or "
+                "'pfgs360_official_chunkwise'"
             )
         if (
             self.map_optimization_strategy in {
                 "gaussian_only_joint_3dgs",
                 "pfgs360_full_50_50",
+                "pfgs360_official_chunkwise",
             }
             and getattr(self.map, "gaussian_parameterization", "legacy")
             != "traditional_3dgs"
@@ -1001,18 +1006,21 @@ class SphericalSelfiGlobalBackend:
                 f"{self.map_optimization_strategy} requires "
                 "MapRepresentation.gaussian_parameterization=traditional_3dgs"
             )
-        if self.map_optimization_strategy == "pfgs360_full_50_50":
+        if self.map_optimization_strategy in {
+            "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
+        }:
             if not (
                 self.two_frame_pointmap_full_sim3_enabled
                 or self.two_frame_global_map_full_sim3_enabled
             ):
                 raise ValueError(
-                    "pfgs360_full_50_50 requires the PointMap-Sim3 or "
+                    f"{self.map_optimization_strategy} requires the PointMap-Sim3 or "
                     "Global-Map-Sim3 mainline"
                 )
             if self.insertion_depth_gate_enabled or self.error_gaussian_prune_enabled:
                 raise ValueError(
-                    "pfgs360_full_50_50 must bypass the legacy depth gate and persistent prune"
+                    f"{self.map_optimization_strategy} must bypass the legacy depth gate and persistent prune"
                 )
             pfgs_cfg = dict(optimize_cfg.get("pfgs360", {}) or {})
             refined_growth = str(
@@ -1051,9 +1059,71 @@ class SphericalSelfiGlobalBackend:
                         "pfgs360_official_sky_only or "
                         "pfgs360_official_no_semantic_gate"
                     )
-                if bool(pfgs_cfg.get("topology_refine_enabled", True)):
+                if (
+                    self.map_optimization_strategy
+                    == "pfgs360_full_50_50"
+                    and bool(pfgs_cfg.get("topology_refine_enabled", True))
+                ):
                     raise ValueError(
                         "Refined-anchor PFGS360 must disable conventional topology refinement"
+                    )
+            if (
+                self.map_optimization_strategy
+                == "pfgs360_official_chunkwise"
+            ):
+                required_steps = {
+                    "initial_steps": 1000,
+                    "camera_steps": 500,
+                    "joint_steps": 500,
+                    "final_finetune_steps": 10000,
+                }
+                for key, expected in required_steps.items():
+                    if int(optimize_cfg.get(key, -1)) != expected:
+                        raise ValueError(
+                            "pfgs360_official_chunkwise requires "
+                            f"{key}={expected}"
+                        )
+                if (
+                    str(pfgs_cfg.get("frame_scope", "")).strip().lower()
+                    != "all_visited"
+                ):
+                    raise ValueError(
+                        "pfgs360_official_chunkwise requires frame_scope=all_visited"
+                    )
+                if (
+                    str(
+                        pfgs_cfg.get("sampling_policy", "")
+                    ).strip().lower()
+                    != "pfgs360_latter_half_biased"
+                ):
+                    raise ValueError(
+                        "pfgs360_official_chunkwise requires the official "
+                        "latter-half-biased sampler"
+                    )
+                if (
+                    str(
+                        pfgs_cfg.get("gaussian_update_scope", "")
+                    ).strip().lower()
+                    != "official_full_tensor"
+                ):
+                    raise ValueError(
+                        "pfgs360_official_chunkwise requires "
+                        "gaussian_update_scope=official_full_tensor"
+                    )
+                if (
+                    str(
+                        pfgs_cfg.get("rollback_policy", "")
+                    ).strip().lower()
+                    != "none"
+                ):
+                    raise ValueError(
+                        "pfgs360_official_chunkwise requires rollback_policy=none"
+                    )
+                if not bool(
+                    pfgs_cfg.get("topology_refine_enabled", False)
+                ):
+                    raise ValueError(
+                        "pfgs360_official_chunkwise requires topology refinement"
                     )
         self.map_steps_on_loop = max(
             0,
@@ -1077,7 +1147,11 @@ class SphericalSelfiGlobalBackend:
             )
         if (
             self.voxel_anchor_refiner_enabled
-            and self.map_optimization_strategy != "pfgs360_full_50_50"
+            and self.map_optimization_strategy
+            not in {
+                "pfgs360_full_50_50",
+                "pfgs360_official_chunkwise",
+            }
         ):
             if not self.boundary_frame_graph:
                 raise ValueError(
@@ -2136,7 +2210,11 @@ class SphericalSelfiGlobalBackend:
                 "Refined packets require rendered_overlap_alignment.enabled=true"
             )
         if (
-            self.map_optimization_strategy != "pfgs360_full_50_50"
+            self.map_optimization_strategy
+            not in {
+                "pfgs360_full_50_50",
+                "pfgs360_official_chunkwise",
+            }
             and not self.insertion_dedup_enabled
         ):
             raise RuntimeError(
@@ -9288,6 +9366,298 @@ class SphericalSelfiGlobalBackend:
             )
         return frame_ids
 
+    @staticmethod
+    def _pfgs360_huber_owner_correction(
+        corrections: list[torch.Tensor],
+        *,
+        iterations: int = 5,
+    ) -> torch.Tensor:
+        """Robustly average left-multiplied SE(3) owner corrections."""
+
+        if not corrections:
+            raise ValueError("Owner correction averaging requires samples")
+        values = torch.stack(
+            [canonicalize_c2w(value) for value in corrections],
+            dim=0,
+        )
+        reference_rotation = values[0, :3, :3]
+        initial_rotation_residual = so3_log(
+            reference_rotation.transpose(0, 1).unsqueeze(0)
+            @ values[:, :3, :3]
+        )
+        mean_rotation = reference_rotation @ so3_exp(
+            initial_rotation_residual.median(dim=0).values
+        )
+        mean_translation = values[:, :3, 3].median(dim=0).values
+        for _ in range(max(1, int(iterations))):
+            rotation_residual = so3_log(
+                mean_rotation.transpose(0, 1).unsqueeze(0)
+                @ values[:, :3, :3]
+            )
+            translation_residual = (
+                values[:, :3, 3] - mean_translation.unsqueeze(0)
+            )
+            rotation_norm = torch.linalg.norm(
+                rotation_residual,
+                dim=-1,
+            )
+            translation_norm = torch.linalg.norm(
+                translation_residual,
+                dim=-1,
+            )
+
+            def huber_weights(residual: torch.Tensor) -> torch.Tensor:
+                median = residual.median()
+                mad = (residual - median).abs().median()
+                threshold = (1.5 * mad).clamp_min(1.0e-6)
+                return torch.where(
+                    residual <= threshold,
+                    torch.ones_like(residual),
+                    threshold / residual.clamp_min(1.0e-8),
+                )
+
+            weights = (
+                huber_weights(rotation_norm)
+                * huber_weights(translation_norm)
+            ).clamp_min(1.0e-8)
+            weights = weights / weights.sum().clamp_min(1.0e-8)
+            rotation_step = (
+                weights.unsqueeze(-1) * rotation_residual
+            ).sum(dim=0)
+            mean_rotation = mean_rotation @ so3_exp(rotation_step)
+            mean_translation = (
+                weights.unsqueeze(-1) * values[:, :3, 3]
+            ).sum(dim=0)
+        output = torch.eye(
+            4,
+            device=values.device,
+            dtype=values.dtype,
+        )
+        output[:3, :3] = mean_rotation
+        output[:3, 3] = mean_translation
+        return canonicalize_c2w(output)
+
+    def _writeback_pfgs360_owner_poses(
+        self,
+        *,
+        optimized_frame_ids: tuple[int, ...],
+    ) -> dict[str, float]:
+        """Publish robust owner R/t while preserving scale and rendering."""
+
+        if self.mapper is None or not self.chunk_first_stride_graph:
+            return {
+                "pose_owner_writeback_count": 0.0,
+                "pose_owner_scale_max_change": 0.0,
+            }
+        selected = {
+            int(frame_id)
+            for frame_id in optimized_frame_ids
+            if int(frame_id) in self.frame_pose_owner_node
+            and self.mapper.refined_pose_c2w(int(frame_id)) is not None
+        }
+        by_owner: dict[int, list[int]] = {}
+        for frame_id in sorted(selected):
+            by_owner.setdefault(
+                int(self.frame_pose_owner_node[frame_id]),
+                [],
+            ).append(frame_id)
+        root = self.graph.fixed_node_id
+        updated_owners: set[int] = set()
+        max_scale_change = 0.0
+        max_effective_pose_change = 0.0
+        total_rebased_rows = 0.0
+        for owner, frame_ids in sorted(by_owner.items()):
+            if root is not None and int(owner) == int(root):
+                continue
+            if owner not in self.graph.nodes:
+                raise RuntimeError(
+                    f"PFGS360 pose writeback references missing owner {owner}"
+                )
+            old_owner = self.graph.transform(owner).detach().clone()
+            old_scale, old_rotation, old_translation = sim3_components(
+                old_owner
+            )
+            corrections: list[torch.Tensor] = []
+            for frame_id in frame_ids:
+                local_pose = self.frame_local_pose_in_owner[frame_id].to(
+                    old_owner
+                )
+                canonical = apply_sim3_to_c2w(
+                    old_owner,
+                    local_pose,
+                )
+                optimized = self.mapper.refined_pose_c2w(frame_id)
+                assert optimized is not None
+                optimized = optimized.to(canonical)
+                correction = optimized @ invert_c2w(canonical)
+                corrections.append(canonicalize_c2w(correction))
+            mean = self._pfgs360_huber_owner_correction(
+                corrections,
+                iterations=5,
+            ).to(old_owner)
+            new_rotation = mean[:3, :3] @ old_rotation
+            new_translation = (
+                mean[:3, :3] @ old_translation + mean[:3, 3]
+            )
+            new_owner = sim3_from_components(
+                old_scale,
+                new_rotation,
+                new_translation,
+            )
+            new_scale = sim3_components(new_owner)[0]
+            max_scale_change = max(
+                max_scale_change,
+                abs(float((new_scale - old_scale).detach().cpu())),
+            )
+            rebase = self.map.rebase_owner_preserving_world(
+                owner,
+                new_owner,
+                adam_moments=self.mapper._pfgs360_gaussian_moments,
+            )
+            total_rebased_rows += float(
+                rebase.get("owner_rows_rebased", 0.0)
+            )
+            self.graph.nodes[owner] = canonicalize_sim3(new_owner).detach()
+            updated_owners.add(owner)
+
+            owner_frames = [
+                int(frame_id)
+                for frame_id, candidate_owner in self.frame_pose_owner_node.items()
+                if int(candidate_owner) == owner
+                and int(frame_id) in self.mapper.pose_deltas
+            ]
+            for frame_id in owner_frames:
+                local = self.frame_local_pose_in_owner[frame_id].to(
+                    new_owner
+                )
+                canonical = apply_sim3_to_c2w(new_owner, local)
+                pose_delta = self.mapper.pose_deltas[frame_id]
+                before = pose_delta().detach().clone()
+                pose_delta.rebase_preserving_effective_pose(canonical)
+                after = pose_delta().detach()
+                max_effective_pose_change = max(
+                    max_effective_pose_change,
+                    float((after - before).abs().max().detach().cpu()),
+                )
+                observation = self.mapper.observations.get(frame_id)
+                if observation is not None:
+                    observation.pose_c2w = canonical.detach().cpu().float()
+        if updated_owners:
+            self._refresh_factor_local_poses(updated_owners)
+            self._refresh_geometry_updates(
+                complete_snapshot=True,
+                affected_node_ids=updated_owners,
+                reason="pfgs360_official_owner_writeback",
+            )
+        if max_scale_change > 1.0e-8:
+            raise RuntimeError(
+                "PFGS360 owner pose writeback changed graph scale"
+            )
+        if max_effective_pose_change > 2.0e-5:
+            raise RuntimeError(
+                "PFGS360 owner pose writeback reapplied a photometric residual"
+            )
+        return {
+            "pose_owner_writeback_count": float(len(updated_owners)),
+            "pose_owner_rebased_gaussians": float(total_rebased_rows),
+            "pose_owner_scale_max_change": float(max_scale_change),
+            "pose_effective_pose_max_change": float(
+                max_effective_pose_change
+            ),
+        }
+
+    def _pfgs360_runtime_settings(self) -> dict[str, Any]:
+        """Resolve one authoritative PFGS360 optimizer configuration."""
+
+        pfgs = dict(
+            self.map_optimize_config.get("pfgs360", {}) or {}
+        )
+        return {
+            **pfgs,
+            "initial_steps": int(
+                self.map_optimize_config.get("initial_steps", 1000)
+            ),
+            "camera_steps": int(
+                self.map_optimize_config.get("camera_steps", 50)
+            ),
+            "joint_steps": int(
+                self.map_optimize_config.get("joint_steps", 50)
+            ),
+            "final_finetune_steps": int(
+                self.map_optimize_config.get(
+                    "final_finetune_steps",
+                    10000,
+                )
+            ),
+            "finetune_topology_steps": int(
+                self.map_optimize_config.get(
+                    "finetune_topology_steps",
+                    500,
+                )
+            ),
+            "seed": int(self.map_optimize_config.get("seed", 123)),
+            "pose_lr": float(
+                self.map_optimize_config.get("pose_lr", 1.0e-3)
+            ),
+            "joint_pose_lr": float(
+                self.map_optimize_config.get(
+                    "joint_pose_lr",
+                    1.0e-3,
+                )
+            ),
+            "pose_grad_clip_value": float(
+                self.map_optimize_config.get(
+                    "pose_grad_clip_value",
+                    1.0e-2,
+                )
+            ),
+            "adam_eps": float(
+                self.map_optimize_config.get("adam_eps", 1.0e-15)
+            ),
+            "xyz_lr": float(
+                self.map_optimize_config.get("xyz_lr", 1.6e-4)
+            ),
+            "features_lr": float(
+                self.map_optimize_config.get(
+                    "feature_lr",
+                    2.5e-3,
+                )
+            ),
+            "sh_rest_lr": float(
+                self.map_optimize_config.get(
+                    "sh_rest_lr",
+                    1.25e-4,
+                )
+            ),
+            "opacity_logit_lr": float(
+                self.map_optimize_config.get(
+                    "opacity_lr",
+                    5.0e-2,
+                )
+            ),
+            "scaling_lr": float(
+                self.map_optimize_config.get(
+                    "scaling_lr",
+                    5.0e-3,
+                )
+            ),
+            "rotation_lr": float(
+                self.map_optimize_config.get(
+                    "rotation_lr",
+                    1.0e-3,
+                )
+            ),
+            "latter_half_sample_probability": float(
+                self.map_optimize_config.get(
+                    "latter_half_probability",
+                    self.map_optimize_config.get(
+                        "latter_half_sample_probability",
+                        0.7,
+                    ),
+                )
+            ),
+        }
+
     def _run_map_optimization(self, window_id: int, frame_ids: tuple[int, ...], steps: int) -> dict[str, float]:
         if self.mapper is None or int(steps) <= 0:
             return {}
@@ -9337,7 +9707,10 @@ class SphericalSelfiGlobalBackend:
             active_owner_window_ids = self._map_optimization_window_ids(
                 int(window_id)
             )
-            if self.map_optimization_strategy == "pfgs360_full_50_50":
+            if self.map_optimization_strategy in {
+                "pfgs360_full_50_50",
+                "pfgs360_official_chunkwise",
+            }:
                 pfgs_settings = dict(
                     self.map_optimize_config.get("pfgs360", {}) or {}
                 )
@@ -9390,48 +9763,53 @@ class SphericalSelfiGlobalBackend:
                             **kwargs,
                         )
 
-                metrics = self.mapper.optimize_pfgs360_full_50_50(
-                    window_id=int(window_id),
-                    frame_ids=visited_frame_ids,
-                    new_frame_ids=new_frame_ids,
-                    settings={
-                        **pfgs_settings,
-                        "camera_steps": int(
-                            self.map_optimize_config.get("camera_steps", 50)
-                        ),
-                        "joint_steps": int(
-                            self.map_optimize_config.get("joint_steps", 50)
-                        ),
-                        "seed": int(self.map_optimize_config.get("seed", 123)),
-                        "pose_lr": float(
-                            self.map_optimize_config.get("pose_lr", 1.0e-3)
-                        ),
-                        "joint_pose_lr": float(
-                            self.map_optimize_config.get("joint_pose_lr", 1.0e-3)
-                        ),
-                        "pose_grad_clip_value": float(
-                            self.map_optimize_config.get("pose_grad_clip_value", 1.0e-2)
-                        ),
-                        "adam_eps": float(
-                            self.map_optimize_config.get("adam_eps", 1.0e-15)
-                        ),
-                        "xyz_lr": float(self.map_optimize_config.get("xyz_lr", 1.6e-4)),
-                        "features_lr": float(self.map_optimize_config.get("feature_lr", 2.5e-3)),
-                        "sh_rest_lr": float(self.map_optimize_config.get("sh_rest_lr", 1.25e-4)),
-                        "opacity_logit_lr": float(self.map_optimize_config.get("opacity_lr", 5.0e-2)),
-                        "scaling_lr": float(self.map_optimize_config.get("scaling_lr", 5.0e-3)),
-                        "rotation_lr": float(self.map_optimize_config.get("rotation_lr", 1.0e-3)),
-                        "latter_half_sample_probability": float(
-                            self.map_optimize_config.get(
-                                "latter_half_sample_probability", 0.7
-                            )
-                        ),
-                        "active_owner_window_ids": tuple(
-                            gaussian_owner_window_ids
-                        ),
-                    },
-                    refined_anchor_update=refined_anchor_update,
-                )
+                common_settings = {
+                    **self._pfgs360_runtime_settings(),
+                    "active_owner_window_ids": tuple(
+                        gaussian_owner_window_ids
+                    ),
+                }
+                if (
+                    self.map_optimization_strategy
+                    == "pfgs360_official_chunkwise"
+                ):
+                    metrics = (
+                        self.mapper.optimize_pfgs360_official_chunkwise(
+                            window_id=int(window_id),
+                            frame_ids=visited_frame_ids,
+                            new_frame_ids=new_frame_ids,
+                            settings=common_settings,
+                            refined_anchor_update=refined_anchor_update,
+                        )
+                    )
+                    writeback = self._writeback_pfgs360_owner_poses(
+                        optimized_frame_ids=visited_frame_ids,
+                    )
+                    metrics.update(writeback)
+                    metrics["pose_to_graph_sync_disabled"] = 0.0
+                else:
+                    metrics = self.mapper.optimize_pfgs360_full_50_50(
+                        window_id=int(window_id),
+                        frame_ids=visited_frame_ids,
+                        new_frame_ids=new_frame_ids,
+                        settings={
+                            **common_settings,
+                            "camera_steps": int(
+                                self.map_optimize_config.get(
+                                    "camera_steps",
+                                    50,
+                                )
+                            ),
+                            "joint_steps": int(
+                                self.map_optimize_config.get(
+                                    "joint_steps",
+                                    50,
+                                )
+                            ),
+                        },
+                        refined_anchor_update=refined_anchor_update,
+                    )
+                    metrics["pose_to_graph_sync_disabled"] = 1.0
                 metrics["optimized_frame_count"] = float(len(visited_frame_ids))
                 metrics["new_frame_count"] = float(len(new_frame_ids))
                 metrics["active_chunk_count"] = float(
@@ -9440,7 +9818,6 @@ class SphericalSelfiGlobalBackend:
                 metrics["pose_frame_chunk_count"] = float(
                     len(active_owner_window_ids)
                 )
-                metrics["pose_to_graph_sync_disabled"] = 1.0
                 if self.map.has_skybox:
                     metrics.update(
                         self.mapper.optimize_cubemap_sky(
@@ -9648,6 +10025,11 @@ class SphericalSelfiGlobalBackend:
                         )
             return metrics
         except SkySphereCameraBoundaryError:
+            if (
+                self.map_optimization_strategy
+                == "pfgs360_official_chunkwise"
+            ):
+                raise
             if backend_transaction is not None:
                 self._restore_boundary_transaction(backend_transaction)
             if self.geometry_rollback_on_failure:
@@ -9656,6 +10038,11 @@ class SphericalSelfiGlobalBackend:
                 self.mapper.commit_spherical_selfi_window()
             raise
         except (RuntimeError, ValueError, KeyError) as exc:
+            if (
+                self.map_optimization_strategy
+                == "pfgs360_official_chunkwise"
+            ):
+                raise
             if backend_transaction is not None:
                 self._restore_boundary_transaction(backend_transaction)
             if self.geometry_rollback_on_failure:
@@ -9775,7 +10162,10 @@ class SphericalSelfiGlobalBackend:
                     seam_owners
                 )
                 if deduplicated > 0 and self.mapper is not None:
-                    if self.map_optimization_strategy == "pfgs360_full_50_50":
+                    if self.map_optimization_strategy in {
+                        "pfgs360_full_50_50",
+                        "pfgs360_official_chunkwise",
+                    }:
                         # External seam compaction does not expose a row
                         # mapping.  Drop only Adam moments; map parameters and
                         # PFGS schedule remain intact and the next JOINT stage
@@ -10408,7 +10798,11 @@ class SphericalSelfiGlobalBackend:
                 mapper_pose_count += 1
                 if refined is not None:
                     if (
-                        self.map_optimization_strategy == "pfgs360_full_50_50"
+                        self.map_optimization_strategy
+                        in {
+                            "pfgs360_full_50_50",
+                            "pfgs360_official_chunkwise",
+                        }
                         and callable(canonical_pose)
                     ):
                         canonical = canonical_pose(int(frame_id))
@@ -11422,7 +11816,11 @@ class SphericalSelfiGlobalBackend:
         )
         if (
             refined_packet
-            and self.map_optimization_strategy != "pfgs360_full_50_50"
+            and self.map_optimization_strategy
+            not in {
+                "pfgs360_full_50_50",
+                "pfgs360_official_chunkwise",
+            }
         ):
             # Keep the frontend-owned packet immutable even for the first
             # chunk or for failures after alignment has succeeded.
@@ -12771,7 +13169,10 @@ class SphericalSelfiGlobalBackend:
             )
 
         window_transform = self._window_anchor_transforms()[window_id]
-        if self.map_optimization_strategy == "pfgs360_full_50_50":
+        if self.map_optimization_strategy in {
+            "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
+        }:
             # Strict PFGS360 owns both bootstrap and subsequent DIA-gated
             # refined-anchor growth.  Committing the packet through the
             # legacy fusion path here would populate the map before CAMERA/DIA,
@@ -13611,6 +14012,7 @@ class SphericalSelfiGlobalBackend:
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
             "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
         }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(
@@ -13904,7 +14306,10 @@ class SphericalSelfiGlobalBackend:
         for frame_id in packet.frame_ids:
             self.frame_windows.setdefault(int(frame_id), set()).add(int(window_id))
             self.frame_depth_owner_window.setdefault(int(frame_id), int(window_id))
-        if self.map_optimization_strategy == "pfgs360_full_50_50":
+        if self.map_optimization_strategy in {
+            "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
+        }:
             transform = self.graph.transform(window_id)
             if hasattr(self.map, "set_lazy_owner_transform"):
                 self.map.set_lazy_owner_transform(
@@ -13925,6 +14330,7 @@ class SphericalSelfiGlobalBackend:
             "gaussian_only_staged",
             "gaussian_only_joint_3dgs",
             "pfgs360_full_50_50",
+            "pfgs360_official_chunkwise",
         }:
             if self.map_steps_per_window > 0:
                 self._enqueue_map_optimization(
@@ -14022,6 +14428,50 @@ class SphericalSelfiGlobalBackend:
     def finalize(self) -> dict[str, Any]:
         if not self.window_order:
             return {}
+        if (
+            self.map_optimization_strategy
+            == "pfgs360_official_chunkwise"
+        ):
+            pending_metrics = self.run_pending_map_optimization()
+            if self.mapper is None:
+                raise RuntimeError(
+                    "PFGS360 official FINETUNE requires the mapper"
+                )
+            settings = self._pfgs360_runtime_settings()
+            frame_ids = tuple(
+                sorted(int(value) for value in self.mapper.observations)
+            )
+            map_metrics = self.mapper.finalize_pfgs360_official(
+                frame_ids=frame_ids,
+                settings=settings,
+            )
+            map_metrics.update(
+                self._writeback_pfgs360_owner_poses(
+                    optimized_frame_ids=frame_ids,
+                )
+            )
+            objective = float(self.graph.objective().detach().cpu())
+            return {
+                "graph_initial_objective": objective,
+                "graph_final_objective": objective,
+                "graph_iterations": 0,
+                "graph_reason": "pfgs360_official_finetune_no_final_lm",
+                "global_graph_optimization_enabled": (
+                    self.global_graph_optimization_enabled
+                ),
+                "graph_node_mode": self.node_mode,
+                "moved_gaussians": 0,
+                "deduplicated_gaussians": 0,
+                "anchors": self.map.anchor_count(),
+                "map_saturated": int(
+                    any(
+                        int(result.fusion.get("map_saturated", 0)) > 0
+                        for result in self.results
+                    )
+                ),
+                "pending_map_optimization": pending_metrics,
+                "map_optimization": map_metrics,
+            }
         if self.boundary_frame_graph:
             pending_metrics = self.run_pending_map_optimization()
             old_transforms = self._window_anchor_transforms()

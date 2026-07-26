@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -456,6 +457,8 @@ class PFGS360FullBackend:
         self.gaussian_update_scope = str(
             self.settings.get("gaussian_update_scope", "all")
         ).strip().lower()
+        if self.gaussian_update_scope == "official_full_tensor":
+            self.gaussian_update_scope = "all"
         if self.gaussian_update_scope not in {
             "all",
             "sampled_view_visible",
@@ -520,9 +523,9 @@ class PFGS360FullBackend:
             "PFGS360 state_storage_device must be 'cpu', 'map', or 'cuda'"
         )
 
-    def _snapshot(self) -> dict[str, object]:
+    def _snapshot(self, *, stage: str | None = None) -> dict[str, object]:
         state_device = self._state_storage_device()
-        return {
+        state = {
             "map": self.map.pfgs360_topology_snapshot(
                 parameter_device=state_device,
             ),
@@ -543,7 +546,41 @@ class PFGS360FullBackend:
                 ).items()
             },
             "joint_steps": int(getattr(self.mapper, "_pfgs360_joint_steps", 0)),
+            "official_global_step": int(
+                getattr(self.mapper, "_pfgs360_official_global_step", 0)
+            ),
+            "official_chunk_index": int(
+                getattr(self.mapper, "_pfgs360_official_chunk_index", 0)
+            ),
+            "official_stage": str(
+                stage
+                if stage is not None
+                else getattr(self.mapper, "_pfgs360_official_stage", "idle")
+            ),
+            "active_sh_degree": int(self.map.active_sh_degree),
+            "densification": {
+                key: (
+                    value.detach().to(state_device).clone()
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in dict(
+                    getattr(
+                        self.mapper,
+                        "_pfgs360_densification_state",
+                        {},
+                    )
+                    or {}
+                ).items()
+            },
+            "torch_rng_state": torch.random.get_rng_state().clone(),
         }
+        if torch.cuda.is_available():
+            state["cuda_rng_state"] = [
+                value.detach().cpu().clone()
+                for value in torch.cuda.get_rng_state_all()
+            ]
+        return state
 
     def _restore(self, state: dict[str, object]) -> None:
         self.map.restore_pfgs360_topology_snapshot(dict(state["map"]))
@@ -559,6 +596,29 @@ class PFGS360FullBackend:
                 pose.delta.copy_(pose_state["delta"].to(pose.delta))
         self.mapper._pfgs360_gaussian_moments = dict(state["moments"])
         self.mapper._pfgs360_joint_steps = int(state["joint_steps"])
+        self.mapper._pfgs360_official_global_step = int(
+            state.get("official_global_step", 0)
+        )
+        self.mapper._pfgs360_official_chunk_index = int(
+            state.get("official_chunk_index", 0)
+        )
+        self.mapper._pfgs360_official_stage = str(
+            state.get("official_stage", "idle")
+        )
+        self.map.active_sh_degree = int(
+            state.get("active_sh_degree", self.map.active_sh_degree)
+        )
+        self.mapper._pfgs360_densification_state = dict(
+            state.get("densification", {}) or {}
+        )
+        rng = state.get("torch_rng_state")
+        if torch.is_tensor(rng):
+            torch.random.set_rng_state(rng.detach().cpu())
+        cuda_rng = state.get("cuda_rng_state")
+        if isinstance(cuda_rng, list) and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(
+                [value.detach().cpu() for value in cuda_rng]
+            )
         self.mapper._pending_pfgs360_anchor_admission = None
         self.mapper.optimizer = self.map.make_optimizer(
             lr=float(self.settings.get("fallback_lr", 2.0e-3))
@@ -661,7 +721,13 @@ class PFGS360FullBackend:
             device=self.device, dtype=self.dtype
         )
 
-    def _render(self, observation, *, query_values: torch.Tensor | None = None) -> dict:
+    def _render(
+        self,
+        observation,
+        *,
+        query_values: torch.Tensor | None = None,
+        background: torch.Tensor | None = None,
+    ) -> dict:
         target = observation.image.to(device=self.device, dtype=self.dtype)
         from backend.pano_gs.adapter import PanoRenderCamera
 
@@ -670,11 +736,36 @@ class PFGS360FullBackend:
             image_width=int(target.shape[-1]),
             c2w=self._pose(observation),
         )
+        kwargs = {"query_values": query_values}
+        if background is not None:
+            kwargs["background"] = background
         return self.mapper.renderer.render(
             render_camera,
             self.map,
-            query_values=query_values,
+            **kwargs,
         )
+
+    def _save_recovery_checkpoint(self, stage: str) -> str | None:
+        if not bool(self.settings.get("save_recovery_checkpoints", True)):
+            return None
+        configured = self.settings.get("recovery_checkpoint_dir")
+        if configured is None:
+            results = (
+                self.map.config.get("Results", {})
+                if isinstance(self.map.config, dict)
+                else {}
+            )
+            save_dir = str(dict(results or {}).get("save_dir", "")).strip()
+            if not save_dir:
+                return None
+            configured = str(Path(save_dir) / "pfgs360_recovery")
+        directory = Path(str(configured))
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "latest.pt"
+        temporary = directory / "latest.pt.tmp"
+        torch.save(self._snapshot(stage=stage), temporary)
+        temporary.replace(path)
+        return str(path)
 
     @staticmethod
     def _owner_state_equal(lhs: dict[str, object], rhs: dict[str, object]) -> bool:
@@ -940,6 +1031,8 @@ class PFGS360FullBackend:
         sampling_policy = str(
             self.settings.get("sampling_policy", "latter_half_biased")
         ).strip().lower()
+        if sampling_policy == "pfgs360_latter_half_biased":
+            sampling_policy = "latter_half_biased"
         if sampling_policy == "uniform":
             for _ in range(int(steps)):
                 index = int(torch.randint(len(observations), (), generator=generator))
@@ -1093,10 +1186,14 @@ class PFGS360FullBackend:
         if not observations or int(steps) <= 0:
             return {"camera_steps": 0.0, "camera_loss": 0.0}
         fixed_frame = min(int(value.frame_id) for value in observations)
+        trainable_observations = [
+            observation
+            for observation in observations
+            if int(observation.frame_id) != fixed_frame
+        ]
         pose_params = [
             self.mapper.pose_deltas[int(obs.frame_id)].delta
-            for obs in observations
-            if int(obs.frame_id) != fixed_frame
+            for obs in trainable_observations
         ]
         if not pose_params:
             return {"camera_steps": 0.0, "camera_loss": 0.0}
@@ -1107,16 +1204,42 @@ class PFGS360FullBackend:
             weight_decay=0.0,
         )
         consistency = self._render_consistency_masks(observations)
-        schedule = self._sampling_schedule(observations, steps, seed)
+        schedule = self._sampling_schedule(
+            trainable_observations,
+            steps,
+            seed,
+        )
+        background_generator = torch.Generator(device="cpu")
+        background_generator.manual_seed(int(seed) + 997)
         last_loss = 0.0
-        gaussian_parameters = self.map.gaussian_parameters() + self.map.skybox_parameters()
-        requires_grad = [parameter.requires_grad for parameter in gaussian_parameters]
+        frozen_parameters = [
+            *self.map.gaussian_parameters(),
+            *self.map.skybox_parameters(),
+            self.mapper.pose_deltas[fixed_frame].delta,
+        ]
+        requires_grad = [
+            parameter.requires_grad for parameter in frozen_parameters
+        ]
         try:
-            for parameter in gaussian_parameters:
+            for parameter in frozen_parameters:
                 parameter.requires_grad_(False)
             for observation in schedule:
                 optimizer.zero_grad(set_to_none=True)
-                package = self._render(observation)
+                background = (
+                    torch.rand(
+                        3,
+                        generator=background_generator,
+                        dtype=torch.float32,
+                    ).to(device=self.device, dtype=self.dtype)
+                    if bool(
+                        self.settings.get("random_background", False)
+                    )
+                    else None
+                )
+                package = self._render(
+                    observation,
+                    background=background,
+                )
                 target = observation.image.to(device=self.device, dtype=self.dtype)
                 mask = consistency[int(observation.frame_id)]
                 if observation.sky_mask is not None:
@@ -1135,9 +1258,19 @@ class PFGS360FullBackend:
                 ):
                     raise FloatingPointError("Non-finite PFGS360 CAMERA pose gradient")
                 optimizer.step()
+                if not all(
+                    bool(torch.isfinite(parameter).all())
+                    for parameter in pose_params
+                ):
+                    raise FloatingPointError(
+                        "Non-finite PFGS360 CAMERA pose parameter"
+                    )
                 last_loss = float(loss.detach().cpu())
         finally:
-            for parameter, enabled in zip(gaussian_parameters, requires_grad):
+            for parameter, enabled in zip(
+                frozen_parameters,
+                requires_grad,
+            ):
                 parameter.requires_grad_(enabled)
         return {
             "camera_steps": float(len(schedule)),
@@ -1245,8 +1378,22 @@ class PFGS360FullBackend:
             responsibility = answers / accum.view(-1, 1).clamp_min(1.0e-8)
             finite = torch.isfinite(responsibility).all(dim=-1) & (accum > 0.0)
             threshold = float(self.settings.get("query_responsibility_threshold", 0.8))
-            inconsistent_hits += (finite & (responsibility[:, 0] >= threshold)).int()
-            inlier_hits += (finite & (responsibility[:, 1] >= threshold)).int()
+            delete_evidence_allowed = not (
+                bool(
+                    self.settings.get(
+                        "exclude_new_frames_from_delete_evidence",
+                        False,
+                    )
+                )
+                and frame_id in new_set
+            )
+            if delete_evidence_allowed:
+                inconsistent_hits += (
+                    finite & (responsibility[:, 0] >= threshold)
+                ).int()
+                inlier_hits += (
+                    finite & (responsibility[:, 1] >= threshold)
+                ).int()
             query_views += 1
             if frame_id in new_set:
                 mono_inlier_masks[frame_id] = mono_inlier.detach()
@@ -1330,82 +1477,108 @@ class PFGS360FullBackend:
                 raise RuntimeError(
                     "Atomic refined-anchor preparation returned no plan"
                 )
-            confirmed_inconsistent_hits = torch.zeros_like(inconsistent_hits)
-            confirmed_inlier_hits = torch.zeros_like(inlier_hits)
-            confirmed_query_views = 0
-            for observation in observations:
-                frame_id = int(observation.frame_id)
-                if frame_id not in new_set:
-                    continue
-                footprint = footprint_masks.get(frame_id)
-                mono_inlier = mono_inlier_masks.get(frame_id)
-                render_inconsistent = render_inconsistent_masks.get(frame_id)
-                if (
-                    footprint is None
-                    or mono_inlier is None
-                    or render_inconsistent is None
-                ):
-                    raise RuntimeError(
-                        f"Atomic replacement lacks frame {frame_id} masks"
-                    )
-                footprint = footprint.to(
-                    device=self.device, dtype=torch.bool
+            if bool(
+                self.settings.get(
+                    "exclude_new_frames_from_delete_evidence",
+                    False,
                 )
-                query = torch.stack(
-                    [
-                        (render_inconsistent & footprint)[0].float(),
-                        (mono_inlier & footprint)[0].float(),
-                    ],
-                    dim=-1,
+            ):
+                matched_old = torch.as_tensor(
+                    atomic_plan.get("matched_old_by_incoming"),
+                    device=self.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                confirmed_old = torch.zeros_like(provisional_cull)
+                valid_match = matched_old >= 0
+                if bool(valid_match.any()):
+                    confirmed_old[matched_old[valid_match]] = True
+                confirmed_cull = provisional_cull & confirmed_old
+                confirmed_reset = (
+                    provisional_reset & confirmed_old & ~confirmed_cull
                 )
-                with torch.no_grad():
-                    package = self._render(
-                        observation, query_values=query
-                    )
-                answers = package.get("query_answers")
-                accum = package.get("accum_visible")
-                if not (
-                    torch.is_tensor(answers)
-                    and torch.is_tensor(accum)
-                ):
-                    raise RuntimeError(
-                        "Atomic DIA requires query_answers and accum_visible"
-                    )
-                if tuple(answers.shape) != (
-                    self.map.anchor_count(),
-                    2,
-                ):
-                    raise RuntimeError(
-                        "Atomic DIA query answer shape mismatch"
-                    )
-                responsibility = answers / accum.view(-1, 1).clamp_min(
-                    1.0e-8
+                confirmed_query_views = 0
+            else:
+                confirmed_inconsistent_hits = torch.zeros_like(
+                    inconsistent_hits
                 )
-                finite = (
-                    torch.isfinite(responsibility).all(dim=-1)
-                    & (accum > 0.0)
-                )
-                threshold = float(
-                    self.settings.get(
-                        "query_responsibility_threshold", 0.8
+                confirmed_inlier_hits = torch.zeros_like(inlier_hits)
+                confirmed_query_views = 0
+                for observation in observations:
+                    frame_id = int(observation.frame_id)
+                    if frame_id not in new_set:
+                        continue
+                    footprint = footprint_masks.get(frame_id)
+                    mono_inlier = mono_inlier_masks.get(frame_id)
+                    render_inconsistent = render_inconsistent_masks.get(
+                        frame_id
                     )
+                    if (
+                        footprint is None
+                        or mono_inlier is None
+                        or render_inconsistent is None
+                    ):
+                        raise RuntimeError(
+                            f"Atomic replacement lacks frame {frame_id} masks"
+                        )
+                    footprint = footprint.to(
+                        device=self.device, dtype=torch.bool
+                    )
+                    query = torch.stack(
+                        [
+                            (render_inconsistent & footprint)[0].float(),
+                            (mono_inlier & footprint)[0].float(),
+                        ],
+                        dim=-1,
+                    )
+                    with torch.no_grad():
+                        package = self._render(
+                            observation, query_values=query
+                        )
+                    answers = package.get("query_answers")
+                    accum = package.get("accum_visible")
+                    if not (
+                        torch.is_tensor(answers)
+                        and torch.is_tensor(accum)
+                    ):
+                        raise RuntimeError(
+                            "Atomic DIA requires query_answers and accum_visible"
+                        )
+                    if tuple(answers.shape) != (
+                        self.map.anchor_count(),
+                        2,
+                    ):
+                        raise RuntimeError(
+                            "Atomic DIA query answer shape mismatch"
+                        )
+                    responsibility = answers / accum.view(
+                        -1, 1
+                    ).clamp_min(1.0e-8)
+                    finite = (
+                        torch.isfinite(responsibility).all(dim=-1)
+                        & (accum > 0.0)
+                    )
+                    threshold = float(
+                        self.settings.get(
+                            "query_responsibility_threshold", 0.8
+                        )
+                    )
+                    confirmed_inconsistent_hits += (
+                        finite
+                        & (responsibility[:, 0] >= threshold)
+                    ).int()
+                    confirmed_inlier_hits += (
+                        finite
+                        & (responsibility[:, 1] >= threshold)
+                    ).int()
+                    confirmed_query_views += 1
+                confirmed_cull = (
+                    (confirmed_inlier_hits > 0) & provisional_cull
                 )
-                confirmed_inconsistent_hits += (
-                    finite & (responsibility[:, 0] >= threshold)
-                ).int()
-                confirmed_inlier_hits += (
-                    finite & (responsibility[:, 1] >= threshold)
-                ).int()
-                confirmed_query_views += 1
-            confirmed_cull = (
-                (confirmed_inlier_hits > 0)
-                & provisional_cull
-            )
-            confirmed_reset = (
-                (confirmed_inconsistent_hits > 0)
-                & provisional_reset
-                & ~confirmed_cull
-            )
+                confirmed_reset = (
+                    (confirmed_inconsistent_hits > 0)
+                    & provisional_reset
+                    & ~confirmed_cull
+                )
             if int(confirmed_cull.sum().item()) < int(
                 self.settings.get("min_delete_gaussians", 100)
             ):
@@ -1847,6 +2020,576 @@ class PFGS360FullBackend:
             )
         return metrics
 
+    def _initial_stage(
+        self,
+        observations,
+        steps: int,
+        seed: int,
+    ) -> dict[str, float]:
+        """Official first-chunk appearance/covariance optimization."""
+
+        if not observations or int(steps) <= 0:
+            return {"initial_steps": 0.0, "initial_loss": 0.0}
+        parameter_groups = []
+        for name in self.map._gaussian_parameter_names():
+            if name == "xyz":
+                continue
+            parameter = getattr(self.map, name)
+            parameter_groups.append(
+                {
+                    "params": [parameter],
+                    "lr": float(
+                        self.settings.get(
+                            f"{name}_lr",
+                            self.PARAMETER_LRS[name],
+                        )
+                    ),
+                    "name": name,
+                }
+            )
+        optimizer = torch.optim.Adam(
+            parameter_groups,
+            eps=float(self.settings.get("adam_eps", 1.0e-15)),
+            weight_decay=0.0,
+        )
+        self._load_moments(optimizer)
+        schedule = self._sampling_schedule(observations, int(steps), int(seed))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed) + 1907)
+        frozen = [
+            self.map.xyz,
+            *self.map.skybox_parameters(),
+            *[
+                self.mapper.pose_deltas[int(observation.frame_id)].delta
+                for observation in observations
+            ],
+        ]
+        requires_grad = [parameter.requires_grad for parameter in frozen]
+        last_loss = 0.0
+        last_depth = 0.0
+        try:
+            for parameter in frozen:
+                parameter.requires_grad_(False)
+            for observation in schedule:
+                optimizer.zero_grad(set_to_none=True)
+                background = torch.rand(
+                    3,
+                    generator=generator,
+                    dtype=torch.float32,
+                ).to(device=self.device, dtype=self.dtype)
+                package = self._render(
+                    observation,
+                    background=background,
+                )
+                target = observation.image.to(
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                mask = None
+                if observation.sky_mask is not None:
+                    mask = ~observation.sky_mask.to(
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                photometric, _ = pfgs360_photometric_loss(
+                    package["render"],
+                    target,
+                    mask=mask,
+                )
+                depth_loss = photometric.new_zeros(())
+                if observation.target_depth is not None:
+                    rendered_depth = package["depth"].clamp_min(1.0e-6)
+                    target_depth = observation.target_depth.to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    ).clamp_min(1.0e-6)
+                    valid = (
+                        torch.isfinite(rendered_depth)
+                        & torch.isfinite(target_depth)
+                        & (target_depth >= self.cfg.min_depth)
+                        & (target_depth <= self.cfg.max_depth)
+                    )
+                    if observation.depth_confidence is not None:
+                        valid &= observation.depth_confidence.to(
+                            device=self.device,
+                            dtype=self.dtype,
+                        ) >= float(
+                            self.settings.get(
+                                "min_depth_confidence",
+                                0.05,
+                            )
+                        )
+                    if mask is not None:
+                        valid &= mask
+                    if bool(valid.any()):
+                        residual = torch.log(
+                            rendered_depth[valid] / target_depth[valid]
+                        )
+                        delta = residual.new_tensor(0.2)
+                        absolute = residual.abs()
+                        depth_loss = torch.where(
+                            absolute <= delta,
+                            0.5 * residual.square(),
+                            delta * (absolute - 0.5 * delta),
+                        ).mean()
+                loss = photometric + float(
+                    self.settings.get("initial_depth_weight", 0.01)
+                ) * depth_loss
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError(
+                        "Non-finite PFGS360 INITIAL loss"
+                    )
+                loss.backward()
+                if not all(
+                    parameter.grad is None
+                    or bool(torch.isfinite(parameter.grad).all())
+                    for group in parameter_groups
+                    for parameter in group["params"]
+                ):
+                    raise FloatingPointError(
+                        "Non-finite PFGS360 INITIAL gradient"
+                    )
+                optimizer.step()
+                if not all(
+                    bool(torch.isfinite(value).all())
+                    for value in self.map.gaussian_parameters()
+                ):
+                    raise FloatingPointError(
+                        "Non-finite PFGS360 INITIAL parameter"
+                    )
+                last_loss = float(loss.detach().cpu())
+                last_depth = float(depth_loss.detach().cpu())
+        finally:
+            for parameter, enabled in zip(frozen, requires_grad):
+                parameter.requires_grad_(enabled)
+        self._store_moments(optimizer)
+        return {
+            "initial_steps": float(len(schedule)),
+            "initial_loss": last_loss,
+            "initial_depth_loss": last_depth,
+            "initial_xyz_frozen": 1.0,
+            "initial_pose_frozen": 1.0,
+        }
+
+    @staticmethod
+    def _exponential_lr(
+        initial: float,
+        final: float,
+        step: int,
+        total_steps: int,
+    ) -> float:
+        if total_steps <= 1 or initial == final:
+            return float(final if total_steps <= 1 else initial)
+        fraction = float(step) / float(max(1, total_steps - 1))
+        return float(
+            math.exp(
+                math.log(max(initial, 1.0e-20)) * (1.0 - fraction)
+                + math.log(max(final, 1.0e-20)) * fraction
+            )
+        )
+
+    def _official_joint_stage(
+        self,
+        observations,
+        steps: int,
+        seed: int,
+        *,
+        stage_name: str,
+        topology_steps: int,
+        xyz_lr_final: float | None = None,
+        pose_lr_final: float | None = None,
+    ) -> dict[str, float]:
+        """Full-tensor PFGS360 joint optimization with in-stage topology."""
+
+        if not observations or int(steps) <= 0:
+            return {
+                f"{stage_name}_steps": 0.0,
+                f"{stage_name}_loss": 0.0,
+            }
+        fixed_frame = min(int(value.frame_id) for value in observations)
+        pose_params = [
+            self.mapper.pose_deltas[int(obs.frame_id)].delta
+            for obs in observations
+            if int(obs.frame_id) != fixed_frame
+        ]
+        xyz_lr = float(
+            self.settings.get("xyz_lr", self.PARAMETER_LRS["xyz"])
+        )
+        pose_lr = float(self.settings.get("joint_pose_lr", 1.0e-3))
+        xyz_final = xyz_lr if xyz_lr_final is None else float(xyz_lr_final)
+        pose_final = pose_lr if pose_lr_final is None else float(pose_lr_final)
+        pose_optimizer_state: dict[
+            torch.nn.Parameter,
+            dict[str, object],
+        ] = {}
+
+        def make_optimizer() -> torch.optim.Optimizer:
+            groups = []
+            for name in self.map._gaussian_parameter_names():
+                parameter = getattr(self.map, name)
+                groups.append(
+                    {
+                        "params": [parameter],
+                        "lr": float(
+                            self.settings.get(
+                                f"{name}_lr",
+                                self.PARAMETER_LRS[name],
+                            )
+                        ),
+                        "name": name,
+                    }
+                )
+            if pose_params:
+                groups.append(
+                    {
+                        "params": pose_params,
+                        "lr": pose_lr,
+                        "name": "poses",
+                    }
+                )
+            value = torch.optim.Adam(
+                groups,
+                eps=float(self.settings.get("adam_eps", 1.0e-15)),
+                weight_decay=0.0,
+            )
+            self._load_moments(value)
+            for parameter, state in pose_optimizer_state.items():
+                value.state[parameter] = {
+                    field: (
+                        item.detach().clone().cpu()
+                        if field == "step" and torch.is_tensor(item)
+                        else item.detach().clone().to(parameter)
+                        if torch.is_tensor(item)
+                        else item
+                    )
+                    for field, item in state.items()
+                }
+            return value
+
+        optimizer = make_optimizer()
+        schedule = self._sampling_schedule(observations, int(steps), int(seed))
+        background_generator = torch.Generator(device="cpu")
+        background_generator.manual_seed(int(seed) + 2909)
+        topology_enabled = int(topology_steps) > 0
+        refine_every = max(
+            1,
+            int(self.settings.get("refine_every_joint_steps", 100)),
+        )
+        grad_sum = torch.zeros(self.map.anchor_count(), device=self.device)
+        grad_count = torch.zeros_like(grad_sum)
+        max_radii = torch.zeros_like(grad_sum)
+        topology_totals = {
+            "split": 0,
+            "split_children": 0,
+            "duplicate": 0,
+            "culled": 0,
+        }
+        last_loss = 0.0
+        sky_parameters = self.map.skybox_parameters()
+        sky_requires_grad = [
+            parameter.requires_grad for parameter in sky_parameters
+        ]
+        fixed_pose = self.mapper.pose_deltas[fixed_frame].delta
+        fixed_pose_requires_grad = fixed_pose.requires_grad
+        try:
+            for parameter in sky_parameters:
+                parameter.requires_grad_(False)
+            fixed_pose.requires_grad_(False)
+            for step_index, observation in enumerate(schedule):
+                progress_step = step_index
+                for group in optimizer.param_groups:
+                    name = str(group.get("name", ""))
+                    if name == "xyz":
+                        group["lr"] = self._exponential_lr(
+                            xyz_lr,
+                            xyz_final,
+                            progress_step,
+                            len(schedule),
+                        )
+                    elif name == "poses":
+                        group["lr"] = self._exponential_lr(
+                            pose_lr,
+                            pose_final,
+                            progress_step,
+                            len(schedule),
+                        )
+                optimizer.zero_grad(set_to_none=True)
+                background = torch.rand(
+                    3,
+                    generator=background_generator,
+                    dtype=torch.float32,
+                ).to(device=self.device, dtype=self.dtype)
+                package = self._render(
+                    observation,
+                    background=background,
+                )
+                target = observation.image.to(
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                mask = None
+                if observation.sky_mask is not None:
+                    mask = ~observation.sky_mask.to(
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                render_loss, _ = pfgs360_photometric_loss(
+                    package["render"],
+                    target,
+                    mask=mask,
+                )
+                distortion = package.get("render_distort")
+                if torch.is_tensor(distortion):
+                    balance = pfgs360_spherical_weight(
+                        int(target.shape[-2]),
+                        int(target.shape[-1]),
+                        device=target.device,
+                        dtype=target.dtype,
+                    )
+                    render_loss = render_loss + float(
+                        self.settings.get("distortion_weight", 0.01)
+                    ) * (
+                        balance
+                        * distortion
+                        / package["depth"].clamp_min(1.0e-3)
+                    ).mean().nan_to_num()
+                regularizer = render_loss.new_zeros(())
+                scaling = self.map.get_scaling
+                opacity = self.map.get_opacity
+                if int(self.map.anchor_count()) > 0:
+                    regularizer = regularizer + float(
+                        self.settings.get(
+                            "opacity_regularizer_weight",
+                            0.01,
+                        )
+                    ) * opacity.mean()
+                    regularizer = regularizer + float(
+                        self.settings.get(
+                            "scale_regularizer_weight",
+                            0.01,
+                        )
+                    ) * scaling.mean()
+                    if (
+                        (step_index + 1)
+                        % int(self.settings.get("phys_ratio_every", 10))
+                        == 0
+                    ):
+                        ratio = scaling.amax(dim=-1) / scaling.amin(
+                            dim=-1
+                        ).clamp_min(1.0e-8)
+                        excessive = ratio - float(
+                            self.settings.get(
+                                "scale_ratio_threshold",
+                                10.0,
+                            )
+                        )
+                        positive = excessive[excessive > 0.0]
+                        physical = (
+                            positive.mean()
+                            if int(positive.numel()) > 0
+                            else excessive.new_zeros(())
+                        )
+                        regularizer = regularizer + float(
+                            self.settings.get("phys_ratio_weight", 0.1)
+                        ) * physical
+                loss = render_loss + regularizer
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError(
+                        f"Non-finite PFGS360 {stage_name.upper()} loss"
+                    )
+                loss.backward()
+                if pose_params:
+                    self._clip_pose_gradients(
+                        pose_params,
+                        float(
+                            self.settings.get(
+                                "pose_grad_clip_value",
+                                1.0e-2,
+                            )
+                        ),
+                    )
+                all_parameters = [
+                    parameter
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                ]
+                if not all(
+                    parameter.grad is None
+                    or bool(torch.isfinite(parameter.grad).all())
+                    for parameter in all_parameters
+                ):
+                    raise FloatingPointError(
+                        f"Non-finite PFGS360 {stage_name.upper()} gradient"
+                    )
+                viewspace = package.get("viewspace_points")
+                radii = package.get("radii")
+                if topology_enabled and torch.is_tensor(viewspace):
+                    gradient = getattr(viewspace, "absgrad", None)
+                    if gradient is None and (
+                        bool(viewspace.is_leaf) or bool(viewspace.retains_grad)
+                    ):
+                        gradient = viewspace.grad
+                    if (
+                        torch.is_tensor(gradient)
+                        and int(gradient.shape[0]) == self.map.anchor_count()
+                    ):
+                        magnitude = torch.linalg.norm(
+                            gradient.detach(),
+                            dim=-1,
+                        )
+                        visible = magnitude > 0.0
+                        grad_sum[visible] += magnitude[visible]
+                        grad_count[visible] += 1.0
+                if (
+                    topology_enabled
+                    and torch.is_tensor(radii)
+                    and int(radii.numel()) == self.map.anchor_count()
+                ):
+                    max_radii = torch.maximum(
+                        max_radii,
+                        radii.detach().reshape(-1).to(max_radii),
+                    )
+                optimizer.step()
+                if not all(
+                    bool(torch.isfinite(value).all())
+                    for value in self.map.gaussian_parameters()
+                ):
+                    raise FloatingPointError(
+                        f"Non-finite PFGS360 {stage_name.upper()} parameter"
+                    )
+                if not all(
+                    bool(torch.isfinite(parameter).all())
+                    for parameter in pose_params
+                ):
+                    raise FloatingPointError(
+                        f"Non-finite PFGS360 {stage_name.upper()} pose parameter"
+                    )
+                last_loss = float(loss.detach().cpu())
+                self.mapper._pfgs360_joint_steps = int(
+                    getattr(self.mapper, "_pfgs360_joint_steps", 0)
+                ) + 1
+                self.mapper._pfgs360_official_global_step = int(
+                    getattr(
+                        self.mapper,
+                        "_pfgs360_official_global_step",
+                        0,
+                    )
+                ) + 1
+                self.mapper._pfgs360_densification_state = {
+                    "grad_sum": grad_sum.detach(),
+                    "grad_count": grad_count.detach(),
+                    "max_radii": max_radii.detach(),
+                }
+                stage_step = step_index + 1
+                if (
+                    topology_enabled
+                    and stage_step <= int(topology_steps)
+                    and stage_step % refine_every == 0
+                ):
+                    pose_optimizer_state.clear()
+                    for parameter in pose_params:
+                        state = optimizer.state.get(parameter)
+                        if state:
+                            pose_optimizer_state[parameter] = {
+                                field: (
+                                    item.detach().clone()
+                                    if torch.is_tensor(item)
+                                    else item
+                                )
+                                for field, item in state.items()
+                            }
+                    self._store_moments(optimizer)
+                    mean_grad = grad_sum / grad_count.clamp_min(1.0)
+                    camera_centers = torch.stack(
+                        [
+                            self._pose(observation)[:3, 3].detach()
+                            for observation in observations
+                        ],
+                        dim=0,
+                    )
+                    refined = self.map.pfgs360_refine_topology(
+                        mean_grad,
+                        max_radii,
+                        grad_threshold=float(
+                            self.settings.get(
+                                "absgrad_threshold",
+                                8.0e-5,
+                            )
+                        ),
+                        split_scale_threshold=float(
+                            self.settings.get(
+                                "split_scale_threshold",
+                                0.01,
+                            )
+                        ),
+                        split_samples=int(
+                            self.settings.get("split_samples", 2)
+                        ),
+                        cull_opacity=float(
+                            self.settings.get("cull_opacity", 0.005)
+                        ),
+                        ood_distance=float(
+                            self.settings.get("ood_distance", 1.0e5)
+                        ),
+                        camera_centers=camera_centers,
+                        ood_chunk_size=int(
+                            self.settings.get("ood_chunk_size", 8192)
+                        ),
+                    )
+                    for key in topology_totals:
+                        topology_totals[key] += int(refined.get(key, 0))
+                    self._remap_moments()
+                    optimizer = make_optimizer()
+                    grad_sum = torch.zeros(
+                        self.map.anchor_count(),
+                        device=self.device,
+                    )
+                    grad_count = torch.zeros_like(grad_sum)
+                    max_radii = torch.zeros_like(grad_sum)
+        finally:
+            fixed_pose.requires_grad_(fixed_pose_requires_grad)
+            for parameter, enabled in zip(
+                sky_parameters,
+                sky_requires_grad,
+            ):
+                parameter.requires_grad_(enabled)
+        self._store_moments(optimizer)
+        self.mapper._pfgs360_densification_state = {
+            "grad_sum": grad_sum.detach(),
+            "grad_count": grad_count.detach(),
+            "max_radii": max_radii.detach(),
+        }
+        return {
+            f"{stage_name}_steps": float(len(schedule)),
+            f"{stage_name}_loss": last_loss,
+            f"{stage_name}_trainable_poses": float(len(pose_params)),
+            f"{stage_name}_full_tensor_gaussians": 1.0,
+            f"{stage_name}_topology_split": float(
+                topology_totals["split"]
+            ),
+            f"{stage_name}_topology_split_children": float(
+                topology_totals["split_children"]
+            ),
+            f"{stage_name}_topology_duplicate": float(
+                topology_totals["duplicate"]
+            ),
+            f"{stage_name}_topology_culled": float(
+                topology_totals["culled"]
+            ),
+            f"{stage_name}_xyz_lr_final": self._exponential_lr(
+                xyz_lr,
+                xyz_final,
+                max(0, len(schedule) - 1),
+                len(schedule),
+            ),
+            f"{stage_name}_pose_lr_final": self._exponential_lr(
+                pose_lr,
+                pose_final,
+                max(0, len(schedule) - 1),
+                len(schedule),
+            ),
+        }
+
     def run(
         self,
         *,
@@ -1949,3 +2692,196 @@ class PFGS360FullBackend:
         except Exception:
             self._restore(state)
             raise
+
+    def _apply_capacity_limit(self) -> int:
+        backend_cfg = dict(
+            self.map.config.get("SphericalSelfiGlobalBackend", {}) or {}
+        )
+        voxel_cfg = dict(backend_cfg.get("voxel_fusion", {}) or {})
+        maximum = max(0, int(voxel_cfg.get("max_total_gaussians", 0)))
+        if maximum <= 0 or self.map.anchor_count() <= maximum:
+            return 0
+        quality = self.map._anchor_quality.to(self.device)
+        score = quality + self.map.get_opacity.detach().view(-1)
+        retained = torch.topk(score, k=maximum, largest=True).indices
+        keep = torch.zeros(
+            self.map.anchor_count(),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        keep[retained] = True
+        removed = self.map.prune_anchors(~keep)
+        self._remap_moments()
+        return int(removed)
+
+    def run_official_chunkwise(
+        self,
+        *,
+        frame_ids: list[int] | tuple[int, ...],
+        new_frame_ids: list[int] | tuple[int, ...],
+        owner_window_id: int,
+        initial_steps: int,
+        camera_steps: int,
+        joint_steps: int,
+        seed: int,
+    ) -> dict[str, float]:
+        """Execute INITIAL or CAMERA->DIA->JOINT without quality rollback."""
+
+        observations = self._observations(frame_ids)
+        if not observations:
+            raise RuntimeError(
+                "PFGS360 official backend has no registered observations"
+            )
+        owner_before = self.map.lazy_owner_transform_state()
+        metrics: dict[str, float] = {
+            "strategy_pfgs360_official_chunkwise": 1.0,
+            "visited_frames": float(len(observations)),
+            "rollback_policy_none": 1.0,
+        }
+        is_first_chunk = self.map.anchor_count() == 0
+        chunk_index = int(
+            getattr(self.mapper, "_pfgs360_official_chunk_index", 0)
+        )
+        self.map.active_sh_degree = min(
+            int(self.map.max_sh_degree),
+            max(0, chunk_index),
+        )
+        if is_first_chunk:
+            self.mapper._pfgs360_official_stage = "initial"
+            checkpoint = self._save_recovery_checkpoint("before_initial")
+            bootstrap = self._bootstrap(
+                observations,
+                int(owner_window_id),
+            )
+            metrics.update(
+                {
+                    f"bootstrap_{key}": float(value)
+                    for key, value in bootstrap.items()
+                }
+            )
+            if self.map.anchor_count() == 0:
+                raise RuntimeError(
+                    "PFGS360 INITIAL bootstrap produced an empty map"
+                )
+            started = time.perf_counter()
+            metrics.update(
+                self._initial_stage(
+                    observations,
+                    int(initial_steps),
+                    int(seed),
+                )
+            )
+            metrics["initial_seconds"] = float(
+                time.perf_counter() - started
+            )
+            metrics["recovery_checkpoint_saved"] = float(
+                checkpoint is not None
+            )
+            metrics["dia_first_window_passthrough"] = 1.0
+        else:
+            self.mapper._pfgs360_official_stage = "camera"
+            checkpoint = self._save_recovery_checkpoint("before_camera")
+            started = time.perf_counter()
+            metrics.update(
+                self._camera_stage(
+                    observations,
+                    int(camera_steps),
+                    int(seed),
+                )
+            )
+            metrics["camera_seconds"] = float(
+                time.perf_counter() - started
+            )
+            self.mapper._pfgs360_official_stage = "dia"
+            started = time.perf_counter()
+            metrics.update(
+                self._dia(
+                    observations,
+                    tuple(int(value) for value in new_frame_ids),
+                    int(owner_window_id),
+                )
+            )
+            metrics["dia_seconds"] = float(time.perf_counter() - started)
+            self.mapper._pfgs360_official_stage = "joint"
+            started = time.perf_counter()
+            metrics.update(
+                self._official_joint_stage(
+                    observations,
+                    int(joint_steps),
+                    int(seed) + 1,
+                    stage_name="joint",
+                    topology_steps=int(joint_steps),
+                )
+            )
+            metrics["joint_seconds"] = float(
+                time.perf_counter() - started
+            )
+            metrics["recovery_checkpoint_saved"] = float(
+                checkpoint is not None
+            )
+        capacity_removed = self._apply_capacity_limit()
+        if not self._owner_state_equal(
+            self.map.lazy_owner_transform_state(),
+            owner_before,
+        ):
+            raise RuntimeError(
+                "PFGS360 stage modified an owner Sim(3) before graph writeback"
+            )
+        if not all(
+            bool(torch.isfinite(value).all())
+            for value in self.map.gaussian_parameters()
+        ):
+            raise FloatingPointError(
+                "PFGS360 official stage ended with non-finite map state"
+            )
+        self.mapper._pfgs360_official_chunk_index = chunk_index + 1
+        self.mapper._pfgs360_official_stage = "idle"
+        metrics["active_sh_degree"] = float(self.map.active_sh_degree)
+        metrics["anchors_after"] = float(self.map.anchor_count())
+        metrics["capacity_removed"] = float(capacity_removed)
+        metrics["window_rollback"] = 0.0
+        return metrics
+
+    def run_official_finetune(
+        self,
+        *,
+        frame_ids: list[int] | tuple[int, ...],
+        steps: int,
+        topology_steps: int,
+        seed: int,
+    ) -> dict[str, float]:
+        """Run the user-specified 10k-step final full-history polish."""
+
+        observations = self._observations(frame_ids)
+        if not observations:
+            raise RuntimeError(
+                "PFGS360 FINETUNE has no registered observations"
+            )
+        self.mapper._pfgs360_official_stage = "finetune"
+        checkpoint = self._save_recovery_checkpoint("before_finetune")
+        started = time.perf_counter()
+        metrics = self._official_joint_stage(
+            observations,
+            int(steps),
+            int(seed),
+            stage_name="finetune",
+            topology_steps=int(topology_steps),
+            xyz_lr_final=float(
+                self.settings.get("finetune_xyz_lr_final", 1.6e-6)
+            ),
+            pose_lr_final=float(
+                self.settings.get("finetune_pose_lr_final", 5.0e-6)
+            ),
+        )
+        metrics["finetune_seconds"] = float(
+            time.perf_counter() - started
+        )
+        metrics["finetune_topology_steps"] = float(topology_steps)
+        metrics["recovery_checkpoint_saved"] = float(
+            checkpoint is not None
+        )
+        metrics["capacity_removed"] = float(self._apply_capacity_limit())
+        metrics["anchors_after"] = float(self.map.anchor_count())
+        metrics["window_rollback"] = 0.0
+        self.mapper._pfgs360_official_stage = "idle"
+        return metrics
