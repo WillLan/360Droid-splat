@@ -154,6 +154,41 @@ def test_owner_rebase_preserves_world_gaussians_and_rebases_adam() -> None:
     torch.testing.assert_close(state["current"][2], new_current)
 
 
+def test_progressive_sh_degree_rotates_full_lazy_owner_tensor() -> None:
+    gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
+    gaussian_map.configure_lazy_owner_transforms(True)
+    gaussian_map.set_lazy_owner_transform(2, torch.eye(4), set_reference=True)
+    gaussian_map.append_pfgs360_points(
+        torch.tensor([[0.0, 0.0, 2.0]]),
+        torch.tensor([[0.25, 0.5, 0.75]]),
+        owner_window_id=2,
+        frame_id=0,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    current = torch.eye(4)
+    current[:3, :3] = torch.tensor(
+        [
+            [0.9950042, -0.0998334, 0.0],
+            [0.0998334, 0.9950042, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    gaussian_map.set_lazy_owner_transform(2, current)
+    gaussian_map.active_sh_degree = 1
+
+    coefficients = gaussian_map.get_sh_coefficients
+    rotation = gaussian_map._lazy_sh_rotation_matrix(
+        2,
+        device=coefficients.device,
+        dtype=coefficients.dtype,
+    )
+
+    assert coefficients.shape == (1, 9, 3)
+    assert rotation.shape == (9, 9)
+    assert torch.isfinite(coefficients).all()
+
+
 def test_erp_sampler_wraps_longitude_seam() -> None:
     image = torch.arange(8, dtype=torch.float32).view(1, 1, 8)
     pixels = torch.tensor([[[-0.25, 0.0], [7.75, 0.0], [8.25, 0.0]]])

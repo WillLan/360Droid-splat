@@ -680,13 +680,19 @@ class PanoGaussianMap(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        key = (int(owner), str(device), str(dtype), int(self.active_sh_degree))
+        # get_sh_coefficients always returns the complete persistent SH tensor.
+        # The rasterizer's sh_degree controls which prefix is active, so owner
+        # rotation must still be dimensioned for max_sh_degree.  Using the
+        # progressive active degree here makes a 4x4 matrix multiply an Nx9x3
+        # tensor while degree 1 is active and degree 2 is stored.
+        rotation_degree = int(self.max_sh_degree)
+        key = (int(owner), str(device), str(dtype), rotation_degree)
         cached = self._lazy_sh_rotation_cache.get(key)
         if cached is not None:
             return cached
         delta = self._lazy_owner_delta(owner, device=device, dtype=dtype)
         _, rotation, _ = sim3_components(delta)
-        coefficient_count = (int(self.active_sh_degree) + 1) ** 2
+        coefficient_count = (rotation_degree + 1) ** 2
         count = max(32, coefficient_count * 4)
         index = torch.arange(count, device=device, dtype=dtype)
         y = 1.0 - 2.0 * (index + 0.5) / float(count)
@@ -695,8 +701,8 @@ class PanoGaussianMap(nn.Module):
         target_direction = torch.stack(
             [radius * torch.cos(angle), y, radius * torch.sin(angle)], dim=-1
         )
-        target_basis = real_sh_basis(self.active_sh_degree, target_direction)
-        local_basis = real_sh_basis(self.active_sh_degree, target_direction @ rotation)
+        target_basis = real_sh_basis(rotation_degree, target_direction)
+        local_basis = real_sh_basis(rotation_degree, target_direction @ rotation)
         matrix = torch.linalg.pinv(target_basis) @ local_basis
         self._lazy_sh_rotation_cache[key] = matrix
         return matrix
