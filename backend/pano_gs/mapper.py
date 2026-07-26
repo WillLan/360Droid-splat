@@ -697,6 +697,13 @@ class PanoGaussianMap(nn.Module):
         key = (int(owner), str(device), str(dtype), rotation_degree)
         cached = self._lazy_sh_rotation_cache.get(key)
         if cached is not None:
+            # Diagnostics may populate this cache under inference_mode().
+            # A later JOINT pass cannot save an inference tensor for backward,
+            # even though this matrix is constant.  Cloning it in grad mode
+            # preserves the exact values and creates a normal autograd-safe
+            # tensor.
+            if torch.is_grad_enabled() and cached.is_inference():
+                return cached.clone()
             return cached
         delta = self._lazy_owner_delta(owner, device=device, dtype=dtype)
         _, rotation, _ = sim3_components(delta)

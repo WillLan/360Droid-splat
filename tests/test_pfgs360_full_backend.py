@@ -245,6 +245,44 @@ def test_progressive_sh_degree_rotates_full_lazy_owner_tensor() -> None:
     assert torch.isfinite(coefficients).all()
 
 
+def test_inference_cached_sh_rotation_supports_later_joint_backward() -> None:
+    gaussian_map = PanoGaussianMap(config=_config(), device="cpu")
+    gaussian_map.configure_lazy_owner_transforms(True)
+    gaussian_map.set_lazy_owner_transform(2, torch.eye(4), set_reference=True)
+    gaussian_map.append_pfgs360_points(
+        torch.tensor([[0.0, 0.0, 2.0]]),
+        torch.tensor([[0.25, 0.5, 0.75]]),
+        owner_window_id=2,
+        frame_id=0,
+        min_raw_points=1,
+        min_unique_voxels=1,
+    )
+    current = torch.eye(4)
+    current[:3, :3] = torch.tensor(
+        [
+            [0.9950042, -0.0998334, 0.0],
+            [0.0998334, 0.9950042, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    gaussian_map.set_lazy_owner_transform(2, current)
+
+    with torch.inference_mode():
+        inference_coefficients = gaussian_map.get_sh_coefficients
+    assert torch.isfinite(inference_coefficients).all()
+    cached = next(iter(gaussian_map._lazy_sh_rotation_cache.values()))
+    assert cached.is_inference()
+
+    gaussian_map.features.grad = None
+    gaussian_map.sh_rest.grad = None
+    gaussian_map.get_sh_coefficients.square().sum().backward()
+
+    assert gaussian_map.features.grad is not None
+    assert gaussian_map.sh_rest.grad is not None
+    assert torch.isfinite(gaussian_map.features.grad).all()
+    assert torch.isfinite(gaussian_map.sh_rest.grad).all()
+
+
 def test_owner_writeback_rotation_projection_preserves_implicit_scale() -> None:
     scale = torch.tensor(0.037, dtype=torch.float32)
     old_rotation = torch.tensor(
