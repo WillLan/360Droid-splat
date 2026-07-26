@@ -9596,7 +9596,12 @@ class SphericalSelfiGlobalBackend:
         # Check the actual SE(3) discrepancy instead.
         if (
             max_effective_rotation_error > 1.0e-4
-            or max_effective_translation_error > 1.0e-4
+            # Pose deltas and owner nodes are persisted in float32.  Rebasing
+            # large-coordinate trajectories can therefore leave sub-millimetre
+            # round-off even when the effective SE(3) pose is preserved.  Keep
+            # this tolerance far below the photometric/graph motion scale while
+            # avoiding false aborts from numerical quantization.
+            or max_effective_translation_error > 5.0e-4
         ):
             raise RuntimeError(
                 "PFGS360 owner pose writeback reapplied a photometric "

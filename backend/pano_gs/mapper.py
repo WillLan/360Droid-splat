@@ -665,10 +665,18 @@ class PanoGaussianMap(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        reference = self._lazy_owner_reference_transforms[int(owner)].to(
+        reference_cpu = self._lazy_owner_reference_transforms[int(owner)]
+        current_cpu = self._lazy_owner_current_transforms[int(owner)]
+        # Rebasing deliberately installs the same owner transform as both the
+        # reference and current state.  Computing T @ inv(T) in float32 is not
+        # exactly identity, especially for large translations, and the
+        # resulting spurious delta can move otherwise unchanged Gaussians.
+        if torch.equal(reference_cpu, current_cpu):
+            return torch.eye(4, device=device, dtype=dtype)
+        reference = reference_cpu.to(
             device=device, dtype=dtype
         )
-        current = self._lazy_owner_current_transforms[int(owner)].to(
+        current = current_cpu.to(
             device=device, dtype=dtype
         )
         return current @ sim3_inverse(reference)

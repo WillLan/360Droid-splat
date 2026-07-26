@@ -100,7 +100,7 @@ def test_pose_delta_near_pi_rebase_is_render_invariant() -> None:
     translation_error = torch.linalg.norm(relative_error[:3, 3])
 
     assert float(rotation_error) <= 1.0e-4
-    assert float(translation_error) <= 1.0e-4
+    assert float(translation_error) <= 5.0e-4
     torch.testing.assert_close(pose.canonical_pose(), new_base)
 
 
@@ -182,8 +182,10 @@ def test_owner_rebase_preserves_world_gaussians_and_rebases_adam() -> None:
             [0.0, 1.0, 0.0],
             [-0.1986693, 0.0, 0.9800666],
         ]
-    )
-    new_current[:3, 3] = torch.tensor([-0.2, 0.4, 0.1])
+    ) * 0.33
+    # Large owner coordinates reproduce the float32 T @ inv(T) cancellation
+    # that previously made an exact reference/current pair move the map.
+    new_current[:3, 3] = torch.tensor([10000.0, -5000.0, 2500.0])
     moments_before = moments["xyz"]["exp_avg"].clone()
 
     stats = gaussian_map.rebase_owner_preserving_world(
